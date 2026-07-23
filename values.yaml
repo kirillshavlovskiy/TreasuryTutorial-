@@ -1,0 +1,48 @@
+app:
+  replicas: 1
+  image:
+    repository: 211125331032.dkr.ecr.eu-west-1.amazonaws.com/fx-test-project
+    tag: latest
+    pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+ingress:
+  host: fx-test-project.dp.com
+
+sandboxName: fx-test-project
+
+database:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+
+externalSecret:
+  storeKind: ClusterSecretStore
+  storeName: aws-secrets-manager
+  secretPath: fx-test-project
+  refreshInterval: 5m
+
+s3:
+  enabled: false

@@ -1,0 +1,26 @@
+{{- if .Values.database.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.sandboxName }}-db
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.sandboxName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header X-Forwarded-Proto $scheme;
+spec:
+  ingressClassName: internal-nginx
+  rules:
+    - host: {{ .Values.sandboxName }}-db.dp.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.sandboxName }}-pgadmin
+                port:
+                  name: http
+{{- end }}

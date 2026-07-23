@@ -1,0 +1,76 @@
+{{- if .Values.s3.enabled }}
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ .Values.sandboxName }}-s3
+  namespace: {{ .Values.sandboxName }}
+spec:
+  name: {{ .Values.sandboxName }}-s3
+  description: "S3 access for {{ .Values.sandboxName }} — restricted to s3://{{ .Values.s3.bucket }}/{{ .Values.sandboxName }}/*"
+  policyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "AllowObjectOperations",
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject",
+            "s3:GetObjectVersion",
+            "s3:GetObjectTagging",
+            "s3:PutObjectTagging"
+          ],
+          "Resource": "arn:aws:s3:::{{ .Values.s3.bucket }}/{{ .Values.sandboxName }}/*"
+        },
+        {
+          "Sid": "AllowListBucket",
+          "Effect": "Allow",
+          "Action": [
+            "s3:ListBucket",
+            "s3:GetBucketLocation"
+          ],
+          "Resource": "arn:aws:s3:::{{ .Values.s3.bucket }}",
+          "Condition": {
+            "StringLike": {
+              "s3:prefix": [
+                "{{ .Values.sandboxName }}/",
+                "{{ .Values.sandboxName }}/*"
+              ]
+            }
+          }
+        }
+      ]
+    }
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Role
+metadata:
+  name: {{ .Values.sandboxName }}-s3
+  namespace: {{ .Values.sandboxName }}
+spec:
+  name: {{ .Values.sandboxName }}-s3
+  description: "IRSA role for {{ .Values.sandboxName }} S3 access"
+  assumeRolePolicyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::211125331032:oidc-provider/oidc.eks.eu-west-1.amazonaws.com/id/6D88D8938454CA111E105EEC1A1D5630"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "{{ .Values.s3.oidcIssuer }}:sub": "system:serviceaccount:{{ .Values.sandboxName }}:{{ .Values.sandboxName }}",
+              "{{ .Values.s3.oidcIssuer }}:aud": "sts.amazonaws.com"
+            }
+          }
+        }
+      ]
+    }
+  policies:
+    - arn:aws:iam::{{ .Values.s3.accountId }}:policy/{{ .Values.sandboxName }}-s3
+{{- end }}

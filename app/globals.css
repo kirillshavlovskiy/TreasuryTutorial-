@@ -1,0 +1,142 @@
+@import "tailwindcss";
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Scoped dark skin for the FX Simulator.
+
+   The simulator's ~3.9k lines of panels use light utility classes
+   (bg-white, text-gray-*, bg-sky-50, text-rose-600, …). Rather than rewrite
+   each file, any subtree wrapped in `.sim-dark` gets its light utilities
+   remapped to a slate dark palette, with semantic accent colours kept but
+   tinted/lightened for contrast on dark. Descendant selectors (`.sim-dark x`)
+   out-specify single-class Tailwind rules, so no !important is needed except
+   for divide/table borders which Tailwind applies via variables.
+
+   Saturated backgrounds (bg-blue-600 buttons, bg-violet-700 badges, …) are
+   intentionally left untouched — they read fine on dark.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* ── Neutral backgrounds ─────────────────────────────────────────────────── */
+.sim-dark .bg-white     { background-color: #0f172a; }
+.sim-dark .bg-gray-50   { background-color: #0b1220; }
+.sim-dark .bg-slate-50  { background-color: #0b1220; }
+.sim-dark .bg-gray-100  { background-color: #1e293b; }
+.sim-dark .bg-slate-100 { background-color: #1e293b; }
+.sim-dark .bg-gray-200  { background-color: #283548; }
+.sim-dark .bg-gray-300  { background-color: #334155; }
+.sim-dark .bg-gray-400  { background-color: #475569; }
+.sim-dark .bg-gray-600  { background-color: #334155; }
+.sim-dark .bg-gray-700  { background-color: #1e293b; }
+.sim-dark .bg-gray-800  { background-color: #0f172a; }
+.sim-dark .bg-gray-900  { background-color: #020617; }
+
+.sim-dark .hover\:bg-gray-50:hover  { background-color: #1e293b; }
+.sim-dark .hover\:bg-gray-100:hover { background-color: #334155; }
+.sim-dark .hover\:bg-gray-200:hover { background-color: #475569; }
+
+/* ── Neutral text (inverted scale: dark-on-light → light-on-dark) ────────── */
+.sim-dark .text-black    { color: #f8fafc; }
+.sim-dark .text-gray-900 { color: #f8fafc; }
+.sim-dark .text-gray-800 { color: #f1f5f9; }
+.sim-dark .text-gray-700 { color: #e2e8f0; }
+.sim-dark .text-gray-600 { color: #cbd5e1; }
+.sim-dark .text-gray-500 { color: #a3b2c7; }
+.sim-dark .text-gray-400 { color: #94a3b8; }
+.sim-dark .text-gray-300 { color: #cbd5e1; }
+.sim-dark .text-gray-200 { color: #e2e8f0; }
+.sim-dark .text-gray-100 { color: #f1f5f9; }
+
+.sim-dark .hover\:text-gray-700:hover { color: #e2e8f0; }
+.sim-dark .hover\:text-gray-900:hover { color: #f8fafc; }
+
+/* ── Neutral borders ─────────────────────────────────────────────────────── */
+.sim-dark .border-gray-100,
+.sim-dark .border-slate-100 { border-color: #1e293b; }
+.sim-dark .border-gray-200,
+.sim-dark .border-slate-200 { border-color: #334155; }
+.sim-dark .border-gray-300 { border-color: #475569; }
+.sim-dark .border-gray-400 { border-color: #64748b; }
+.sim-dark .hover\:border-gray-300:hover { border-color: #475569; }
+
+/* Divide + table borders (Tailwind sets these via border-color on children) */
+.sim-dark [class*="divide-gray"] > * { border-color: #334155 !important; }
+.sim-dark table,
+.sim-dark th,
+.sim-dark td { border-color: #334155; }
+
+/* ── Form controls ───────────────────────────────────────────────────────── */
+.sim-dark input,
+.sim-dark select,
+.sim-dark textarea {
+  background-color: #0f172a;
+  color: #e2e8f0;
+  border-color: #334155;
+}
+.sim-dark input::placeholder,
+.sim-dark textarea::placeholder { color: #64748b; }
+
+/* ── Semantic tint backgrounds (-50 → 12% / -100 → 20%) ──────────────────── */
+.sim-dark .bg-sky-50      { background-color: rgba(14,165,233,0.12); }
+.sim-dark .bg-sky-100     { background-color: rgba(14,165,233,0.20); }
+.sim-dark .bg-blue-50     { background-color: rgba(59,130,246,0.12); }
+.sim-dark .bg-blue-100    { background-color: rgba(59,130,246,0.20); }
+.sim-dark .bg-indigo-50   { background-color: rgba(99,102,241,0.12); }
+.sim-dark .bg-indigo-100  { background-color: rgba(99,102,241,0.20); }
+.sim-dark .bg-violet-50   { background-color: rgba(139,92,246,0.12); }
+.sim-dark .bg-violet-100  { background-color: rgba(139,92,246,0.20); }
+.sim-dark .bg-purple-50   { background-color: rgba(168,85,247,0.12); }
+.sim-dark .bg-purple-100  { background-color: rgba(168,85,247,0.20); }
+.sim-dark .bg-emerald-50  { background-color: rgba(16,185,129,0.12); }
+.sim-dark .bg-emerald-100 { background-color: rgba(16,185,129,0.20); }
+.sim-dark .bg-green-50    { background-color: rgba(34,197,94,0.12); }
+.sim-dark .bg-green-100   { background-color: rgba(34,197,94,0.20); }
+.sim-dark .bg-lime-50     { background-color: rgba(132,204,22,0.12); }
+.sim-dark .bg-lime-100    { background-color: rgba(132,204,22,0.20); }
+.sim-dark .bg-amber-50    { background-color: rgba(245,158,11,0.12); }
+.sim-dark .bg-amber-100   { background-color: rgba(245,158,11,0.20); }
+.sim-dark .bg-yellow-50   { background-color: rgba(234,179,8,0.12); }
+.sim-dark .bg-yellow-100  { background-color: rgba(234,179,8,0.20); }
+.sim-dark .bg-orange-50   { background-color: rgba(249,115,22,0.12); }
+.sim-dark .bg-orange-100  { background-color: rgba(249,115,22,0.20); }
+.sim-dark .bg-red-50      { background-color: rgba(239,68,68,0.12); }
+.sim-dark .bg-red-100     { background-color: rgba(239,68,68,0.20); }
+.sim-dark .bg-rose-50     { background-color: rgba(244,63,94,0.12); }
+.sim-dark .bg-rose-100    { background-color: rgba(244,63,94,0.20); }
+
+/* ── Semantic text → lightened for contrast on dark (all shades) ─────────── */
+.sim-dark [class*="text-sky-"]     { color: #7dd3fc; }
+.sim-dark [class*="text-blue-"]    { color: #93c5fd; }
+.sim-dark [class*="text-indigo-"]  { color: #a5b4fc; }
+.sim-dark [class*="text-violet-"]  { color: #c4b5fd; }
+.sim-dark [class*="text-purple-"]  { color: #d8b4fe; }
+.sim-dark [class*="text-emerald-"] { color: #6ee7b7; }
+.sim-dark [class*="text-green-"]   { color: #86efac; }
+.sim-dark [class*="text-lime-"]    { color: #bef264; }
+.sim-dark [class*="text-amber-"]   { color: #fcd34d; }
+.sim-dark [class*="text-yellow-"]  { color: #fde047; }
+.sim-dark [class*="text-orange-"]  { color: #fdba74; }
+.sim-dark [class*="text-red-"]     { color: #fca5a5; }
+.sim-dark [class*="text-rose-"]    { color: #fda4af; }
+
+/* ── Consistent full-row hover highlight ─────────────────────────────────────
+   Table cells carry opaque per-section backgrounds (bg-gray-50, bg-white,
+   bg-sky-50, …), so the row-level `hover:bg-*` on <tr> is hidden behind them
+   in the neutral sections. Overlay a translucent sheen on the cells of the
+   hovered row (as a background-image, so it layers over any background-color)
+   — every section highlights uniformly. */
+.sim-dark tbody tr:hover > td,
+.sim-dark tbody tr:hover > th {
+  background-image: linear-gradient(rgba(129,180,255,0.10), rgba(129,180,255,0.10));
+}
+
+/* ── Semantic borders → 40% alpha of the accent ──────────────────────────── */
+.sim-dark [class*="border-sky-"]     { border-color: rgba(14,165,233,0.40); }
+.sim-dark [class*="border-blue-"]    { border-color: rgba(59,130,246,0.40); }
+.sim-dark [class*="border-indigo-"]  { border-color: rgba(99,102,241,0.40); }
+.sim-dark [class*="border-violet-"]  { border-color: rgba(139,92,246,0.40); }
+.sim-dark [class*="border-purple-"]  { border-color: rgba(168,85,247,0.40); }
+.sim-dark [class*="border-emerald-"] { border-color: rgba(16,185,129,0.40); }
+.sim-dark [class*="border-green-"]   { border-color: rgba(34,197,94,0.40); }
+.sim-dark [class*="border-amber-"]   { border-color: rgba(245,158,11,0.40); }
+.sim-dark [class*="border-orange-"]  { border-color: rgba(249,115,22,0.40); }
+.sim-dark [class*="border-red-"]     { border-color: rgba(239,68,68,0.40); }
+.sim-dark [class*="border-rose-"]    { border-color: rgba(244,63,94,0.40); }

@@ -1,0 +1,64 @@
+{
+  "framework_version": "1.3",
+  "package": "claude-deel-treasury",
+  "project_name": "test-treasury-project",
+  "project_purpose": "",
+  "department": "treasury",
+  "division": "fx",
+  "division_label": "FX Team",
+  "installed_at": "2026-04-28T21:06:51.625Z",
+  "gdrive_knowledge_root": {
+    "folder_id": "1GCtnAJjcngaVdPOurusnxkhEU-BWPYIS",
+    "folder_name": "Knowledge Base",
+    "folder_url": "https://drive.google.com/drive/folders/1GCtnAJjcngaVdPOurusnxkhEU-BWPYIS"
+  },
+  "dept_knowledge_source": {
+    "type": "gdrive",
+    "gdrive_folder_id": "1Mz1sX0SI2TXQzE93a_cg2Z8Fq3NJp8h1",
+    "gdrive_folder_name": "Treasury"
+  },
+  "division_config_source": {
+    "type": "gdrive",
+    "gdrive_folder_id": "19rqdRvMX824j95NPPZvPxd1YRQNtt_n_",
+    "gdrive_folder_name": "FX Team"
+  },
+  "include_layers": {
+    "dept": true,
+    "div": true,
+    "project": true
+  },
+  "selected_files": {
+    "dept": [
+      "department.md",
+      "compliance.md",
+      "engineering.md"
+    ],
+    "div": [
+      "division.md",
+      "standards.md",
+      "policy.md",
+      "fx-hedging-policy.md",
+      "fx-hedging-strategy.md",
+      "fx-rate-mesh.md",
+      "fxall-integration.md"
+    ],
+    "project": [
+      "context.md",
+      "decisions.md",
+      "setup.md",
+      "engineering.md"
+    ]
+  },
+  "protected_paths": [
+    ".claude/rules/dept/",
+    ".claude/rules/div/"
+  ],
+  "editable_paths": [
+    ".claude/rules/project/"
+  ],
+  "this_project": {
+    "name": "test-treasury-project",
+    "gdrive_folder_id": "1djrNz9lIrJI3QwBRQZWUO0-5aPChDmd1",
+    "gdrive_folder_url": "https://drive.google.com/drive/folders/1djrNz9lIrJI3QwBRQZWUO0-5aPChDmd1"
+  }
+}

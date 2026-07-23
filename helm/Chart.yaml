@@ -1,0 +1,8 @@
+apiVersion: v2
+name: fx-test-project
+description: fx-test-project — deployed via Nexus
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+annotations:
+  deel-tools/template-version: "16"

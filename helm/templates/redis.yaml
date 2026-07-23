@@ -1,0 +1,62 @@
+{{- if .Values.redis.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.sandboxName }}-redis
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    sandbox.deel/name: {{ .Values.sandboxName }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
+      {{- with .Values.redis.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      containers:
+        - name: redis
+          image: "public.ecr.aws/docker/library/redis:{{ .Values.redis.version }}"
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+      {{- with .Values.redis.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.sandboxName }}-redis
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
+    sandbox.deel/name: {{ .Values.sandboxName }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+{{- end }}

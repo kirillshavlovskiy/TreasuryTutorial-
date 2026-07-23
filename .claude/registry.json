@@ -1,0 +1,76 @@
+{
+  "_note": "Mirrors the GDrive Knowledge Base folder structure exactly. Folder IDs come from the GDrive URL after /folders/",
+  "framework_docs_folder_id": "1t4gpsSjmqITdHqD9_BgDg4E5SFdb-Eh4",
+  "framework_docs_folder_name": "Framework Documentation",
+  "knowledge_base_docs": [
+    {
+      "gdrive_file_id": "1KahTthzSeOqsZKefl4CNCW0CCgGK__CVzsBlvuyXRxU",
+      "title": "README — Claude Knowledge Framework",
+      "local_path": "framework-readme.md"
+    },
+    {
+      "gdrive_file_id": "1BpeScM34C2TbLJvVtofsKBkvkzquuN7uwrXnqKshpko",
+      "title": "Setup Guide — Claude Deel Treasury Framework",
+      "local_path": "framework-setup.md"
+    }
+  ],
+  "departments": [
+    {
+      "key": "treasury",
+      "label": "Treasury",
+      "source": {
+        "type": "gdrive",
+        "gdrive_folder_id": "1Mz1sX0SI2TXQzE93a_cg2Z8Fq3NJp8h1",
+        "gdrive_folder_name": "Treasury"
+      }
+    }
+  ],
+  "divisions": {
+    "treasury": [
+      {
+        "key": "fx",
+        "label": "FX Team",
+        "gdrive_knowledge_root": {
+          "folder_id":   "1GCtnAJjcngaVdPOurusnxkhEU-BWPYIS",
+          "folder_name": "Knowledge Base",
+          "folder_url":  "https://drive.google.com/drive/folders/1GCtnAJjcngaVdPOurusnxkhEU-BWPYIS"
+        },
+        "dept_folder": {
+          "type":              "gdrive",
+          "gdrive_folder_id":  "1Mz1sX0SI2TXQzE93a_cg2Z8Fq3NJp8h1",
+          "gdrive_folder_name": "Treasury"
+        },
+        "source": {
+          "type":              "gdrive",
+          "gdrive_folder_id":  "19rqdRvMX824j95NPPZvPxd1YRQNtt_n_",
+          "gdrive_folder_name": "FX Team"
+        },
+        "projects_root": {
+          "type":              "gdrive",
+          "gdrive_folder_id":  "1-mgs00yGB539IkpOdueIzhfaS-neLKrH",
+          "gdrive_folder_name": "Projects"
+        }
+      }
+    ]
+  },
+  "dept_files": [
+    { "key": "department.md",  "label": "department.md  — org structure, team info, reporting lines" },
+    { "key": "compliance.md",  "label": "compliance.md  — regulatory & compliance requirements"      },
+    { "key": "engineering.md", "label": "engineering.md — engineering standards & practices"         }
+  ],
+  "div_files": [
+    { "key": "division.md",            "label": "division.md            — division overview, goals, FX position rules" },
+    { "key": "standards.md",           "label": "standards.md           — team coding & review standards"              },
+    { "key": "policy.md",              "label": "policy.md              — division policies & approval rules"          },
+    { "key": "fx-hedging-policy.md",   "label": "fx-hedging-policy.md   — FX business policy: limits, instruments, NWC rules", "divisions": ["fx"] },
+    { "key": "fx-hedging-strategy.md", "label": "fx-hedging-strategy.md — 2026 trading strategy, automation roadmap",           "divisions": ["fx"] },
+    { "key": "fx-rate-mesh.md",        "label": "fx-rate-mesh.md        — FX rate service: providers, API, monitoring",          "divisions": ["fx"], "wiki_page_id": 7220,  "wiki_url": "https://wiki.deel.network/i/7220"  },
+    { "key": "fxall-integration.md",   "label": "fxall-integration.md   — FXAll integration & v2 bid/ask API",                   "divisions": ["fx"], "wiki_page_id": 14521, "wiki_url": "https://wiki.deel.network/i/14521" }
+  ],
+  "project_files": [
+    { "key": "context.md",     "label": "context.md     — sprint goals, stakeholders & key links"  },
+    { "key": "decisions.md",   "label": "decisions.md   — architecture decision records (ADRs)"    },
+    { "key": "setup.md",       "label": "setup.md       — dev environment, commands & gotchas"     },
+    { "key": "engineering.md", "label": "engineering.md — coding standards & Claude behavior rules" }
+  ]
+}

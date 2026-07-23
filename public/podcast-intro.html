@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simple Sigma — Podcast Intro</title>
+  <style>
+    :root {
+      --bg0: #020617;
+      --bg1: #0f172a;
+      --accent: #38bdf8;
+      --muted: #64748b;
+      --formula: rgba(148, 163, 184, 0.55);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg0);
+      font-family: "SF Mono", "Menlo", "Consolas", ui-monospace, monospace;
+      color: #e2e8f0;
+    }
+    .stage {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background:
+        radial-gradient(ellipse 80% 60% at 50% 45%, #1e293b 0%, transparent 55%),
+        linear-gradient(180deg, var(--bg1) 0%, var(--bg0) 100%);
+    }
+    /* subtle grid */
+    .grid {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(56, 189, 248, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(56, 189, 248, 0.04) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse 70% 60% at 50% 50%, black 20%, transparent 75%);
+      animation: gridPulse 8s ease-in-out infinite;
+    }
+    @keyframes gridPulse {
+      0%, 100% { opacity: 0.5; }
+      50% { opacity: 1; }
+    }
+    /* orbiting ring */
+    .orbit {
+      position: absolute;
+      left: 50%;
+      top: 46%;
+      width: min(52vmin, 420px);
+      height: min(52vmin, 420px);
+      margin: calc(min(52vmin, 420px) / -2) 0 0 calc(min(52vmin, 420px) / -2);
+      border: 1px solid rgba(56, 189, 248, 0.15);
+      border-radius: 50%;
+      animation: spin 28s linear infinite;
+    }
+    .orbit::before {
+      content: "";
+      position: absolute;
+      top: -3px;
+      left: 50%;
+      width: 6px;
+      height: 6px;
+      margin-left: -3px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+    .orbit-2 {
+      width: min(70vmin, 560px);
+      height: min(70vmin, 560px);
+      margin: calc(min(70vmin, 560px) / -2) 0 0 calc(min(70vmin, 560px) / -2);
+      border-color: rgba(148, 163, 184, 0.1);
+      animation-duration: 42s;
+      animation-direction: reverse;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* 3D scene — perspective so Z-axis spin has depth */
+    .logo-scene {
+      position: absolute;
+      left: 50%;
+      top: 46%;
+      width: min(36vmin, 280px);
+      height: min(36vmin, 280px);
+      margin: calc(min(36vmin, 280px) / -2) 0 0 calc(min(36vmin, 280px) / -2);
+      perspective: 900px;
+      perspective-origin: 50% 50%;
+    }
+
+    /* logo card — rotate around Z (depth axis) with a slight X tilt so foreshortening reads as 3D */
+    .logo-wrap {
+      position: absolute;
+      inset: 10%;
+      border-radius: 28px;
+      background: transparent;
+      display: grid;
+      place-items: center;
+      transform-style: preserve-3d;
+      backface-visibility: visible;
+      filter: drop-shadow(0 0 28px rgba(56, 189, 248, 0.2))
+              drop-shadow(0 18px 40px rgba(0, 0, 0, 0.55));
+      animation:
+        logoIn 1.4s cubic-bezier(0.22, 1, 0.36, 1) both,
+        logoSpinZ 10s linear 1.4s infinite;
+    }
+    .logo-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      transform: translateZ(1px);
+      border-radius: 22%;
+    }
+    @keyframes logoIn {
+      from {
+        opacity: 0;
+        transform: rotateX(22deg) rotateZ(-40deg) scale(0.55);
+      }
+      to {
+        opacity: 1;
+        transform: rotateX(22deg) rotateZ(0deg) scale(1);
+      }
+    }
+    /* Continuous 3D spin around Z (out of screen), plate tilted on X for depth */
+    @keyframes logoSpinZ {
+      from { transform: rotateX(22deg) rotateZ(0deg); }
+      to   { transform: rotateX(22deg) rotateZ(360deg); }
+    }
+
+    /* title */
+    .brand {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: calc(46% + min(18vmin, 140px));
+      text-align: center;
+      animation: fadeUp 1.2s ease 0.6s both;
+    }
+    .brand h1 {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-weight: 550;
+      font-size: clamp(0.95rem, 2.4vw, 1.45rem);
+      letter-spacing: 0.02em;
+      max-width: 42rem;
+      margin: 0 auto;
+      padding: 0 1.25rem;
+      line-height: 1.35;
+      color: #e2e8f0;
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(18px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* floating formulas */
+    .formula {
+      position: absolute;
+      color: var(--formula);
+      font-size: clamp(0.7rem, 1.6vw, 0.95rem);
+      white-space: nowrap;
+      pointer-events: none;
+      user-select: none;
+      animation: drift var(--dur, 14s) ease-in-out var(--delay, 0s) infinite;
+      opacity: 0;
+    }
+    @keyframes drift {
+      0%   { opacity: 0; transform: translateY(12px); }
+      15%  { opacity: 0.85; }
+      50%  { opacity: 0.55; transform: translateY(-18px); }
+      85%  { opacity: 0.85; }
+      100% { opacity: 0; transform: translateY(12px); }
+    }
+
+    .hint {
+      position: absolute;
+      bottom: 1.25rem;
+      left: 0;
+      right: 0;
+      text-align: center;
+      font-size: 0.7rem;
+      color: #475569;
+      font-family: system-ui, sans-serif;
+      animation: fadeUp 1s ease 2s both;
+    }
+    .hint kbd {
+      padding: 0.1rem 0.4rem;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      background: #1e293b;
+    }
+  </style>
+</head>
+<body>
+  <div class="stage" id="stage">
+    <div class="grid"></div>
+    <div class="orbit"></div>
+    <div class="orbit orbit-2"></div>
+
+    <div class="logo-scene">
+      <div class="logo-wrap">
+        <img src="/simple-sigma-logo.png" alt="Simple Sigma" />
+      </div>
+    </div>
+
+    <div class="brand">
+      <h1>Corporate Treasury — from basics to modern practical navigation</h1>
+    </div>
+
+    <p class="hint">Fullscreen <kbd>F</kbd> · Replay <kbd>R</kbd> · Screen-record for podcast B-roll</p>
+  </div>
+
+  <script>
+    // Mix of corporate-finance motifs + a few core quant formulas
+    const FLOATERS = [
+      'Cash Flow · Liquidity',
+      'Notional Pool',
+      'FX Spot / Forward / Swap',
+      'Net Working Capital',
+      'Mark-to-Market P&L',
+      'Hedge Ratio',
+      'Balance Sheet · NWC',
+      'Interest Margin · NIM',
+      'USD · EUR · GBP · JPY',
+      'Credit / Debit Facility',
+      'Treasury Hub',
+      'Collateral · Margin',
+      'VaR₉₅ · Policy Limits',
+      'CIP · Carry Trade',
+      'H* buffer · σ_P',
+      'Δr = r_USD − r_FCY',
+      'EARN / PAY Carry',
+      'Settlement · Value Date',
+    ];
+
+    const stage = document.getElementById('stage');
+    const positions = [
+      { left: '5%',  top: '10%' },
+      { left: '58%', top: '8%' },
+      { left: '78%', top: '18%' },
+      { left: '8%',  top: '28%' },
+      { left: '70%', top: '32%' },
+      { left: '4%',  top: '48%' },
+      { left: '82%', top: '52%' },
+      { left: '12%', top: '62%' },
+      { left: '62%', top: '68%' },
+      { left: '6%',  top: '78%' },
+      { left: '48%', top: '82%' },
+      { left: '76%', top: '76%' },
+      { left: '28%', top: '14%' },
+      { left: '40%', top: '72%' },
+      { left: '88%', top: '40%' },
+      { left: '18%', top: '88%' },
+      { left: '55%', top: '22%' },
+      { left: '34%', top: '54%' },
+    ];
+
+    FLOATERS.forEach((text, i) => {
+      const el = document.createElement('div');
+      el.className = 'formula';
+      el.textContent = text;
+      const pos = positions[i % positions.length];
+      el.style.left = pos.left;
+      el.style.top = pos.top;
+      el.style.setProperty('--dur', `${12 + (i % 5) * 2}s`);
+      el.style.setProperty('--delay', `${(i * 0.4) % 7}s`);
+      stage.appendChild(el);
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'f' || e.key === 'F') {
+        if (!document.fullscreenElement) stage.requestFullscreen?.();
+        else document.exitFullscreen?.();
+      }
+      if (e.key === 'r' || e.key === 'R') {
+        location.reload();
+      }
+    });
+  </script>
+</body>
+</html>

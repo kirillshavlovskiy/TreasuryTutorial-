@@ -1,0 +1,141 @@
+{{- if .Values.database.enabled -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.sandboxName }}-pgadmin
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    sandbox.deel/name: {{ .Values.sandboxName }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      securityContext:
+        fsGroup: 5050
+      initContainers:
+        - name: setup-pgadmin
+          image: public.ecr.aws/docker/library/busybox:1.36
+          securityContext:
+            runAsUser: 5050
+            runAsGroup: 5050
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sandboxName }}-pg-app
+                  key: password
+          command:
+            - sh
+            - -c
+            - |
+              # Wildcard pgpass entry — matches any host/port/db for this user.
+              # libpq will use this automatically when PassFile is set on the server.
+              printf '*:*:*:{{ .Values.database.bootstrapOwner }}:%s\n' "$DB_PASSWORD" \
+                > /pgadmin-data/pgpass
+              chmod 600 /pgadmin-data/pgpass
+
+              # servers.json — PassFile tells pgAdmin/libpq where to find the password.
+              # ConnectNow:true auto-connects when pgAdmin starts.
+              cat > /pgadmin-data/servers.json << EOF
+              {
+                "Servers": {
+                  "1": {
+                    "Name": "{{ .Values.sandboxName }}",
+                    "Group": "Servers",
+                    "Host": "{{ .Values.sandboxName }}-pg-rw",
+                    "Port": 5432,
+                    "MaintenanceDB": "{{ .Values.database.bootstrapDatabase }}",
+                    "Username": "{{ .Values.database.bootstrapOwner }}",
+                    "SSLMode": "prefer",
+                    "PassFile": "/var/lib/pgadmin/pgpass",
+                    "ConnectNow": true
+                  }
+                }
+              }
+              EOF
+          volumeMounts:
+            - name: pgadmin-data
+              mountPath: /pgadmin-data
+      containers:
+        - name: pgadmin
+          image: public.ecr.aws/publive/dpage/pgadmin4:latest
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PGADMIN_DEFAULT_EMAIL
+              value: {{ .Values.database.pgadmin.email | quote }}
+            - name: PGADMIN_DEFAULT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.sandboxName }}-pg-app
+                  key: password
+            - name: PGADMIN_LISTEN_PORT
+              value: "8080"
+            - name: PGADMIN_CONFIG_SERVER_MODE
+              value: "False"
+            - name: PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED
+              value: "False"
+            - name: PGADMIN_CONFIG_PROXY_X_PROTO_COUNT
+              value: "1"
+            - name: PGADMIN_SERVER_JSON_FILE
+              value: /var/lib/pgadmin/servers.json
+            - name: PGPASSFILE
+              value: /var/lib/pgadmin/pgpass
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: pgadmin-data
+              mountPath: /var/lib/pgadmin
+      volumes:
+        - name: pgadmin-data
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.sandboxName }}-pgadmin
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    sandbox.deel/name: {{ .Values.sandboxName }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+{{- end }}

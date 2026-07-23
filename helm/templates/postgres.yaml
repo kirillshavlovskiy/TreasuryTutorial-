@@ -1,0 +1,79 @@
+{{- if .Values.database.enabled -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ .Values.sandboxName }}-pg
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    app.kubernetes.io/name: {{ .Values.sandboxName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    sandbox.deel/name: {{ .Values.sandboxName }}
+spec:
+  instances: {{ .Values.database.instances }}
+  enablePDB: false
+  imageName: "ghcr.io/cloudnative-pg/postgresql:{{ .Values.database.postgresVersion }}"
+
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 100m
+
+  bootstrap:
+    {{- if and .Values.database.recovery .Values.database.recovery.enabled }}
+    recovery:
+      source: {{ .Values.database.recovery.source }}
+    {{- else }}
+    initdb:
+      database: {{ .Values.database.bootstrapDatabase }}
+      owner: {{ .Values.database.bootstrapOwner }}
+    {{- end }}
+
+  {{- if and .Values.database.recovery .Values.database.recovery.enabled }}
+  externalClusters:
+  - name: {{ .Values.database.recovery.source }}
+    plugin:
+      name: barman-cloud.cloudnative-pg.io
+      parameters:
+        barmanObjectName: recovery-store
+        serverName: {{ .Values.database.recovery.source }}
+  {{- end }}
+
+  storage:
+    size: {{ .Values.database.storage.size }}
+    {{- if .Values.database.storage.storageClass }}
+    storageClass: {{ .Values.database.storage.storageClass }}
+    {{- end }}
+
+  affinity:
+    {{- if .Values.database.nodeSelector }}
+    nodeSelector:
+      {{- toYaml .Values.database.nodeSelector | nindent 6 }}
+    {{- end }}
+    {{- if .Values.database.tolerations }}
+    tolerations:
+      {{- toYaml .Values.database.tolerations | nindent 6 }}
+    {{- end }}
+
+  postgresql:
+    pg_hba:
+      - "host all all 0.0.0.0/0 md5"
+
+  serviceAccountTemplate:
+    metadata:
+      annotations:
+        {{- if and .Values.database.recovery .Values.database.recovery.enabled }}
+        eks.amazonaws.com/role-arn: arn:aws:iam::{{ .Values.s3.accountId }}:role/{{ .Values.sandboxName }}-recovery
+        {{- else }}
+        eks.amazonaws.com/role-arn: arn:aws:iam::{{ .Values.s3.accountId }}:role/{{ .Values.sandboxName }}-backup-s3
+        {{- end }}
+
+  {{- if .Values.database.backup }}
+  plugins:
+  - name: barman-cloud.cloudnative-pg.io
+    isWALArchiver: true
+    parameters:
+      barmanObjectName: s3-store
+  {{- end }}
+{{- end }}

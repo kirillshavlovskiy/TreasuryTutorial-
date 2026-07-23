@@ -1,0 +1,26 @@
+name: Pre-deployment build test
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - '.test-trigger'
+
+jobs:
+  build:
+    name: Build check
+    runs-on:
+      group: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install and build (Docker)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/app" \
+            -w /app \
+            -e NEXT_TELEMETRY_DISABLED=1 \
+            public.ecr.aws/docker/library/node:24-alpine \
+            sh -c 'npm ci && npm run build'

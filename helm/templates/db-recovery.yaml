@@ -1,0 +1,69 @@
+{{- if and .Values.database.enabled .Values.database.recovery .Values.database.recovery.enabled }}
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ .Values.sandboxName }}-recovery
+  namespace: {{ .Values.sandboxName }}
+spec:
+  name: {{ .Values.sandboxName }}-recovery
+  description: "S3 read access for {{ .Values.sandboxName }} to restore from {{ trimSuffix "-dev" .Values.sandboxName }} backups"
+  policyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:GetObject", "s3:ListBucket"],
+          "Resource": [
+            "arn:aws:s3:::{{ .Values.s3.bucket }}",
+            "arn:aws:s3:::{{ .Values.s3.bucket }}/{{ trimSuffix "-dev" .Values.sandboxName }}/db_backup/*"
+          ]
+        }
+      ]
+    }
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Role
+metadata:
+  name: {{ .Values.sandboxName }}-recovery
+  namespace: {{ .Values.sandboxName }}
+spec:
+  name: {{ .Values.sandboxName }}-recovery
+  description: "IRSA role for {{ .Values.sandboxName }} recovery from {{ trimSuffix "-dev" .Values.sandboxName }} S3 backups"
+  assumeRolePolicyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Principal": {
+            "Federated": "arn:aws:iam::{{ .Values.s3.accountId }}:oidc-provider/{{ .Values.s3.oidcIssuer }}"
+          },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "{{ .Values.s3.oidcIssuer }}:sub": "system:serviceaccount:{{ .Values.sandboxName }}:{{ .Values.sandboxName }}-pg",
+              "{{ .Values.s3.oidcIssuer }}:aud": "sts.amazonaws.com"
+            }
+          }
+        }
+      ]
+    }
+  policies:
+    - arn:aws:iam::{{ .Values.s3.accountId }}:policy/{{ .Values.sandboxName }}-recovery
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: recovery-store
+  namespace: {{ .Values.sandboxName }}
+spec:
+  configuration:
+    destinationPath: s3://{{ .Values.s3.bucket }}/{{ trimSuffix "-dev" .Values.sandboxName }}/db_backup/
+    s3Credentials:
+      inheritFromIAMRole: true
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+{{- end }}

@@ -1,0 +1,37 @@
+{{- if .Values.ingress.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.sandboxName }}
+  namespace: {{ .Values.sandboxName }}
+  labels:
+    app.kubernetes.io/name: {{ .Values.sandboxName }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 10m
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName | default "internal-nginx" }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.sandboxName }}-app
+                port:
+                  number: {{ .Values.service.port }}
+    {{- if .Values.ingress.aliasHost }}
+    - host: {{ .Values.ingress.aliasHost }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.sandboxName }}-app
+                port:
+                  number: {{ .Values.service.port }}
+    {{- end }}
+{{- end }}

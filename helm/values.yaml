@@ -1,0 +1,87 @@
+sandboxName: "my-sandbox"
+
+app:
+  image:
+    repository: nginx
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  port: 3000
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "300m"
+    limits:
+      memory: "1024Mi"
+  env: []
+podAnnotations: {}
+database:
+  enabled: false
+  instances: 1
+  postgresVersion: "16"
+  backup: true
+  recovery:
+    enabled: false
+    source: ""
+  pgadmin:
+    email: "admin@deel.tools"
+  storage:
+    size: "8Gi"
+  bootstrapDatabase: "app"
+  bootstrapOwner: "app"
+  nodeSelector:
+    karpenter.sh/nodepool: playgrounds-v1
+  tolerations:
+    - key: playgrounds-v1
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+redis:
+  enabled: false
+  version: "7.4-alpine"
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+  podAnnotations: {}
+  nodeSelector:
+    karpenter.sh/nodepool: playgrounds-v1
+ingress:
+  enabled: true
+  ingressClassName: internal-nginx
+  host: ""
+  path: "/"
+  pathType: Prefix
+  annotations: {}
+  tls: []
+  aliasHost: ""
+
+publicIngress:
+  enabled: false
+  host: ""
+  whitelistSourceRange: ""
+
+service:
+  port: 80
+
+externalSecret:
+  refreshInterval: 1h
+  storeKind: ClusterSecretStore
+  storeName: aws-secrets-manager
+  secretPath: ""
+
+nodeSelector:
+  karpenter.sh/nodepool: playgrounds-v1
+tolerations:
+  - key: playgrounds-v1
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+s3:
+  enabled: true
+  bucket: "deel-playgrounds-data"
+  accountId: "211125331032"
+  oidcIssuer: "oidc.eks.eu-west-1.amazonaws.com/id/6D88D8938454CA111E105EEC1A1D5630"
