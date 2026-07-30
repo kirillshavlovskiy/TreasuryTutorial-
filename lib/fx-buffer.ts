@@ -5,6 +5,11 @@ export interface SharedGlobals {
   r_USD: number;   // JPM NP USD credit rate % p.a.
   σ_P: number;     // payout forecast uncertainty fraction (0.10 = 10%)
   days: number;    // settlement gap days
+  /**
+   * FX Risk forecast period in months. Scales monthly Revenue (collections) /
+   * Expenses (payout) / fcastFX into Net FX Forecast. Default 1 when omitted.
+   */
+  forecastMonths?: number;
 }
 
 export interface CurrencyParam {
@@ -51,15 +56,50 @@ export function ccySpotRate(ccy: string): number {
   return CURRENCY_PARAMS[ccy]?.spot ?? 1;
 }
 
+/**
+ * Round money / notional figures so IEEE-754 noise never lands in state or inputs
+ * (e.g. 3.400000000000002 → 3.4). 8 dp is far below UI precision for M units.
+ */
+export function roundMoney(v: number, dp = 8): number {
+  if (!Number.isFinite(v)) return v;
+  const f = 10 ** dp;
+  return Math.round(v * f) / f;
+}
+
 /** Convert M FCY → M USD using TMS spot rate. */
 export function fcyToUsdM(fcy: number, ccy: string): number {
-  return fcy * ccySpotRate(ccy);
+  return roundMoney(fcy * ccySpotRate(ccy));
 }
 
 /** Convert M USD → M FCY using TMS spot rate. */
 export function usdToFcyM(usd: number, ccy: string): number {
   const rate = ccySpotRate(ccy);
-  return rate > 0 ? usd / rate : 0;
+  return rate > 0 ? roundMoney(usd / rate) : 0;
+}
+
+/**
+ * Net FX book (M FCY): long cash/fwd/assets minus FCY debt.
+ * `ir_liab_notional` is entered as a positive liability notional → short FX → deducted.
+ * `ir_invest_notional` is a long investment asset → added.
+ */
+export function fxBookNetLocalM(
+  row: Pick<
+    RowState,
+    | 'ccy'
+    | 'spot'
+    | 'fwd'
+    | 'nonCash'
+    | 'nonCashAsset'
+    | 'ir_liab_notional'
+    | 'ir_invest_notional'
+  >,
+): number {
+  const fwdFcy = usdToFcyM(row.fwd, row.ccy);
+  const invest = row.ir_invest_notional ?? 0;
+  const debt = row.ir_liab_notional; // +notional = liability short
+  return roundMoney(
+    row.spot + fwdFcy + row.nonCash + (row.nonCashAsset ?? 0) + invest - debt,
+  );
 }
 
 // ── Swap overlay formulas ──────────────────────────────────────────────────

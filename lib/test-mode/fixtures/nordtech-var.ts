@@ -1,12 +1,13 @@
 /**
  * Curriculum VaR inputs for Sigma Task 01 (episode var.json semantics).
  *
- * Exposure basis for scoring: STOCK net (EUR €4.9M), not the 3-month average.
- * Using avg (€6.7M) would land ~$275K at 95% — the guide flags that as a common mistake.
+ * Exposure basis for scoring: STOCK net after debt
+ *   EUR = cash + receivables − venture debt = 4.9 − 3.0 = €1.9M
+ * Forecast: Net FX + monthly flow × T (e.g. 1.9 + 1.2 at 1m).
  *
  * EUR spot is reporting-normalized (~1.0):
- *   95%: |4.9| × spot × 2.5% × 1.645 ≈ $202K
- *   99%: |4.9| × spot × 2.5% × 2.326 ≈ $285K  ← Task 01 Analytics target
+ *   95%: |1.9| × spot × 2.5% × 1.645 ≈ $78K
+ *   99%: |1.9| × spot × 2.5% × 2.326 ≈ $110K  ← Task 01 Analytics target
  */
 export const NORDTECH_VAR = {
   monthlyVol: 0.025,

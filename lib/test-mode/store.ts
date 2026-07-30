@@ -3,7 +3,9 @@ import {
   type Workspace,
 } from '@/lib/workspace-store';
 import { ensureTask01FxLayers } from '@/lib/test-mode/score';
+import type { EntityHedgeBook } from '@/lib/test-mode/hedge-var';
 import type {
+  SandboxUiState,
   TaskAnswers,
   TaskProgress,
   TaskStepId,
@@ -11,7 +13,8 @@ import type {
 } from '@/lib/test-mode/types';
 
 const STORAGE_PREFIX = 'treasury:test:';
-const STATE_VERSION = 3; // v3: parent-group consolidated dashboard
+/** v4: hedges + UI resume location for cross-session continuity. */
+export const STATE_VERSION = 4;
 
 export const TEST_GUEST_USER_KEY = 'test:guest';
 
@@ -38,7 +41,18 @@ export function emptyAnswers(): TaskAnswers {
     varConfidencePct: '',
     varExposureBasis: '',
     varHorizon: '',
+    varForecastMonths: '',
+    varForecastUncertainty: '',
     eurVarUsdK: '',
+  };
+}
+
+export function defaultSandboxUi(): SandboxUiState {
+  return {
+    view: 'home',
+    entityId: null,
+    dashboardId: null,
+    activeProfileId: null,
   };
 }
 
@@ -87,12 +101,107 @@ export function seedSandbox(taskId = '01'): TestSandboxState {
     },
     answers: emptyAnswers(),
     progress: defaultTaskProgress(taskId),
+    hedgesByEntityId: {},
+    ui: defaultSandboxUi(),
     seededAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
 }
 
 interface StoredBlob extends TestSandboxState {
   version?: number;
+}
+
+function isEntityShape(e: unknown): e is { name: string; baseCurrency: string; id: string } {
+  if (!e || typeof e !== 'object') return false;
+  const row = e as { name?: unknown; baseCurrency?: unknown; id?: unknown };
+  return (
+    typeof row.name === 'string'
+    && row.name.length > 0
+    && typeof row.baseCurrency === 'string'
+    && row.baseCurrency.length > 0
+    && typeof row.id === 'string'
+  );
+}
+
+function normalizeHedges(
+  raw: unknown,
+): Record<string, EntityHedgeBook> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, EntityHedgeBook> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue;
+    const book = value as { bookedHedges?: unknown; hedgeRatios?: unknown };
+    out[key] = {
+      bookedHedges: Array.isArray(book.bookedHedges) ? book.bookedHedges : [],
+      hedgeRatios:
+        book.hedgeRatios && typeof book.hedgeRatios === 'object'
+          ? (book.hedgeRatios as Record<string, number>)
+          : {},
+    };
+  }
+  return out;
+}
+
+function normalizeUi(raw: unknown): SandboxUiState {
+  const defaults = defaultSandboxUi();
+  if (!raw || typeof raw !== 'object') return defaults;
+  const ui = raw as Partial<SandboxUiState>;
+  const view =
+    ui.view === 'home' || ui.view === 'group' || ui.view === 'entity'
+      ? ui.view
+      : defaults.view;
+  return {
+    view,
+    entityId: typeof ui.entityId === 'string' ? ui.entityId : null,
+    dashboardId: typeof ui.dashboardId === 'string' ? ui.dashboardId : null,
+    activeProfileId:
+      typeof ui.activeProfileId === 'string' ? ui.activeProfileId : null,
+  };
+}
+
+/** Normalize any stored / API blob into a valid TestSandboxState. */
+export function normalizeSandboxState(parsed: unknown): TestSandboxState {
+  const seeded = seedSandbox();
+  if (!parsed || typeof parsed !== 'object') return seeded;
+  const blob = parsed as StoredBlob;
+
+  if (!blob.workspace || !Array.isArray(blob.workspace.entities)) {
+    return seeded;
+  }
+  if (!blob.workspace.entities.every(isEntityShape)) {
+    return seeded;
+  }
+
+  const group = blob.group?.dashboard
+    ? {
+        ...blob.group,
+        dashboard: {
+          ...blob.group.dashboard,
+          includedEntityIds:
+            blob.group.dashboard.includedEntityIds
+            ?? blob.workspace.entities.map(e => e.id),
+        },
+      }
+    : seeded.group;
+
+  const defaults = defaultTaskProgress();
+  const workspace = ensureTask01FxLayers(blob.workspace);
+
+  return {
+    workspace,
+    group,
+    answers: { ...emptyAnswers(), ...blob.answers },
+    progress: {
+      taskId: blob.progress?.taskId ?? defaults.taskId,
+      steps: { ...defaults.steps, ...blob.progress?.steps },
+    },
+    lastScore: blob.lastScore,
+    hedgesByEntityId: normalizeHedges(blob.hedgesByEntityId),
+    ui: normalizeUi(blob.ui),
+    seededAt: blob.seededAt ?? new Date().toISOString(),
+    updatedAt: blob.updatedAt ?? new Date().toISOString(),
+  };
 }
 
 export function loadSandbox(userKey: string): TestSandboxState {
@@ -102,49 +211,11 @@ export function loadSandbox(userKey: string): TestSandboxState {
     if (!raw) return seedSandbox();
     const parsed = JSON.parse(raw) as StoredBlob;
     // Migrate away from pre-v2 account-ladder sandbox shape.
-    if (!parsed?.version || parsed.version < STATE_VERSION) return seedSandbox();
-    if (!parsed.workspace || !Array.isArray(parsed.workspace.entities)) {
-      return seedSandbox();
-    }
-    // Reject legacy / corrupt entities (e.g. TestEntity with legalName only).
-    const entitiesOk = parsed.workspace.entities.every(
-      (e: { name?: unknown; baseCurrency?: unknown }) =>
-        typeof e?.name === 'string' &&
-        e.name.length > 0 &&
-        typeof e?.baseCurrency === 'string' &&
-        e.baseCurrency.length > 0,
-    );
-    if (!entitiesOk) return seedSandbox();
-    const seeded = seedSandbox();
-    const group = parsed.group?.dashboard
-      ? {
-          ...parsed.group,
-          dashboard: {
-            ...parsed.group.dashboard,
-            // Default: include every entity currently in the workspace.
-            includedEntityIds:
-              parsed.group.dashboard.includedEntityIds ??
-              parsed.workspace.entities.map((e: { id: string }) => e.id),
-          },
-        }
-      : seeded.group;
-    const defaults = defaultTaskProgress();
-    const workspace = ensureTask01FxLayers(parsed.workspace);
-    const state: TestSandboxState = {
-      workspace,
-      group,
-      answers: { ...emptyAnswers(), ...parsed.answers },
-      progress: {
-        taskId: parsed.progress?.taskId ?? defaults.taskId,
-        steps: { ...defaults.steps, ...parsed.progress?.steps },
-      },
-      lastScore: parsed.lastScore,
-      seededAt: parsed.seededAt ?? new Date().toISOString(),
-    };
-    // Persist layer backfill so Validate matches what the UI already shows.
-    if (workspace !== parsed.workspace) {
-      saveSandbox(userKey, state);
-    }
+    // v3 → v4 is additive (hedges/ui); keep workspace/answers/progress.
+    if (!parsed?.version || parsed.version < 3) return seedSandbox();
+    const state = normalizeSandboxState(parsed);
+    // Persist layer / v4 backfill so Validate matches what the UI already shows.
+    saveSandbox(userKey, state);
     return state;
   } catch {
     return seedSandbox();
@@ -153,7 +224,11 @@ export function loadSandbox(userKey: string): TestSandboxState {
 
 export function saveSandbox(userKey: string, state: TestSandboxState): void {
   if (typeof window === 'undefined') return;
-  const blob: StoredBlob = { ...state, version: STATE_VERSION };
+  const blob: StoredBlob = {
+    ...normalizeSandboxState(state),
+    updatedAt: state.updatedAt ?? new Date().toISOString(),
+    version: STATE_VERSION,
+  };
   window.localStorage.setItem(storageKey(userKey), JSON.stringify(blob));
 }
 
@@ -172,4 +247,14 @@ export function markStep(
     ...progress,
     steps: { ...progress.steps, [step]: status },
   };
+}
+
+/** Pick the newer of two sandbox states by updatedAt. */
+export function newerSandboxState(
+  a: TestSandboxState,
+  b: TestSandboxState,
+): TestSandboxState {
+  const aAt = Date.parse(a.updatedAt ?? a.seededAt ?? '') || 0;
+  const bAt = Date.parse(b.updatedAt ?? b.seededAt ?? '') || 0;
+  return bAt >= aAt ? b : a;
 }

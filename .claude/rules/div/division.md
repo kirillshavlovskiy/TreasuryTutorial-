@@ -2,12 +2,12 @@
 
 ## Mission
 
-Manage Deel's FX exposure across 150+ currencies, implement hedging strategies, and build tooling to automate FX risk management.
+Manage FX exposure across 150+ currencies, implement hedging strategies, and build tooling to automate FX risk management.
 
 ## Team structure
 
-- **FX Lead**: Dor (dor@deel.com)
-- **FX Engineer**: Kirill Shavlovskiy (kirill.shavlovskiy@deel.com)
+- **FX Lead**: Dor
+- **FX Engineer**: Kirill Shavlovskiy
 
 ## Responsibilities
 
@@ -18,28 +18,28 @@ Manage Deel's FX exposure across 150+ currencies, implement hedging strategies, 
 
 ## Shared services we own
 
-- Deel Treasury MCP — fx_order_search, fx_pl_report, fx_hedging_controls
+- Treasury MCP — fx_order_search, fx_pl_report, fx_hedging_controls
 - FX hedging models (Notional Pool FX Risk Hedging)
 
 ## Escalation path
 
-- TMS issues: Neeraj (neeraj@deel.com)
+- TMS issues: Neeraj
 - Rate feed issues: #treasury-fx Slack
 
 ---
 
 ## FX Position Rules
 
-**All FX positions are measured and counted against USD** (consolidated reporting currency of Deel Inc).
+**All FX positions are measured and counted against USD** (consolidated reporting currency of the organization).
 
-All currency balances across the Deel Inc subsidiary structure are included in the open currency position calculation.
+All currency balances across the group subsidiary structure are included in the open currency position calculation.
 
 ### Collection and Hedging Models
 
 The FX team operates three distinct models depending on currency and jurisdiction:
 
 **Model 1 — Global collection + Notional Pool sweep**
-- Funds collected globally into Deel Inc, swept to Notional Pool account
+- Funds collected globally into the parent entity, swept to Notional Pool account
 - FX hedging operates **independently** of the funding and sweep process
 - Hedging executed across all NP-supported currencies
 - This is the primary model; FX P&L is measured and tracked as trading activity

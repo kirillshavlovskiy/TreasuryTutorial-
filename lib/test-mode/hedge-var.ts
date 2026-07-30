@@ -1,10 +1,30 @@
-import type { RowState } from '@/lib/fx-buffer';
+import {
+  fcyToUsdM,
+  fxBookNetLocalM,
+  roundMoney,
+  usdToFcyM,
+  type RowState,
+} from '@/lib/fx-buffer';
+import {
+  effectiveMonthlyFlowLocalM,
+  monthlyFlowSeriesLocalM,
+  periodFlowSumLocalM,
+  type ForecastProfileState,
+} from '@/lib/forecast-profile';
 import { computeTaskVar } from '@/lib/test-mode/task-var';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   DEFAULT_VAR_SETUP,
   VAR_HORIZON_OPTIONS,
+  accruedForecastMonths,
+  accruedPositionFromScheduleM,
+  buildupLocalMForBasis,
+  computeAnalyticsVarUsdM,
+  computeGrowingExposureVarUsdM,
   computeParametricVarUsdM,
+  exposureLocalMForBasis,
+  horizonMonths,
+  linearBulletNotionalFromVarUsdM,
   type VarExposureBasis,
   type VarHorizonId,
   type VarSetup,
@@ -29,9 +49,13 @@ export interface FxTableRiskMetric extends RowRiskMetric {
   forwardHedgeLocalM: number;
 }
 
-/** Stock FX book used for Task Mode VaR columns. */
+/**
+ * Stock / Net FX book for exposure math (same as workspace Net FX):
+ *   Cash FX + Fwd + Receivables + Liability + Investments − Debt
+ * NordTech EUR unhedged: 2.5 + 2.4 − 3.0 = 1.9
+ */
 export function fxStockExposureLocalM(row: RowState): number {
-  return row.spot + (row.nonCashAsset ?? 0) + row.nonCash;
+  return fxBookNetLocalM(row);
 }
 
 /** Forecast / flow buildup for avg exposure (collections + payout + fcastFX). */
@@ -39,22 +63,52 @@ export function fxFlowLocalM(row: RowState): number {
   return row.collections + row.payout + (row.fcastFX ?? 0);
 }
 
+/**
+ * Hedge-target exposure for Risk Metrics Exp:
+ *   Net FX Forecast = Net FX book + period flow (F×T or custom Σ)
+ * This is what the book is trying to hedge — not Analytics "stock only".
+ */
+export function fxHedgeTargetLocalM(
+  row: RowState,
+  forecastMonths: number = 1,
+  forecastProfile?: ForecastProfileState | null,
+): number {
+  const T = Number.isFinite(forecastMonths) && forecastMonths >= 0 ? forecastMonths : 1;
+  return roundMoney(
+    fxBookNetLocalM(row) + periodFlowSumLocalM(row, T, forecastProfile),
+  );
+}
+
 /** Exposure for Analytics basis on a live simulator row. */
 export function fxExposureForBasis(
   row: RowState,
   basis: VarSetup['exposureBasis'],
+  forecastMonths: number = 1,
+  forecastProfile?: ForecastProfileState | null,
 ): number {
-  const stock = fxStockExposureLocalM(row);
-  if (basis === 'stock') return stock;
-  // avg ≈ S + 1.5F (same ladder convention)
-  return stock + 1.5 * fxFlowLocalM(row);
+  const T = Number.isFinite(forecastMonths) && forecastMonths >= 0 ? forecastMonths : 1;
+  // When a custom period profile is active, feed an equivalent monthly flow
+  // so existing S + F×T / S + ½×F×T helpers stay correct (F_eff × T = Σ months).
+  const flowM = effectiveMonthlyFlowLocalM(row, T, forecastProfile);
+  return exposureLocalMForBasis(
+    fxStockExposureLocalM(row),
+    flowM,
+    basis,
+    T,
+  );
 }
 
 export function exposureFromRiskRow(
   row: CurrencyRiskRow,
   basis: VarSetup['exposureBasis'],
+  forecastMonths: number = 1,
 ): number {
-  return basis === 'avgBuildup' ? row.bar.avg3mM : row.bar.stockNetM;
+  return exposureLocalMForBasis(
+    row.bar.stockNetM,
+    row.bar.flowM,
+    basis,
+    forecastMonths,
+  );
 }
 
 /** Build VaR-before-hedge metrics from live simulator FX rows. */
@@ -72,14 +126,26 @@ export function riskMetricsFromRows(
 }
 
 /**
- * FX Risk table metrics: original exposure, spot/forward hedge structure,
- * residual, and VaR after hedges under the Analytics regime.
+ * FX Risk table metrics: Exp = Net FX Forecast (hedge target), plus booked
+ * spot/forward hedge structure, residual, and path-integrated VaR.
+ *
+ * Exp follows Exposure period (F×T / custom profile) — hedge notional target.
+ * VaR uses linearly growing book e(t)=S+F·t over the VaR tenure (√∫ e² dt),
+ * not snapshot |E_end|×σ×√T (which overstates risk on a building pipeline).
+ *
+ * Tickets are exposure-signed (long → SELL hedge). Hedge columns show the
+ * offsetting position (−ticket), so Residual = Exp + Spot hedge + Fwd hedge.
+ *
+ * `hedgeRatios` (Decision-layer Hedge-add %) is optional staging math. The FX
+ * Risk table should pass `{}` so Residual/VaR stay on the open book until a
+ * trade is actually booked.
  */
 export function fxTableRiskMetrics(
   rows: RowState[],
   setupOrConfidence: VarSetup | VarConfidencePct = 95,
   bookedTickets: readonly HedgeTicket[] = [],
   hedgeRatios: Record<string, number> = {},
+  forecastProfile?: ForecastProfileState | null,
 ): FxTableRiskMetric[] {
   const setup: VarSetup =
     typeof setupOrConfidence === 'number'
@@ -89,26 +155,52 @@ export function fxTableRiskMetrics(
   return rows
     .filter(r => r.ccy !== 'USD')
     .map(r => {
-      const exposureLocalM = fxExposureForBasis(r, setup.exposureBasis);
-      const tickets = bookedTickets.filter(t => t.ccy === r.ccy);
+      const stockM = fxBookNetLocalM(r);
+      const T =
+        typeof setup.forecastMonths === 'number' && setup.forecastMonths >= 0
+          ? setup.forecastMonths
+          : 1;
+      const schedule =
+        T > 0 ? monthlyFlowSeriesLocalM(r, T, forecastProfile) : [];
+      const monthlyFlowM = effectiveMonthlyFlowLocalM(r, T > 0 ? T : 1, forecastProfile);
+      const flowForPath = T > 0 ? monthlyFlowM : 0;
+      const exposureLocalM = fxHedgeTargetLocalM(r, T, forecastProfile);
+      const tickets = bookedTickets.filter(
+        t => t.ccy === r.ccy && isLiveHedgeTicket(t),
+      );
       let spotBooked = 0;
       let forwardBooked = 0;
       for (const t of tickets) {
         if (t.instrument === 'spot') spotBooked += t.amountLocalM;
-        else forwardBooked += t.amountLocalM;
+        else forwardBooked += t.amountLocalM; // forward + option notionals
       }
       const bookedAmt = spotBooked + forwardBooked;
-      const ratio = Math.min(1, Math.max(0, hedgeRatios[r.ccy] ?? 0));
+      // Chip apply (Total E_end) may exceed 100% of Equal-VaR.
+      const ratio = Math.max(0, hedgeRatios[r.ccy] ?? 0);
       const incremental = (exposureLocalM - bookedAmt) * ratio;
-      // Attribute unbooked incremental % to the Analytics instrument.
-      const spotHedgeLocalM =
-        spotBooked + (setup.exposureBasis === 'stock' ? incremental : 0);
-      const forwardHedgeLocalM =
-        forwardBooked + (setup.exposureBasis === 'avgBuildup' ? incremental : 0);
-      const totalHedge = spotHedgeLocalM + forwardHedgeLocalM;
-      const residualLocalM = exposureLocalM - totalHedge;
-      const varBeforeUsdM = computeParametricVarUsdM(exposureLocalM, r.ccy, setup);
-      const varUsdM = computeParametricVarUsdM(residualLocalM, r.ccy, setup);
+      // Position sign: opposite of exposure-signed ticket (SELL long → short hedge).
+      const spotHedgeLocalM = -spotBooked;
+      const forwardHedgeLocalM = -forwardBooked;
+      const totalHedgeLocalM = bookedAmt + incremental;
+      const residualLocalM =
+        exposureLocalM + spotHedgeLocalM + forwardHedgeLocalM - incremental;
+      // Constant hedge notional shifts the path: e_res(t) = (S − B) + F·t.
+      const stockAfterHedgeM = stockM - totalHedgeLocalM;
+      const flows = schedule.length > 0 ? schedule : undefined;
+      const varBeforeUsdM = computeAnalyticsVarUsdM(
+        stockM,
+        flowForPath,
+        r.ccy,
+        setup,
+        flows,
+      );
+      const varUsdM = computeAnalyticsVarUsdM(
+        stockAfterHedgeM,
+        flowForPath,
+        r.ccy,
+        setup,
+        flows,
+      );
       return {
         ccy: r.ccy,
         exposureLocalM,
@@ -124,14 +216,135 @@ export function fxTableRiskMetrics(
 export interface HedgeVarRow {
   ccy: string;
   direction: 'long' | 'short' | 'hub';
-  /** Pre-hedge exposure used for VaR (stock or avg buildup). */
+  /**
+   * Net book on this Analytics basis after booked hedges (before Hedge-add %).
+   * 0 when booked trades fully cover the open exposure.
+   */
   exposureLocalM: number;
+  /** Original Analytics exposure before any booked hedges (Δ = 1 basis). */
+  openExposureLocalM: number;
   hedgeRatio: number;
+  /**
+   * VaR delta: varAfter / varBefore — 1 = unhedged, 0 = equal-VaR hedge fully offsets.
+   * (Not |residual|/|open| — path VaR can be matched by a smaller bullet notional.)
+   */
   delta: number;
+  /**
+   * Incremental Decision hedge notional (local M) = Target × Hedge-add %.
+   * 100% = full Total expected (Target); Cash / VaR-neutral sit below that.
+   */
   hedgeNotionalLocalM: number;
+  /**
+   * 100% Decision reference — Total expected over the forecast (net of booked).
+   * Hedge-add % scales this, not Equal-VaR.
+   */
+  targetHedgeLocalM: number;
+  /** Cash / stock exposure net of booked (Decision min meaningful hedge). */
+  stockHedgeLocalM: number;
+  /**
+   * VaR-neutral (Equal-VaR linear bullet) for the working book — Decision mid.
+   * |N| ≤ |accrued forecast position at min(Th,Tf)|.
+   */
+  equalVarHedgeLocalM: number;
+  /** True when equal-VaR size was capped by accrued position (cannot fully offset VaR). */
+  hedgeCapped: boolean;
   residualLocalM: number;
+  /** VaR on open (unhedged) exposure — always the Δ = 1 figure. */
   varBeforeUsdM: number;
+  /** VaR after booked + equal-VaR Hedge-add % (linear opposite-VaR offset). */
   varAfterUsdM: number;
+}
+
+/**
+ * Accrued exposure by VaR horizon — upper bound for a bullet hedge notional:
+ *   g = min(Th, Tf)
+ *   stock → S
+ *   avg   → S + ½×F×g
+ *   path  → S + F×g
+ */
+export function accruedPositionLocalM(
+  stockM: number,
+  monthlyFlowM: number,
+  basis: VarExposureBasis,
+  setup: Pick<VarSetup, 'horizon' | 'forecastMonths'>,
+): number {
+  const g = accruedForecastMonths(horizonMonths(setup.horizon), setup.forecastMonths);
+  const F =
+    g > 0 && Number.isFinite(monthlyFlowM) ? monthlyFlowM : 0;
+  const S = Number.isFinite(stockM) ? stockM : 0;
+  if (basis === 'stock') return S;
+  if (basis === 'simpleAvg' || basis === 'avgBuildup') return S + 0.5 * F * g;
+  return S + F * g;
+}
+
+/**
+ * Accrued (end-of-window) position at Th — physical forecast buildup / hedge cap.
+ * Weighted-avg VaR uses time-avg Ē=(1/T)∫e dt; Exposure @ Δ1 always shows end.
+ * Optional `monthlyFlows` = custom uneven schedule (overrides flat F).
+ */
+export function analyticsOpenExposureLocalM(
+  stockM: number,
+  monthlyFlowM: number,
+  setup: Pick<VarSetup, 'exposureBasis' | 'horizon' | 'forecastMonths'>,
+  monthlyFlows?: readonly number[],
+): number {
+  if (setup.exposureBasis === 'stock') {
+    return Number.isFinite(stockM) ? stockM : 0;
+  }
+  const Th = horizonMonths(setup.horizon);
+  if (setup.exposureBasis === 'simpleAvg') {
+    if (monthlyFlows && monthlyFlows.length > 0) {
+      const end = accruedPositionFromScheduleM(stockM, monthlyFlows, Th);
+      const S = Number.isFinite(stockM) ? stockM : 0;
+      return (S + end) / 2;
+    }
+    return accruedPositionLocalM(stockM, monthlyFlowM, 'simpleAvg', setup);
+  }
+  // Weighted avg / growth path: Exposure @ Δ1 = end buildup
+  if (monthlyFlows && monthlyFlows.length > 0) {
+    return accruedPositionFromScheduleM(stockM, monthlyFlows, Th);
+  }
+  return accruedPositionLocalM(stockM, monthlyFlowM, 'totalBuildup', setup);
+}
+
+/**
+ * Equal-VaR linear hedge notional (exposure-signed):
+ * invert Analytics VaR through the bullet formula |N|×σ×√Th×z, then cap by
+ * |accrued end position at Th| (not by Ē).
+ *
+ * Weighted avg: VaR uses Ē=(1/T)∫e ⇒ |N|≈Ē ≪ |E_end| on a growing book.
+ * Growth path: |N| = RMS-equivalent ≪ |E_end|. Cap binds when forecast-u
+ * inflates VaR above what a bullet on the accrued position can offset.
+ */
+export function equalVarLinearHedgeNotionalLocalM(
+  stockM: number,
+  monthlyFlowM: number,
+  ccy: string,
+  setup: VarSetup,
+  pathVarUsdM?: number,
+  monthlyFlows?: readonly number[],
+): { amountLocalM: number; uncappedAbsLocalM: number; capped: boolean } {
+  const varUsd =
+    typeof pathVarUsdM === 'number'
+      ? pathVarUsdM
+      : computeAnalyticsVarUsdM(stockM, monthlyFlowM, ccy, setup, monthlyFlows);
+  const uncappedAbs = linearBulletNotionalFromVarUsdM(varUsd, ccy, setup);
+  // Cap / sign from accrued end (Exposure @ Δ1) — never from Ē (that made N≡Exposure on avg).
+  const end = analyticsOpenExposureLocalM(
+    stockM,
+    monthlyFlowM,
+    setup,
+    monthlyFlows,
+  );
+  const capAbs = Math.abs(end);
+  const sign = end >= 0 ? 1 : -1;
+  const cappedAbs = Math.min(uncappedAbs, capAbs);
+  const capped = uncappedAbs > capAbs + 1e-12;
+  return {
+    amountLocalM: sign * cappedAbs,
+    uncappedAbsLocalM: uncappedAbs,
+    capped,
+  };
 }
 
 export interface HedgeVarSummary {
@@ -157,18 +370,21 @@ export function computeVarOnExposure(
 }
 
 /** Hedge instrument for a booked decision-layer trade. */
-export type HedgeInstrument = 'spot' | 'forward';
+export type HedgeInstrument = 'spot' | 'forward' | 'option';
+
+/** Live trade vs future roll leg (not yet executable). */
+export type HedgeTicketStatus = 'booked' | 'scheduled';
 
 export interface HedgeTicket {
   /** Stable id for the booked-transactions list / cancellation. */
   id: string;
   ccy: string;
-  /** Stock now → spot; avg monthly buildup (future) → forward. */
+  /** Spot / forward / option — chosen at book time (not forced by exposure basis). */
   instrument: HedgeInstrument;
   basis: VarExposureBasis;
   /** Local FCY millions to hedge (signed with exposure). */
   amountLocalM: number;
-  /** Forward value date = VaR horizon; null for spot. */
+  /** Forward / option tenor; null for spot. */
   maturity: VarHorizonId | null;
   maturityLabel: string | null;
   varUsdM: number;
@@ -178,6 +394,26 @@ export interface HedgeTicket {
   entityId?: string;
   /** Display name for consolidated booked-hedge lists. */
   entityName?: string;
+  /**
+   * `scheduled` = planned roll (not traded yet) — excluded from VaR / positions.
+   * Omit or `booked` = live ticket.
+   */
+  status?: HedgeTicketStatus;
+  /** Shared id for a rolling strip (M0 live + later scheduled legs). */
+  stripId?: string;
+  /** 0-based edge index within the strip. */
+  stripEdgeIndex?: number;
+}
+
+/** Live (traded) tickets — scheduled strip legs do not count. */
+export function isLiveHedgeTicket(t: HedgeTicket): boolean {
+  return t.status !== 'scheduled';
+}
+
+export function liveHedgeTickets(
+  tickets: readonly HedgeTicket[],
+): HedgeTicket[] {
+  return tickets.filter(isLiveHedgeTicket);
 }
 
 /** Scope key for hedges booked on the Group FX consolidated book. */
@@ -252,13 +488,15 @@ export function newHedgeTicketId(): string {
   return `ht-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Prefer a booked ticket on the active Analytics basis; else any ticket for the CCY. */
+/** Prefer a live booked ticket on the active Analytics basis; else any live ticket for the CCY. */
 export function bookedTicketForCcy(
   bookedTickets: readonly HedgeTicket[],
   ccy: string,
   preferredBasis?: VarExposureBasis,
 ): HedgeTicket | undefined {
-  const forCcy = bookedTickets.filter(t => t.ccy === ccy);
+  const forCcy = bookedTickets.filter(
+    t => t.ccy === ccy && isLiveHedgeTicket(t),
+  );
   if (forCcy.length === 0) return undefined;
   if (preferredBasis) {
     const match = forCcy.find(t => t.basis === preferredBasis);
@@ -267,28 +505,75 @@ export function bookedTicketForCcy(
   return forCcy[0];
 }
 
-/** Signed booked notional still sitting on the book for a CCY (sum of tickets). */
+/** Signed live booked notional for a CCY (scheduled strip legs excluded). */
 export function bookedNotionalLocalM(
   bookedTickets: readonly HedgeTicket[],
   ccy: string,
 ): number {
   return bookedTickets
-    .filter(t => t.ccy === ccy)
+    .filter(t => t.ccy === ccy && isLiveHedgeTicket(t))
     .reduce((s, t) => s + t.amountLocalM, 0);
+}
+
+/** Additive FX POSITION adjustments from Decision-layer tickets (book sign). */
+export interface BookedPositionOffset {
+  spotLocalM: number;
+  fwdLocalM: number;
+}
+
+/**
+ * Map booked hedges into FX POSITION offsets.
+ * Tickets are exposure-signed (long → SELL); the position book records the
+ * offsetting short spot/forward leg (−amount).
+ */
+export function bookedPositionOffsetsByCcy(
+  bookedTickets: readonly HedgeTicket[],
+): Record<string, BookedPositionOffset> {
+  const map: Record<string, BookedPositionOffset> = {};
+  for (const t of bookedTickets) {
+    if (!isLiveHedgeTicket(t)) continue;
+    const cur = map[t.ccy] ?? { spotLocalM: 0, fwdLocalM: 0 };
+    if (t.instrument === 'spot') cur.spotLocalM -= t.amountLocalM;
+    else cur.fwdLocalM -= t.amountLocalM; // forward + option → FWD position overlay
+    map[t.ccy] = cur;
+  }
+  return map;
+}
+
+/** Apply booked Decision-layer hedges onto simulator rows for FWD/Spot display. */
+export function applyBookedHedgePositions(
+  rows: RowState[],
+  bookedTickets: readonly HedgeTicket[],
+): RowState[] {
+  if (!bookedTickets.length) return rows;
+  const offsets = bookedPositionOffsetsByCcy(bookedTickets);
+  return rows.map(r => {
+    const o = offsets[r.ccy];
+    if (!o) return r;
+    if (Math.abs(o.spotLocalM) < 1e-12 && Math.abs(o.fwdLocalM) < 1e-12) return r;
+    const fwdFcy = usdToFcyM(r.fwd, r.ccy) + o.fwdLocalM;
+    return {
+      ...r,
+      spot: r.spot + o.spotLocalM,
+      fwd: fcyToUsdM(fwdFcy, r.ccy),
+    };
+  });
 }
 
 /**
  * Hedging Decision / Live Ladder / Analytics rows.
  *
- * Booked tickets are netted into the base exposure (raw − booked), then incremental
- * hedge % starts from 0 on that net book. Switching Analytics basis recalculates raw
- * exposure, so a stock hedge leaves avg-buildup residual active again.
+ * Decision Hedge-add % is of Total expected (Target):
+ *   0% → unhedged · Cash → stock/Target · VaR-neutral → Equal-VaR/Target · 100% → Target
+ * Open VaR still uses the Analytics engine at Th; Equal-VaR is the mid reference only.
  */
 export function buildHedgeVarSummary(
   risk: CurrencyRiskRow[],
   hedgeRatios: Record<string, number> = {},
   setupOrConfidence: VarSetup | VarConfidencePct = 95,
   bookedTickets: readonly HedgeTicket[] = [],
+  /** Per-CCY custom month nets; when set, Analytics VaR uses the uneven schedule. */
+  monthlyFlowsByCcy: Record<string, readonly number[]> = {},
 ): HedgeVarSummary {
   const setup: VarSetup =
     typeof setupOrConfidence === 'number'
@@ -299,22 +584,100 @@ export function buildHedgeVarSummary(
     .filter(r => r.bar.ccy !== 'USD')
     .map(row => {
       const { bar } = row;
-      const rawLocalM = exposureFromRiskRow(row, setup.exposureBasis);
+      const stockM = bar.stockNetM;
+      const flowM =
+        setup.forecastMonths > 0 && Math.abs(bar.flowM) > 1e-15 ? bar.flowM : 0;
+      const schedule = monthlyFlowsByCcy[bar.ccy];
+      const flows =
+        schedule && schedule.length > 0 ? schedule : undefined;
+      // Open exposure at Th: avg/path accrue with g=min(Th,Tf) — not full F×Tf.
+      const openLocalM = analyticsOpenExposureLocalM(
+        stockM,
+        flowM,
+        setup,
+        flows,
+      );
       const bookedAmt = bookedNotionalLocalM(bookedTickets, bar.ccy);
-      // Stock' = original exposure + hedge offset (= raw − booked amount).
-      const exposureLocalM = rawLocalM - bookedAmt;
+      // Working book after settled hedges (incremental % applies here).
+      const exposureLocalM = openLocalM - bookedAmt;
+      // Decision ladder: 100% = Total expected over full forecast (Target).
+      const Tf = setup.forecastMonths;
+      const totalRaw =
+        flows && flows.length > 0 && Tf > 0
+          ? accruedPositionFromScheduleM(stockM, flows, Tf)
+          : exposureLocalMForBasis(stockM, flowM, 'totalBuildup', Tf);
+      const stockHedgeLocalM = stockM - bookedAmt;
+      const targetHedgeLocalM = totalRaw - bookedAmt;
+      // Hedge-add % of Target (0–100%).
       const ratio = Math.min(1, Math.max(0, hedgeRatios[bar.ccy] ?? 0));
-      const residualLocalM = exposureLocalM * (1 - ratio);
+
+      const varBeforeUsdM = computeAnalyticsVarUsdM(
+        stockM,
+        flowM,
+        bar.ccy,
+        setup,
+        flows,
+      );
+      // Booked tickets as linear bullets (opposite VaR); size remaining on residual VaR.
+      const bookedVarUsdM = computeParametricVarUsdM(bookedAmt, bar.ccy, setup);
+      const varAfterBookUsdM = Math.max(0, varBeforeUsdM - bookedVarUsdM);
+      const eq = equalVarLinearHedgeNotionalLocalM(
+        stockM,
+        flowM,
+        bar.ccy,
+        setup,
+        varAfterBookUsdM,
+        flows,
+      );
+      // Cap remaining equal-VaR size by leftover accrued capacity after booked.
+      const accruedCap = analyticsOpenExposureLocalM(
+        stockM,
+        flowM,
+        setup,
+        flows,
+      );
+      const remainCapAbs = Math.max(0, Math.abs(accruedCap) - Math.abs(bookedAmt));
+      const equalAbs = Math.min(Math.abs(eq.amountLocalM), remainCapAbs);
+      const sign =
+        Math.abs(targetHedgeLocalM) > 1e-12
+          ? targetHedgeLocalM >= 0
+            ? 1
+            : -1
+          : openLocalM >= 0
+            ? 1
+            : -1;
+      const equalVarHedgeLocalM = sign * equalAbs;
+      const hedgeNotionalLocalM = targetHedgeLocalM * ratio;
+      const hedgeVarUsdM = computeParametricVarUsdM(
+        hedgeNotionalLocalM,
+        bar.ccy,
+        setup,
+      );
+      const varAfterUsdM = Math.max(0, varAfterBookUsdM - hedgeVarUsdM);
+      const residualLocalM = openLocalM - bookedAmt - hedgeNotionalLocalM;
+      const delta =
+        varBeforeUsdM < 1e-12
+          ? 0
+          : Math.min(1, Math.max(0, varAfterUsdM / varBeforeUsdM));
+      const hedgeCapped =
+        eq.uncappedAbsLocalM > Math.abs(accruedCap) + 1e-12 ||
+        eq.uncappedAbsLocalM > remainCapAbs + Math.abs(bookedAmt) + 1e-12;
+
       return {
         ccy: bar.ccy,
         direction: bar.direction,
         exposureLocalM,
+        openExposureLocalM: openLocalM,
         hedgeRatio: ratio,
-        delta: 1 - ratio,
-        hedgeNotionalLocalM: exposureLocalM * ratio,
+        delta,
+        hedgeNotionalLocalM,
+        targetHedgeLocalM,
+        stockHedgeLocalM,
+        equalVarHedgeLocalM,
+        hedgeCapped,
         residualLocalM,
-        varBeforeUsdM: computeParametricVarUsdM(exposureLocalM, bar.ccy, setup),
-        varAfterUsdM: computeParametricVarUsdM(residualLocalM, bar.ccy, setup),
+        varBeforeUsdM,
+        varAfterUsdM,
       };
     });
 
@@ -342,21 +705,56 @@ export function stockVarMatches(
 }
 
 /**
- * Build a bookable hedge ticket for one exposure measurement.
- * - stock → spot hedge for stock notional
- * - avgBuildup → forward hedge, maturity = VaR horizon, notional = avg monthly buildup
+ * Build a bookable hedge ticket sized for equal opposite VaR (linear bullet).
+ * - stock → spot @ equal-VaR notional (≈ |S| when u=0)
+ * - avg / growth → forward @ VaR horizon, |N| from invert(VaR) ≤ accrued @ Th
  */
 export function proposeBookHedge(
   row: CurrencyRiskRow,
   basis: VarExposureBasis,
-  setup: Pick<VarSetup, 'confidencePct' | 'horizon'>,
+  setup: Pick<
+    VarSetup,
+    'confidencePct' | 'horizon' | 'forecastMonths' | 'forecastUncertainty1m' | 'exposureBasis'
+  > | VarSetup,
 ): HedgeTicket {
+  const fullSetup: VarSetup = {
+    ...DEFAULT_VAR_SETUP,
+    ...setup,
+    exposureBasis: basis,
+  };
   const stockM = row.bar.stockNetM;
-  const avgM = row.bar.avg3mM;
-  const varStock = computeParametricVarUsdM(stockM, row.bar.ccy, setup);
-  const varAvg = computeParametricVarUsdM(avgM, row.bar.ccy, setup);
-  const higher: VarExposureBasis =
-    varAvg > varStock + 1e-12 ? 'avgBuildup' : 'stock';
+  const flowM =
+    fullSetup.forecastMonths > 0 && Math.abs(row.bar.flowM) > 1e-15
+      ? row.bar.flowM
+      : 0;
+  const pathVar = computeAnalyticsVarUsdM(stockM, flowM, row.bar.ccy, fullSetup);
+  const { amountLocalM } = equalVarLinearHedgeNotionalLocalM(
+    stockM,
+    flowM,
+    row.bar.ccy,
+    fullSetup,
+    pathVar,
+  );
+  const varUsdM = computeParametricVarUsdM(amountLocalM, row.bar.ccy, fullSetup);
+
+  const candidates: VarExposureBasis[] = [
+    'stock',
+    'simpleAvg',
+    'avgBuildup',
+    'totalBuildup',
+  ];
+  let higher: VarExposureBasis = 'stock';
+  let higherVar = -Infinity;
+  for (const b of candidates) {
+    const v = computeAnalyticsVarUsdM(stockM, flowM, row.bar.ccy, {
+      ...fullSetup,
+      exposureBasis: b,
+    });
+    if (v > higherVar + 1e-12) {
+      higherVar = v;
+      higher = b;
+    }
+  }
 
   if (basis === 'stock') {
     return {
@@ -364,39 +762,46 @@ export function proposeBookHedge(
       ccy: row.bar.ccy,
       instrument: 'spot',
       basis: 'stock',
-      amountLocalM: stockM,
+      amountLocalM,
       maturity: null,
       maturityLabel: null,
-      varUsdM: varStock,
+      varUsdM,
       addressesHigherVar: higher === 'stock',
     };
   }
 
   const horizonLabel =
-    VAR_HORIZON_OPTIONS.find(h => h.id === setup.horizon)?.label ?? setup.horizon;
+    VAR_HORIZON_OPTIONS.find(h => h.id === fullSetup.horizon)?.label ??
+    fullSetup.horizon;
   return {
     id: newHedgeTicketId(),
     ccy: row.bar.ccy,
     instrument: 'forward',
-    basis: 'avgBuildup',
-    amountLocalM: avgM,
-    maturity: setup.horizon,
+    basis,
+    amountLocalM,
+    maturity: fullSetup.horizon,
     maturityLabel: horizonLabel,
-    varUsdM: varAvg,
-    addressesHigherVar: higher === 'avgBuildup',
+    varUsdM,
+    addressesHigherVar: higher === basis,
   };
 }
 
-/** Prefer the exposure basis with the higher parametric VaR. */
+/** Prefer the exposure basis with the higher Analytics VaR. */
 export function proposeHigherVarHedge(
   row: CurrencyRiskRow,
-  setup: Pick<VarSetup, 'confidencePct' | 'horizon'>,
-  /** Fraction of exposure to book (0–1). Defaults to full cover. */
+  setup: Pick<
+    VarSetup,
+    'confidencePct' | 'horizon' | 'forecastMonths' | 'forecastUncertainty1m' | 'exposureBasis'
+  > | VarSetup,
+  /** Fraction of equal-VaR notional to book (0–1). Defaults to full cover. */
   hedgeRatio = 1,
 ): HedgeTicket {
   const stock = proposeBookHedge(row, 'stock', setup);
   const avg = proposeBookHedge(row, 'avgBuildup', setup);
-  const full = avg.varUsdM > stock.varUsdM + 1e-12 ? avg : stock;
+  const total = proposeBookHedge(row, 'totalBuildup', setup);
+  const full = [stock, avg, total].reduce((best, t) =>
+    t.varUsdM > best.varUsdM + 1e-12 ? t : best,
+  );
   const ratio = Math.min(1, Math.max(0, hedgeRatio));
   if (ratio >= 1 - 1e-12) return full;
   return {
@@ -404,4 +809,16 @@ export function proposeHigherVarHedge(
     amountLocalM: full.amountLocalM * ratio,
     varUsdM: full.varUsdM * ratio,
   };
+}
+
+/** Buildup leg (local M) for the active Analytics basis — 0 for stock. */
+export function analyticsBuildupLocalM(
+  row: CurrencyRiskRow,
+  setup: Pick<VarSetup, 'exposureBasis' | 'forecastMonths'>,
+): number {
+  return buildupLocalMForBasis(
+    row.bar.flowM,
+    setup.exposureBasis,
+    setup.forecastMonths,
+  );
 }

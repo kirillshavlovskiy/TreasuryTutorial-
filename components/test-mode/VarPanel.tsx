@@ -37,7 +37,11 @@ export function VarPanel({ bar, result }: VarPanelProps) {
         <div className="mt-1 text-xs text-slate-400">
           USD reporting · exposure basis:{' '}
           <span className="font-medium text-slate-300">
-            {result.exposureBasis === 'stock' ? 'stock net' : '3-month average'}
+            {result.exposureBasis === 'stock'
+              ? 'stock net'
+              : result.exposureBasis === 'totalBuildup'
+                ? 'total monthly buildup'
+                : 'avg monthly buildup'}
           </span>{' '}
           ({result.exposureLocalM >= 0 ? '+' : ''}
           {result.exposureLocalM.toFixed(1)}M {result.ccy})

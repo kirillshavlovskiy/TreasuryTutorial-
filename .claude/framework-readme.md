@@ -10,7 +10,7 @@
 Knowledge Base/
 ├─ Framework Documentation/
 │  ├─ README — Claude Knowledge Framework   # this file
-│  └─ Setup Guide — Claude Deel Treasury    # step-by-step install guide
+│  └─ Setup Guide — Claude Treasury    # step-by-step install guide
 └─ Treasury/                                      ↔ LAYER 1: Department knowledge (read-only in Claude)
     ├─ department.md                         Org structure, mission, cross-team standards
     ├─ compliance.md                         Regulatory requirements, data classification
@@ -50,8 +50,8 @@ Inside a Claude Code session, use slash commands:
 Or via CLI:
 
 ```
-claude-deel-treasury sync dept
-claude-deel-treasury sync division
+claude-treasury-framework sync dept
+claude-treasury-framework sync division
 ```
 
 ---
@@ -60,7 +60,7 @@ claude-deel-treasury sync division
 
 1. Create a new folder inside `FX Team/Projects/` named exactly after your git repo
 2. Copy the three template files: `context.md`, `decisions.md`, `setup.md`
-3. In your project repo, run: `claude-deel-treasury init`
+3. In your project repo, run: `claude-treasury-framework init`
 4. Run: `/sync-division` inside Claude Code to pull content
 
 ---
@@ -75,6 +75,6 @@ claude-deel-treasury sync division
 
 ## Maintained by
 
-- Deel Treasury FX Team
-- package: `claude-deel-treasury` (npm)
+- Treasury FX Team
+- package: `claude-treasury-framework` (npm)
 - Slack: TODO - add your team channel

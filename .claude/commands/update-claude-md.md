@@ -1,6 +1,6 @@
 Update the framework notation section of CLAUDE.md from the canonical template.
 
-Use this when the claude-deel-treasury package has released a new version and you
+Use this when the claude-treasury-framework package has released a new version and you
 need to update the instructions for Claude without touching the @import lines or
 project-specific content below them.
 
@@ -19,7 +19,7 @@ Follow these steps exactly:
 ---
 # Knowledge framework — read this before anything else
 
-This project uses the Deel Treasury three-layer shared knowledge framework.
+This project uses the Treasury three-layer shared knowledge framework.
 You must understand the layers before acting on any instruction.
 
 ## Layer rules
@@ -27,14 +27,14 @@ You must understand the layers before acting on any instruction.
 LAYER 1 — dept/ (department knowledge)
 - Owner: department head
 - NEVER suggest editing any file under .claude/rules/dept/
-- These files are populated by: claude-deel-treasury sync dept
-- If dept knowledge seems outdated, tell the user to run: claude-deel-treasury sync dept
+- These files are populated by: claude-treasury-framework sync dept
+- If dept knowledge seems outdated, tell the user to run: claude-treasury-framework sync dept
 
 LAYER 2 — div/ (division knowledge)
 - Owner: team lead
 - NEVER suggest editing any file under .claude/rules/div/
-- These files are populated by: claude-deel-treasury sync division
-- If div knowledge seems outdated, tell the user to run: claude-deel-treasury sync division
+- These files are populated by: claude-treasury-framework sync division
+- If div knowledge seems outdated, tell the user to run: claude-treasury-framework sync division
 
 LAYER 3 — project/ (project knowledge)
 - Owner: all team members
@@ -47,9 +47,9 @@ div/ standards apply unless project/ explicitly overrides for this codebase.
 project/ context applies to this specific codebase only.
 
 ## Sync commands (CLI)
-claude-deel-treasury sync dept
-claude-deel-treasury sync division
-claude-deel-treasury sync division --division <name>
+claude-treasury-framework sync dept
+claude-treasury-framework sync division
+claude-treasury-framework sync division --division <name>
 
 ## When project knowledge needs updating
 1. Complete the coding task first

@@ -3,12 +3,12 @@ import type { LadderBar, TestAccount } from '@/lib/test-mode/types';
 /**
  * Group-level unified exposure ladder (all entities netted).
  *
- * Stock bars follow the episode mismatch definition — operating FX layers only:
- * EUR = Frankfurt cash + EU receivables (+€4.9M); PLN payroll accrual (−zł1.8M).
- * Venture debt and GBP stake are ladderLayer 'none' and excluded.
+ * Stock bars follow Net FX economics:
+ * EUR = cash + receivables − venture debt (+€1.9M); PLN payroll accrual (−zł1.8M).
  *
- * 3-month average: avg ≈ S + 1.5F (guide). Monthly stock items (e.g. PLN payroll
- * accrual) also contribute to F so PLN avg = −1.8 + 1.5×(−1.8) = −4.5.
+ * Average P&L pipeline (1m default): avg = S + ½F (mid-point of linear buildup).
+ * Monthly stock items (e.g. PLN payroll accrual) also contribute to F so
+ * PLN avg = −1.8 + 0.5×(−1.8) = −2.7 at the 1m convention.
  */
 export function computeStockLadder(accounts: TestAccount[]): LadderBar[] {
   const byCcy = new Map<string, { stock: number; flow: number }>();
@@ -17,7 +17,7 @@ export function computeStockLadder(accounts: TestAccount[]): LadderBar[] {
     const row = byCcy.get(a.currency) ?? { stock: 0, flow: 0 };
     if (a.ladderLayer === 'stock') {
       row.stock += a.amount;
-      // Recurring stock obligations also drive the monthly flow leg of 3m avg.
+      // Recurring stock obligations also drive the monthly flow leg of avg pipeline.
       if (a.cadence === 'monthly') row.flow += a.amount;
     } else if (a.ladderLayer === 'flow') {
       row.flow += a.amount;
@@ -27,7 +27,7 @@ export function computeStockLadder(accounts: TestAccount[]): LadderBar[] {
 
   const bars: LadderBar[] = [];
   for (const [ccy, { stock, flow }] of byCcy) {
-    const avg3mM = stock + 1.5 * flow;
+    const avg3mM = stock + 0.5 * flow;
     let direction: LadderBar['direction'] = 'hub';
     if (Math.abs(stock) < 1e-9 && Math.abs(flow) > 1e-9) {
       direction = 'hub';
@@ -51,7 +51,7 @@ export function computeStockLadder(accounts: TestAccount[]): LadderBar[] {
   return bars;
 }
 
-/** Largest |stock| bar — guide answer: EUR +€4.9M. */
+/** Largest |stock| bar — guide answer: EUR +€1.9M (4.9 − 3 debt). */
 export function largestMismatch(bars: LadderBar[]): LadderBar | undefined {
   return bars.reduce<LadderBar | undefined>((best, b) => {
     if (b.ccy === 'USD') return best; // hub is never the primary mismatch

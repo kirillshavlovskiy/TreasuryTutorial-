@@ -219,7 +219,8 @@ export function FormulaCell({
       {canFill && (
         <span
           onMouseDown={startFill}
-          className={`absolute bottom-0 right-0 h-2 w-2 cursor-crosshair border border-white bg-blue-600 opacity-0 group-hover:opacity-100 ${
+          title="Drag to fill formula down the column"
+          className={`absolute bottom-0 right-0 z-10 h-2.5 w-2.5 cursor-crosshair border border-white bg-blue-600 shadow-sm opacity-50 group-hover:opacity-100 ${
             isDragSource ? 'opacity-100' : ''
           }`}
           aria-hidden

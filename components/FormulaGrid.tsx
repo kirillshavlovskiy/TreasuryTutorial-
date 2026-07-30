@@ -30,12 +30,16 @@ export function useFormulaGrid(): FormulaGridApi | null {
  * same column; on release every covered row is committed with the source
  * cell's exact formula text (named refs re-resolve per-row, so this behaves
  * like a relative-reference copy — same as dragging a formula in Excel).
+ *
+ * `onFill` receives the full target row list in one call so parents can apply
+ * a single batch state update (required for workspace persistence).
  */
 export function FormulaGridProvider({
   rowOrder, onFill, children,
 }: {
   rowOrder: string[];
-  onFill: (columnKey: string, rowKey: string, formula: string) => void;
+  /** Apply `formula` to every `rowKey` in the drag range (excluding the source). */
+  onFill: (columnKey: string, rowKeys: string[], formula: string) => void;
   children: ReactNode;
 }) {
   const [dragging, setDragging] = useState<DragState | null>(null);
@@ -62,10 +66,12 @@ export function FormulaGridProvider({
         const endIdx = rowOrder.indexOf(state.hoverRowKey);
         if (startIdx !== -1 && endIdx !== -1) {
           const [lo, hi] = startIdx <= endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+          const targets: string[] = [];
           for (let i = lo; i <= hi; i++) {
             const rowKey = rowOrder[i];
-            if (rowKey !== state.sourceRowKey) onFill(state.columnKey, rowKey, state.formula);
+            if (rowKey && rowKey !== state.sourceRowKey) targets.push(rowKey);
           }
+          if (targets.length > 0) onFill(state.columnKey, targets, state.formula);
         }
       }
       dragRef.current = null;

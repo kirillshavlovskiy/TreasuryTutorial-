@@ -1,4 +1,4 @@
-Sync FX Team division knowledge from Deel Wiki into this project.
+Sync FX Team division knowledge from internal wiki into this project.
 
 Updates wiki-sourced div files only. Division config files (division.md, standards.md, policy.md, etc.) are maintained locally in the repo and are never overwritten.
 

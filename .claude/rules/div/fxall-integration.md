@@ -1,6 +1,6 @@
 # FXAll Integration
 
-> Source: https://wiki.deel.network/i/14521
+> Source: internal wiki (FXAll Integration)
 > Last updated: 2026-03-05
 
 ## Create the FXAll Adapter in fin-info-ex

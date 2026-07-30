@@ -31,7 +31,7 @@ Fetch BOTH documents and ALWAYS overwrite local files, even if they already exis
 1. Search for file titled exactly: `README — Claude Knowledge Framework`
    → OVERWRITE: `.claude/framework-readme.md`
 
-2. Search for file titled exactly: `Setup Guide — Claude Deel Treasury Framework`
+2. Search for file titled exactly: `Setup Guide — Claude Treasury Framework`
    → OVERWRITE: `.claude/framework-setup.md`
 
 Rules:

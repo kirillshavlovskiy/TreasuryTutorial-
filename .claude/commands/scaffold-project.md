@@ -1,6 +1,6 @@
 Link this repository to a project folder in Google Drive and upload local project knowledge files.
 
-Run this inside Claude Code after `claude-deel-treasury init` has been run once.
+Run this inside Claude Code after `claude-treasury-framework init` has been run once.
 Requires: Google Drive MCP configured in .mcp.json.
 
 Follow these steps exactly. Do not skip any step.

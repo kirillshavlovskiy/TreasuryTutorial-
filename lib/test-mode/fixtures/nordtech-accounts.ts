@@ -36,8 +36,7 @@ export const NORDTECH_ENTITIES: TestEntity[] = [
 
 /**
  * NordTech sample book from Sigma Task 01 guide.
- * Ladder stock EUR = Frankfurt cash + EU receivables = +€4.9M (not full BS FX).
- * Venture debt and GBP stake are ladderLayer 'none'.
+ * Ladder / Net FX stock EUR = cash + receivables − venture debt = +€1.9M.
  */
 export const NORDTECH_ACCOUNTS: TestAccount[] = [
   {
@@ -93,7 +92,8 @@ export const NORDTECH_ACCOUNTS: TestAccount[] = [
     currency: 'EUR',
     amount: -3.0,
     cadence: 'stock',
-    ladderLayer: 'none',
+    // Included in Net FX / ladder stock (short EUR).
+    ladderLayer: 'stock',
   },
   {
     id: 'acc-de-gbp-stake',

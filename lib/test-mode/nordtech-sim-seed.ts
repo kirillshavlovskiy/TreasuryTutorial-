@@ -40,7 +40,7 @@ function entityIdentity(entity: Entity | Record<string, unknown>): {
  *
  * Liquidity / rates / IR / swap stay off.
  * Presetup layers: Decision = Hedging; Analytical = Risk Metrics (VaR).
- * Episode stock mismatch for scoring: EUR Cash FX + receivables = +4.9.
+ * Episode stock / Net FX for scoring: EUR Cash FX + receivables − debt = 4.9 − 3 = +1.9.
  */
 export const TASK01_REQUIRED_FX_INPUTS = ['fxExposure'] as const;
 
@@ -71,7 +71,7 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
     name.includes('germany') ||
     base === 'EUR'
   ) {
-    // Cash FX (spot) carries the Frankfurt cash so the FX-only book still shows +4.9.
+    // Cash FX (spot) + receivables − venture debt → Net FX / Exp stock = 1.9.
     const eur = makeSimRow('de-1', 'EUR', 2.5, 0, 0, 2.5, 0, 1.2, 0);
     eur.nonCashAsset = 2.4; // EU receivables (FX Risk → Non-cash Asset)
     eur.ir_liab_notional = 3.0; // venture debt (FX POSITION → Debt)

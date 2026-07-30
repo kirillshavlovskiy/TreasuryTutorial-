@@ -22,7 +22,7 @@
 - [x] Add portfolio diversification VAR as 4th layer in Buffer Optimizer — 14-currency pairwise correlation matrix, component VAR, standalone VAR, beta, policy limit panel ($5M/$10M/$20M thresholds)
 - [x] Fix computeLayeredBuffer scale: changed from |payout| to |forecasted_cash| = |cash+payout| so safety/carry deltas are sized to the actual NP position, not just the outflow volume
 - [x] Fix swap formula for layers-off mode: `swap = −spot_raw` only (reverse spot position; fwd already at far tenor); layers-on stays `MAX(H_final − fcast, −(spot+fwd))`
-- [ ] Integrate live CIP-implied rates from FX Rate Mesh API: replace hardcoded CURRENCY_PARAMS.carry with r_USD + (F−S)/S × 365/30 per currency, sourced from `@letsdeel/fx-rate-mesh-node-client`
+- [ ] Integrate live CIP-implied rates from FX Rate Mesh API: replace hardcoded CURRENCY_PARAMS.carry with r_USD + (F−S)/S × 365/30 per currency, sourced from the FX Rate Mesh API client
 - [ ] Maximize NWC interest accruals: for EARN CARRY currencies (r_FCY > r_USD) automate buffer sizing to hold maximum pre-position; for PAY CARRY currencies minimize buffer to reduce opportunity cost
 - [ ] Net swap position in balance sheet: confirm I+J=0 netting treatment in NP accounting; add swap overlay column showing net balance sheet impact per currency
 

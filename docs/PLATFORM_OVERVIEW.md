@@ -6,9 +6,9 @@
 
 ## 1. What it is
 
-**Simple Sigma** is an interactive Treasury workbench that turns Deel FX Team's spreadsheet-based FX exposure and liquidity models into a live, policy-governed web application. It lets the FX desk model multi-currency cash buffers, interest-rate carry, swap restructuring, and hedging decisions in one VaR-governed view — replacing manual Excel recalculation with a real-time, auditable simulator.
+**Simple Sigma** is an interactive Treasury workbench that turns the FX Team's spreadsheet-based FX exposure and liquidity models into a live, policy-governed web application. It lets the FX desk model multi-currency cash buffers, interest-rate carry, swap restructuring, and hedging decisions in one VaR-governed view — replacing manual Excel recalculation with a real-time, auditable simulator.
 
-It is built as a **Next.js (App Router) + TypeScript** application, deployed as a containerized service on the Deel platform (Helm/ArgoCD), with Google OAuth (NextAuth) gating access to a per-user workspace.
+It is built as a **Next.js (App Router) + TypeScript** application, deployed as a containerized service on the platform (Helm/ArgoCD), with Google OAuth (NextAuth) gating access to a per-user workspace.
 
 The product tagline on the landing page frames its purpose directly: *"Size FX buffers with confidence… an interactive treasury workbench for modelling multi-currency cash buffers, interest-rate carry and hedging decisions — all inside a single VaR-governed view."*
 
@@ -16,7 +16,7 @@ The product tagline on the landing page frames its purpose directly: *"Size FX b
 
 ## 2. Business problem it solves
 
-Deel Treasury's FX Team (division mission: *"Manage Deel's FX exposure across 150+ currencies, implement hedging strategies, and build tooling to automate FX risk management"*) must continuously answer, per currency:
+Treasury's FX Team (division mission: *"Manage FX exposure across 150+ currencies, implement hedging strategies, and build tooling to automate FX risk management"*) must continuously answer, per currency:
 
 1. **How much FCY cash should we hold** in the Notional Pool (NP) vs. sweep to USD? (liquidity sufficiency vs. opportunity cost)
 2. **How large should the restructuring FX swap be** to fund that target without changing net FX exposure?
@@ -151,7 +151,7 @@ A dedicated Cursor rule (`.cursor/rules/fx-simulator-consistency.mdc`) and a `fx
 
 ## 5. Governance: policy and strategy encoded in the tool
 
-The platform is explicitly built to reflect (not replace) Deel Treasury's written FX policy and 2026 strategy documents:
+The platform is explicitly built to reflect (not replace) Treasury's written FX policy and 2026 strategy documents:
 
 ### 5.1 From the FX Hedging Policy (`fx-hedging-policy.md`)
 - **Approval thresholds** are hard limits the tool must respect: FX position size >$50M/$100M/$250M requires Director of Finance/CFO/CEO approval; stressed P&L VaR >$5M/$10M/$20M requires the same escalation chain. The Portfolio VaR layer's policy-limit control in the Layer Setup tab is a direct implementation of this.
@@ -164,7 +164,7 @@ The platform is explicitly built to reflect (not replace) Deel Treasury's writte
 
 ### 5.3 From division/department engineering & compliance standards
 - Financial amounts and rates in the model follow the naming and rounding conventions from `div/standards.md` conceptually (amounts to 2dp, rates to 4dp) though the current implementation uses native JS numbers rather than `Decimal.js` — a gap worth flagging against the FX division's own code standard, which mandates `Decimal.js` for all FX calculations and never native floats.
-- All financial-data access is meant to go through the Deel Treasury MCP per department standards; today the app uses hardcoded/manually-updated rate tables (JPM LU_661 reports) rather than a live MCP/FX-Rate-Mesh feed — see the "Integrate live CIP-implied rates" backlog item below.
+- All financial-data access is meant to go through the Treasury MCP per department standards; today the app uses hardcoded/manually-updated rate tables (JPM LU_661 reports) rather than a live MCP/FX-Rate-Mesh feed — see the "Integrate live CIP-implied rates" backlog item below.
 
 ---
 
@@ -198,7 +198,7 @@ Parallel to the FX Buffer Simulator workbench (`/workspace`), the app ships a ga
 | Engine | `lib/test-mode/` — NordTech seeds, consolidate, `buildHedgeVarSummary`, `scoreTask01` |
 | Production gate | Off unless `TEST_MODE_ENABLED=true`; in `NODE_ENV=production` also requires `TEST_MODE_ALLOW_PROD=true` |
 
-Task 01 acceptance targets: open Group FX; EUR stock **+€4.9M**, PLN stock **−zł1.8M**, EUR 1M 95% VaR **≈ $202K** (all ±5%).
+Task 01 acceptance targets: open Group FX; EUR Net FX stock **+€1.9M** (4.9 − 3 debt), PLN stock **−zł1.8M**, EUR 1M 99% VaR **≈ $110K** (all ±5%).
 
 ---
 
@@ -216,7 +216,7 @@ From `.claude/rules/project/context.md`, sprint goals already delivered:
 
 Open items still tracked:
 
-- [ ] **Live CIP-implied rates** from the FX Rate Mesh (`@letsdeel/fx-rate-mesh-node-client`), replacing hardcoded `CURRENCY_PARAMS.carry`
+- [ ] **Live CIP-implied rates** from the FX Rate Mesh API client, replacing hardcoded `CURRENCY_PARAMS.carry`
 - [ ] **Automated NWC maximization**: for EARN-carry currencies, automatically size buffers to the pre-positioning maximum; for PAY-carry currencies, minimize to reduce opportunity cost
 - [ ] **Swap balance-sheet netting confirmation**: verify `I + J = 0` treatment against actual NP accounting
 
@@ -224,7 +224,7 @@ Open items still tracked:
 
 ## 9. Summary
 
-Simple Sigma is Deel Treasury's FX Team's move from static, hand-maintained Excel models to a **live, tested, policy-aware simulation platform**. Its core value is threefold:
+Simple Sigma is the FX Team's move from static, hand-maintained Excel models to a **live, tested, policy-aware simulation platform**. Its core value is threefold:
 
 1. **Correctness** — every formula in the model (dynamic H, swap sizing, portfolio VaR, carry direction) has a documented derivation, a documented set of alternatives that were rejected and why, and an automated invariant test suite that prevents the recurrence of previously-fixed bugs.
 2. **Policy alignment** — VaR and position-size approval thresholds from the FX Hedging Policy flow directly into the Layer Setup tab's Portfolio VaR control, keeping every simulated buffer decision inside Treasury's approved risk envelope.

@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 import { signOutToHome } from '@/app/test/sign-out';
 
@@ -7,9 +8,18 @@ type UserAvatarMenuProps = {
   name?: string | null;
   email?: string | null;
   image?: string | null;
+  sandboxEnabled?: boolean;
 };
 
-export function UserAvatarMenu({ name, email, image }: UserAvatarMenuProps) {
+const itemCls =
+  'block w-full px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800';
+
+export function UserAvatarMenu({
+  name,
+  email,
+  image,
+  sandboxEnabled = true,
+}: UserAvatarMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const initial = (name ?? email ?? '?').charAt(0).toUpperCase();
@@ -57,14 +67,42 @@ export function UserAvatarMenu({ name, email, image }: UserAvatarMenuProps) {
       {open && (
         <div
           role="menu"
-          className="absolute right-0 z-50 mt-2 min-w-[10rem] overflow-hidden rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl"
+          className="absolute right-0 z-50 mt-2 min-w-[12rem] overflow-hidden rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl"
         >
-          <form action={signOutToHome}>
-            <button
-              type="submit"
+          {(name || email) && (
+            <div className="border-b border-slate-800 px-3 py-2">
+              {name && (
+                <div className="truncate text-xs font-medium text-white">{name}</div>
+              )}
+              {email && (
+                <div className="truncate text-[11px] text-slate-500">{email}</div>
+              )}
+            </div>
+          )}
+          <Link href="/" role="menuitem" className={itemCls} onClick={() => setOpen(false)}>
+            Home · choose mode
+          </Link>
+          {sandboxEnabled && (
+            <Link
+              href="/test"
               role="menuitem"
-              className="block w-full px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+              className={itemCls}
+              onClick={() => setOpen(false)}
             >
+              Sandbox · practice
+            </Link>
+          )}
+          <Link
+            href="/workspace"
+            role="menuitem"
+            className={itemCls}
+            onClick={() => setOpen(false)}
+          >
+            Workbench · live desk
+          </Link>
+          <div className="my-1 border-t border-slate-800" />
+          <form action={signOutToHome}>
+            <button type="submit" role="menuitem" className={itemCls}>
               Log out
             </button>
           </form>

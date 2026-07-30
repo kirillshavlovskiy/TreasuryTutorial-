@@ -115,7 +115,7 @@ import { createClient } from "redis";
 
 # Knowledge framework — read this before anything else
 
-This project uses the Deel Treasury three-layer shared knowledge framework.
+This project uses the Treasury three-layer shared knowledge framework.
 You must understand the layers before acting on any instruction.
 
 ## Framework documentation (above all layers — always auto-fetched)

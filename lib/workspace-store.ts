@@ -370,6 +370,24 @@ export function updateDashboardFormula(
   cellKey: string,
   formula: string,
 ): Workspace {
+  return updateDashboardFormulas(workspace, entityId, dashboardId, {
+    [cellKey]: formula,
+  });
+}
+
+/**
+ * Batch set/clear formula overrides (used by Excel-like column fill-down so
+ * every covered row lands in one state update — avoids stale-closure loss).
+ * Empty string values remove the override for that cell key.
+ */
+export function updateDashboardFormulas(
+  workspace: Workspace,
+  entityId: string,
+  dashboardId: string,
+  updates: Record<string, string>,
+): Workspace {
+  const keys = Object.keys(updates);
+  if (keys.length === 0) return workspace;
   const entities = workspace.entities.map(e => {
     if (e.id !== entityId) return e;
     return {
@@ -377,8 +395,11 @@ export function updateDashboardFormula(
       dashboards: e.dashboards.map(d => {
         if (d.id !== dashboardId) return d;
         const next = { ...(d.formulas ?? {}) };
-        if (formula.trim() === '') delete next[cellKey];
-        else next[cellKey] = formula.trim();
+        for (const cellKey of keys) {
+          const formula = updates[cellKey] ?? '';
+          if (formula.trim() === '') delete next[cellKey];
+          else next[cellKey] = formula.trim().replace(/^=/, '').trim();
+        }
         return { ...d, formulas: next };
       }),
     };

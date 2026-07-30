@@ -8,7 +8,7 @@
 
 ## API conventions
 
-- All external calls go through MCP tools — no raw HTTP to Deel APIs
+- All external calls go through MCP tools — no raw HTTP to internal APIs
 - Pagination: always handle `nextPageToken` / cursor patterns
 - Errors: wrap in typed result objects, never swallow
 

@@ -26,6 +26,8 @@ import {
   ccySpotRate,
   fcyToUsdM,
   usdToFcyM,
+  roundMoney,
+  fxBookNetLocalM,
   type LayerId,
   type LayerResult,
   type LayeredBufferResult,
@@ -34,6 +36,10 @@ import {
   type SharedGlobals,
   type UsdParams,
 } from './fx-buffer';
+import {
+  periodFlowSumLocalM,
+  type ForecastProfileState,
+} from './forecast-profile';
 
 // ─── Simulator row math (lifted from UnifiedSimulator) ───────────────────────
 
@@ -144,6 +150,7 @@ export function computeSimdRow(
   syncedThreshold?: number,
   syncedSwap?: number,
   timing?: TimingInput,
+  forecastProfile?: ForecastProfileState | null,
 ): SimRowComputed {
   const cashPos = r.cash + r.nonNpCash;
   const spot_rate = ccySpotRate(r.ccy);
@@ -154,13 +161,24 @@ export function computeSimdRow(
   const fxFwdFCY = usdToFcyM(r.fwd, r.ccy);
   const fxNonCashUSD = fcyToUsdM(r.nonCash, r.ccy);
   const fxNonCashAssetUSD = fcyToUsdM(r.nonCashAsset ?? 0, r.ccy);
-  const netFxFCY = fxSpotFCY + fxFwdFCY + r.nonCash + (r.nonCashAsset ?? 0);
-  const netFxUSD = fxSpotUSD + fxFwdUSD + fxNonCashUSD + fxNonCashAssetUSD;
-  // Forecast net FX exposure at cycle end: the CURRENT net FX book plus the
-  // expected cycle flows (payins positive, payouts negative) plus any explicit
-  // invoice forecast (fcastFX). This is the hedging basis — a zero here means
-  // genuinely nothing to hedge, not merely "no flows expected".
-  const netFxForecast = netFxFCY + r.collections + r.payout + r.fcastFX;
+  // Long book − FCY debt (+investments). Debt notional is a short → deducted.
+  const netFxFCY = fxBookNetLocalM(r);
+  const netFxUSD = roundMoney(
+    fxSpotUSD
+      + fxFwdUSD
+      + fxNonCashUSD
+      + fxNonCashAssetUSD
+      + fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy)
+      - fcyToUsdM(r.ir_liab_notional, r.ccy),
+  );
+  // Forecast net FX over the FX Risk period: book + flat (F×T) or custom Σ months.
+  // T = 0 → no forecast (Net FX Forecast = Net FX book only).
+  const T =
+    typeof shared.forecastMonths === 'number' && shared.forecastMonths >= 0
+      ? shared.forecastMonths
+      : 1;
+  const periodFlow = periodFlowSumLocalM(r, T, forecastProfile);
+  const netFxForecast = roundMoney(netFxFCY + periodFlow);
 
   const varFactor = var95_1m_factor(r.σ_daily);
   const irMult = combinedMultiplier(r.r_FCY, r.β_IR);
@@ -294,7 +312,14 @@ export function computeSimdUsdRow(
     fxNonCashAssetUSD: r.nonCashAsset ?? 0,
     netFxFCY: 0,
     netFxUSD: r.spot + r.fwd + r.nonCash + (r.nonCashAsset ?? 0),
-    netFxForecast: r.collections + r.payout + r.fcastFX,
+    netFxForecast: (() => {
+      const T =
+        typeof shared.forecastMonths === 'number' && shared.forecastMonths >= 0
+          ? shared.forecastMonths
+          : 1;
+      // USD stays on the flat workspace formula (no custom FCY profile).
+      return roundMoney((r.collections + r.payout + r.fcastFX) * T);
+    })(),
     netFX: 0,
     npNetFX: r.cash + r.fwd,
     varFactor: 0, irMult: 1, varBuffer: 0,
@@ -379,6 +404,8 @@ export interface DashboardInputs {
   policyVAR: number;
   /** Optional payin/payout timing that re-weights natural NP cash carry. */
   timing?: TimingInput;
+  /** Flat monthly×T or custom per-period Revenue/Expenses profile. */
+  forecastProfile?: ForecastProfileState | null;
 }
 
 export interface PortfolioSummary {
@@ -684,7 +711,13 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
     const row = {
       ...r,
       ...computeSimdRow(
-        r, input.shared, input.activeLayers, thresholdByCcy[r.ccy], swapByCcy[r.ccy], input.timing,
+        r,
+        input.shared,
+        input.activeLayers,
+        thresholdByCcy[r.ccy],
+        swapByCcy[r.ccy],
+        input.timing,
+        input.forecastProfile,
       ),
       cash_threshold_raw: layer?.cash_threshold_raw,
       debit_floor_binding: layer?.debit_floor_binding,

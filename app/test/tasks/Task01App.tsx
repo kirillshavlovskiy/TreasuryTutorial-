@@ -1,33 +1,41 @@
 'use client';
 
 import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
+import Link from 'next/link';
 import { Simulator, type SimulatorTab } from '@/app/dashboard/Simulator';
 import { TaskScore } from '@/components/test-mode/TaskScore';
 import { HedgingDecisionLayer } from '@/components/test-mode/HedgingDecisionLayer';
 import { ConsolidatedLiveLadder } from '@/components/test-mode/ConsolidatedLiveLadder';
 import { VarAnalyticsPanel } from '@/components/test-mode/VarAnalyticsPanel';
 import {
+  DEFAULT_FORECAST_PROFILE,
+  type ForecastProfileState,
+} from '@/lib/forecast-profile';
+import type { RowState } from '@/lib/fx-buffer';
+import {
   TEST_GUEST_USER_KEY,
   aggregateBookedHedges,
   applyConsolidatedBookedChange,
   computeConsolidatedRisk,
   consolidateEntityBooks,
+  defaultSandboxUi,
   emptyHedgeBook,
   entityHasLocalPositions,
-  loadSandbox,
+  loadSandboxPersistent,
   localReadinessByEntity,
   localsReadyForConsolidation,
   DEFAULT_VAR_SETUP,
   ensureTask01FxLayers,
-  expectedEurVarUsdM,
   GROUP_HEDGE_SCOPE,
   markStep,
+  parseForecastMonths,
+  parseForecastUncertainty1m,
   parseVarConfidencePct,
   parseVarExposureBasis,
   parseVarHorizonId,
   parseVarSetup,
-  resetSandbox,
-  saveSandbox,
+  resetSandboxPersistent,
+  saveSandboxPersistent,
   scoreTask01,
   simSeedForEntity,
   setupLabel,
@@ -36,6 +44,7 @@ import {
   TASK01_REQUIRED_FX_INPUTS,
   type EntityHedgeBook,
   type HedgeTicket,
+  type SandboxUiState,
   type TaskAnswers,
   type TaskStepId,
   type TestSandboxState,
@@ -57,6 +66,7 @@ import {
   TASK01_INACTIVE_EXTRA_METRICS,
   TASK01_INACTIVE_FX_INPUTS,
   updateDashboardFormula,
+  updateDashboardFormulas,
   updateDashboardTiming,
   updateFxProfileConfig,
   type AnalyticalLayer,
@@ -72,8 +82,14 @@ import {
   type Workspace,
 } from '@/lib/workspace-store';
 
+export type SandboxPlayMode = 'curriculum' | 'practice';
+
 interface Task01AppProps {
   userKey: string;
+  /** Guided Validate rails vs free NordTech exploration. */
+  mode?: SandboxPlayMode;
+  /** Persistence slot (`01` curriculum · `practice` self practice). */
+  taskId?: string;
 }
 
 const TASK01_TAB_LABELS: Partial<Record<SimulatorTab, string>> = {
@@ -192,8 +208,13 @@ function ProfileTypeIcon({
   }
 }
 
-export function Task01App({ userKey }: Task01AppProps) {
+export function Task01App({
+  userKey,
+  mode = 'curriculum',
+  taskId = '01',
+}: Task01AppProps) {
   const storageKey = userKey || TEST_GUEST_USER_KEY;
+  const isPractice = mode === 'practice';
   const [state, setState] = useState<TestSandboxState | null>(null);
   const [view, setView] = useState<'home' | 'group' | 'entity'>('home');
   const [entityId, setEntityId] = useState<string | null>(null);
@@ -205,11 +226,74 @@ export function Task01App({ userKey }: Task01AppProps) {
   const [hedgesByEntityId, setHedgesByEntityId] = useState<
     Record<string, EntityHedgeBook>
   >({});
+  const [resumeReady, setResumeReady] = useState(false);
+  const [serverPersistent, setServerPersistent] = useState(false);
+
+  const currentUi = (): SandboxUiState => ({
+    view,
+    entityId,
+    dashboardId,
+    activeProfileId,
+  });
+
+  const persist = (
+    next: TestSandboxState,
+    hedges: Record<string, EntityHedgeBook> = hedgesByEntityId,
+    ui: SandboxUiState = currentUi(),
+  ) => {
+    const saved = saveSandboxPersistent(
+      storageKey,
+      {
+        ...next,
+        hedgesByEntityId: hedges,
+        ui,
+      },
+      taskId,
+    );
+    setState(saved);
+    return saved;
+  };
 
   useEffect(() => {
-    setState(loadSandbox(storageKey));
-    setHedgesByEntityId({});
-  }, [storageKey]);
+    let cancelled = false;
+    setResumeReady(false);
+    void (async () => {
+      const { state: loaded, persistent } = await loadSandboxPersistent(
+        storageKey,
+        taskId,
+      );
+      if (cancelled) return;
+      setServerPersistent(persistent);
+      setState(loaded);
+      setHedgesByEntityId(loaded.hedgesByEntityId ?? {});
+      const ui = loaded.ui ?? defaultSandboxUi();
+      setView(ui.view);
+      setEntityId(ui.entityId);
+      setDashboardId(ui.dashboardId);
+      setActiveProfileId(ui.activeProfileId);
+      setResumeReady(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [storageKey, taskId]);
+
+  // Persist navigation so the next login resumes the same screen.
+  useEffect(() => {
+    if (!state || !resumeReady) return;
+    const ui = currentUi();
+    const prev = state.ui ?? defaultSandboxUi();
+    if (
+      prev.view === ui.view
+      && prev.entityId === ui.entityId
+      && prev.dashboardId === ui.dashboardId
+      && prev.activeProfileId === ui.activeProfileId
+    ) {
+      return;
+    }
+    persist(state, hedgesByEntityId, ui);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional navigation snapshot
+  }, [view, entityId, dashboardId, activeProfileId, resumeReady]);
 
   // If locals are incomplete, never stay on the consolidated view.
   useEffect(() => {
@@ -221,9 +305,54 @@ export function Task01App({ userKey }: Task01AppProps) {
     }
   }, [view, state]);
 
-  const update = (next: TestSandboxState) => {
-    setState(next);
-    saveSandbox(storageKey, next);
+  const update = (
+    next: TestSandboxState | ((prev: TestSandboxState) => TestSandboxState),
+  ) => {
+    if (typeof next === 'function') {
+      setState(current => {
+        if (!current) return current;
+        const resolved = next(current);
+        return saveSandboxPersistent(
+          storageKey,
+          {
+            ...resolved,
+            hedgesByEntityId,
+            ui: currentUi(),
+          },
+          taskId,
+        );
+      });
+      return;
+    }
+    persist(next);
+  };
+
+  const updateHedges = (
+    next:
+      | Record<string, EntityHedgeBook>
+      | ((prev: Record<string, EntityHedgeBook>) => Record<string, EntityHedgeBook>),
+  ) => {
+    setHedgesByEntityId(prev => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      setState(current => {
+        if (!current) return current;
+        return saveSandboxPersistent(
+          storageKey,
+          {
+            ...current,
+            hedgesByEntityId: resolved,
+            ui: {
+              view,
+              entityId,
+              dashboardId,
+              activeProfileId,
+            },
+          },
+          taskId,
+        );
+      });
+      return resolved;
+    });
   };
 
   const setWorkspace = (workspace: Workspace) => {
@@ -308,6 +437,11 @@ export function Task01App({ userKey }: Task01AppProps) {
     exposureBasis:
       parseVarExposureBasis(answers.varExposureBasis) ?? DEFAULT_VAR_SETUP.exposureBasis,
     horizon: parseVarHorizonId(answers.varHorizon) ?? DEFAULT_VAR_SETUP.horizon,
+    forecastMonths:
+      parseForecastMonths(answers.varForecastMonths) ?? DEFAULT_VAR_SETUP.forecastMonths,
+    forecastUncertainty1m:
+      parseForecastUncertainty1m(answers.varForecastUncertainty) ??
+      DEFAULT_VAR_SETUP.forecastUncertainty1m,
   };
 
   const setVarSetup = (setup: VarSetup) => {
@@ -318,6 +452,9 @@ export function Task01App({ userKey }: Task01AppProps) {
         varConfidencePct: String(setup.confidencePct),
         varExposureBasis: setup.exposureBasis,
         varHorizon: setup.horizon,
+        varForecastMonths: String(setup.forecastMonths),
+        varForecastUncertainty:
+          setup.forecastUncertainty1m > 0 ? String(setup.forecastUncertainty1m) : '',
       },
       progress: markStep(progress, 'setVarConfidence'),
     });
@@ -364,36 +501,71 @@ export function Task01App({ userKey }: Task01AppProps) {
 
   return (
     <main className={`mx-auto px-6 py-8 ${wide ? 'max-w-screen-2xl' : 'max-w-6xl'}`}>
+      <div className="mb-4">
+        <Link
+          href="/test"
+          title="Back to Curriculum vs Self Practice"
+          className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/50 bg-violet-500/15 px-3 py-1.5 text-xs font-semibold text-violet-100 transition-colors hover:border-violet-400 hover:bg-violet-500/25"
+        >
+          ← Sandbox portal
+        </Link>
+      </div>
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
+          <div className="mb-1.5">
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                isPractice
+                  ? 'bg-sky-500/20 text-sky-200 ring-1 ring-sky-400/50'
+                  : 'bg-violet-500/20 text-violet-200 ring-1 ring-violet-400/50'
+              }`}
+            >
+              {isPractice ? 'Self practice' : 'Curriculum'}
+            </span>
+          </div>
           <h1 className="text-xl font-semibold tracking-tight">
-            SIGMA TASK 01 — Map the Book
+            {isPractice
+              ? 'NordTech — Self practice'
+              : 'SIGMA TASK 01 — Map the Book'}
           </h1>
           <p className="mt-1 text-xs text-slate-500">
-            Build entity dashboards → find the largest mismatch → configure VaR in Analytics
-            (confidence · horizon · exposure) → read VaR at Δ = 1 for that setup.
+            {isPractice
+              ? 'Explore entity books, Group FX, VaR regimes and hedge booking without Validate rails.'
+              : 'Build entity dashboards → find the largest mismatch → configure VaR in Analytics (confidence · horizon · exposure) → read VaR at Δ = 1 for that setup.'}
+          </p>
+          <p className="mt-1 text-[11px] text-slate-600">
+            {serverPersistent
+              ? isPractice
+                ? 'Practice book syncs to your account (separate from curriculum Task 01).'
+                : 'Progress syncs to your account — continue on any device after sign-in.'
+              : 'Progress is saved in this browser for your Google account. Add DATABASE_URL for cross-device sync.'}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={runValidate}
-            disabled={!answersReady}
-            title={answersReady ? 'Validate answers' : 'Fill all answer fields first'}
-            className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Validate
-          </button>
+          {!isPractice && (
+            <button
+              type="button"
+              onClick={runValidate}
+              disabled={!answersReady}
+              title={answersReady ? 'Validate answers' : 'Fill all answer fields first'}
+              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Validate
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
-              setState(resetSandbox(storageKey, '01'));
-              setHedgesByEntityId({});
-              setView('home');
-              setEntityId(null);
-              setDashboardId(null);
-              setActiveProfileId(null);
-              setShowValidate(false);
+              void (async () => {
+                const next = await resetSandboxPersistent(storageKey, taskId);
+                setState(next);
+                setHedgesByEntityId({});
+                setView('home');
+                setEntityId(null);
+                setDashboardId(null);
+                setActiveProfileId(null);
+                setShowValidate(false);
+              })();
             }}
             className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
           >
@@ -402,31 +574,37 @@ export function Task01App({ userKey }: Task01AppProps) {
         </div>
       </div>
 
-      <ol className="sticky top-0 z-10 mt-6 flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-950/95 p-3 backdrop-blur">
-        {STEPS.map((s, i) => {
-          const done = progress.steps[s.id] === 'done';
-          const current = !done && s.id === firstPendingStep;
-          return (
-            <li
-              key={s.id}
-              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                done
-                  ? 'bg-emerald-500/25 text-emerald-200 ring-1 ring-emerald-500/50'
-                  : current
-                    ? 'bg-amber-500/20 text-amber-100 ring-1 ring-amber-400/60'
-                    : 'bg-slate-800/80 text-slate-500'
-              }`}
-            >
-              <span className={done ? 'text-emerald-400' : current ? 'text-amber-300' : 'text-slate-600'}>
-                {done ? '✓' : i + 1}.
-              </span>{' '}
-              {s.label}
-            </li>
-          );
-        })}
-      </ol>
+      {!isPractice && (
+        <ol className="sticky top-0 z-10 mt-6 flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-950/95 p-3 backdrop-blur">
+          {STEPS.map((s, i) => {
+            const done = progress.steps[s.id] === 'done';
+            const current = !done && s.id === firstPendingStep;
+            return (
+              <li
+                key={s.id}
+                className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                  done
+                    ? 'bg-emerald-500/25 text-emerald-200 ring-1 ring-emerald-500/50'
+                    : current
+                      ? 'bg-amber-500/20 text-amber-100 ring-1 ring-amber-400/60'
+                      : 'bg-slate-800/80 text-slate-500'
+                }`}
+              >
+                <span className={done ? 'text-emerald-400' : current ? 'text-amber-300' : 'text-slate-600'}>
+                  {done ? '✓' : i + 1}.
+                </span>{' '}
+                {s.label}
+              </li>
+            );
+          })}
+        </ol>
+      )}
 
-      <div className="mt-6 grid gap-6 lg:grid-cols-[1fr_300px]">
+      <div
+        className={`mt-6 grid gap-6 ${
+          isPractice ? '' : 'lg:grid-cols-[1fr_300px]'
+        }`}
+      >
         <div className="min-w-0">
           <Breadcrumb
             view={view}
@@ -449,7 +627,7 @@ export function Task01App({ userKey }: Task01AppProps) {
               }
               onEditSettings={saveGroupDashboard}
               hedgesByEntityId={hedgesByEntityId}
-              onHedgesByEntityIdChange={setHedgesByEntityId}
+              onHedgesByEntityIdChange={updateHedges}
             />
           ) : view === 'home' || !entity ? (
             <EntitiesView
@@ -475,6 +653,11 @@ export function Task01App({ userKey }: Task01AppProps) {
           ) : !dashboard ? (
             <DashboardsView
               entity={entity}
+              onBack={() => {
+                setView('home');
+                setEntityId(null);
+                setDashboardId(null);
+              }}
               onOpen={id => { setDashboardId(id); setActiveProfileId(null); }}
               onCreate={() => setModal('dashboard')}
               onSaveDashboard={(id, patch) => {
@@ -503,7 +686,7 @@ export function Task01App({ userKey }: Task01AppProps) {
               onVarSetupChange={setVarSetup}
               hedgeBook={hedgesByEntityId[entity.id] ?? emptyHedgeBook()}
               onHedgeBookChange={updater =>
-                setHedgesByEntityId(prev => ({
+                updateHedges(prev => ({
                   ...prev,
                   [entity.id]: updater(prev[entity.id] ?? emptyHedgeBook()),
                 }))
@@ -525,42 +708,79 @@ export function Task01App({ userKey }: Task01AppProps) {
                 setWorkspace(deleteRiskProfile(workspace, entity.id, dashboard.id, id))
               }
               onTimingChange={t =>
-                setWorkspace(updateDashboardTiming(workspace, entity.id, dashboard.id, t))
+                update(prev => {
+                  if (!entity || !dashboard) return prev;
+                  return {
+                    ...prev,
+                    workspace: updateDashboardTiming(
+                      prev.workspace,
+                      entity.id,
+                      dashboard.id,
+                      t,
+                    ),
+                  };
+                })
               }
               onFormulaChange={(cellKey, formula) =>
-                setWorkspace(
-                  updateDashboardFormula(workspace, entity.id, dashboard.id, cellKey, formula),
-                )
+                update(prev => {
+                  if (!entity || !dashboard) return prev;
+                  return {
+                    ...prev,
+                    workspace: updateDashboardFormula(
+                      prev.workspace,
+                      entity.id,
+                      dashboard.id,
+                      cellKey,
+                      formula,
+                    ),
+                  };
+                })
+              }
+              onFormulaChanges={updates =>
+                update(prev => {
+                  if (!entity || !dashboard) return prev;
+                  return {
+                    ...prev,
+                    workspace: updateDashboardFormulas(
+                      prev.workspace,
+                      entity.id,
+                      dashboard.id,
+                      updates,
+                    ),
+                  };
+                })
               }
             />
           )}
         </div>
 
-        <aside className="space-y-4 lg:sticky lg:top-16 lg:self-start">
-          <AnswersPanel
-            answers={answers}
-            onChange={next => update({ ...state, answers: next })}
-          />
-          <button
-            type="button"
-            onClick={runValidate}
-            disabled={!answersReady}
-            title={answersReady ? 'Validate answers' : 'Fill all answer fields first'}
-            className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Validate progress & answers
-          </button>
-          {!answersReady && (
-            <p className="text-[11px] text-amber-400/90">
-              Complete every field in Your answers before Validate.
+        {!isPractice && (
+          <aside className="space-y-4 lg:sticky lg:top-16 lg:self-start">
+            <AnswersPanel
+              answers={answers}
+              onChange={next => update({ ...state, answers: next })}
+            />
+            <button
+              type="button"
+              onClick={runValidate}
+              disabled={!answersReady}
+              title={answersReady ? 'Validate answers' : 'Fill all answer fields first'}
+              className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Validate progress & answers
+            </button>
+            {!answersReady && (
+              <p className="text-[11px] text-amber-400/90">
+                Complete every field in Your answers before Validate.
+              </p>
+            )}
+            {state.lastScore && showValidate && <TaskScore result={state.lastScore} />}
+            <p className="text-[11px] leading-relaxed text-slate-500">
+              Finish entity dashboards → mismatch → Analytics setup → VaR at Δ = 1. Answers must
+              match your chosen confidence / horizon / exposure (±5%).
             </p>
-          )}
-          {state.lastScore && showValidate && <TaskScore result={state.lastScore} />}
-          <p className="text-[11px] leading-relaxed text-slate-500">
-            Finish entity dashboards → mismatch → Analytics setup → VaR at Δ = 1. Answers must
-            match your chosen confidence / horizon / exposure (±5%).
-          </p>
-        </aside>
+          </aside>
+        )}
       </div>
 
       {modal === 'dashboard' && entity && (
@@ -647,13 +867,12 @@ function AnswersPanel({
   onChange: (a: TaskAnswers) => void;
 }) {
   const setup = parseVarSetup(answers);
-  const expectedK = setup ? Math.round(expectedEurVarUsdM(setup) * 1000) : null;
   const ready = answersComplete(answers);
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
       <h3 className="text-sm font-semibold text-white">Your answers</h3>
       <p className="mt-1 text-[11px] text-slate-500">
-        Mismatch → Analytics setup → VaR at Δ = 1 matching that setup.
+        Mismatch exposure for your Analytics basis → setup → VaR at Δ = 1 from the book.
         {!ready && (
           <span className="mt-1 block text-amber-400/90">All fields required.</span>
         )}
@@ -663,16 +882,19 @@ function AnswersPanel({
         <input
           value={answers.largestMismatchCcy}
           onChange={e => onChange({ ...answers, largestMismatchCcy: e.target.value })}
-          placeholder="EUR"
+          placeholder="CCY"
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
       <label className="mt-2 block text-[11px] text-slate-400">
-        Stock net (local M)
+        Largest mismatch (local M)
+        <span className="mt-0.5 block text-[10px] text-slate-600">
+          Stock now, avg P&L pipeline, or total forecast — same basis as Analytics
+        </span>
         <input
           value={answers.largestMismatchAmount}
           onChange={e => onChange({ ...answers, largestMismatchAmount: e.target.value })}
-          placeholder="4.9"
+          placeholder="local M"
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
@@ -681,25 +903,40 @@ function AnswersPanel({
         <input
           value={answers.varConfidencePct}
           onChange={e => onChange({ ...answers, varConfidencePct: e.target.value })}
-          placeholder="99"
+          placeholder="%"
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
       <label className="mt-2 block text-[11px] text-slate-400">
-        Horizon (1w / 1m / 3m / 6m / 1y)
+        VaR analysis horizon (1w / 1m / 3m / 6m / 9m / 1y)
+        <span className="mt-0.5 block text-[10px] text-slate-600">
+          Vol √T only — Task Q / Analytics. Does not scale forecast exposure.
+        </span>
         <input
           value={answers.varHorizon}
           onChange={e => onChange({ ...answers, varHorizon: e.target.value })}
-          placeholder="1m"
+          placeholder="horizon"
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
       <label className="mt-2 block text-[11px] text-slate-400">
-        Exposure (stock / avgBuildup)
+        Forecast period (months)
+        <span className="mt-0.5 block text-[10px] text-slate-600">
+          From FX Risk — scales Net FX Forecast / total buildup (0 = none / 1 / 3 / 6 / 12)
+        </span>
+        <input
+          value={answers.varForecastMonths}
+          onChange={e => onChange({ ...answers, varForecastMonths: e.target.value })}
+          placeholder="months"
+          className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
+        />
+      </label>
+      <label className="mt-2 block text-[11px] text-slate-400">
+        Exposure (stock / avgBuildup / totalBuildup)
         <input
           value={answers.varExposureBasis}
           onChange={e => onChange({ ...answers, varExposureBasis: e.target.value })}
-          placeholder="stock"
+          placeholder="basis"
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
@@ -708,13 +945,13 @@ function AnswersPanel({
         <input
           value={answers.eurVarUsdK}
           onChange={e => onChange({ ...answers, eurVarUsdK: e.target.value })}
-          placeholder={expectedK !== null ? String(expectedK) : '285'}
+          placeholder="$K"
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
       {setup && (
         <p className="mt-2 text-[10px] text-slate-500">
-          Active setup {setupLabel(setup)} → ref ≈ ${expectedK}K
+          Declared setup: {setupLabel(setup)} — score VaR against that regime.
         </p>
       )}
     </div>
@@ -787,6 +1024,10 @@ function GroupConsolidatedView({
   const decision = [...TASK01_REQUIRED_DECISION_LAYERS];
   const analytical = [...TASK01_REQUIRED_ANALYTICAL_LAYERS];
   const [editing, setEditing] = useState(false);
+  const [analyticsBook, setAnalyticsBook] = useState<{
+    rows: RowState[];
+    forecastProfile: ForecastProfileState;
+  }>({ rows: [], forecastProfile: DEFAULT_FORECAST_PROFILE });
   const includedNames = entities.map(e => e.name).join(' · ') || 'none';
 
   const entityIds = useMemo(
@@ -888,6 +1129,7 @@ function GroupConsolidatedView({
           simplifiedBook
           showRiskMetrics
           varSetup={varSetup}
+          onVarSetupChange={onVarSetupChange}
           bookedHedges={bookedHedges}
           hedgeRatios={hedgeRatios}
           initialRows={book.rows}
@@ -898,6 +1140,7 @@ function GroupConsolidatedView({
           fxInputs={[...TASK01_REQUIRED_FX_INPUTS]}
           hiddenTabs={hiddenTabsForLayers(decision, analytical)}
           tabLabels={TASK01_TAB_LABELS}
+          onAnalyticsBookChange={setAnalyticsBook}
           hedgingPanel={
             <HedgingDecisionLayer
               risk={risk}
@@ -908,16 +1151,19 @@ function GroupConsolidatedView({
               onBookedHedgesChange={setBookedHedges}
               onBookHedge={handleBookHedge}
               varSetup={varSetup}
+              bookRows={analyticsBook.rows}
+              forecastProfile={analyticsBook.forecastProfile}
             />
           }
           liveLadderPanel={
             <ConsolidatedLiveLadder
-              rows={book.rows}
+              rows={analyticsBook.rows.length > 0 ? analyticsBook.rows : book.rows}
               risk={risk}
               hedgeRatios={hedgeRatios}
               onHedgeRatiosChange={setHedgeRatios}
               bookedHedges={bookedHedges}
               varSetup={varSetup}
+              forecastProfile={analyticsBook.forecastProfile}
               title="Consolidated Live Ladder — Group FX"
             />
           }
@@ -927,8 +1173,12 @@ function GroupConsolidatedView({
               setup={varSetup}
               onSetupChange={onVarSetupChange}
               hedgeRatios={hedgeRatios}
+              onHedgeRatiosChange={setHedgeRatios}
               bookedHedges={bookedHedges}
+              onBookedHedgesChange={setBookedHedges}
               title="Analytics — Group FX VaR setup"
+              bookRows={analyticsBook.rows}
+              forecastProfile={analyticsBook.forecastProfile}
             />
           }
         />
@@ -1365,9 +1615,10 @@ type DashboardEditPatch = {
 };
 
 function DashboardsView({
-  entity, onOpen, onCreate, onSaveDashboard, onDelete,
+  entity, onBack, onOpen, onCreate, onSaveDashboard, onDelete,
 }: {
   entity: Entity;
+  onBack: () => void;
   onOpen: (id: string) => void;
   onCreate: () => void;
   onSaveDashboard: (id: string, patch: DashboardEditPatch) => void;
@@ -1377,15 +1628,24 @@ function DashboardsView({
 
   return (
     <>
-      <div className="mb-4 flex items-center justify-between">
-        <div>
-          <h2 className="text-lg font-semibold text-white">Dashboards — {entity.name}</h2>
-          <p className="text-xs text-slate-500">Create at least one dashboard for this entity.</p>
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <button
+            type="button"
+            onClick={onBack}
+            className="mt-0.5 shrink-0 rounded-lg border border-slate-700 px-3 py-1.5 text-sm font-medium text-slate-300 transition-colors hover:border-slate-500 hover:bg-slate-800 hover:text-white"
+          >
+            ← Back
+          </button>
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-white">Dashboards — {entity.name}</h2>
+            <p className="text-xs text-slate-500">Create at least one dashboard for this entity.</p>
+          </div>
         </div>
         <button
           type="button"
           onClick={onCreate}
-          className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-blue-500"
+          className="shrink-0 rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-blue-500"
         >
           + New dashboard
         </button>
@@ -1468,6 +1728,7 @@ function DashboardView({
   onDelete,
   onTimingChange,
   onFormulaChange,
+  onFormulaChanges,
   varSetup,
   onVarSetupChange,
   hedgeBook,
@@ -1482,6 +1743,7 @@ function DashboardView({
   onDelete: (id: string) => void;
   onTimingChange: (t: TimingProfile) => void;
   onFormulaChange: (cellKey: string, formula: string) => void;
+  onFormulaChanges: (updates: Record<string, string>) => void;
   varSetup: VarSetup;
   onVarSetupChange: (setup: VarSetup) => void;
   hedgeBook: EntityHedgeBook;
@@ -1502,6 +1764,10 @@ function DashboardView({
     () => computeConsolidatedRisk([entity], varSetup),
     [entity, varSetup],
   );
+  const [analyticsBook, setAnalyticsBook] = useState<{
+    rows: RowState[];
+    forecastProfile: ForecastProfileState;
+  }>({ rows: [], forecastProfile: DEFAULT_FORECAST_PROFILE });
   const hedgeRatios = hedgeBook.hedgeRatios;
   const bookedHedges = hedgeBook.bookedHedges;
 
@@ -1676,8 +1942,10 @@ function DashboardView({
                     initialActiveLayers={[]}
                     simplifiedBook
                     varSetup={varSetup}
+                    onVarSetupChange={onVarSetupChange}
                     bookedHedges={bookedHedges}
                     hedgeRatios={hedgeRatios}
+                    onAnalyticsBookChange={setAnalyticsBook}
                     showRiskMetrics={
                       (
                         active.fxConfig?.analyticalLayers?.length
@@ -1689,6 +1957,7 @@ function DashboardView({
                     timing={fractions}
                     formulas={dashboard.formulas}
                     onFormulaChange={onFormulaChange}
+                    onFormulaChanges={onFormulaChanges}
                     hiddenTabs={hiddenTabsForLayers(
                       // Match Group FX: missing layers → Task 01 required defaults
                       // (empty decisionLayers hid Hedging + Live Ladder and collapsed the tab nav).
@@ -1712,16 +1981,23 @@ function DashboardView({
                         onBookedHedgesChange={setBookedHedges}
                         onBookHedge={handleBookHedge}
                         varSetup={varSetup}
+                        bookRows={analyticsBook.rows}
+                        forecastProfile={analyticsBook.forecastProfile}
                       />
                     }
                     liveLadderPanel={
                       <ConsolidatedLiveLadder
-                        rows={ladderRows}
+                        rows={
+                          analyticsBook.rows.length > 0
+                            ? analyticsBook.rows
+                            : ladderRows
+                        }
                         risk={entityRisk}
                         hedgeRatios={hedgeRatios}
                         onHedgeRatiosChange={setHedgeRatios}
                         bookedHedges={bookedHedges}
                         varSetup={varSetup}
+                        forecastProfile={analyticsBook.forecastProfile}
                         title={`Live Ladder — ${entity.name}`}
                       />
                     }
@@ -1731,8 +2007,12 @@ function DashboardView({
                         setup={varSetup}
                         onSetupChange={onVarSetupChange}
                         hedgeRatios={hedgeRatios}
+                        onHedgeRatiosChange={setHedgeRatios}
                         bookedHedges={bookedHedges}
+                        onBookedHedgesChange={setBookedHedges}
                         title={`Analytics — ${entity.name} VaR setup`}
+                        bookRows={analyticsBook.rows}
+                        forecastProfile={analyticsBook.forecastProfile}
                       />
                     }
                   />

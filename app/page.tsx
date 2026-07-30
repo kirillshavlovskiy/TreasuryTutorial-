@@ -14,7 +14,7 @@ const CAPABILITIES: { title: string; description: string; tag: string }[] = [
     title: 'Hedging Decision Layer',
     tag: 'Strategy',
     description:
-      'Start unhedged (Δ = 1), size spot and forward cover against stock or average monthly buildup, and read residual VaR before you book. Cancel trades in practice mode to test how hedge structure changes risk.',
+      'Start unhedged (Δ = 1), size spot and forward cover against stock or average monthly buildup, and read residual VaR before you book. Cancel trades in sandbox to test how hedge structure changes risk.',
   },
   {
     title: 'Analytics & VaR Regime',
@@ -45,72 +45,86 @@ const CAPABILITIES: { title: string; description: string; tag: string }[] = [
 export default async function LandingPage() {
   const session = await auth();
   const user = session?.user;
-  const testMode = isTestModeEnabled();
+  const sandboxEnabled = isTestModeEnabled();
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
       <header className="mx-auto flex max-w-6xl items-center justify-between px-6 py-6">
         <BrandMark href="/" label="Treasury Workbench" size="lg" />
         <div className="flex items-center gap-3">
-          {testMode && (
-            <Link
-              href="/test"
-              className="rounded-md border border-emerald-600/50 px-4 py-2 text-sm font-medium text-emerald-300 transition-colors hover:bg-emerald-600/10"
-            >
-              Practice
-            </Link>
-          )}
           {user ? (
             <Link
               href="/workspace"
               className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500"
             >
-              Open workspace
+              Workbench
             </Link>
           ) : (
-            <SignInButton compact />
+            <SignInButton compact redirectTo="/workspace" />
           )}
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl px-6">
-        <section className="py-20 text-center sm:py-28">
+        <section className="py-16 text-center sm:py-24">
           <div className="mx-auto mb-6 inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-800/50 px-4 py-1.5 text-xs font-medium text-slate-300">
             Simple Sigma · Modern Treasury Workbench
           </div>
           <h1 className="mx-auto max-w-4xl text-4xl font-bold tracking-tight sm:text-6xl">
-            Smart decisions for hedging, liquidity and investment.
+            Smart decisions for financing and hedging, liquidity investment management.
           </h1>
           <p className="mx-auto mt-6 max-w-2xl text-lg text-slate-300">
-            Treasury Workbench gives modern treasurers one place to size FX risk, choose optimal
-            hedge structure, manage liquidity and connect investment exposure — with VaR, live
-            ladders and decision layers that update as you book.
+            Choose how you want to work: train in the sandbox curriculum on corporate treasury
+            topics, or open the live workbench for desk decisions on your own books.
           </p>
-          <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
-            {user ? (
-              <Link
-                href="/workspace"
-                className="rounded-lg bg-blue-600 px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
-              >
-                Go to your workspace
-              </Link>
-            ) : (
-              <SignInButton />
-            )}
-            {testMode && (
-              <Link
+        </section>
+
+        <section id="modes" className="pb-20">
+          <h2 className="mb-2 text-center text-2xl font-semibold tracking-tight">
+            Choose your mode
+          </h2>
+          <p className="mx-auto mb-10 max-w-xl text-center text-sm text-slate-400">
+            Two ways in — same platform. Pick sandbox learning or the production workbench.
+          </p>
+
+          <div
+            className={`mx-auto grid max-w-4xl gap-5 ${
+              sandboxEnabled ? 'md:grid-cols-2' : 'md:grid-cols-1'
+            }`}
+          >
+            {sandboxEnabled && (
+              <ModeCard
+                eyebrow="Sandbox"
+                title="Curriculum & practice"
+                description="Guided Sigma Tasks on corporate treasury topics — FX books, VaR regimes, hedge booking and group consolidation — on NordTech sample data. Learn and rehearse before the live desk."
+                points={[
+                  'Corporate treasury curriculum (Sigma Tasks)',
+                  'Sample multi-entity books & Validate scoring',
+                  'Safe place to book / cancel hedges and watch VaR',
+                ]}
+                accent="emerald"
+                signedIn={Boolean(user)}
                 href="/test"
-                className="rounded-lg bg-emerald-600 px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-emerald-500"
-              >
-                Practice environment
-              </Link>
+                cta="Enter sandbox"
+                signInRedirect="/test"
+              />
             )}
-            <a
-              href="#capabilities"
-              className="rounded-lg border border-slate-700 px-6 py-3 text-sm font-semibold text-slate-200 transition-colors hover:bg-slate-800"
-            >
-              Explore capabilities
-            </a>
+
+            <ModeCard
+              eyebrow="Workbench"
+              title="Live treasury desk"
+              description="Full Treasury Workbench for your entities and dashboards — FX risk, liquidity, investment context, hedging decisions and consolidated metrics without the training rails."
+              points={[
+                'Your workspace entities & risk profiles',
+                'Decision layers, Analytics and Live Ladder',
+                'Desk-ready hedging and liquidity views',
+              ]}
+              accent="blue"
+              signedIn={Boolean(user)}
+              href="/workspace"
+              cta="Open workbench"
+              signInRedirect="/workspace"
+            />
           </div>
         </section>
 
@@ -121,10 +135,9 @@ export default async function LandingPage() {
             </h2>
             <p className="mt-4 text-sm leading-relaxed text-slate-400 sm:text-base">
               From entity Cash/FX books to group consolidation, the workbench links exposure,
-              hedge tickets (spot and forward), residual risk and policy VaR. Practice mode walks
-              through NordTech-style scenarios so teams can rehearse hedge strategy before it hits
-              the live desk — with Analytics regimes, Live Ladder structure and Decision-layer
-              booking all wired together.
+              hedge tickets (spot and forward), residual risk and policy VaR. Sandbox curriculum
+              walks through structured scenarios; Workbench mode applies the same stack to your
+              operating books.
             </p>
           </div>
         </section>
@@ -134,8 +147,8 @@ export default async function LandingPage() {
             What you can run today
           </h2>
           <p className="mx-auto mb-12 max-w-2xl text-center text-slate-400">
-            Connected layers for risk, hedging, liquidity and investment context — the same stack
-            we are expanding in the practice and workspace flows.
+            Connected layers for risk, hedging, liquidity and investment — shared by sandbox
+            curriculum and the live workbench.
           </p>
           <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
             {CAPABILITIES.map(cap => (
@@ -152,56 +165,115 @@ export default async function LandingPage() {
             ))}
           </div>
         </section>
-
-        {!user && (
-          <section className="mb-24 rounded-2xl border border-slate-800 bg-slate-900/60 p-10 text-center">
-            <h2 className="text-2xl font-semibold tracking-tight">
-              Ready for sharper treasury decisions?
-            </h2>
-            <p className="mx-auto mt-3 max-w-xl text-slate-400">
-              Sign in with Google to open your workspace — or use Practice to train hedging,
-              VaR setup and consolidation on sample books.
-            </p>
-            <div className="mt-8 flex flex-wrap justify-center gap-3">
-              <SignInButton />
-              {testMode && (
-                <Link
-                  href="/test"
-                  className="inline-flex items-center rounded-lg border border-emerald-600/50 px-6 py-3 text-sm font-semibold text-emerald-300 transition-colors hover:bg-emerald-600/10"
-                >
-                  Enter practice
-                </Link>
-              )}
-            </div>
-          </section>
-        )}
       </main>
 
       <footer className="border-t border-slate-800 py-8 text-center text-xs text-slate-500">
-        Simple Sigma · Treasury Workbench — hedging, liquidity & investment decisions
+        Simple Sigma · Treasury Workbench — sandbox curriculum & live desk modes
       </footer>
     </div>
   );
 }
 
-function SignInButton({ compact = false }: { compact?: boolean }) {
+function ModeCard({
+  eyebrow,
+  title,
+  description,
+  points,
+  accent,
+  signedIn,
+  href,
+  cta,
+  signInRedirect,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  points: string[];
+  accent: 'emerald' | 'blue';
+  signedIn: boolean;
+  href: string;
+  cta: string;
+  signInRedirect: string;
+}) {
+  const border =
+    accent === 'emerald'
+      ? 'border-emerald-700/50 hover:border-emerald-500/60'
+      : 'border-blue-700/50 hover:border-blue-500/60';
+  const eyebrowCls =
+    accent === 'emerald' ? 'text-emerald-400' : 'text-blue-400';
+  const btnCls =
+    accent === 'emerald'
+      ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+      : 'bg-blue-600 hover:bg-blue-500 text-white';
+
+  return (
+    <div
+      className={`flex flex-col rounded-2xl border bg-slate-900/70 p-6 text-left transition-colors sm:p-8 ${border}`}
+    >
+      <div className={`text-xs font-semibold uppercase tracking-wide ${eyebrowCls}`}>
+        {eyebrow}
+      </div>
+      <h3 className="mt-2 text-xl font-semibold text-white sm:text-2xl">{title}</h3>
+      <p className="mt-3 text-sm leading-relaxed text-slate-400">{description}</p>
+      <ul className="mt-5 flex-1 space-y-2 text-sm text-slate-300">
+        {points.map(p => (
+          <li key={p} className="flex gap-2">
+            <span className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${
+              accent === 'emerald' ? 'bg-emerald-400' : 'bg-blue-400'
+            }`} />
+            <span>{p}</span>
+          </li>
+        ))}
+      </ul>
+      <div className="mt-8">
+        {signedIn ? (
+          <Link
+            href={href}
+            className={`inline-flex w-full items-center justify-center rounded-lg px-5 py-3 text-sm font-semibold transition-colors ${btnCls}`}
+          >
+            {cta}
+          </Link>
+        ) : (
+          <SignInButton
+            redirectTo={signInRedirect}
+            label={`Sign in · ${cta}`}
+            className={`inline-flex w-full items-center justify-center gap-2 rounded-lg px-5 py-3 text-sm font-semibold transition-colors ${btnCls}`}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SignInButton({
+  compact = false,
+  redirectTo = '/workspace',
+  label = 'Sign in with Google',
+  className,
+}: {
+  compact?: boolean;
+  redirectTo?: string;
+  label?: string;
+  className?: string;
+}) {
   return (
     <form
       action={async () => {
         'use server';
-        await signIn('google', { redirectTo: '/workspace' });
+        await signIn('google', { redirectTo });
       }}
     >
       <button
         type="submit"
         className={
-          compact
+          className ??
+          (compact
             ? 'inline-flex items-center gap-2 rounded-md bg-white px-4 py-2 text-sm font-medium text-slate-800 transition-colors hover:bg-slate-100'
-            : 'inline-flex items-center gap-3 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-slate-800 shadow-lg transition-colors hover:bg-slate-100'
+            : 'inline-flex items-center gap-3 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-slate-800 shadow-lg transition-colors hover:bg-slate-100')
         }
       >
-        <GoogleIcon />
-        Sign in with Google
+        {(compact || !className) && <GoogleIcon />}
+        {label}
       </button>
     </form>
   );

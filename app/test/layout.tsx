@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import type { Session } from 'next-auth';
 import { auth, signIn } from '@/auth';
 import { BrandMark } from '@/components/BrandMark';
+import { ModeNav } from '@/components/ModeNav';
 import { UserAvatarMenu } from '@/components/UserAvatarMenu';
 import { isTestModeEnabled, TEST_GUEST_EMAIL } from '@/lib/test-mode/enabled';
 
@@ -29,8 +30,9 @@ export default async function TestLayout({
       <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
         <TestBanner />
         <header className="border-b border-slate-800">
-          <div className="mx-auto flex max-w-6xl items-center px-6 py-4">
-            <BrandMark href="/test" label="Treasury Workbench Practice" />
+          <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-4">
+            <BrandMark href="/" label="Treasury Workbench Practice" />
+            <ModeNav sandboxEnabled />
           </div>
         </header>
         <main className="mx-auto flex max-w-lg flex-col items-center px-6 py-24 text-center">
@@ -65,13 +67,17 @@ export default async function TestLayout({
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
       <TestBanner />
       <header className="border-b border-slate-800">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
-          <BrandMark href="/test" label="Treasury Workbench Practice" />
-          <UserAvatarMenu
-            name={session!.user?.name}
-            email={session!.user?.email}
-            image={session!.user?.image}
-          />
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-4">
+          <BrandMark href="/" label="Treasury Workbench Practice" />
+          <div className="flex flex-wrap items-center gap-3">
+            <ModeNav sandboxEnabled />
+            <UserAvatarMenu
+              name={session!.user?.name}
+              email={session!.user?.email}
+              image={session!.user?.image}
+              sandboxEnabled
+            />
+          </div>
         </div>
       </header>
       {children}

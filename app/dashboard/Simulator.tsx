@@ -1,6 +1,14 @@
 'use client';
 
-import { useState, useMemo, type ReactNode } from 'react';
+import {
+  cloneElement,
+  isValidElement,
+  useState,
+  useMemo,
+  useEffect,
+  type ReactElement,
+  type ReactNode,
+} from 'react';
 import { BrandMark } from '@/components/BrandMark';
 import { UnifiedSimulator } from '@/components/UnifiedSimulator';
 import { BufferOptimizer } from '@/components/BufferOptimizer';
@@ -17,6 +25,12 @@ import {
   type LayerId,
 } from '@/lib/fx-buffer';
 import {
+  DEFAULT_FORECAST_PROFILE,
+  type ForecastProfileState,
+} from '@/lib/forecast-profile';
+import {
+  applyBookedHedgePositions,
+  bookedPositionOffsetsByCcy,
   fxTableRiskMetrics,
   type HedgeTicket,
 } from '@/lib/test-mode/hedge-var';
@@ -48,6 +62,7 @@ const SHARED_DEFAULTS: SharedGlobals = {
   r_USD: 3.50,
   σ_P:   0.10,
   days:  3,
+  forecastMonths: 1,
 };
 
 interface SimulatorProps {
@@ -64,6 +79,8 @@ interface SimulatorProps {
   timing?: { fPayout: number; fPayin: number };
   formulas?: Record<string, string>;
   onFormulaChange?: (cellKey: string, formula: string) => void;
+  /** Batch formula writes for Excel-like column fill-down. */
+  onFormulaChanges?: (updates: Record<string, string>) => void;
   embedded?: boolean;
   hiddenTabs?: SimulatorTab[];
   /**
@@ -80,11 +97,21 @@ interface SimulatorProps {
   analyticsPanel?: ReactNode;
   /** Analytics VaR setup for Risk Metrics columns. */
   varSetup?: VarSetup;
+  /** Sync FX Risk forecast period (and default VaR month) into parent answers. */
+  onVarSetupChange?: (setup: VarSetup) => void;
   /** Decision-layer booked spot/forward hedges — drive FX table VaR. */
   bookedHedges?: HedgeTicket[];
   /** Incremental hedge % on remaining net book (synced with Hedging Decision). */
   hedgeRatios?: Record<string, number>;
   tabLabels?: Partial<Record<SimulatorTab, string>>;
+  /**
+   * Publish live FX book + forecast schedule so Analytics / Decision can
+   * recompute VaR on custom uneven month paths.
+   */
+  onAnalyticsBookChange?: (book: {
+    rows: RowState[];
+    forecastProfile: ForecastProfileState;
+  }) => void;
 }
 
 const ALL_LAYERS: LayerId[] = ['sigmaP', 'carryOptim', 'floorH', 'portfolioDiv'];
@@ -103,6 +130,7 @@ export function Simulator({
   timing,
   formulas,
   onFormulaChange,
+  onFormulaChanges,
   embedded = false,
   hiddenTabs = [],
   simplifiedBook = false,
@@ -111,9 +139,10 @@ export function Simulator({
   liveLadderPanel,
   analyticsPanel,
   varSetup = DEFAULT_VAR_SETUP,
+  onVarSetupChange,
   bookedHedges = [],
-  hedgeRatios = {},
   tabLabels,
+  onAnalyticsBookChange,
 }: SimulatorProps) {
   // Task Mode simplified book: never expose Sensitivity / Layer Setup / IR Profile.
   // Live Ladder + Analytics are Task Mode only — hide in the full book unless shown.
@@ -125,23 +154,56 @@ export function Simulator({
     label: tabLabels?.[t.id] ?? t.label,
   }));
   const [tab, setTab] = useState<SimulatorTab>('simulator');
-  const [shared, setShared] = useState<SharedGlobals>(SHARED_DEFAULTS);
+  const [shared, setShared] = useState<SharedGlobals>(() => ({
+    ...SHARED_DEFAULTS,
+    forecastMonths: varSetup.forecastMonths ?? 1,
+  }));
+
+  // Keep Net FX Forecast period aligned with Analytics / answers forecast months.
+  useEffect(() => {
+    const m =
+      typeof varSetup.forecastMonths === 'number' && varSetup.forecastMonths >= 0
+        ? varSetup.forecastMonths
+        : 1;
+    setShared(s => (s.forecastMonths === m ? s : { ...s, forecastMonths: m }));
+  }, [varSetup.forecastMonths]);
 
   const activeTab = tabs.some(t => t.id === tab) ? tab : (tabs[0]?.id ?? 'simulator');
 
-  const [rows,      setRows]      = useState<RowState[]>(() => {
-    if (initialRows) return initialRows.map(r => ({ ...r }));
-    if (currencyFilter && currencyFilter.length > 0) {
-      return INITIAL_ROWS.filter(r => currencyFilter.includes(r.ccy));
-    }
-    return INITIAL_ROWS;
+  /** Snapshot at mount — Reset table restores this book, not the full workbench catalog. */
+  const [seed] = useState(() => {
+    const rows = initialRows
+      ? initialRows.map(r => ({ ...r }))
+      : currencyFilter && currencyFilter.length > 0
+        ? INITIAL_ROWS.filter(r => currencyFilter.includes(r.ccy)).map(r => ({ ...r }))
+        : INITIAL_ROWS.map(r => ({ ...r }));
+    return {
+      rows,
+      usdCash: initialUsdCash ?? 303.9,
+      usdNonNpCash: initialUsdNonNpCash ?? 154.1,
+      usdParams: { ...INITIAL_USD_PARAMS, ...initialUsdParams } as UsdParams,
+    };
   });
-  const [usdCash,      setUsdCash]      = useState(initialUsdCash ?? 303.9);
-  const [usdNonNpCash, setUsdNonNpCash] = useState(initialUsdNonNpCash ?? 154.1);
-  const [usdParams, setUsdParams] = useState<UsdParams>({
-    ...INITIAL_USD_PARAMS,
-    ...initialUsdParams,
-  });
+  const [rows,      setRows]      = useState<RowState[]>(() => seed.rows.map(r => ({ ...r })));
+  const [usdCash,      setUsdCash]      = useState(seed.usdCash);
+  const [usdNonNpCash, setUsdNonNpCash] = useState(seed.usdNonNpCash);
+  const [usdParams, setUsdParams] = useState<UsdParams>(() => ({ ...seed.usdParams }));
+  const [forecastProfile, setForecastProfile] = useState<ForecastProfileState>(
+    () => ({ ...DEFAULT_FORECAST_PROFILE, byCcy: {}, formulas: {} }),
+  );
+  const [forecastProfileOpen, setForecastProfileOpen] = useState(false);
+
+  useEffect(() => {
+    onAnalyticsBookChange?.({ rows, forecastProfile });
+  }, [rows, forecastProfile, onAnalyticsBookChange]);
+
+  const onResetTable = () => {
+    setRows(seed.rows.map(r => ({ ...r })));
+    setUsdCash(seed.usdCash);
+    setUsdNonNpCash(seed.usdNonNpCash);
+    setUsdParams({ ...seed.usdParams });
+    setForecastProfile({ ...DEFAULT_FORECAST_PROFILE, byCcy: {}, formulas: {} });
+  };
 
   const [policyVAR, setPolicyVAR] = useState(5.0);
 
@@ -164,11 +226,40 @@ export function Simulator({
     value: number,
   ) => setRows(prev => prev.map(r => r.ccy === ccy ? { ...r, [field]: value } : r));
 
+  // Overlay booked Decision-layer spot/forward into FX POSITION (FWD CCY / FWD USD).
+  // Risk Metrics still uses the unadjusted book + tickets separately (no double-count).
+  const displayRows = useMemo(
+    () => applyBookedHedgePositions(rows, bookedHedges),
+    [rows, bookedHedges],
+  );
+  const bookedPositionByCcy = useMemo(
+    () => bookedPositionOffsetsByCcy(bookedHedges),
+    [bookedHedges],
+  );
+
   const dashboard = useMemo(
     () => computeDashboardModel({
-      rows, usdCash, usdNonNpCash, usdParams, shared, activeLayers, policyVAR, timing,
+      rows: displayRows,
+      usdCash,
+      usdNonNpCash,
+      usdParams,
+      shared,
+      activeLayers,
+      policyVAR,
+      timing,
+      forecastProfile,
     }),
-    [rows, usdCash, usdNonNpCash, usdParams, shared, activeLayers, policyVAR, timing],
+    [
+      displayRows,
+      usdCash,
+      usdNonNpCash,
+      usdParams,
+      shared,
+      activeLayers,
+      policyVAR,
+      timing,
+      forecastProfile,
+    ],
   );
 
   const riskMetricsByCcy = useMemo(() => {
@@ -184,7 +275,9 @@ export function Simulator({
         forwardHedgeLocalM: number;
       }
     > = {};
-    for (const m of fxTableRiskMetrics(rows, varSetup, bookedHedges, hedgeRatios)) {
+    // Booked tickets only — Decision-layer Hedge-add % must not zero Residual/VaR
+    // while Spot/Fwd columns stay empty (staging belongs on Hedging Decision).
+    for (const m of fxTableRiskMetrics(rows, varSetup, bookedHedges, {}, forecastProfile)) {
       map[m.ccy] = {
         exposureLocalM: m.exposureLocalM,
         residualLocalM: m.residualLocalM,
@@ -195,7 +288,7 @@ export function Simulator({
       };
     }
     return map;
-  }, [rows, showRiskMetrics, varSetup, bookedHedges, hedgeRatios]);
+  }, [rows, showRiskMetrics, varSetup, bookedHedges, forecastProfile]);
 
   const showRates       = !simplifiedBook && (!fxInputs || fxInputs.includes('rates'));
   const showFxPosition  = !fxInputs || fxInputs.includes('fxExposure');
@@ -254,6 +347,7 @@ export function Simulator({
               usdCash={usdCash}         setUsdCash={setUsdCash}
               usdNonNpCash={usdNonNpCash} setUsdNonNpCash={setUsdNonNpCash}
               usdParams={usdParams}     setUsdParams={setUsdParams}
+              onResetTable={onResetTable}
               activeLayers={activeLayers}
               onLayerToggle={onLayerToggle}
               policyVAR={policyVAR}
@@ -270,9 +364,17 @@ export function Simulator({
               showAdvancedBook={!simplifiedBook}
               showRiskMetrics={showRiskMetrics}
               riskMetricsByCcy={riskMetricsByCcy}
+              bookedPositionByCcy={bookedPositionByCcy}
               varSetup={varSetup}
+              onVarSetupChange={onVarSetupChange}
+              forecastProfile={forecastProfile}
+              onForecastProfileChange={setForecastProfile}
+              forecastProfileOpen={forecastProfileOpen}
+              onForecastProfileOpenChange={setForecastProfileOpen}
+              simDark={embedded}
               formulas={formulas}
               onFormulaChange={onFormulaChange}
+              onFormulaChanges={onFormulaChanges}
             />
           </div>
         )}
@@ -323,14 +425,27 @@ export function Simulator({
         )}
         {!effectiveHiddenTabs.includes('analytics') && (
           <div className={activeTab === 'analytics' ? '' : 'hidden'}>
-            {analyticsPanel ?? (
-              <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-10 text-center">
-                <h3 className="text-sm font-semibold text-gray-800">Analytics</h3>
-                <p className="mt-2 text-xs text-gray-500">
-                  VaR confidence setup — available in Test Mode Group / entity FX dashboards.
-                </p>
-              </div>
-            )}
+            {analyticsPanel && isValidElement(analyticsPanel)
+              ? cloneElement(
+                  analyticsPanel as ReactElement<{
+                    bookRows?: RowState[];
+                    forecastProfile?: ForecastProfileState;
+                    onOpenForecastProfile?: () => void;
+                  }>,
+                  {
+                    bookRows: rows,
+                    forecastProfile,
+                    onOpenForecastProfile: () => setForecastProfileOpen(true),
+                  },
+                )
+              : (analyticsPanel ?? (
+                  <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-10 text-center">
+                    <h3 className="text-sm font-semibold text-gray-800">Analytics</h3>
+                    <p className="mt-2 text-xs text-gray-500">
+                      VaR confidence setup — available in Test Mode Group / entity FX dashboards.
+                    </p>
+                  </div>
+                ))}
           </div>
         )}
         {!effectiveHiddenTabs.includes('monteCarlo') && (

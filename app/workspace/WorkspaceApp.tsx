@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { BrandMark } from '@/components/BrandMark';
+import { ModeNav } from '@/components/ModeNav';
 import { INITIAL_ROWS } from '@/lib/fx-buffer';
 import { Simulator } from '@/app/dashboard/Simulator';
 import {
@@ -16,6 +17,7 @@ import {
   metricsToLayers,
   updateDashboardTiming,
   updateDashboardFormula,
+  updateDashboardFormulas,
   resolveTimingFractions,
   DEFAULT_TIMING,
   RISK_PROFILE_TYPES,
@@ -38,6 +40,7 @@ interface WorkspaceAppProps {
   userKey: string;
   userName: string;
   accountMenu: ReactNode;
+  sandboxEnabled?: boolean;
 }
 
 type Modal =
@@ -46,7 +49,12 @@ type Modal =
   | { kind: 'dashboard' }
   | { kind: 'profile' };
 
-export function WorkspaceApp({ userKey, userName, accountMenu }: WorkspaceAppProps) {
+export function WorkspaceApp({
+  userKey,
+  userName,
+  accountMenu,
+  sandboxEnabled = true,
+}: WorkspaceAppProps) {
   const [workspace, setWorkspace] = useState<Workspace>({ entities: [] });
   const [loaded, setLoaded] = useState(false);
 
@@ -60,9 +68,12 @@ export function WorkspaceApp({ userKey, userName, accountMenu }: WorkspaceAppPro
     setLoaded(true);
   }, [userKey]);
 
-  const update = (next: Workspace) => {
-    setWorkspace(next);
-    saveWorkspace(userKey, next);
+  const update = (next: Workspace | ((prev: Workspace) => Workspace)) => {
+    setWorkspace(prev => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      saveWorkspace(userKey, resolved);
+      return resolved;
+    });
   };
 
   const entity: Entity | undefined = useMemo(
@@ -79,9 +90,16 @@ export function WorkspaceApp({ userKey, userName, accountMenu }: WorkspaceAppPro
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 text-slate-100">
       <header className="border-b border-slate-800">
-        <div className={`mx-auto flex items-center justify-between px-6 py-4 ${wide ? 'max-w-screen-2xl' : 'max-w-6xl'}`}>
-          <BrandMark href="/workspace" label="Treasury Workbench" />
-          {accountMenu}
+        <div
+          className={`mx-auto flex flex-wrap items-center justify-between gap-3 px-6 py-4 ${
+            wide ? 'max-w-screen-2xl' : 'max-w-6xl'
+          }`}
+        >
+          <BrandMark href="/" label="Treasury Workbench" />
+          <div className="flex flex-wrap items-center gap-3">
+            <ModeNav sandboxEnabled={sandboxEnabled} />
+            {accountMenu}
+          </div>
         </div>
       </header>
 
@@ -106,6 +124,10 @@ export function WorkspaceApp({ userKey, userName, accountMenu }: WorkspaceAppPro
         ) : !dashboard ? (
           <DashboardsView
             entity={entity}
+            onBack={() => {
+              setEntityId(null);
+              setDashboardId(null);
+            }}
             onOpen={id => { setDashboardId(id); setActiveProfileId(null); }}
             onCreate={() => setModal({ kind: 'dashboard' })}
             onDelete={id => update(deleteDashboard(workspace, entity.id, id))}
@@ -118,8 +140,19 @@ export function WorkspaceApp({ userKey, userName, accountMenu }: WorkspaceAppPro
             onSelect={setActiveProfileId}
             onAdd={() => setModal({ kind: 'profile' })}
             onDelete={id => update(deleteRiskProfile(workspace, entity.id, dashboard.id, id))}
-            onTimingChange={t => update(updateDashboardTiming(workspace, entity.id, dashboard.id, t))}
-            onFormulaChange={(cellKey, formula) => update(updateDashboardFormula(workspace, entity.id, dashboard.id, cellKey, formula))}
+            onTimingChange={t =>
+              update(ws => updateDashboardTiming(ws, entity.id, dashboard.id, t))
+            }
+            onFormulaChange={(cellKey, formula) =>
+              update(ws =>
+                updateDashboardFormula(ws, entity.id, dashboard.id, cellKey, formula),
+              )
+            }
+            onFormulaChanges={updates =>
+              update(ws =>
+                updateDashboardFormulas(ws, entity.id, dashboard.id, updates),
+              )
+            }
           />
         )}
       </main>
@@ -276,23 +309,33 @@ function EntitiesView({
 // ── Dashboards ────────────────────────────────────────────────────────────
 
 function DashboardsView({
-  entity, onOpen, onCreate, onDelete,
+  entity, onBack, onOpen, onCreate, onDelete,
 }: {
   entity: Entity;
+  onBack: () => void;
   onOpen: (id: string) => void;
   onCreate: () => void;
   onDelete: (id: string) => void;
 }) {
   return (
     <>
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">{entity.name} · Dashboards</h1>
-          <p className="text-sm text-slate-400">Create a dashboard to group risk profiles.</p>
+      <div className="mb-6 flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <button
+            type="button"
+            onClick={onBack}
+            className="mt-1 shrink-0 rounded-lg border border-slate-700 px-3 py-1.5 text-sm font-medium text-slate-300 transition-colors hover:border-slate-500 hover:bg-slate-800 hover:text-white"
+          >
+            ← Back
+          </button>
+          <div className="min-w-0">
+            <h1 className="text-2xl font-semibold tracking-tight">{entity.name} · Dashboards</h1>
+            <p className="text-sm text-slate-400">Create a dashboard to group risk profiles.</p>
+          </div>
         </div>
         <button
           onClick={onCreate}
-          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
+          className="shrink-0 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500"
         >
           + New dashboard
         </button>
@@ -333,7 +376,15 @@ const TYPE_ICON: Record<RiskProfileType, string> = {
 };
 
 function DashboardView({
-  entity, dashboard, activeProfileId, onSelect, onAdd, onDelete, onTimingChange, onFormulaChange,
+  entity,
+  dashboard,
+  activeProfileId,
+  onSelect,
+  onAdd,
+  onDelete,
+  onTimingChange,
+  onFormulaChange,
+  onFormulaChanges,
 }: {
   entity: Entity;
   dashboard: Dashboard;
@@ -343,6 +394,7 @@ function DashboardView({
   onDelete: (id: string) => void;
   onTimingChange: (timing: TimingProfile) => void;
   onFormulaChange: (cellKey: string, formula: string) => void;
+  onFormulaChanges: (updates: Record<string, string>) => void;
 }) {
   const profiles = dashboard.riskProfiles;
   const active = profiles.find(p => p.id === activeProfileId) ?? profiles[0];
@@ -464,6 +516,7 @@ function DashboardView({
                     timing={fractions}
                     formulas={dashboard.formulas}
                     onFormulaChange={onFormulaChange}
+                    onFormulaChanges={onFormulaChanges}
                   />
                 </div>
               ) : (

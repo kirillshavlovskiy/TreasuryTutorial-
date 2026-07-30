@@ -116,9 +116,9 @@ export function computeConsolidatedRisk(
   const accounts = book.rows.flatMap(r => {
     const out: Parameters<typeof computeStockLadder>[0] = [];
     // Stock mismatch legs used by Task 01:
-    // EUR: cash (liquidity) + nonCashAsset (receivables)
+    // EUR: cash + receivables − venture debt (= Net FX stock)
     // PLN: nonCash liability (payroll accrual)
-    // Other: cash + nonCashAsset + nonCash
+    // Other: cash + nonCashAsset + nonCash + invest − debt
     if (r.ccy === 'EUR') {
       if (Math.abs(r.cash) > 1e-9) {
         out.push({
@@ -132,6 +132,14 @@ export function computeConsolidatedRisk(
           id: `${r.ccy}-recv`, seedKey: `${r.ccy}-recv`, entityId: 'consol',
           name: 'Receivables', kind: 'asset', currency: r.ccy,
           amount: r.nonCashAsset ?? 0, cadence: 'stock', ladderLayer: 'stock',
+        });
+      }
+      if (Math.abs(r.ir_liab_notional) > 1e-9) {
+        out.push({
+          id: `${r.ccy}-debt`, seedKey: `${r.ccy}-debt`, entityId: 'consol',
+          name: 'Venture debt', kind: 'liability', currency: r.ccy,
+          // Positive debt notional = short FX → negative stock contribution
+          amount: -r.ir_liab_notional, cadence: 'stock', ladderLayer: 'stock',
         });
       }
       if (Math.abs(r.collections) > 1e-9) {
@@ -149,7 +157,12 @@ export function computeConsolidatedRisk(
         cadence: 'monthly', ladderLayer: 'stock',
       });
     } else {
-      const stock = r.cash + (r.nonCashAsset ?? 0) + r.nonCash;
+      const stock =
+        r.cash
+        + (r.nonCashAsset ?? 0)
+        + r.nonCash
+        + (r.ir_invest_notional ?? 0)
+        - r.ir_liab_notional;
       if (Math.abs(stock) > 1e-9) {
         out.push({
           id: `${r.ccy}-stock`, seedKey: `${r.ccy}-stock`, entityId: 'consol',

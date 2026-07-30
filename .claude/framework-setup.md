@@ -1,4 +1,4 @@
-# Setup Guide — Claude Deel Treasury Framework
+# Setup Guide — Claude Treasury Framework
 
 Comprehensive step-by-step instructions from scratch to your first Claude Code session.
 
@@ -47,38 +47,38 @@ claude --version
 ### 2.1 Install the CLI
 
 ```
-npm install -g claude-deel-treasury
+npm install -g claude-treasury-framework
 ```
 
 Verify:
 ```
-claude-deel-treasury --version
+claude-treasury-framework --version
 ```
 
 Update to latest any time:
 ```
-npm install -g claude-deel-treasury@latest
+npm install -g claude-treasury-framework@latest
 ```
 
 ### 2.2 Set your authentication token
 
-Obtain your DEEL_TREASURY token from the FX Team lead.
+Obtain your TREASURY_FRAMEWORK token from the FX Team lead.
 
 Set it permanently:
 
 Windows (PowerShell):
 ```
-[System.Environment]::SetEnvironmentVariable("DEEL_TREASURY_TOKEN", "dlt_yourtokenhere", "User")
+[System.Environment]::SetEnvironmentVariable("TREASURY_FRAMEWORK_TOKEN", "tft_yourtokenhere", "User")
 ```
 
 macOS / Linux (add to ~/.zshrc or ~/.bashrc):
 ```
-export DEEL_TREASURY_TOKEN="dlt_yourtokenhere"
+export TREASURY_FRAMEWORK_TOKEN="tft_yourtokenhere"
 ```
 
 Verify your token:
 ```
-claude-deel-treasury auth
+claude-treasury-framework auth
 ```
 
 You should see: "✓ Token valid"
@@ -98,7 +98,7 @@ git init
 ### 3.2 Run init
 
 ```
-claude-deel-treasury init
+claude-treasury-framework init
 ```
 
 The interactive flow will ask:
@@ -114,7 +114,7 @@ The interactive flow will ask:
 10.  Select project in GDrive Projects/ — pick your project or create new
 11.  Project files to include — select all
 12. Configure MCP servers? — Y for first time
-13. Create in Nexus + Deel-Playground? — Y to set up GitHub repo
+13. Create in Nexus + GitHub? — Y to set up GitHub repo
 14. Commit the framework files to git? — Y
 
 ### 3.3 What gets created
@@ -162,7 +162,7 @@ Division files (div/) are pre-filled from npm and maintained locally — they ar
 /sync-division
 ```
 
-Updates wiki-sourced div files only: fx-rate-mesh.md, fxall-integration.md (pulled from Deel Wiki).
+Updates wiki-sourced div files only: fx-rate-mesh.md, fxall-integration.md (pulled from internal wiki).
 Division config files (division.md, standards.md, policy.md, etc.) are maintained locally — never overwritten.
 
 ### Sync project knowledge
@@ -198,7 +198,7 @@ claude
 
 ```
 /sync-dept        Refresh dept/ layer from GDrive Treasury/
-/sync-division    Refresh wiki-sourced div files from Deel Wiki
+/sync-division    Refresh wiki-sourced div files from internal wiki
 /sync-project     Pull project/ files from GDrive Projects/<name>/
 /project-commit   Upload local project/ files to GDrive Projects/<name>/
 /scaffold-project Link this repo to a GDrive project folder
@@ -208,7 +208,7 @@ claude
 ### Check status
 
 ```
-claude-deel-treasury status
+claude-treasury-framework status
 ```
 
 ---
@@ -221,20 +221,20 @@ claude-deel-treasury status
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
-### "Unauthorized: DEEL_TREASURY token missing"
+### "Unauthorized: TREASURY_FRAMEWORK token missing"
 
 ```
-claude-deel-treasury auth
+claude-treasury-framework auth
 ```
 
 If not set:
-- Windows: `[System.Environment]::SetEnvironmentVariable("DEEL_TREASURY_TOKEN", "dlt_...", "User")`
-- mac/Linux: `export DEEL_TREASURY_TOKEN="dlt_..."` (add to ~/.zshrc)
+- Windows: `[System.Environment]::SetEnvironmentVariable("TREASURY_FRAMEWORK_TOKEN", "tft_...", "User")`
+- mac/Linux: `export TREASURY_FRAMEWORK_TOKEN="tft_..."` (add to ~/.zshrc)
 
 ### "This package requires a newer version"
 
 ```
-npm install -g claude-deel-treasury@latest
+npm install -g claude-treasury-framework@latest
 ```
 
 ### GDrive project folder not found
@@ -244,4 +244,4 @@ npm install -g claude-deel-treasury@latest
 
 ---
 
-Maintained by Deel Treasury FX Team | package: claude-deel-treasury (npm)
+Maintained by Treasury FX Team | package: claude-treasury-framework (npm)

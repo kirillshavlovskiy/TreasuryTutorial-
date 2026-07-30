@@ -5,25 +5,25 @@ import type { VarConfidencePct } from '@/lib/test-mode/var-confidence';
 
 export const SCORE_TOLERANCE = 0.05;
 
-/** EUR stock × monthly vol × z99 (curriculum spots). */
+/** EUR stock (cash+receivables−debt) × monthly vol × z99 (curriculum spots). */
 const EUR_VAR_99_USD_M =
-  4.9 * NORDTECH_VAR.monthlyVol * NORDTECH_VAR.z99; // ≈ 0.285
+  1.9 * NORDTECH_VAR.monthlyVol * NORDTECH_VAR.z99; // ≈ 0.110
 
 export const NORDTECH_REFERENCE = {
   requiredEntityCodes: ['US', 'DE', 'PL'] as const,
-  /** EUR stock net (local M) — cash Frankfurt + receivables. */
-  eurStockNetM: 4.9,
+  /** EUR stock net (local M) — cash + receivables − venture debt. */
+  eurStockNetM: 1.9,
   /** PLN stock net (local M) — payroll accrual short. */
   plnStockNetM: -1.8,
   /** Analytics step: student must set this confidence. */
   requiredVarConfidencePct: 99 as VarConfidencePct,
-  /** EUR 1-month 99% VaR in USD millions (~$285K) — scored answer. */
+  /** EUR 1-month 99% VaR in USD millions (~$110K) — scored answer. */
   eurVarUsdM: EUR_VAR_99_USD_M,
-  /** Legacy 95% figure (~$202K) — curriculum compare only. */
-  eurVarUsdM95: 0.202,
+  /** Legacy 95% figure (~$78K) — curriculum compare only. */
+  eurVarUsdM95: 1.9 * NORDTECH_VAR.monthlyVol * NORDTECH_VAR.z95,
   /** PLN VaR context at 95% (~$46K) — not a hard pass gate. */
   plnVarUsdM: 0.046,
-  handEstimateUsdM: 0.285,
+  handEstimateUsdM: EUR_VAR_99_USD_M,
 } as const;
 
 export function withinTolerance(

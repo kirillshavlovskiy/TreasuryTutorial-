@@ -1,6 +1,11 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import {
+  DEFAULT_FORECAST_PROFILE,
+  monthlyFlowSeriesLocalM,
+  type ForecastProfileState,
+} from '@/lib/forecast-profile';
 import { fcyToUsdM, type RowState } from '@/lib/fx-buffer';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
@@ -9,7 +14,11 @@ import {
   type HedgeTicket,
   type HedgeVarRow,
 } from '@/lib/test-mode/hedge-var';
-import { DEFAULT_VAR_SETUP, type VarSetup } from '@/lib/test-mode/var-setup';
+import {
+  DEFAULT_VAR_SETUP,
+  exposureLocalMForBasis,
+  type VarSetup,
+} from '@/lib/test-mode/var-setup';
 
 export type LadderPerspective = 'fxRisk' | 'cashCarry' | 'dv01' | 'greeks';
 
@@ -25,7 +34,7 @@ const PERSPECTIVES: {
     label: 'FX Risk',
     active: true,
     description:
-      'Original exposure sources vs booked / proposed hedge structure. Residual tick = after hedges.',
+      'Original stock (and avg buildup when Analytics includes it) vs hedge structure. Residual = exposure − hedge.',
     yLabel: 'Exposure (M)',
   },
   {
@@ -55,6 +64,7 @@ const SEG_META = {
   cashFx: { label: 'Cash FX', color: '#0ea5e9' },
   nca: { label: 'rReceivables', color: '#8b5cf6' },
   liability: { label: 'Liability', color: '#f43f5e' },
+  avgBuildup: { label: 'Buildup', color: '#a78bfa' },
   debt: { label: 'Debt', color: '#d97706' },
   invest: { label: 'Investments', color: '#14b8a6' },
   carry: { label: 'Cash Carry', color: '#fbbf24' },
@@ -79,10 +89,14 @@ interface BarGroup {
   hedge: number;
   hedgeRatio: number;
   delta: number;
-  /** Residual after total hedge structure. */
+  /** Residual after total hedge structure (Analytics exposure − hedge). */
   net: number;
-  /** Original stock exposure (local M) — never netted by bookings. */
-  stockLocalM: number;
+  /** Original stock exposure (display unit) — never netted by bookings. */
+  stockM: number;
+  /** Buildup leg for Analytics basis (½×F×T or F×T); 0 when stock-only. */
+  avgBuildupM: number;
+  /** Analytics-basis total exposure (stock, or stock + avg buildup). */
+  exposureM: number;
   /** True when remaining net book ≈ 0 — incremental hedge % inactive. */
   hedgeInactive: boolean;
   varBeforeUsdM: number;
@@ -97,6 +111,8 @@ interface ConsolidatedLiveLadderProps {
   /** Booked Decision-layer trades — shown as hedge structure (not netted into sources). */
   bookedHedges?: HedgeTicket[];
   varSetup?: VarSetup;
+  /** Custom month schedule from FX Risk — drives path / avg VaR when set. */
+  forecastProfile?: ForecastProfileState;
   title?: string;
 }
 
@@ -122,31 +138,41 @@ export function ConsolidatedLiveLadder({
   rows,
   risk,
   hedgeRatios: controlledRatios,
-  onHedgeRatiosChange,
   bookedHedges = [],
   varSetup = DEFAULT_VAR_SETUP,
+  forecastProfile = DEFAULT_FORECAST_PROFILE,
   title = 'Consolidated Live Ladder',
 }: ConsolidatedLiveLadderProps) {
-  const [localRatios, setLocalRatios] = useState<Record<string, number>>({});
   const [perspective, setPerspective] = useState<LadderPerspective>('fxRisk');
   const [unit, setUnit] = useState<'local' | 'usd'>('local');
 
-  const ratios = controlledRatios ?? localRatios;
-  const setRatios = (next: Record<string, number>) => {
-    if (onHedgeRatiosChange) onHedgeRatiosChange(next);
-    else setLocalRatios(next);
-  };
+  // Hedge-add % is edited on Hedging Decision only — ladder displays the result.
+  const ratios = controlledRatios ?? {};
+
+  const monthlyFlowsByCcy = useMemo(() => {
+    const out: Record<string, number[]> = {};
+    const T = varSetup.forecastMonths;
+    if (T <= 0) return out;
+    const rowsByCcy = new Map(rows.map(r => [r.ccy, r]));
+    for (const { bar } of risk) {
+      if (bar.ccy === 'USD') continue;
+      const row = rowsByCcy.get(bar.ccy);
+      if (!row) continue;
+      out[bar.ccy] = monthlyFlowSeriesLocalM(row, T, forecastProfile);
+    }
+    return out;
+  }, [rows, risk, varSetup.forecastMonths, forecastProfile]);
 
   /** Decision-layer residual VaR (booked netted for incremental %). */
   const hedgeSummary = useMemo(
-    () => buildHedgeVarSummary(risk, ratios, varSetup, bookedHedges),
-    [risk, ratios, varSetup, bookedHedges],
+    () => buildHedgeVarSummary(risk, ratios, varSetup, bookedHedges, monthlyFlowsByCcy),
+    [risk, ratios, varSetup, bookedHedges, monthlyFlowsByCcy],
   );
 
   /** Unhedged originals — VaR @ Δ=1 and source baseline for the ladder. */
   const unhedgedSummary = useMemo(
-    () => buildHedgeVarSummary(risk, {}, varSetup, []),
-    [risk, varSetup],
+    () => buildHedgeVarSummary(risk, {}, varSetup, [], monthlyFlowsByCcy),
+    [risk, varSetup, monthlyFlowsByCcy],
   );
 
   const hedgeByCcy = useMemo(() => {
@@ -161,12 +187,19 @@ export function ConsolidatedLiveLadder({
     return map;
   }, [unhedgedSummary]);
 
+  const includeBuildup = varSetup.exposureBasis !== 'stock';
+  const buildupLabel =
+    varSetup.exposureBasis === 'totalBuildup'
+      ? 'Total buildup'
+      : 'Avg pipeline';
+
   const bars = useMemo((): BarGroup[] => {
     return rows
       .filter(r => r.ccy !== 'USD')
       .map(r => {
         const hv = hedgeByCcy.get(r.ccy);
         const open = unhedgedByCcy.get(r.ccy);
+        const riskRow = risk.find(x => x.bar.ccy === r.ccy);
         const ratio = ratios[r.ccy] ?? 0;
 
         // Original FX legs — never scaled by bookings.
@@ -175,21 +208,38 @@ export function ConsolidatedLiveLadder({
         const liability = r.nonCash;
         const debt = r.ir_liab_notional;
         const invest = r.ir_invest_notional ?? 0;
-        const originalFx = cashFx + nca + liability;
-
-        // Analytics-basis original + total hedge structure (booked + incremental).
-        const rawLocal = open?.exposureLocalM ?? originalFx;
+        const stockLocal =
+          riskRow?.bar.stockNetM
+          ?? cashFx + nca + liability + invest - debt;
+        const flowLocal =
+          riskRow?.bar.flowM ??
+          r.collections + r.payout + (r.fcastFX ?? 0);
+        // Original Analytics exposure (Δ = 1) — never net of booked hedges.
+        const rawLocal =
+          open?.openExposureLocalM
+          ?? open?.exposureLocalM
+          ?? exposureLocalMForBasis(
+            stockLocal,
+            flowLocal,
+            varSetup.exposureBasis,
+            varSetup.forecastMonths,
+          );
+        const avgBuildupLocal = includeBuildup ? rawLocal - stockLocal : 0;
         const bookedAmt = bookedNotionalLocalM(bookedHedges, r.ccy);
         const netBook = rawLocal - bookedAmt;
         const incremental = netBook * ratio;
         const totalHedge = bookedAmt + incremental;
         const hedgeSigned = -totalHedge;
         const hedgeInactive = Math.abs(netBook) < 1e-9;
-        // Cover ratio vs original (for Δ / chart balance), not incremental-only.
-        const coverRatio =
+        // Δ = remaining / open (0 when fully covered by booked + %).
+        const delta =
           Math.abs(rawLocal) < 1e-12
             ? 0
-            : Math.min(1, Math.abs(totalHedge) / Math.abs(rawLocal));
+            : Math.min(
+                1,
+                Math.max(0, Math.abs(rawLocal + hedgeSigned) / Math.abs(rawLocal)),
+              );
+        const coverRatio = 1 - delta;
 
         const toUnit = (v: number) => (unit === 'usd' ? fcyToUsdM(v, r.ccy) : v);
 
@@ -202,11 +252,18 @@ export function ConsolidatedLiveLadder({
             { id: 'cashFx', value: toUnit(cashFx) },
             { id: 'nca', value: toUnit(nca) },
             { id: 'liability', value: toUnit(liability) },
+            // Net FX stock includes −debt / +invest (same as Risk Metrics Exp).
+            { id: 'debt', value: toUnit(-Math.abs(debt) || 0) },
+            { id: 'invest', value: toUnit(invest) },
           ];
+          // When Analytics includes buildup, stack the flow leg so left = hedge basis.
+          if (includeBuildup && Math.abs(avgBuildupLocal) > 1e-9) {
+            fx.push({ id: 'avgBuildup', value: toUnit(avgBuildupLocal) });
+          }
           sources = fx.filter(s => Math.abs(s.value) > 1e-9);
           hedge = toUnit(hedgeSigned);
-          // Visual residual of drawn columns (stock sources + hedge structure).
-          net = toUnit(originalFx + hedgeSigned);
+          // Residual = Analytics exposure + hedge structure (balances chart).
+          net = toUnit(rawLocal + hedgeSigned);
         } else if (perspective === 'cashCarry') {
           const m = r.r_FCY / 100 / 12;
           const carry: Segment[] = [
@@ -231,7 +288,7 @@ export function ConsolidatedLiveLadder({
           hedge = toUnit(-(debtDv + investDv) * coverRatio);
           net = sources.reduce((s, seg) => s + seg.value, 0) + hedge;
         } else {
-          const gk: Segment[] = [{ id: 'greeksSpot', value: toUnit(originalFx) }];
+          const gk: Segment[] = [{ id: 'greeksSpot', value: toUnit(rawLocal) }];
           sources = gk.filter(s => Math.abs(s.value) > 1e-9);
           hedge = toUnit(hedgeSigned * 0.5);
           net = sources.reduce((s, seg) => s + seg.value, 0) + hedge;
@@ -243,9 +300,11 @@ export function ConsolidatedLiveLadder({
           hedge,
           // Slider stays on incremental % of remaining net book (Decision sync).
           hedgeRatio: hedgeInactive ? 0 : ratio,
-          delta: 1 - coverRatio,
+          delta,
           net,
-          stockLocalM: originalFx,
+          stockM: toUnit(stockLocal),
+          avgBuildupM: toUnit(includeBuildup ? avgBuildupLocal : 0),
+          exposureM: toUnit(rawLocal),
           hedgeInactive,
           varBeforeUsdM: open?.varBeforeUsdM ?? 0,
           varAfterUsdM: hv?.varAfterUsdM ?? open?.varBeforeUsdM ?? 0,
@@ -261,9 +320,13 @@ export function ConsolidatedLiveLadder({
       });
   }, [
     rows,
+    risk,
     ratios,
     perspective,
     unit,
+    includeBuildup,
+    varSetup.exposureBasis,
+    varSetup.forecastMonths,
     hedgeByCcy,
     unhedgedByCcy,
     hedgeSummary.rows,
@@ -396,15 +459,44 @@ export function ConsolidatedLiveLadder({
 
       {perspective === 'fxRisk' && bars.length > 0 && (
         <div className="overflow-x-auto rounded-lg border border-slate-800">
-          <table className="w-full min-w-[640px] text-left text-xs">
+          <table
+            className={`w-full text-left text-xs ${
+              includeBuildup ? 'min-w-[760px]' : 'min-w-[640px]'
+            }`}
+          >
             <thead>
               <tr className="border-b border-slate-800 text-slate-500">
                 <th className="px-3 py-2 font-medium">CCY</th>
-                <th className="px-3 py-2 font-medium">Original stock</th>
+                <th
+                  className="px-3 py-2 font-medium"
+                  title="Net FX stock: Cash FX + receivables + liability + invest − debt"
+                >
+                  Original stock
+                </th>
+                {includeBuildup && (
+                  <th
+                    className="px-3 py-2 font-medium"
+                    title={
+                      varSetup.exposureBasis === 'totalBuildup'
+                        ? 'F×T monthly flow over FX Risk forecast period'
+                        : '½×F×T average P&L pipeline over FX Risk forecast period'
+                    }
+                  >
+                    {buildupLabel}
+                  </th>
+                )}
                 <th className="px-3 py-2 font-medium">Hedge</th>
-                <th className="px-3 py-2 font-medium">Add %</th>
                 <th className="px-3 py-2 font-medium">Δ</th>
-                <th className="px-3 py-2 font-medium">Residual</th>
+                <th
+                  className="px-3 py-2 font-medium"
+                  title={
+                    includeBuildup
+                      ? 'Stock + buildup − hedge'
+                      : 'Original stock − hedge'
+                  }
+                >
+                  Residual
+                </th>
                 <th className="px-3 py-2 font-medium">VaR @ Δ1</th>
                 <th className="px-3 py-2 font-medium">VaR after</th>
               </tr>
@@ -414,43 +506,18 @@ export function ConsolidatedLiveLadder({
                 <tr key={b.ccy} className="border-b border-slate-800/80 hover:bg-slate-800/40">
                   <td className="px-3 py-2 font-semibold">{b.ccy}</td>
                   <td className="px-3 py-2 font-mono text-slate-300">
-                    {fmtSigned(b.stockLocalM)}M
+                    {fmtSigned(b.stockM)}M
                   </td>
+                  {includeBuildup && (
+                    <td
+                      className="px-3 py-2 font-mono text-violet-300"
+                      title={`Total exposure ${fmtSigned(b.exposureM)}M`}
+                    >
+                      {fmtSigned(b.avgBuildupM)}M
+                    </td>
+                  )}
                   <td className="px-3 py-2 font-mono text-emerald-300">
                     {fmtSigned(b.hedge)}M
-                  </td>
-                  <td className="px-3 py-2">
-                    <label
-                      className={`flex items-center gap-2${
-                        b.hedgeInactive ? ' grayscale' : ''
-                      }`}
-                    >
-                      <input
-                        type="range"
-                        min={0}
-                        max={100}
-                        step={1}
-                        value={Math.round(b.hedgeRatio * 100)}
-                        disabled={b.hedgeInactive}
-                        onChange={e => {
-                          const pct = Number(e.target.value) / 100;
-                          setRatios({ ...ratios, [b.ccy]: pct });
-                        }}
-                        className="w-24 accent-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-                        title={
-                          b.hedgeInactive
-                            ? 'Fully covered by booked hedges — cancel a trade or switch Analytics basis'
-                            : 'Incremental hedge % on remaining net book'
-                        }
-                      />
-                      <span
-                        className={`w-10 tabular-nums ${
-                          b.hedgeInactive ? 'text-slate-500' : 'text-emerald-300'
-                        }`}
-                      >
-                        {Math.round(b.hedgeRatio * 100)}%
-                      </span>
-                    </label>
                   </td>
                   <td className="px-3 py-2 font-mono text-amber-300">{b.delta.toFixed(2)}</td>
                   <td className="px-3 py-2 font-mono text-slate-400">{fmtSigned(b.net)}</td>
@@ -466,9 +533,14 @@ export function ConsolidatedLiveLadder({
       )}
 
       <p className="text-[11px] leading-relaxed text-slate-500">
-        Left column keeps original exposure sources. Right column shows the hedge structure from
-        Hedging Decision (booked trades + incremental %). Residual / VaR after update when you book
-        or cancel hedges.
+        Left column keeps original exposure sources
+        {includeBuildup
+          ? varSetup.exposureBasis === 'totalBuildup'
+            ? ' plus total forecast buildup (F×forecast months) when Analytics uses that basis'
+            : ' plus average P&L pipeline (½×F×T) when Analytics uses that basis'
+          : ''}
+        . Hedge structure comes from Hedging Decision (booked trades + hedge add there). Residual =
+        Analytics exposure − hedge so the ladder balances.
       </p>
     </div>
   );
@@ -697,7 +769,7 @@ function VerticalStackedChart({
         </text>
       </svg>
       <div className="mt-1 flex flex-wrap gap-4 px-2 text-[10px] text-slate-500">
-        <span>Left = original exposure sources</span>
+        <span>Left = original stock sources (+ avg buildup when selected)</span>
         <span>Right = booked + proposed hedge structure</span>
         <span>Dashed tick = residual · label = VaR after</span>
       </div>

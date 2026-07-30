@@ -543,4 +543,49 @@ const swap_needed = formulaLayersActive
 | Long spot, cash OK | +15 | 0 | +300 | 0 | −15 (deploy long to fwd) | −15 ✓ |
 | Long spot, cash low | +15 | 0 | −100 | 50 | +150 (cash maint wins) | +150 ✓ |
 
+## Analytics VaR — profiles, horizon chart, forecast uncertainty
+
+**Date:** 2026-07-28
+**Decision:** Task 01 / Workbench Analytics drives shared VaR setup across Decision, Live Ladder, and Risk Metrics. Exposure inputs are forecast period Tf, VaR profile (stock / weighted average / growth path), and optional 1m incremental forecast uncertainty. Active VaR tenure is chosen on the EUR VaR evolution chart (not separate √T period chips). Confidence sits beside the narrow chart.
+**Alternatives considered:** Snapshot `|E_end|×σ×√T` for growing books — rejected (overstates). Separate horizon chip row in Analytics — removed in favour of chart/table selection. Forecast uncertainty as a pure spot EaR add-on (`σ_E×spot×z`) RSS’d with FX VaR — rejected because when both legs scale √T the term structure stays √T and does not steepen.
+**Reason:** Growing exposure needs path-aware VaR; Tf (forecast buildup) must stay independent of Th (vol tenure). Forecast quantity risk should compound over multiple months and visibly change curvature on the 1w→1y chart.
+**Anti-patterns:** Do not use stock-only Exp for Risk Metrics hedge target when Analytics basis includes forecast — Exp = Net FX Forecast for the active profile. Do not apply `|E_end|×σ×√T` to linear buildup. Do not conflate Tf with Th. Do not apply forecast uncertainty to stock / Tf=0. Do not edit dept/ or div/ knowledge for this — keep in project/.
+**Ticket:** —
+
+### Shared setup (`VarSetup` in `lib/test-mode/var-setup.ts`)
+
+| Field | Role |
+|-------|------|
+| `confidencePct` | 90 / 95 / 99 → z |
+| `horizon` | VaR tenure Th (1w…1y); σ_T = σ_1m×√Th |
+| `forecastMonths` | Tf — caps growth / sets average area; `0` = no forecast |
+| `exposureBasis` | `stock` \| `avgBuildup` \| `totalBuildup` |
+| `forecastUncertainty1m` | Relative 1m vol of monthly flow F (`u`); `0` = off |
+
+Engine entry point: `computeAnalyticsVarUsdM` (also used by `buildHedgeVarSummary` / Risk Metrics).
+
+### VaR profiles (curvature vs tenure)
+
+| Profile | Exposure / path | FX VaR (u = 0) | Curvature |
+|---------|-----------------|----------------|-----------|
+| Stock now | S | \|S\|×σ×√Th×z | Pure √T |
+| Weighted average | Ē = S+½×F×g, g=min(Th,Tf) | \|Ē\|×σ×√Th×z | √T once Th≥Tf; Ē accrues until Tf |
+| Growth path | e(t)=S+F·min(t,Tf) | σ×z×√∫₀^{Th} e(t)² dt | Path (≠ √T) |
+
+### Incremental forecast uncertainty (1m)
+
+- Input presets: Off / 5% / 10% / 20% / 30% of monthly flow F.
+- Accrual: `g = min(Th, Tf)`, `σ_E = |F|·u·√g` (independent monthly errors → variance adds → √g).
+- Folded into FX factor (steepens tenure when u > 0 and Th ≤ Tf):
+  - avg: `√(Ē² + σ_E²) × σ × √Th × z` → `σ z √(Ē² Th + σ_E² Th)`
+  - path: `σ × z × √(∫e²dt + σ_E²·Th)`
+- When `g = Th`, the `σ_E²·Th` term grows ~Th² inside the sqrt → VaR/√Th rises with tenure.
+- UI lives under Input exposure metrics; disabled for stock / Tf=0.
+
+### UI (`VarAnalyticsPanel`)
+
+1. Input exposure metrics: Tf chips, forecast-u chips, profile toggle.
+2. EUR VaR evolution: narrow bar chart (click = set `horizon`) + confidence column on the right.
+3. Same setup feeds Hedging Decision, Live Ladder, Risk Metrics Exp/VaR.
+
 <!-- Add new decisions above this line -->

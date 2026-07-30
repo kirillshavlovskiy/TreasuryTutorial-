@@ -3,8 +3,8 @@
 ## Data classification
 
 - Payment data: RESTRICTED — never log amounts, account numbers, or transaction IDs in plaintext
-- FX rates: INTERNAL — may be shared within Deel, not externally
-- Worker contract data: CONFIDENTIAL — access via Deel Public MCP only, no caching
+- FX rates: INTERNAL — may be shared within the organization, not externally
+- Worker contract data: CONFIDENTIAL — access via Public MCP only, no caching
 
 ## Security rules
 
@@ -22,5 +22,5 @@
 
 1. Contain — disable the affected integration
 2. Assess — identify data exposure scope
-3. Report — notify treasury-security@deel.com within 1 hour
+3. Report — notify treasury security within 1 hour
 4. Document — file incident report within 24 hours

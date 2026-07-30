@@ -72,7 +72,7 @@
 - **FWD FX Rate fixing** for payrolls
 - **FX Orders** for contractors
 - **FXALL Settlement Center** back-feed into TMS → target 0 discrepancy between Accounting, Cash Management, TMS booking, and P&L modules
-- **FX P&L and Exposure completeness:** Map all FX risk sources to TMS; capture missing edge cases from the Deel platform
+- **FX P&L and Exposure completeness:** Map all FX risk sources to TMS; capture missing edge cases from the platform
 
 ---
 

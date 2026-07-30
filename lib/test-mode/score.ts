@@ -1,7 +1,4 @@
-import {
-  NORDTECH_REFERENCE,
-  withinTolerance,
-} from '@/lib/test-mode/fixtures/nordtech-reference';
+import { withinTolerance } from '@/lib/test-mode/fixtures/nordtech-reference';
 import {
   classifyNordtechEntity,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
@@ -14,6 +11,7 @@ import type {
   TaskScoreResult,
 } from '@/lib/test-mode/types';
 import {
+  eurRefExposureM,
   expectedEurVarUsdM,
   parseVarSetup,
   setupLabel,
@@ -41,13 +39,13 @@ const HINTS = {
   analyticalLayers:
     'On Add risk profile → Analytical layers: enable Risk Metrics (VaR). Sensitivity / Monte Carlo are optional.',
   mismatchCcy:
-    'Largest stock mismatch is EUR long (Frankfurt cash + EU receivables). Enter currency code EUR.',
+    'Largest stock mismatch is EUR long Net FX (cash + receivables − venture debt ≈ €1.9M). Enter currency code EUR.',
   mismatchAmt:
-    'EUR stock net should be about +€4.9M (±5%) = Cash FX 2.5 + rReceivables 2.4.',
+    'EUR exposure for your Analytics basis: Stock now ≈ Net FX (cash + receivables − debt ≈ 1.9); Weighted avg ≈ stock + ½×F×min(Th,Tf); Growth path accrued ≈ stock + F×min(Th,Tf). Match Analytics Exposure @ Δ1 (±5%).',
   varSetup:
-    'In Analytics choose confidence (90/95/99), horizon (1w/1m/3m/6m/1y), and exposure (Stock now or Avg monthly buildup). Copy those into Your answers.',
+    'In Analytics choose confidence (90/95/99), VaR analysis horizon (vol √T), and exposure basis. Set forecast period on FX Risk. Copy those into Your answers.',
   varAmt:
-    'Enter EUR VaR at Δ = 1 ($K) that matches your Analytics setup (±5%). Example: stock · 1m · 99% ≈ $285K; avg buildup · 1m · 99% ≈ $390K.',
+    'Enter EUR VaR at Δ = 1 ($K) that matches your Analytics setup (±5%). Read it from Risk Metrics / Analytics at Δ = 1 — not from a guessed template.',
 } as const;
 
 function profileHasRequiredInputs(inputs: FxInput[] | undefined): boolean {
@@ -300,19 +298,31 @@ export function scoreTask01(
     hint: ccyOk ? undefined : HINTS.mismatchCcy,
   });
 
+  const setup = parseVarSetup(answers);
+  const exposureBasis = setup?.exposureBasis ?? 'stock';
+  const expectedExposureM = setup
+    ? eurRefExposureM(setup)
+    : eurRefExposureM({ exposureBasis: 'stock', forecastMonths: 1 });
   const amt = parseNum(answers.largestMismatchAmount);
   const amtOk =
-    amt !== null && withinTolerance(amt, NORDTECH_REFERENCE.eurStockNetM);
+    amt !== null && withinTolerance(amt, expectedExposureM);
+  const basisLabel =
+    exposureBasis === 'simpleAvg'
+      ? 'simple average'
+      : exposureBasis === 'avgBuildup'
+        ? 'weighted average'
+        : exposureBasis === 'totalBuildup'
+          ? 'total forecast buildup'
+          : 'stock now';
   checks.push({
     id: 'answerAmount',
-    label: 'Answer: EUR stock net (local M)',
+    label: `Answer: EUR ${basisLabel} (local M)`,
     pass: amtOk,
-    expected: `+${NORDTECH_REFERENCE.eurStockNetM} (±5%)`,
+    expected: `+${expectedExposureM} (±5%) · ${basisLabel}`,
     actual: amt === null ? '(blank/invalid)' : `${amt}`,
     hint: amtOk ? undefined : HINTS.mismatchAmt,
   });
 
-  const setup = parseVarSetup(answers);
   const setupOk = setup !== null;
   checks.push({
     id: 'answerConfidence',

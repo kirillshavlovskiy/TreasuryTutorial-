@@ -2,7 +2,7 @@
 
 ## Mission
 
-Deel Treasury manages global cash, FX risk, payments infrastructure, and financial operations across all Deel entities.
+Treasury manages global cash, FX risk, payments infrastructure, and financial operations across all group entities.
 
 ## Divisions
 
@@ -13,11 +13,11 @@ Deel Treasury manages global cash, FX risk, payments infrastructure, and financi
 
 ## Cross-team standards
 
-- All financial data access goes through Deel Treasury MCP or Deel Public MCP — no direct DH queries
+- All financial data access goes through Treasury MCP or Public MCP — no direct DH queries
 - All model outputs must be reviewed before execution in production systems
 - Code touching payment logic requires two-engineer sign-off
 
 ## Escalation
 
 - On-call: check #treasury-oncall Slack channel
-- Data incidents: escalate to treasury-eng@deel.com within 30 min
+- Data incidents: escalate to treasury engineering within 30 min

@@ -1,4 +1,4 @@
-# FX Hedging Policy — Deel Treasury
+# FX Hedging Policy — Treasury
 
 > **Business Policy** — Approved by: Treasury Manager / Director of Finance
 > Source: FX Hedging Policy (Aug 2024 WIP)
@@ -60,11 +60,11 @@ This policy provides an overall framework for managing corporate foreign currenc
 ## FX Position Calculation
 
 - All FX positions are measured against USD (consolidated reporting currency)
-- All currency balances across the Deel Inc subsidiary structure are included in the position calculation
+- All currency balances across the group subsidiary structure are included in the position calculation
 - **Three collection and hedging models:**
 
   **1. Global collection + Notional Pool sweep:**
-  Funds collected globally into Deel Inc, swept to NP account. FX hedging operates independently of the funding/sweep process. Executed in all NP currencies.
+  Funds collected globally into the parent entity, swept to NP account. FX hedging operates independently of the funding/sweep process. Executed in all NP currencies.
 
   **2. Local collection + conversion on demand:**
   Funds collected locally, converted to salary payout currency as needed.
@@ -108,7 +108,7 @@ FCY Net Working Capital can be managed as:
 5. Hedged via NDF or non-deliverable options
 6. Hedged via overnight FX Swap
 
-> Note: There may be markets where selling FX onshore imposes taxation consequences for the Deel subsidiary, limiting NWC management options. Risk-averse strategy assumes FCY NWC is minimized or kept at 0 at any point in time.
+> Note: There may be markets where selling FX onshore imposes taxation consequences for the subsidiary, limiting NWC management options. Risk-averse strategy assumes FCY NWC is minimized or kept at 0 at any point in time.
 
 ---
 

@@ -1,4 +1,4 @@
-Initialize this project with the Deel Treasury knowledge framework.
+Initialize this project with the Treasury knowledge framework.
 
 Run this command once after cloning a new repo — or when the .claude/ folder is missing.
 
@@ -69,7 +69,7 @@ Read `.claude/registry.json` if it exists. If it does NOT exist, use the values 
     },
     {
       "gdrive_file_id": "1BpeScM34C2TbLJvVtofsKBkvkzquuN7uwrXnqKshpko",
-      "title": "Setup Guide — Claude Deel Treasury Framework",
+      "title": "Setup Guide — Claude Treasury Framework",
       "local_path": "framework-setup.md"
     }
   ],
@@ -310,7 +310,7 @@ Content:
 ```markdown
 # Knowledge framework — read this before anything else
 
-This project uses the Deel Treasury three-layer shared knowledge framework.
+This project uses the Treasury three-layer shared knowledge framework.
 You must understand the layers before acting on any instruction.
 
 ## Framework documentation (above all layers — always auto-fetched)
@@ -399,7 +399,7 @@ Write `.claude/framework.json`:
 ```json
 {
   "framework_version": "1.2",
-  "package": "claude-deel-treasury",
+  "package": "claude-treasury-framework",
   "project_name": "$PROJECT_NAME",
   "project_purpose": "$PROJECT_PURPOSE",
   "project_type": "$PROJECT_TYPE",
@@ -460,7 +460,7 @@ Show a diff summary (`git diff --cached --stat`), then ask:
 
 If yes, commit with message:
 ```
-chore(claude): install Deel Treasury knowledge framework
+chore(claude): install Treasury knowledge framework
 
 - Framework docs: fetched from GDrive Framework Documentation/
 - Dept knowledge: fetched from GDrive Treasury/

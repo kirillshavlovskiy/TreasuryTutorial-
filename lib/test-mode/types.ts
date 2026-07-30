@@ -1,6 +1,15 @@
 /** Test-mode domain — Sigma Tasks on the workspace Entity → Dashboard → Simulator flow. */
 
+import type { EntityHedgeBook } from '@/lib/test-mode/hedge-var';
 import type { Workspace } from '@/lib/workspace-store';
+
+/** Resume location inside the sandbox task UI. */
+export interface SandboxUiState {
+  view: 'home' | 'group' | 'entity';
+  entityId: string | null;
+  dashboardId: string | null;
+  activeProfileId: string | null;
+}
 
 export type TaskStepId =
   | 'buildWorkspace'
@@ -15,16 +24,23 @@ export interface TaskProgress {
 
 /** Student answers submitted before Validate. */
 export interface TaskAnswers {
-  /** Currency code of the largest stock mismatch (expected EUR). */
+  /** Currency code of the largest mismatch (expected EUR). */
   largestMismatchCcy: string;
-  /** Stock net in local millions (expected +4.9). */
+  /** Exposure net in local M for the declared Analytics basis (stock or avg). */
   largestMismatchAmount: string;
   /** VaR confidence % from Analytics (90 | 95 | 99). */
   varConfidencePct: string;
-  /** Exposure basis from Analytics (stock | avgBuildup). */
+  /** Exposure basis from Analytics (stock | simpleAvg | avgBuildup | totalBuildup). */
   varExposureBasis: string;
-  /** Horizon from Analytics (1w | 1m | 3m | 6m | 1y). */
+  /** VaR analysis horizon from Analytics (1w | 1m | 3m | 6m | 9m | 1y) — vol √T only. */
   varHorizon: string;
+  /** FX Risk forecast period in months (scales totalBuildup / Net FX Forecast). */
+  varForecastMonths: string;
+  /**
+   * Incremental 1m forecast uncertainty (relative to monthly flow), e.g. "0.1" or "10%".
+   * Empty / omitted → 0 (off).
+   */
+  varForecastUncertainty: string;
   /**
    * EUR VaR at Δ=1 in USD thousands — must match Analytics setup
    * (confidence × horizon × exposure basis) within ±5%.
@@ -59,7 +75,13 @@ export interface TestSandboxState {
   progress: TaskProgress;
   /** Last Validate result snapshot (optional UI). */
   lastScore?: TaskScoreResult;
+  /** Decision-layer hedge books keyed by entity id (or group scope). */
+  hedgesByEntityId?: Record<string, EntityHedgeBook>;
+  /** Last UI location so practice resumes where the student stopped. */
+  ui?: SandboxUiState;
   seededAt: string;
+  /** Wall-clock update time — used to merge local vs server copies. */
+  updatedAt?: string;
 }
 
 export interface ScoreCheck {

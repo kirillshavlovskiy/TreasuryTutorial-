@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import {
   CURRENCY_PARAMS,
   INITIAL_ROWS,
@@ -8,6 +9,8 @@ import {
   sumFcySwapNearUsd,
   fcyToUsdM,
   usdToFcyM,
+  roundMoney,
+  fxBookNetLocalM,
   type RowState,
   type UsdParams,
   type SharedGlobals,
@@ -29,7 +32,30 @@ import {
   type SimFieldKey,
 } from '@/lib/sim-formulas';
 import type { Scope } from '@/lib/formula';
-import { setupLabel, type VarSetup } from '@/lib/test-mode/var-setup';
+import type { BookedPositionOffset } from '@/lib/test-mode/hedge-var';
+import {
+  DEFAULT_FORECAST_PROFILE,
+  copyMonth1ToAll,
+  ensureProfileForRows,
+  evalPeriodFormula,
+  forecastFormulaKey,
+  monthNet,
+  periodFlowSumLocalM,
+  periodFormulaScope,
+  seedMonthsFromRow,
+  sumPeriodFlow,
+  type ForecastFlowMode,
+  type ForecastMonthFlow,
+  type ForecastProfileState,
+} from '@/lib/forecast-profile';
+import {
+  DEFAULT_VAR_SETUP,
+  FORECAST_PERIOD_OPTIONS,
+  forecastPeriodIdForMonths,
+  VAR_HORIZON_OPTIONS,
+  type VarHorizonId,
+  type VarSetup,
+} from '@/lib/test-mode/var-setup';
 
 export type FxRiskMetricCell = {
   exposureLocalM: number;
@@ -43,6 +69,11 @@ export type FxRiskMetricCell = {
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 
 function f2(v: number)  { return isNaN(v) ? '—' : v.toFixed(2); }
+/** Input display — strip binary float garbage (3.400000000000002 → "3.4"). */
+function n(v: number): string {
+  if (!Number.isFinite(v)) return '';
+  return String(roundMoney(v));
+}
 function clr(v: number) { return v < 0 ? 'text-red-600' : 'text-gray-900'; }
 function dclr(v: number){ return v > 0 ? 'text-red-600' : 'text-green-600'; }
 /** Explicit "$M/yr" carry formatting so USD-denominated P&L cells never read
@@ -84,18 +115,19 @@ function CarryBadge({ dir }: { dir: 'earn' | 'pay' | 'neutral' }) {
 
 // ─── Global param input ───────────────────────────────────────────────────────
 
-function GParam({ label, value, min, max, step, unit, onChange }: {
+function GParam({ label, value, min, max, step, unit, onChange, title }: {
   label: string;
   value: number; min: number; max: number; step: number; unit: string;
   onChange: (v: number) => void;
+  title?: string;
 }) {
   return (
-    <div className="flex flex-col gap-0.5 min-w-[96px]">
+    <div className="flex flex-col gap-0.5 min-w-[96px]" title={title}>
       <label className="text-xs font-medium text-gray-700">{label}</label>
       <div className="flex items-center gap-1 mt-0.5">
         <input
-          type="number" step={step} min={min} max={max} value={value}
-          onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) onChange(v); }}
+          type="number" step={step} min={min} max={max} value={roundMoney(value)}
+          onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) onChange(roundMoney(v)); }}
           className="w-20 rounded border border-gray-300 px-2 py-1 text-xs text-right font-mono"
         />
         <span className="text-xs text-gray-400 whitespace-nowrap">{unit}</span>
@@ -119,10 +151,11 @@ const inBase = 'text-right text-xs border-0 bg-transparent focus:bg-white focus:
 
 export function UnifiedSimulator({
   shared, onSharedChange,
-  setRows,
+  rows, setRows,
   usdCash, setUsdCash,
   usdNonNpCash, setUsdNonNpCash,
   usdParams, setUsdParams,
+  onResetTable,
   activeLayers,
   onLayerToggle,
   policyVAR,
@@ -142,10 +175,24 @@ export function UnifiedSimulator({
   showRiskMetrics = false,
   /** Per-CCY VaR metrics for the Risk Metrics columns (keyed by currency). */
   riskMetricsByCcy = {},
+  /**
+   * Decision-layer booked spot/forward already included in fcyComputed.
+   * Used when editing so write-back strips the overlay from the seed book.
+   */
+  bookedPositionByCcy = {},
   /** Analytics regime — labels VaR columns (confidence · horizon · basis). */
   varSetup,
+  /** Sync FX Risk forecast period into Analytics / answers. */
+  onVarSetupChange,
+  forecastProfile = DEFAULT_FORECAST_PROFILE,
+  onForecastProfileChange,
+  forecastProfileOpen: forecastProfileOpenControlled,
+  onForecastProfileOpenChange,
+  /** When true, portaled modals keep the `.sim-dark` skin (body portal escapes the tree). */
+  simDark = false,
   formulas,
   onFormulaChange,
+  onFormulaChanges,
 }: {
   shared: SharedGlobals;
   onSharedChange: (key: keyof SharedGlobals, value: number) => void;
@@ -157,6 +204,8 @@ export function UnifiedSimulator({
   setUsdNonNpCash: React.Dispatch<React.SetStateAction<number>>;
   usdParams: UsdParams;
   setUsdParams: React.Dispatch<React.SetStateAction<UsdParams>>;
+  /** Restore the dashboard seed book (not the full workbench currency catalog). */
+  onResetTable?: () => void;
   activeLayers: Set<LayerId>;
   onLayerToggle: (id: LayerId) => void;
   policyVAR: number;
@@ -175,10 +224,22 @@ export function UnifiedSimulator({
   showAdvancedBook?: boolean;
   showRiskMetrics?: boolean;
   riskMetricsByCcy?: Record<string, FxRiskMetricCell>;
+  bookedPositionByCcy?: Record<string, BookedPositionOffset>;
   varSetup?: VarSetup;
+  onVarSetupChange?: (setup: VarSetup) => void;
+  /** Flat monthly×T or custom per-period Revenue/Expenses. */
+  forecastProfile?: ForecastProfileState;
+  onForecastProfileChange?: (profile: ForecastProfileState) => void;
+  /** Controlled open state for the Forecast profile modal (e.g. from Analytics). */
+  forecastProfileOpen?: boolean;
+  onForecastProfileOpenChange?: (open: boolean) => void;
+  /** Apply `.sim-dark` to body-portaled modals (Task Mode / embedded). */
+  simDark?: boolean;
   /** Per-cell formula overrides keyed `${ccy}::${fieldKey}`. */
   formulas?: Record<string, string>;
   onFormulaChange?: (cellKey: string, formula: string) => void;
+  /** Batch formula writes (column fill-down) — prefer this over N× onFormulaChange. */
+  onFormulaChanges?: (updates: Record<string, string>) => void;
 }) {
   // IR / fixed-rate book section: shown when any of its inputs are selected.
   const irCols = (showBonds ? 2 : 0) + (showInvestments ? 2 : 0) + (showLiabilities ? 2 : 0);
@@ -192,25 +253,59 @@ export function UnifiedSimulator({
   /** Task Mode: Debt + Investments live in FX POSITION; every FX cell is editable. */
   const simplifiedFx = !showAdvancedBook;
   const fxPosColSpan = simplifiedFx ? 16 : 12;
-  /** Exp · Spot · Fwd · Residual · VaR */
-  const riskMetricCols = 5;
-  const varRegimeLabel = varSetup ? setupLabel(varSetup) : '1M 95% VaR';
-  const varTotalUsdM = Object.values(riskMetricsByCcy).reduce((s, m) => s + m.varUsdM, 0);
-  const spotHedgeTotalLocal = Object.values(riskMetricsByCcy).reduce(
-    (s, m) => s + Math.abs(m.spotHedgeLocalM ?? 0),
-    0,
-  );
-  const fwdHedgeTotalLocal = Object.values(riskMetricsByCcy).reduce(
-    (s, m) => s + Math.abs(m.forwardHedgeLocalM ?? 0),
-    0,
-  );
+  /** Exp · Fwd hedge · Residual · VaR (spot booked hedges still fold into Residual) */
+  const riskMetricCols = 4;
+  const riskUsdTotals = useMemo(() => {
+    let exp = 0;
+    let fwd = 0;
+    let resid = 0;
+    let varUsdM = 0;
+    for (const [ccy, m] of Object.entries(riskMetricsByCcy)) {
+      exp += fcyToUsdM(m.exposureLocalM, ccy);
+      fwd += fcyToUsdM(m.forwardHedgeLocalM ?? 0, ccy);
+      resid += fcyToUsdM(m.residualLocalM ?? m.exposureLocalM, ccy);
+      varUsdM += m.varUsdM;
+    }
+    return { exp, fwd, resid, varUsdM };
+  }, [riskMetricsByCcy]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [forecastProfileOpenLocal, setForecastProfileOpenLocal] = useState(false);
+  const forecastProfileOpen =
+    forecastProfileOpenControlled ?? forecastProfileOpenLocal;
+  const setForecastProfileOpen = (open: boolean) => {
+    onForecastProfileOpenChange?.(open);
+    if (forecastProfileOpenControlled === undefined) {
+      setForecastProfileOpenLocal(open);
+    }
+  };
 
-  const editRow = useCallback((id: string, field: keyof Omit<RowState, 'id' | 'ccy'>, raw: string) => {
+  const offsetFor = useCallback(
+    (ccy: string): BookedPositionOffset =>
+      bookedPositionByCcy[ccy] ?? { spotLocalM: 0, fwdLocalM: 0 },
+    [bookedPositionByCcy],
+  );
+
+  const editRow = useCallback((
+    id: string,
+    field: keyof Omit<RowState, 'id' | 'ccy'>,
+    raw: string,
+    ccy?: string,
+  ) => {
     setDrafts(prev => ({ ...prev, [`${id}.${field}`]: raw }));
-    const val = parseFloat(raw);
-    if (!isNaN(val)) setRows(prev => prev.map(r => r.id === id ? { ...r, [field]: val } : r));
-  }, [setRows]);
+    const val = roundMoney(parseFloat(raw));
+    if (isNaN(val)) return;
+    setRows(prev => prev.map(r => {
+      if (r.id !== id) return r;
+      if (field === 'spot' && ccy) {
+        return { ...r, spot: roundMoney(val - offsetFor(ccy).spotLocalM) };
+      }
+      if (field === 'fwd' && ccy) {
+        const seedFwdFcy = roundMoney(usdToFcyM(val, ccy) - offsetFor(ccy).fwdLocalM);
+        return { ...r, fwd: fcyToUsdM(seedFwdFcy, ccy) };
+      }
+      return { ...r, [field]: val };
+    }));
+  }, [setRows, offsetFor]);
 
   const blurRow = useCallback((id: string, field: string) => {
     setDrafts(prev => { const next = { ...prev }; delete next[`${id}.${field}`]; return next; });
@@ -219,11 +314,14 @@ export function UnifiedSimulator({
   // `fwd` is stored in USD (source of truth from TMS); this lets the FCY
   // column be edited directly too, converting back into the USD field so
   // both columns stay in sync — same two-way pattern as Cash FX / Cash FX $USD.
+  // Display may include booked Decision-layer forwards — strip before write-back.
   const editFwdFcy = useCallback((id: string, ccy: string, raw: string) => {
     setDrafts(prev => ({ ...prev, [`${id}.fwdFcy`]: raw }));
-    const val = parseFloat(raw);
-    if (!isNaN(val)) setRows(prev => prev.map(r => r.id === id ? { ...r, fwd: fcyToUsdM(val, ccy) } : r));
-  }, [setRows]);
+    const val = roundMoney(parseFloat(raw));
+    if (isNaN(val)) return;
+    const seedFcy = roundMoney(val - offsetFor(ccy).fwdLocalM);
+    setRows(prev => prev.map(r => (r.id === id ? { ...r, fwd: fcyToUsdM(seedFcy, ccy) } : r)));
+  }, [setRows, offsetFor]);
 
   /** Edit a FCY-stored field via its $USD companion. */
   const editFcyViaUsd = useCallback((
@@ -234,62 +332,265 @@ export function UnifiedSimulator({
     raw: string,
   ) => {
     setDrafts(prev => ({ ...prev, [`${id}.${draftKey}`]: raw }));
-    const val = parseFloat(raw);
+    const val = roundMoney(parseFloat(raw));
     if (!isNaN(val)) {
-      const fcy = usdToFcyM(val, ccy);
+      let fcy = usdToFcyM(val, ccy);
+      if (field === 'spot') fcy = roundMoney(fcy - offsetFor(ccy).spotLocalM);
       setRows(prev => prev.map(r => (r.id === id ? { ...r, [field]: fcy } : r)));
     }
-  }, [setRows]);
+  }, [setRows, offsetFor]);
 
   /** Edit Net FX (FCY) by solving for Cash FX (spot). */
   const editNetFxFcy = useCallback((id: string, raw: string) => {
     setDrafts(prev => ({ ...prev, [`${id}.netFxFCY`]: raw }));
-    const val = parseFloat(raw);
+    const val = roundMoney(parseFloat(raw));
     if (isNaN(val)) return;
     setRows(prev => prev.map(r => {
       if (r.id !== id) return r;
-      const fwdFcy = usdToFcyM(r.fwd, r.ccy);
-      return { ...r, spot: val - fwdFcy - r.nonCash - (r.nonCashAsset ?? 0) };
+      const o = offsetFor(r.ccy);
+      const displayFwdFcy = usdToFcyM(r.fwd, r.ccy) + o.fwdLocalM;
+      // Net FX = spot + fwd + nonCash + NCA + invest − debt
+      const displaySpot =
+        val
+        - displayFwdFcy
+        - r.nonCash
+        - (r.nonCashAsset ?? 0)
+        - (r.ir_invest_notional ?? 0)
+        + r.ir_liab_notional;
+      return { ...r, spot: roundMoney(displaySpot - o.spotLocalM) };
     }));
-  }, [setRows]);
+  }, [setRows, offsetFor]);
 
   const editNetFxUsd = useCallback((id: string, ccy: string, raw: string) => {
     setDrafts(prev => ({ ...prev, [`${id}.netFxUSD`]: raw }));
-    const val = parseFloat(raw);
+    const val = roundMoney(parseFloat(raw));
     if (isNaN(val)) return;
     const targetFcy = usdToFcyM(val, ccy);
     setRows(prev => prev.map(r => {
       if (r.id !== id) return r;
-      const fwdFcy = usdToFcyM(r.fwd, r.ccy);
-      return { ...r, spot: targetFcy - fwdFcy - r.nonCash - (r.nonCashAsset ?? 0) };
+      const o = offsetFor(r.ccy);
+      const displayFwdFcy = usdToFcyM(r.fwd, r.ccy) + o.fwdLocalM;
+      const displaySpot =
+        targetFcy
+        - displayFwdFcy
+        - r.nonCash
+        - (r.nonCashAsset ?? 0)
+        - (r.ir_invest_notional ?? 0)
+        + r.ir_liab_notional;
+      return { ...r, spot: roundMoney(displaySpot - o.spotLocalM) };
     }));
-  }, [setRows]);
+  }, [setRows, offsetFor]);
 
-  /** Edit Net FX Forecast by writing the residual into fcastFX. */
+  // Explicit 0 = no forecast — do not coerce to 1.
+  const forecastMonths =
+    typeof shared.forecastMonths === 'number' && shared.forecastMonths >= 0
+      ? shared.forecastMonths
+      : typeof varSetup?.forecastMonths === 'number' && varSetup.forecastMonths >= 0
+        ? varSetup.forecastMonths
+        : 1;
+
+  /**
+   * Risk Metrics Exp = Net FX Forecast (F×T). VaR √T uses
+   * `varSetup.horizon` from Analytics — never synced from these chips.
+   */
+  const exposureRegimeLabel =
+    forecastMonths === 0
+      ? 'Net FX Forecast · F×0 (stock only)'
+      : `Net FX Forecast · F×${forecastMonths}m`;
+  const varHorizonLabel = varSetup
+    ? (VAR_HORIZON_OPTIONS.find(h => h.id === varSetup.horizon)?.label ?? varSetup.horizon)
+    : '1m';
+
+  const setForecastMonths = useCallback(
+    (months: number) => {
+      onSharedChange('forecastMonths', months);
+      // Updates Risk Metrics Exp (buildup) + Net FX Forecast only — never VaR horizon.
+      const base = varSetup ?? DEFAULT_VAR_SETUP;
+      onVarSetupChange?.({
+        ...base,
+        forecastMonths: months,
+      });
+      if (onForecastProfileChange) {
+        onForecastProfileChange(
+          ensureProfileForRows(forecastProfile, rows, months),
+        );
+      }
+    },
+    [
+      onSharedChange,
+      onVarSetupChange,
+      varSetup,
+      onForecastProfileChange,
+      forecastProfile,
+      rows,
+    ],
+  );
+
+  const setAnalysisHorizon = useCallback(
+    (horizon: VarHorizonId) => {
+      const base = varSetup ?? DEFAULT_VAR_SETUP;
+      onVarSetupChange?.({ ...base, horizon });
+    },
+    [onVarSetupChange, varSetup],
+  );
+
+  const setForecastMode = useCallback(
+    (mode: ForecastFlowMode) => {
+      if (!onForecastProfileChange) return;
+      if (mode === 'custom') {
+        const seeded = ensureProfileForRows(
+          { ...forecastProfile, mode: 'custom' },
+          rows,
+          forecastMonths,
+        );
+        // Re-seed months from current flat scalars when entering custom.
+        const byCcy: Record<string, ForecastMonthFlow[]> = { ...seeded.byCcy };
+        for (const r of rows) {
+          if (r.ccy === 'USD') continue;
+          byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths);
+        }
+        onForecastProfileChange({ ...seeded, mode: 'custom', byCcy });
+        return;
+      }
+      onForecastProfileChange({ ...forecastProfile, mode: 'flat' });
+    },
+    [onForecastProfileChange, forecastProfile, rows, forecastMonths],
+  );
+
+  const commitPeriodCell = useCallback(
+    (
+      ccy: string,
+      monthIndex: number,
+      field: 'collections' | 'payout',
+      raw: string,
+    ) => {
+      const draftKey = `fp.${ccy}.${field}.${monthIndex}`;
+      setDrafts(prev => {
+        const next = { ...prev };
+        delete next[draftKey];
+        return next;
+      });
+      if (!onForecastProfileChange) return;
+      const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
+      const row = rows.find(r => r.ccy === ccy);
+      if (!row) return;
+      const months = [...(ensured.byCcy[ccy] ?? seedMonthsFromRow(row, forecastMonths))];
+      const cur = months[monthIndex] ?? { collections: 0, payout: 0 };
+      const trimmed = raw.trim();
+      let numeric: number;
+      const formulas = { ...ensured.formulas };
+      const fKey = forecastFormulaKey(ccy, field, monthIndex);
+      if (trimmed.startsWith('=')) {
+        const scope = periodFormulaScope(row, months, field, monthIndex);
+        const { value, error } = evalPeriodFormula(trimmed, scope);
+        if (error || !Number.isFinite(value)) return;
+        formulas[fKey] = trimmed;
+        numeric = value;
+      } else {
+        delete formulas[fKey];
+        numeric = roundMoney(parseFloat(trimmed));
+        if (isNaN(numeric)) return;
+      }
+      months[monthIndex] =
+        field === 'collections'
+          ? { ...cur, collections: roundMoney(numeric) }
+          : { ...cur, payout: roundMoney(-Math.abs(numeric)) };
+      if (monthIndex === 0) {
+        setRows(prev =>
+          prev.map(r =>
+            r.ccy === ccy
+              ? {
+                  ...r,
+                  collections: months[0]!.collections,
+                  payout: months[0]!.payout,
+                }
+              : r,
+          ),
+        );
+      }
+      onForecastProfileChange({
+        ...ensured,
+        mode: 'custom',
+        byCcy: { ...ensured.byCcy, [ccy]: months },
+        formulas,
+      });
+    },
+    [onForecastProfileChange, forecastProfile, rows, forecastMonths, setRows],
+  );
+
+  const fillCustomFromFlat = useCallback(() => {
+    if (!onForecastProfileChange) return;
+    const byCcy: Record<string, ForecastMonthFlow[]> = {};
+    for (const r of rows) {
+      if (r.ccy === 'USD') continue;
+      byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths);
+    }
+    onForecastProfileChange({
+      ...forecastProfile,
+      mode: 'custom',
+      byCcy,
+      formulas: {},
+    });
+  }, [onForecastProfileChange, forecastProfile, rows, forecastMonths]);
+
+  const copyM1Across = useCallback(() => {
+    if (!onForecastProfileChange) return;
+    const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
+    const byCcy: Record<string, ForecastMonthFlow[]> = { ...ensured.byCcy };
+    for (const r of rows) {
+      if (r.ccy === 'USD') continue;
+      byCcy[r.ccy] = copyMonth1ToAll(byCcy[r.ccy] ?? seedMonthsFromRow(r, forecastMonths));
+    }
+    onForecastProfileChange({ ...ensured, mode: 'custom', byCcy });
+  }, [onForecastProfileChange, forecastProfile, rows, forecastMonths]);
+
+  /** Edit Net FX Forecast by writing the residual into fcastFX (period-scaled). */
   const editNetFxForecast = useCallback((id: string, raw: string) => {
     setDrafts(prev => ({ ...prev, [`${id}.netFxForecast`]: raw }));
-    const val = parseFloat(raw);
+    const val = roundMoney(parseFloat(raw));
     if (isNaN(val)) return;
-    setRows(prev => prev.map(r => {
-      if (r.id !== id) return r;
-      const fwdFcy = usdToFcyM(r.fwd, r.ccy);
-      const netFx = r.spot + fwdFcy + r.nonCash + (r.nonCashAsset ?? 0);
-      return { ...r, fcastFX: val - netFx - r.collections - r.payout };
-    }));
-  }, [setRows]);
+    const T = forecastMonths;
+    const row = rows.find(r => r.id === id);
+    if (!row) return;
+    const netFx = fxBookNetLocalM(row);
+    if (forecastProfile.mode === 'custom' && onForecastProfileChange) {
+      // Adjust the last custom month so Σ period flow matches the typed forecast.
+      const targetPeriod = val - netFx;
+      const ensured = ensureProfileForRows(forecastProfile, rows, T);
+      const months = [...(ensured.byCcy[row.ccy] ?? seedMonthsFromRow(row, T))];
+      const headSum = sumPeriodFlow(months.slice(0, -1));
+      const lastNeed = roundMoney(targetPeriod - headSum);
+      const lastIdx = months.length - 1;
+      if (lastIdx >= 0) {
+        months[lastIdx] = {
+          collections: roundMoney(Math.max(0, lastNeed)),
+          payout: roundMoney(Math.min(0, lastNeed)),
+        };
+      }
+      onForecastProfileChange({
+        ...ensured,
+        mode: 'custom',
+        byCcy: { ...ensured.byCcy, [row.ccy]: months },
+      });
+      return;
+    }
+    const monthlyFlow = (val - netFx) / T;
+    setRows(prev =>
+      prev.map(r =>
+        r.id === id
+          ? { ...r, fcastFX: roundMoney(monthlyFlow - r.collections - r.payout) }
+          : r,
+      ),
+    );
+  }, [setRows, forecastMonths, forecastProfile, onForecastProfileChange, rows]);
 
   const editNetFxForecastUsd = useCallback((id: string, ccy: string, raw: string) => {
     setDrafts(prev => ({ ...prev, [`${id}.netFxForecastUSD`]: raw }));
-    const val = parseFloat(raw);
+    const val = roundMoney(parseFloat(raw));
     if (isNaN(val)) return;
     const targetFcy = usdToFcyM(val, ccy);
-    setRows(prev => prev.map(r => {
-      if (r.id !== id) return r;
-      const fwdFcy = usdToFcyM(r.fwd, r.ccy);
-      const netFx = r.spot + fwdFcy + r.nonCash + (r.nonCashAsset ?? 0);
-      return { ...r, fcastFX: targetFcy - netFx - r.collections - r.payout };
-    }));
-  }, [setRows]);
+    editNetFxForecast(id, String(targetFcy));
+  }, [editNetFxForecast]);
 
   const editCcy = useCallback((id: string, raw: string) => {
     const ccy = raw.toUpperCase();
@@ -305,7 +606,7 @@ export function UnifiedSimulator({
 
   const editUsd = useCallback((field: keyof UsdParams, raw: string) => {
     setDrafts(prev => ({ ...prev, [`usd.${field}`]: raw }));
-    const val = parseFloat(raw);
+    const val = roundMoney(parseFloat(raw));
     if (!isNaN(val)) setUsdParams(prev => ({ ...prev, [field]: val }));
   }, [setUsdParams]);
 
@@ -319,14 +620,31 @@ export function UnifiedSimulator({
   const [hedgeDeltas, setHedgeDeltas] = useState<Record<string, number>>({});
 
   const resetRows = useCallback(() => {
-    setRows(INITIAL_ROWS);
-    setUsdParams(INITIAL_USD_PARAMS);
-    setUsdCash(303.9);
-    setUsdNonNpCash(154.1);
+    if (onResetTable) {
+      onResetTable();
+    } else {
+      setRows(INITIAL_ROWS.map(r => ({ ...r })));
+      setUsdParams({ ...INITIAL_USD_PARAMS });
+      setUsdCash(303.9);
+      setUsdNonNpCash(154.1);
+    }
     setStrategy('SWAP_ONLY');
     setHedgeDeltas({});
     setDrafts({});
-  }, [setRows, setUsdParams, setUsdCash, setUsdNonNpCash]);
+    setForecastProfileOpen(false);
+    onForecastProfileChange?.({
+      ...DEFAULT_FORECAST_PROFILE,
+      byCcy: {},
+      formulas: {},
+    });
+  }, [
+    onResetTable,
+    setRows,
+    setUsdParams,
+    setUsdCash,
+    setUsdNonNpCash,
+    onForecastProfileChange,
+  ]);
 
   const computed = fcyComputed;
 
@@ -490,11 +808,55 @@ export function UnifiedSimulator({
             onChange={v => onSharedChange('r_USD', v)}
           />
           <GParam
-            label="Payout forecast uncertainty"
+            label="Incremental forecast uncertainty"
             value={shared.σ_P * 100} min={0} max={40} step={1} unit="%"
             onChange={v => onSharedChange('σ_P', v / 100)}
+            title="σ used for forecast-uncertainty analysis (payout buffer / stress layers)"
           />
+          <div className="flex flex-col gap-0.5 min-w-[140px]">
+            <label className="text-xs font-medium text-gray-700">Exposure period</label>
+            <div className="mt-0.5 flex flex-wrap items-center gap-1">
+              {FORECAST_PERIOD_OPTIONS.map(opt => {
+                const on = forecastPeriodIdForMonths(forecastMonths) === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    title={
+                      opt.months === 0
+                        ? 'No forecast — Net FX Forecast / Exp buildup = stock only (F×0).'
+                        : 'Risk Metrics Exp / Net FX Forecast buildup (F×T). Does not change VaR calculation horizon.'
+                    }
+                    onClick={() => setForecastMonths(opt.months)}
+                    className={`rounded border px-2 py-1 text-xs font-medium transition-colors ${
+                      on
+                        ? 'border-blue-500 bg-blue-50 text-blue-800'
+                        : 'border-gray-300 bg-white text-gray-600 hover:bg-gray-100'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
           <div className="flex items-end gap-2 ml-auto">
+            <button
+              type="button"
+              onClick={() => setForecastProfileOpen(true)}
+              disabled={forecastMonths === 0}
+              className="rounded border border-blue-300 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
+              title={
+                forecastMonths === 0
+                  ? 'No forecast period — pick 1 month+ to edit Revenue / Expenses profile'
+                  : 'Edit flat or custom per-period Revenue / Expenses'
+              }
+            >
+              Forecast profile…
+              {forecastProfile.mode === 'custom' && (
+                <span className="ml-1 text-[10px] font-semibold text-violet-600">custom</span>
+              )}
+            </button>
             <button
               onClick={resetRows}
               className="rounded border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-100"
@@ -503,6 +865,340 @@ export function UnifiedSimulator({
             </button>
           </div>
         </div>
+
+        {forecastProfileOpen &&
+          typeof document !== 'undefined' &&
+          createPortal(
+            <div
+              className={`fixed inset-0 z-[200] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm${
+                simDark ? ' sim-dark' : ''
+              }`}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="forecast-profile-title"
+              onClick={e => {
+                if (e.target === e.currentTarget) setForecastProfileOpen(false);
+              }}
+            >
+              <div className="w-full max-w-5xl rounded-xl border border-gray-200 bg-white p-5 shadow-2xl">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h4 id="forecast-profile-title" className="text-sm font-semibold text-gray-900">
+                      Forecast profile — Revenue / Expenses
+                    </h4>
+                    <p className="mt-1 text-[11px] text-gray-500">
+                      {forecastProfile.mode === 'flat'
+                        ? `Workspace formula: Net FX Forecast = book + monthly net × ${forecastMonths}${forecastMonths === 1 ? ' month' : ' months'}.`
+                        : `Custom profile: one Revenue / Expense input per month (M1…M${forecastMonths}). Period net = Σ months. Cells accept numbers or =formulas (rev, exp, prev, m1…).`}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setForecastProfileOpen(false)}
+                    className="rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <div className="flex rounded border border-gray-200 p-0.5">
+                    {(
+                      [
+                        {
+                          id: 'flat' as const,
+                          label: 'Flat formula',
+                          title:
+                            'Same monthly Rev/Exp × forecasting period (workspace)',
+                        },
+                        {
+                          id: 'custom' as const,
+                          label: 'Custom by period',
+                          title: 'Edit each month in the selected forecast term',
+                        },
+                      ] as const
+                    ).map(opt => {
+                      const on = forecastProfile.mode === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          title={opt.title}
+                          onClick={() => setForecastMode(opt.id)}
+                          className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+                            on
+                              ? 'bg-blue-600 text-white'
+                              : 'text-gray-600 hover:bg-gray-50'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {forecastProfile.mode === 'custom' && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={fillCustomFromFlat}
+                        className="rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
+                        title="Fill every month from the current flat monthly Revenue / Expenses"
+                      >
+                        Fill from flat formula
+                      </button>
+                      <button
+                        type="button"
+                        onClick={copyM1Across}
+                        className="rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
+                        title="Copy M1 Revenue / Expenses across all months"
+                      >
+                        Copy M1 → all
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                <div className="mt-4 max-h-[60vh] overflow-auto">
+                  {forecastProfile.mode === 'flat' ? (
+                    <table className="min-w-full text-left text-[11px]">
+                      <thead className="sticky top-0 bg-white">
+                        <tr className="text-gray-500">
+                          <th className="py-1.5 pr-3 font-medium">CCY</th>
+                          <th
+                            className="py-1.5 pr-3 font-medium text-right"
+                            title="Monthly collections / payins (M FCY)"
+                          >
+                            Revenue (in)
+                          </th>
+                          <th
+                            className="py-1.5 pr-3 font-medium text-right"
+                            title="Monthly payouts as positive outflow (stored negative)"
+                          >
+                            Expenses (out)
+                          </th>
+                          <th
+                            className="py-1.5 font-medium text-right"
+                            title="Monthly net flow × forecast period"
+                          >
+                            Period net ×{forecastMonths}
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows
+                          .filter(r => r.ccy !== 'USD')
+                          .map(r => {
+                            const periodNet = periodFlowSumLocalM(
+                              r,
+                              forecastMonths,
+                              forecastProfile,
+                            );
+                            const expenseOut = Math.abs(Math.min(0, r.payout));
+                            return (
+                              <tr key={r.id} className="border-t border-gray-100">
+                                <td className="py-1.5 pr-3 font-semibold text-gray-900">
+                                  {r.ccy}
+                                </td>
+                                <td className="py-1.5 pr-3 text-right">
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={drafts[`${r.id}.collections`] ?? n(r.collections)}
+                                    onChange={e =>
+                                      editRow(r.id, 'collections', e.target.value)
+                                    }
+                                    onBlur={() => blurRow(r.id, 'collections')}
+                                    className={`${inBase} w-[72px] border border-gray-200 bg-white`}
+                                  />
+                                </td>
+                                <td className="py-1.5 pr-3 text-right">
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={
+                                      drafts[`${r.id}.expenseOut`] ??
+                                      n(expenseOut === 0 && r.payout >= 0 ? 0 : expenseOut)
+                                    }
+                                    onChange={e => {
+                                      const raw = e.target.value;
+                                      setDrafts(prev => ({
+                                        ...prev,
+                                        [`${r.id}.expenseOut`]: raw,
+                                      }));
+                                      const v = roundMoney(parseFloat(raw));
+                                      if (isNaN(v)) return;
+                                      setRows(prev =>
+                                        prev.map(row =>
+                                          row.id === r.id
+                                            ? { ...row, payout: -Math.abs(v) }
+                                            : row,
+                                        ),
+                                      );
+                                    }}
+                                    onBlur={() =>
+                                      setDrafts(prev => {
+                                        const next = { ...prev };
+                                        delete next[`${r.id}.expenseOut`];
+                                        return next;
+                                      })
+                                    }
+                                    className={`${inBase} w-[72px] border border-gray-200 bg-white`}
+                                  />
+                                </td>
+                                <td
+                                  className={`py-1.5 text-right font-medium tabular-nums ${
+                                    periodNet < 0 ? 'text-red-600' : 'text-gray-800'
+                                  }`}
+                                >
+                                  {f2(periodNet)}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <table className="min-w-full text-left text-[11px]">
+                      <thead className="sticky top-0 z-10 bg-white">
+                        <tr className="text-gray-500">
+                          <th className="sticky left-0 z-20 bg-white py-1.5 pr-3 font-medium">
+                            CCY
+                          </th>
+                          <th className="sticky left-10 z-20 bg-white py-1.5 pr-3 font-medium">
+                            Line
+                          </th>
+                          {Array.from({ length: forecastMonths }, (_, i) => (
+                            <th
+                              key={i}
+                              className="min-w-[68px] px-1 py-1.5 text-right font-medium"
+                            >
+                              M{i + 1}
+                            </th>
+                          ))}
+                          <th className="py-1.5 pl-2 text-right font-medium">Period net</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows
+                          .filter(r => r.ccy !== 'USD')
+                          .map(r => {
+                            const ensured = ensureProfileForRows(
+                              forecastProfile,
+                              rows,
+                              forecastMonths,
+                            );
+                            const months =
+                              ensured.byCcy[r.ccy] ?? seedMonthsFromRow(r, forecastMonths);
+                            const periodNet = sumPeriodFlow(months);
+                            const lines: {
+                              key: 'collections' | 'payout' | 'net';
+                              label: string;
+                              readOnly?: boolean;
+                            }[] = [
+                              { key: 'collections', label: 'Revenue' },
+                              { key: 'payout', label: 'Expenses' },
+                              { key: 'net', label: 'Net', readOnly: true },
+                            ];
+                            return lines.map((line, li) => (
+                              <tr
+                                key={`${r.id}.${line.key}`}
+                                className={`border-t border-gray-100 ${li === 0 ? 'border-t-gray-200' : ''}`}
+                              >
+                                <td className="sticky left-0 bg-white py-1 pr-3 font-semibold text-gray-900">
+                                  {li === 0 ? r.ccy : ''}
+                                </td>
+                                <td className="sticky left-10 bg-white py-1 pr-3 text-gray-500">
+                                  {line.label}
+                                </td>
+                                {months.map((m, mi) => {
+                                  if (line.key === 'net') {
+                                    const net = monthNet(m);
+                                    return (
+                                      <td
+                                        key={mi}
+                                        className={`px-1 py-1 text-right tabular-nums ${
+                                          net < 0 ? 'text-red-600' : 'text-gray-700'
+                                        }`}
+                                      >
+                                        {f2(net)}
+                                      </td>
+                                    );
+                                  }
+                                  const fKey = forecastFormulaKey(r.ccy, line.key, mi);
+                                  const formula = forecastProfile.formulas[fKey];
+                                  const draftKey = `fp.${r.ccy}.${line.key}.${mi}`;
+                                  const expenseOut = Math.abs(Math.min(0, m.payout));
+                                  const displayNum =
+                                    line.key === 'collections'
+                                      ? m.collections
+                                      : expenseOut === 0 && m.payout >= 0
+                                        ? 0
+                                        : expenseOut;
+                                  return (
+                                    <td key={mi} className="px-1 py-1 text-right">
+                                      <input
+                                        type="text"
+                                        inputMode="decimal"
+                                        title={
+                                          formula
+                                            ? formula
+                                            : 'Number or =formula (rev, exp, prev, m1…)'
+                                        }
+                                        value={
+                                          drafts[draftKey] ??
+                                          (formula ? formula : n(displayNum))
+                                        }
+                                        onChange={e =>
+                                          setDrafts(prev => ({
+                                            ...prev,
+                                            [draftKey]: e.target.value,
+                                          }))
+                                        }
+                                        onBlur={e =>
+                                          commitPeriodCell(
+                                            r.ccy,
+                                            mi,
+                                            line.key as 'collections' | 'payout',
+                                            e.target.value,
+                                          )
+                                        }
+                                        className={`${inBase} w-[64px] border ${
+                                          formula
+                                            ? 'border-violet-300 bg-violet-50'
+                                            : 'border-gray-200 bg-white'
+                                        }`}
+                                      />
+                                    </td>
+                                  );
+                                })}
+                                <td
+                                  className={`py-1 pl-2 text-right font-medium tabular-nums ${
+                                    periodNet < 0 ? 'text-red-600' : 'text-gray-800'
+                                  }`}
+                                >
+                                  {li === 0 ? f2(periodNet) : ''}
+                                </td>
+                              </tr>
+                            ));
+                          })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setForecastProfileOpen(false)}
+                    className="rounded border border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )}
+
         {showAdvancedBook && (
         <div className="mt-3 flex flex-wrap items-center gap-2">
           {/* Formula layer toggles — same state as Layer Setup tab */}
@@ -644,7 +1340,22 @@ export function UnifiedSimulator({
       <div className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-10rem)] rounded-lg border border-gray-200">
         <FormulaGridProvider
           rowOrder={computedWithHedge.map(r => r.ccy)}
-          onFill={(columnKey, ccy, formulaText) => onFormulaChange?.(`${ccy}::${columnKey}`, formulaText)}
+          onFill={(columnKey, rowKeys, formulaText) => {
+            const norm = formulaText.trim().replace(/^=/, '').trim();
+            const def =
+              SIM_FIELD_BY_KEY[columnKey as SimFieldKey]?.defaultFormula ?? '';
+            // Empty / default → clear overrides so targets stay on model formula.
+            const value = norm === '' || norm === def ? '' : norm;
+            const updates: Record<string, string> = {};
+            for (const ccy of rowKeys) updates[`${ccy}::${columnKey}`] = value;
+            if (onFormulaChanges) {
+              onFormulaChanges(updates);
+              return;
+            }
+            for (const [cellKey, formula] of Object.entries(updates)) {
+              onFormulaChange?.(cellKey, formula);
+            }
+          }}
         >
         <table className="w-max min-w-full text-xs border-collapse">
           <thead className="sticky top-0 z-30">
@@ -694,7 +1405,7 @@ export function UnifiedSimulator({
               {showFxHedge && (
                 <th className="border-l-2 border-rose-400 bg-rose-50 px-2 py-1 text-center text-xs font-semibold text-rose-700 tracking-wide" colSpan={5}>
                   FX HEDGE
-                  <span className="ml-1 font-normal text-rose-400">all $USD M</span>
+
                   {strategy === 'SWAP_ONLY' && (
                     <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800 normal-case">
                       Swap only — no fwd/option placed; select Swap + Fwd (± Option) above to hedge the forecast
@@ -709,7 +1420,33 @@ export function UnifiedSimulator({
                   colSpan={riskMetricCols}
                 >
                   RISK METRICS
-                  <span className="ml-1 font-normal text-violet-400">{varRegimeLabel}</span>
+                  <span className="ml-1 font-normal text-violet-400">{exposureRegimeLabel}</span>
+                  {varSetup && onVarSetupChange && (
+                    <span className="ml-2 inline-flex flex-wrap items-center justify-center gap-0.5 align-middle normal-case tracking-normal">
+                      <span className="text-[10px] font-normal text-violet-500">VaR tenure</span>
+                      {VAR_HORIZON_OPTIONS.map(opt => {
+                        const on = varSetup.horizon === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            title={`VaR calculation horizon (vol √T) · ${opt.label}. Independent of Exposure period.`}
+                            onClick={e => {
+                              e.stopPropagation();
+                              setAnalysisHorizon(opt.id);
+                            }}
+                            className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${
+                              on
+                                ? 'border-violet-600 bg-violet-600 text-white'
+                                : 'border-violet-300 bg-white text-violet-700 hover:bg-violet-100'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      })}
+                    </span>
+                  )}
                 </th>
               )}
 
@@ -732,10 +1469,25 @@ export function UnifiedSimulator({
 
               {/* FX POSITION */}
               {showFxPosition && (<>
-              <th className={`${thBase} bg-white border-l border-gray-300 min-w-[68px]`}>Cash FX</th>
+              <th
+                className={`${thBase} bg-white border-l border-gray-300 min-w-[68px]`}
+                title="Cash FX book (M FCY), including booked Decision-layer spot hedges"
+              >
+                Cash FX
+              </th>
               <th className={`${thBase} bg-white min-w-[68px]`}>Cash FX $USD</th>
-              <th className={`${thBase} bg-white min-w-[68px]`}>Fwd (FCY)</th>
-              <th className={`${thBase} bg-white min-w-[68px]`}>Fwd $USD</th>
+              <th
+                className={`${thBase} bg-white min-w-[68px]`}
+                title="Outstanding forward (M FCY), including booked Decision-layer forward hedges"
+              >
+                Fwd (FCY)
+              </th>
+              <th
+                className={`${thBase} bg-white min-w-[68px]`}
+                title="Outstanding forward settlement (M USD), including booked Decision-layer forward hedges"
+              >
+                Fwd $USD
+              </th>
               <th className={`${thBase} bg-white min-w-[76px]`} title="Receivables — accruals/receivables/NDF assets (M FCY, positive increases exposure)">Receivables</th>
               <th className={`${thBase} bg-white min-w-[80px]`}>Receivables $USD</th>
               <th className={`${thBase} bg-white min-w-[72px]`} title="Non-cash LIABILITY FX exposure — payables/accruals (M FCY, enter negative to reduce exposure)">Liability (FCY)</th>
@@ -746,9 +1498,14 @@ export function UnifiedSimulator({
               <th className={`${thBase} bg-white min-w-[76px]`} title="Investment notional (M FCY)">Investments (FCY)</th>
               <th className={`${thBase} bg-white min-w-[76px]`}>Investments $USD</th>
               </>)}
-              <th className={`${thBase} bg-white min-w-[68px]`}>Net FX (FCY)</th>
+              <th
+                className={`${thBase} bg-white min-w-[68px]`}
+                title="Cash FX + Fwd(FCY) + Liability + Non-cash Asset + Investments − Debt"
+              >
+                Net FX (FCY)
+              </th>
               <th className={`${thBase} bg-white min-w-[68px]`}>Net FX $USD</th>
-              <th className={`${thBase} bg-white min-w-[76px]`} title="Current net FX book + expected payins/payouts + invoice forecast (M FCY) — hedging basis">Net FX Forecast</th>
+              <th className={`${thBase} bg-white min-w-[76px]`} title="Current net FX book + (Revenue + Expenses + invoice fcast) × forecasting period (M FCY) — hedging basis">Net FX Forecast</th>
               <th className={`${thBase} bg-white min-w-[80px]`}>Net FX Forecast $USD</th>
               </>)}
 
@@ -808,33 +1565,27 @@ export function UnifiedSimulator({
               {showRiskMetrics && (<>
               <th
                 className={`${thBase} bg-violet-50 border-l border-violet-300 min-w-[72px]`}
-                title="Analytics exposure basis (stock or avg buildup), M FCY — unhedged"
+                title="Net FX Forecast — hedge-target exposure (Net FX book + F×Exposure period), $USD M"
               >
                 Exp
               </th>
               <th
                 className={`${thBase} bg-emerald-50 min-w-[72px]`}
-                title="Booked / proposed spot hedges from Hedging Decision (M FCY, signed with exposure)"
-              >
-                Spot hedge
-              </th>
-              <th
-                className={`${thBase} bg-emerald-50 min-w-[72px]`}
-                title="Booked / proposed forward hedges from Hedging Decision (M FCY, signed with exposure)"
+                title="Booked forward / option hedge position ($USD M) — opposite sign to exposure"
               >
                 Fwd hedge
               </th>
               <th
                 className={`${thBase} bg-violet-50 min-w-[72px]`}
-                title="Exposure remaining after spot + forward hedges (M FCY)"
+                title="Residual = Exp + booked hedges (spot + fwd/option), $USD M"
               >
                 Residual
               </th>
               <th
                 className={`${thBase} bg-violet-100 min-w-[80px]`}
-                title={`Parametric VaR on residual under Analytics regime: ${varRegimeLabel}`}
+                title={`Path-integrated VaR on growing book e(t)=S+F·t over tenure ${varHorizonLabel}: spot×σ×z×√∫e²dt (not snapshot |E_end|×√T)`}
               >
-                VaR $USD
+                VaR
               </th>
               </>)}
 
@@ -859,7 +1610,7 @@ export function UnifiedSimulator({
               const fCommit = (k: SimFieldKey) => (text: string) => {
                 const norm = text.trim().replace(/^=/, '').trim();
                 const def = SIM_FIELD_BY_KEY[k].defaultFormula;
-                onFormulaChange?.(`${r.ccy}::${k}`, norm === '' || norm === def ? '' : text.trim());
+                onFormulaChange?.(`${r.ccy}::${k}`, norm === '' || norm === def ? '' : norm);
               };
               const hedgeCarry = R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr;
               const residual = R?.residualFx ?? r.residualFx;
@@ -878,13 +1629,13 @@ export function UnifiedSimulator({
                 {/* RATES */}
                 {ratesOn && (<>
                 <td className={`${tdBase} bg-gray-50 border-l border-gray-300`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.r_FCY`] ?? r.r_FCY}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.r_FCY`] ?? n(r.r_FCY)}
                     onChange={e => editRow(r.id, 'r_FCY', e.target.value)}
                     onBlur={() => blurRow(r.id, 'r_FCY')}
                     className={`${inBase} w-[52px]`} />
                 </td>
                 <td className={`${tdBase} bg-gray-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.r_OD`] ?? r.r_OD}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.r_OD`] ?? n(r.r_OD)}
                     onChange={e => editRow(r.id, 'r_OD', e.target.value)}
                     onBlur={() => blurRow(r.id, 'r_OD')}
                     className={`${inBase} w-[52px]`} />
@@ -897,14 +1648,23 @@ export function UnifiedSimulator({
                 {/* FX POSITION — spot/fwd/non-cash in FCY + USD */}
                 {showFxPosition && (<>
                 <td className={`${tdBase} bg-white border-l border-gray-300`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.spot`] ?? r.spot}
-                    onChange={e => editRow(r.id, 'spot', e.target.value)}
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={drafts[`${r.id}.spot`] ?? n(r.spot)}
+                    onChange={e => editRow(r.id, 'spot', e.target.value, r.ccy)}
                     onBlur={() => blurRow(r.id, 'spot')}
-                    className={`${inBase} w-[62px] ${r.spot < 0 ? 'text-red-600' : ''}`} />
+                    title={
+                      Math.abs(offsetFor(r.ccy).spotLocalM) > 1e-9
+                        ? `Includes booked spot hedge ${offsetFor(r.ccy).spotLocalM.toFixed(2)} M`
+                        : undefined
+                    }
+                    className={`${inBase} w-[62px] ${r.spot < 0 ? 'text-red-600' : ''}`}
+                  />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.spotUsd`] ?? r.fxSpotUSD}
+                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.spotUsd`] ?? n(r.fxSpotUSD)}
                       onChange={e => editFcyViaUsd(r.id, r.ccy, 'spot', 'spotUsd', e.target.value)}
                       onBlur={() => blurRow(r.id, 'spotUsd')}
                       className={`${inBase} w-[62px] font-medium ${r.fxSpotUSD < 0 ? 'text-red-600' : ''}`} />
@@ -913,26 +1673,44 @@ export function UnifiedSimulator({
                   )}
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.fwdFcy`] ?? r.fxFwdFCY}
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={drafts[`${r.id}.fwdFcy`] ?? n(r.fxFwdFCY)}
                     onChange={e => editFwdFcy(r.id, r.ccy, e.target.value)}
                     onBlur={() => blurRow(r.id, 'fwdFcy')}
-                    className={`${inBase} w-[62px] font-medium ${r.fxFwdFCY < 0 ? 'text-red-600' : ''}`} />
+                    title={
+                      Math.abs(offsetFor(r.ccy).fwdLocalM) > 1e-9
+                        ? `Includes booked forward ${offsetFor(r.ccy).fwdLocalM.toFixed(2)} M FCY`
+                        : undefined
+                    }
+                    className={`${inBase} w-[62px] font-medium ${r.fxFwdFCY < 0 ? 'text-red-600' : ''}`}
+                  />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.fwd`] ?? r.fwd}
-                    onChange={e => editRow(r.id, 'fwd', e.target.value)}
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={drafts[`${r.id}.fwd`] ?? n(r.fwd)}
+                    onChange={e => editRow(r.id, 'fwd', e.target.value, r.ccy)}
                     onBlur={() => blurRow(r.id, 'fwd')}
-                    className={`${inBase} w-[62px] ${r.fwd < 0 ? 'text-red-600' : ''}`} />
+                    title={
+                      Math.abs(offsetFor(r.ccy).fwdLocalM) > 1e-9
+                        ? `Includes booked forward ${fcyToUsdM(offsetFor(r.ccy).fwdLocalM, r.ccy).toFixed(2)} M USD`
+                        : undefined
+                    }
+                    className={`${inBase} w-[62px] ${r.fwd < 0 ? 'text-red-600' : ''}`}
+                  />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAsset`] ?? (r.nonCashAsset ?? 0)}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAsset`] ?? n((r.nonCashAsset ?? 0))}
                     onChange={e => editRow(r.id, 'nonCashAsset', e.target.value)}
                     onBlur={() => blurRow(r.id, 'nonCashAsset')}
                     className={`${inBase} w-[58px] ${(r.nonCashAsset ?? 0) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAssetUsd`] ?? r.fxNonCashAssetUSD}
+                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAssetUsd`] ?? n(r.fxNonCashAssetUSD)}
                       onChange={e => editFcyViaUsd(r.id, r.ccy, 'nonCashAsset', 'nonCashAssetUsd', e.target.value)}
                       onBlur={() => blurRow(r.id, 'nonCashAssetUsd')}
                       className={`${inBase} w-[62px] font-medium ${r.fxNonCashAssetUSD < 0 ? 'text-red-600' : ''}`} />
@@ -941,14 +1719,14 @@ export function UnifiedSimulator({
                   )}
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCash`] ?? r.nonCash}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCash`] ?? n(r.nonCash)}
                     onChange={e => editRow(r.id, 'nonCash', e.target.value)}
                     onBlur={() => blurRow(r.id, 'nonCash')}
                     className={`${inBase} w-[58px] ${r.nonCash < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashUsd`] ?? r.fxNonCashUSD}
+                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashUsd`] ?? n(r.fxNonCashUSD)}
                       onChange={e => editFcyViaUsd(r.id, r.ccy, 'nonCash', 'nonCashUsd', e.target.value)}
                       onBlur={() => blurRow(r.id, 'nonCashUsd')}
                       className={`${inBase} w-[62px] font-medium ${r.fxNonCashUSD < 0 ? 'text-red-600' : ''}`} />
@@ -958,35 +1736,50 @@ export function UnifiedSimulator({
                 </td>
                 {simplifiedFx && (<>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? r.ir_liab_notional}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? n(r.ir_liab_notional)}
                     onChange={e => editRow(r.id, 'ir_liab_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_liab_notional')}
                     className={`${inBase} w-[58px] ${r.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   <input type="text" inputMode="decimal"
-                    value={drafts[`${r.id}.debtUsd`] ?? fcyToUsdM(r.ir_liab_notional, r.ccy)}
+                    value={drafts[`${r.id}.debtUsd`] ?? n(fcyToUsdM(r.ir_liab_notional, r.ccy))}
                     onChange={e => editFcyViaUsd(r.id, r.ccy, 'ir_liab_notional', 'debtUsd', e.target.value)}
                     onBlur={() => blurRow(r.id, 'debtUsd')}
                     className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.ir_liab_notional, r.ccy) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? (r.ir_invest_notional ?? 0)}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? n((r.ir_invest_notional ?? 0))}
                     onChange={e => editRow(r.id, 'ir_invest_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_invest_notional')}
                     className={`${inBase} w-[58px] ${(r.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   <input type="text" inputMode="decimal"
-                    value={drafts[`${r.id}.investUsd`] ?? fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy)}
+                    value={drafts[`${r.id}.investUsd`] ?? n(fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy))}
                     onChange={e => editFcyViaUsd(r.id, r.ccy, 'ir_invest_notional', 'investUsd', e.target.value)}
                     onBlur={() => blurRow(r.id, 'investUsd')}
                     className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 </>)}
-                <td className={`${tdBase} bg-white`}>
+                <td
+                  className={`${tdBase} bg-white`}
+                  title={[
+                    `Cash FX ${f2(r.spot)}`,
+                    `+ Fwd ${f2(r.fxFwdFCY)}`,
+                    `+ Liability ${f2(r.nonCash)}`,
+                    `+ Receivables ${f2(r.nonCashAsset ?? 0)}`,
+                    `+ Investments ${f2(r.ir_invest_notional ?? 0)}`,
+                    `− Debt ${f2(r.ir_liab_notional)}`,
+                    `= Net FX ${f2(r.netFxFCY)}`,
+                    Math.abs(offsetFor(r.ccy).spotLocalM) > 1e-9
+                      || Math.abs(offsetFor(r.ccy).fwdLocalM) > 1e-9
+                      ? `(Cash/Fwd include booked hedges: spot ${f2(offsetFor(r.ccy).spotLocalM)}, fwd ${f2(offsetFor(r.ccy).fwdLocalM)})`
+                      : '',
+                  ].filter(Boolean).join(' ')}
+                >
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxFCY`] ?? r.netFxFCY}
+                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxFCY`] ?? n(r.netFxFCY)}
                       onChange={e => editNetFxFcy(r.id, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxFCY')}
                       className={`${inBase} w-[62px] font-medium ${r.netFxFCY < 0 ? 'text-red-600' : ''}`} />
@@ -996,7 +1789,7 @@ export function UnifiedSimulator({
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxUSD`] ?? r.netFxUSD}
+                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxUSD`] ?? n(r.netFxUSD)}
                       onChange={e => editNetFxUsd(r.id, r.ccy, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxUSD')}
                       className={`${inBase} w-[62px] font-medium ${r.netFxUSD < 0 ? 'text-red-600' : ''}`} />
@@ -1005,9 +1798,13 @@ export function UnifiedSimulator({
                   )}
                 </td>
                 <td className={`${tdBase} bg-white`}
-                  title={`Net FX (${f2(r.netFxFCY)}) + Payins (${f2(r.collections)}) + Payouts (${f2(r.payout)}) + Fcast (${f2(r.fcastFX)}) = ${f2(r.netFxForecast)} M FCY`}>
+                  title={
+                    forecastProfile.mode === 'custom'
+                      ? `Net FX (${f2(r.netFxFCY)}) + custom period Σ (${f2(periodFlowSumLocalM(r, forecastMonths, forecastProfile))}) = ${f2(r.netFxForecast)} M FCY`
+                      : `Net FX (${f2(r.netFxFCY)}) + (Rev ${f2(r.collections)} + Exp ${f2(r.payout)} + Fcast ${f2(r.fcastFX)}) × ${forecastMonths} = ${f2(r.netFxForecast)} M FCY`
+                  }>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxForecast`] ?? r.netFxForecast}
+                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxForecast`] ?? n(r.netFxForecast)}
                       onChange={e => editNetFxForecast(r.id, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxForecast')}
                       className={`${inBase} w-[62px] font-medium ${r.netFxForecast < 0 ? 'text-red-600' : ''}`} />
@@ -1020,7 +1817,7 @@ export function UnifiedSimulator({
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
                     <input type="text" inputMode="decimal"
-                      value={drafts[`${r.id}.netFxForecastUSD`] ?? fcyToUsdM(r.netFxForecast, r.ccy)}
+                      value={drafts[`${r.id}.netFxForecastUSD`] ?? n(fcyToUsdM(r.netFxForecast, r.ccy))}
                       onChange={e => editNetFxForecastUsd(r.id, r.ccy, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxForecastUSD')}
                       className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.netFxForecast, r.ccy) < 0 ? 'text-red-600' : ''}`} />
@@ -1035,7 +1832,7 @@ export function UnifiedSimulator({
                 {/* LIQUIDITY */}
                 {showLiquidity && (<>
                 <td className={`${tdBase} bg-sky-50 border-l border-sky-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.cash`] ?? r.cash}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.cash`] ?? n(r.cash)}
                     onChange={e => editRow(r.id, 'cash', e.target.value)}
                     onBlur={() => blurRow(r.id, 'cash')}
                     className={`${inBase} w-[58px] ${r.cash < 0 ? 'text-red-600' : ''}`} />
@@ -1045,19 +1842,19 @@ export function UnifiedSimulator({
                   {f2(swapNearUsd(r.ccy, r.cash))}
                 </td>
                 <td className={`${tdBase} bg-sky-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.payout`] ?? r.payout}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.payout`] ?? n(r.payout)}
                     onChange={e => editRow(r.id, 'payout', e.target.value)}
                     onBlur={() => blurRow(r.id, 'payout')}
                     className={`${inBase} w-[62px] ${r.payout < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-sky-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.collections`] ?? r.collections}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.collections`] ?? n(r.collections)}
                     onChange={e => editRow(r.id, 'collections', e.target.value)}
                     onBlur={() => blurRow(r.id, 'collections')}
                     className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-sky-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonNpCash`] ?? r.nonNpCash}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonNpCash`] ?? n(r.nonNpCash)}
                     onChange={e => editRow(r.id, 'nonNpCash', e.target.value)}
                     onBlur={() => blurRow(r.id, 'nonNpCash')}
                     className={`${inBase} w-[58px] ${r.nonNpCash < 0 ? 'text-red-600' : ''}`} />
@@ -1093,13 +1890,13 @@ export function UnifiedSimulator({
                 {/* IR / FIXED-RATE BOOK */}
                 {showBonds && (<>
                 <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_notional`] ?? r.ir_asset_notional}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_notional`] ?? n(r.ir_asset_notional)}
                     onChange={e => editRow(r.id, 'ir_asset_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_asset_notional')}
                     className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-rose-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_rate`] ?? r.ir_asset_rate}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_rate`] ?? n(r.ir_asset_rate)}
                     onChange={e => editRow(r.id, 'ir_asset_rate', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_asset_rate')}
                     className={`${inBase} w-[46px]`} />
@@ -1107,13 +1904,13 @@ export function UnifiedSimulator({
                 </>)}
                 {showInvestments && (<>
                 <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? (r.ir_invest_notional ?? 0)}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? n((r.ir_invest_notional ?? 0))}
                     onChange={e => editRow(r.id, 'ir_invest_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_invest_notional')}
                     className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-rose-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_rate`] ?? (r.ir_invest_rate ?? 0)}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_rate`] ?? n((r.ir_invest_rate ?? 0))}
                     onChange={e => editRow(r.id, 'ir_invest_rate', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_invest_rate')}
                     className={`${inBase} w-[46px]`} />
@@ -1121,13 +1918,13 @@ export function UnifiedSimulator({
                 </>)}
                 {showLiabilities && (<>
                 <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? r.ir_liab_notional}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? n(r.ir_liab_notional)}
                     onChange={e => editRow(r.id, 'ir_liab_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_liab_notional')}
                     className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-rose-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_rate`] ?? r.ir_liab_rate}
+                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_rate`] ?? n(r.ir_liab_rate)}
                     onChange={e => editRow(r.id, 'ir_liab_rate', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_liab_rate')}
                     className={`${inBase} w-[46px]`} />
@@ -1223,7 +2020,7 @@ export function UnifiedSimulator({
                   <input
                     type="text" inputMode="decimal"
                     disabled={strategy !== 'SWAP_FWD_OPT'}
-                    value={drafts[`${r.id}.hedgeDelta`] ?? (hedgeDeltas[r.id] ?? 0.5)}
+                    value={drafts[`${r.id}.hedgeDelta`] ?? n((hedgeDeltas[r.id] ?? 0.5))}
                     onChange={e => {
                       setDrafts(prev => ({ ...prev, [`${r.id}.hedgeDelta`]: e.target.value }));
                       const v = parseFloat(e.target.value);
@@ -1252,62 +2049,48 @@ export function UnifiedSimulator({
 
                 {showRiskMetrics && (() => {
                   const rm = riskMetricsByCcy[r.ccy];
-                  const exp = rm?.exposureLocalM ?? 0;
-                  const spotH = rm?.spotHedgeLocalM ?? 0;
-                  const fwdH = rm?.forwardHedgeLocalM ?? 0;
-                  const resid = rm?.residualLocalM ?? exp;
+                  const expUsd = fcyToUsdM(rm?.exposureLocalM ?? 0, r.ccy);
+                  const fwdUsd = fcyToUsdM(rm?.forwardHedgeLocalM ?? 0, r.ccy);
+                  const residUsd = fcyToUsdM(rm?.residualLocalM ?? rm?.exposureLocalM ?? 0, r.ccy);
                   const v = rm?.varUsdM ?? 0;
-                  const vBefore = rm?.varBeforeUsdM ?? v;
-                  const fmtSigned = (n: number) => `${n >= 0 ? '+' : ''}${f2(n)}`;
+                  const fmtUsdM = (n: number) => `${n >= 0 ? '+' : '−'}$${f2(Math.abs(n))}`;
                   return (
                     <>
                       <td
                         className={`${tdBase} bg-violet-50 border-l border-violet-300 font-mono ${
-                          exp >= 0 ? 'text-emerald-700' : 'text-rose-600'
+                          expUsd >= 0 ? 'text-emerald-700' : 'text-rose-600'
                         }`}
-                        title={`Unhedged Analytics exposure · VaR before $${(vBefore * 1000).toFixed(0)}K`}
+                        title={`Hedge-target Exp $USD M · ${exposureRegimeLabel}`}
                       >
-                        {fmtSigned(exp)}
+                        {fmtUsdM(expUsd)}
                       </td>
                       <td
                         className={`${tdBase} bg-emerald-50 font-mono ${
-                          Math.abs(spotH) < 1e-9
+                          Math.abs(fwdUsd) < 1e-9
                             ? 'text-gray-300'
-                            : spotH >= 0
+                            : fwdUsd >= 0
                               ? 'text-emerald-700'
                               : 'text-rose-600'
                         }`}
-                        title="Spot hedge notional (M FCY) — Decision layer bookings + incremental stock %"
+                        title="Booked forward / option hedge position $USD M (opposite sign to Exp)"
                       >
-                        {Math.abs(spotH) < 1e-9 ? '—' : fmtSigned(spotH)}
-                      </td>
-                      <td
-                        className={`${tdBase} bg-emerald-50 font-mono ${
-                          Math.abs(fwdH) < 1e-9
-                            ? 'text-gray-300'
-                            : fwdH >= 0
-                              ? 'text-emerald-700'
-                              : 'text-rose-600'
-                        }`}
-                        title="Forward hedge notional (M FCY) — Decision layer bookings + incremental avg-buildup %"
-                      >
-                        {Math.abs(fwdH) < 1e-9 ? '—' : fmtSigned(fwdH)}
+                        {Math.abs(fwdUsd) < 1e-9 ? '—' : fmtUsdM(fwdUsd)}
                       </td>
                       <td
                         className={`${tdBase} bg-violet-50 font-mono ${
-                          Math.abs(resid) < 1e-9
+                          Math.abs(residUsd) < 1e-9
                             ? 'text-emerald-700'
-                            : resid >= 0
+                            : residUsd >= 0
                               ? 'text-emerald-700'
                               : 'text-rose-600'
                         }`}
-                        title="Residual = Exp − Spot hedge − Fwd hedge"
+                        title="Residual $USD M = Exp + booked hedges (spot + fwd/option)"
                       >
-                        {Math.abs(resid) < 1e-9 ? '✓ 0.00' : fmtSigned(resid)}
+                        {Math.abs(residUsd) < 1e-9 ? '✓ $0.00' : fmtUsdM(residUsd)}
                       </td>
                       <td
                         className={`${tdBase} bg-violet-100 font-semibold font-mono text-violet-900`}
-                        title={`VaR on residual · ${varRegimeLabel} (unhedged $${(vBefore * 1000).toFixed(0)}K)`}
+                        title={`Path-integrated VaR on residual path (S−hedge)+F·t · tenure ${varHorizonLabel}`}
                       >
                         ${(v * 1000).toFixed(0)}K
                       </td>
@@ -1359,13 +2142,13 @@ export function UnifiedSimulator({
               {/* RATES */}
               {ratesOn && (<>
               <td className={`${tdBase} bg-gray-50 border-l border-gray-300`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.r_FCY'] ?? usdParams.r_FCY}
+                <input type="text" inputMode="decimal" value={drafts['usd.r_FCY'] ?? n(usdParams.r_FCY)}
                   onChange={e => editUsd('r_FCY', e.target.value)}
                   onBlur={() => blurUsd('r_FCY')}
                   className={`${inBase} w-[52px]`} />
               </td>
               <td className={`${tdBase} bg-gray-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.r_OD'] ?? usdParams.r_OD}
+                <input type="text" inputMode="decimal" value={drafts['usd.r_OD'] ?? n(usdParams.r_OD)}
                   onChange={e => editUsd('r_OD', e.target.value)}
                   onBlur={() => blurUsd('r_OD')}
                   className={`${inBase} w-[52px]`} />
@@ -1388,25 +2171,25 @@ export function UnifiedSimulator({
               <td className={`${tdBase} bg-white font-medium ${clr(usdComputed.fxNonCashUSD)}`}>{f2(usdComputed.fxNonCashUSD)}</td>
               {simplifiedFx && (<>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? usdParams.ir_liab_notional}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
                   onChange={e => editUsd('ir_liab_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_notional')}
                   className={`${inBase} w-[58px] ${usdParams.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? usdParams.ir_liab_notional}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
                   onChange={e => editUsd('ir_liab_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_notional')}
                   className={`${inBase} w-[62px] font-medium ${usdParams.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? (usdParams.ir_invest_notional ?? 0)}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
                   onChange={e => editUsd('ir_invest_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_notional')}
                   className={`${inBase} w-[58px] ${(usdParams.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? (usdParams.ir_invest_notional ?? 0)}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
                   onChange={e => editUsd('ir_invest_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_notional')}
                   className={`${inBase} w-[62px] font-medium ${(usdParams.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
@@ -1426,10 +2209,10 @@ export function UnifiedSimulator({
               {/* LIQUIDITY */}
               {showLiquidity && (<>
               <td className={`${tdBase} bg-sky-50 border-l border-sky-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.cash'] ?? usdCash}
+                <input type="text" inputMode="decimal" value={drafts['usd.cash'] ?? n(usdCash)}
                   onChange={e => {
                     setDrafts(prev => ({ ...prev, 'usd.cash': e.target.value }));
-                    const v = parseFloat(e.target.value);
+                    const v = roundMoney(parseFloat(e.target.value));
                     if (!isNaN(v)) setUsdCash(v);
                   }}
                   onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next['usd.cash']; return next; })}
@@ -1437,22 +2220,22 @@ export function UnifiedSimulator({
               </td>
               <td className={`${tdBase} bg-sky-100 font-medium ${clr(usdComputed.cash)}`}>{f2(usdComputed.cash)}</td>
               <td className={`${tdBase} bg-sky-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.payout'] ?? usdParams.payout}
+                <input type="text" inputMode="decimal" value={drafts['usd.payout'] ?? n(usdParams.payout)}
                   onChange={e => editUsd('payout', e.target.value)}
                   onBlur={() => blurUsd('payout')}
                   className={`${inBase} w-[62px] ${usdParams.payout < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-sky-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.collections'] ?? usdParams.collections}
+                <input type="text" inputMode="decimal" value={drafts['usd.collections'] ?? n(usdParams.collections)}
                   onChange={e => editUsd('collections', e.target.value)}
                   onBlur={() => blurUsd('collections')}
                   className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-sky-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.nonNpCash'] ?? usdNonNpCash}
+                <input type="text" inputMode="decimal" value={drafts['usd.nonNpCash'] ?? n(usdNonNpCash)}
                   onChange={e => {
                     setDrafts(prev => ({ ...prev, 'usd.nonNpCash': e.target.value }));
-                    const v = parseFloat(e.target.value);
+                    const v = roundMoney(parseFloat(e.target.value));
                     if (!isNaN(v)) setUsdNonNpCash(v);
                   }}
                   onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next['usd.nonNpCash']; return next; })}
@@ -1476,13 +2259,13 @@ export function UnifiedSimulator({
               {/* IR / FIXED-RATE BOOK — USD */}
               {showBonds && (<>
               <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_asset_notional'] ?? usdParams.ir_asset_notional}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_asset_notional'] ?? n(usdParams.ir_asset_notional)}
                   onChange={e => editUsd('ir_asset_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_asset_notional')}
                   className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-rose-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_asset_rate'] ?? usdParams.ir_asset_rate}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_asset_rate'] ?? n(usdParams.ir_asset_rate)}
                   onChange={e => editUsd('ir_asset_rate', e.target.value)}
                   onBlur={() => blurUsd('ir_asset_rate')}
                   className={`${inBase} w-[46px]`} />
@@ -1490,13 +2273,13 @@ export function UnifiedSimulator({
               </>)}
               {showInvestments && (<>
               <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? (usdParams.ir_invest_notional ?? 0)}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
                   onChange={e => editUsd('ir_invest_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_notional')}
                   className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-rose-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_rate'] ?? (usdParams.ir_invest_rate ?? 0)}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_rate'] ?? n((usdParams.ir_invest_rate ?? 0))}
                   onChange={e => editUsd('ir_invest_rate', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_rate')}
                   className={`${inBase} w-[46px]`} />
@@ -1504,13 +2287,13 @@ export function UnifiedSimulator({
               </>)}
               {showLiabilities && (<>
               <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? usdParams.ir_liab_notional}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
                   onChange={e => editUsd('ir_liab_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_notional')}
                   className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-rose-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_rate'] ?? usdParams.ir_liab_rate}
+                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_rate'] ?? n(usdParams.ir_liab_rate)}
                   onChange={e => editUsd('ir_liab_rate', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_rate')}
                   className={`${inBase} w-[46px]`} />
@@ -1585,7 +2368,6 @@ export function UnifiedSimulator({
               {showRiskMetrics && (
                 <>
                   <td className={`${tdBase} bg-violet-50 border-l border-violet-300 text-gray-400 text-xs`}>—</td>
-                  <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`}>—</td>
                   <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`}>—</td>
                   <td className={`${tdBase} bg-violet-50 text-gray-400 text-xs`}>—</td>
                   <td className={`${tdBase} bg-violet-100 text-gray-400 text-xs`} title="Reporting CCY — no FX mismatch VaR">—</td>
@@ -1724,25 +2506,41 @@ export function UnifiedSimulator({
 
               {showRiskMetrics && (
                 <>
-                  <td className={`${tdBase} bg-violet-50 border-l border-violet-300 text-gray-400 text-xs`}>—</td>
                   <td
-                    className={`${tdBase} bg-emerald-50 font-bold text-emerald-800`}
-                    title="Σ |spot hedge| local M across FCY (not additive across currencies)"
+                    className={`${tdBase} bg-violet-50 border-l border-violet-300 font-bold ${
+                      riskUsdTotals.exp >= 0 ? 'text-emerald-800' : 'text-rose-700'
+                    }`}
+                    title="Σ Exp $USD M across FCY"
                   >
-                    {spotHedgeTotalLocal < 1e-9 ? '—' : f2(spotHedgeTotalLocal)}
+                    {`${riskUsdTotals.exp >= 0 ? '+' : '−'}$${f2(Math.abs(riskUsdTotals.exp))}`}
                   </td>
                   <td
                     className={`${tdBase} bg-emerald-50 font-bold text-emerald-800`}
-                    title="Σ |forward hedge| local M across FCY (not additive across currencies)"
+                    title="Σ Fwd / option hedge $USD M across FCY"
                   >
-                    {fwdHedgeTotalLocal < 1e-9 ? '—' : f2(fwdHedgeTotalLocal)}
+                    {Math.abs(riskUsdTotals.fwd) < 1e-9
+                      ? '—'
+                      : `${riskUsdTotals.fwd >= 0 ? '+' : '−'}$${f2(Math.abs(riskUsdTotals.fwd))}`}
                   </td>
-                  <td className={`${tdBase} bg-violet-50 text-gray-400 text-xs`}>—</td>
+                  <td
+                    className={`${tdBase} bg-violet-50 font-bold ${
+                      Math.abs(riskUsdTotals.resid) < 1e-9
+                        ? 'text-emerald-700'
+                        : riskUsdTotals.resid >= 0
+                          ? 'text-emerald-800'
+                          : 'text-rose-700'
+                    }`}
+                    title="Σ Residual $USD M across FCY"
+                  >
+                    {Math.abs(riskUsdTotals.resid) < 1e-9
+                      ? '✓ $0.00'
+                      : `${riskUsdTotals.resid >= 0 ? '+' : '−'}$${f2(Math.abs(riskUsdTotals.resid))}`}
+                  </td>
                   <td
                     className={`${tdBase} bg-violet-100 font-bold text-violet-900`}
-                    title={`Σ undiversified VaR after hedges · ${varRegimeLabel}`}
+                    title={`Σ undiversified VaR on residual · analysis tenure ${varHorizonLabel}`}
                   >
-                    ${(varTotalUsdM * 1000).toFixed(0)}K
+                    ${(riskUsdTotals.varUsdM * 1000).toFixed(0)}K
                   </td>
                 </>
               )}

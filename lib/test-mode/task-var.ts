@@ -1,7 +1,9 @@
 import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   DEFAULT_VAR_SETUP,
+  VAR_HORIZON_OPTIONS,
   computeParametricVarUsdM,
+  exposureLocalMForBasis,
   type VarExposureBasis,
   type VarSetup,
   volForHorizon,
@@ -31,7 +33,9 @@ export interface VarResult {
 function basisFromLegacy(
   basis: 'stock' | 'threeMonthAvg' | VarExposureBasis,
 ): VarExposureBasis {
-  if (basis === 'threeMonthAvg' || basis === 'avgBuildup') return 'avgBuildup';
+  if (basis === 'threeMonthAvg' || basis === 'simpleAvg') return 'simpleAvg';
+  if (basis === 'avgBuildup') return 'avgBuildup';
+  if (basis === 'totalBuildup') return 'totalBuildup';
   return 'stock';
 }
 
@@ -53,8 +57,12 @@ export function computeTaskVar(
           confidencePct,
         };
 
-  const exposureLocalM =
-    setup.exposureBasis === 'avgBuildup' ? bar.avg3mM : bar.stockNetM;
+  const exposureLocalM = exposureLocalMForBasis(
+    bar.stockNetM,
+    bar.flowM,
+    setup.exposureBasis,
+    setup.forecastMonths,
+  );
   const spotUsd = NORDTECH_VAR.spotUsd[bar.ccy] ?? 1;
   const horizonVol = volForHorizon(setup.horizon);
   const varUsdM = computeParametricVarUsdM(exposureLocalM, bar.ccy, setup);
@@ -72,7 +80,7 @@ export function computeTaskVar(
     horizon: setup.horizon,
     varUsdM,
     horizonLabel:
-      setup.horizon === '1w' ? '1 week' : setup.horizon === '3m' ? '3 months' : '1 month',
+      VAR_HORIZON_OPTIONS.find(h => h.id === setup.horizon)?.label ?? setup.horizon,
     confidenceLabel: `${setup.confidencePct}%`,
     z95: NORDTECH_VAR.z95,
   };

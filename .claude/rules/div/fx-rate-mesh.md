@@ -1,11 +1,11 @@
 # FX Rate Mesh
 
-> Source: https://wiki.deel.network/i/7220
+> Source: internal wiki (FX Rate Mesh)
 > Last updated: 2026-03-05
 
 ## Overview
 
-This service improves the way Deel services interact with FX Rate Providers (XE, Oanda, etc.).
+This service improves the way internal services interact with FX Rate Providers (XE, Oanda, etc.).
 
 ## Requirements
 
@@ -47,11 +47,11 @@ Use OpenLens/Kubectl port-forward to access it and read docs: `http://fx-rate-me
 For Node.js integration use the OpenAPI lib published on AWS CodeArtifact:
 
 ```bash
-npm install @letsdeel/fx-rate-mesh-node-client
+npm install fx-rate-mesh-node-client
 ```
 
 ```js
-const {FXRateApi} = require('@letsdeel/fx-rate-mesh-node-client');
+const {FXRateApi} = require('fx-rate-mesh-node-client');
 const fxRateClient = new FXRateApi(new Configuration(), 'http://fx-rate-mesh');
 
 const base = 'USD';
@@ -64,7 +64,7 @@ const res = await fxRateClient.getLatest({base, symbols});
 ### Usage
 
 ```js
-const {FXRateApi} = require('@letsdeel/fx-rate-mesh-node-client');
+const {FXRateApi} = require('fx-rate-mesh-node-client');
 const fxRateClient = new FXRateApi(new Configuration(), 'http://fx-rate-mesh');
 
 const date = '2024-05-27';
@@ -140,8 +140,8 @@ If the required Central Bank or currency pair is not listed, reach out to the Tr
 
 ## UI
 
-- FX Rates: `https://treasury.deel.training/admin/pages/FXRates`
-- Provider Priorities: `https://treasury.deel.network/admin/resources/FXRatesProviderPriorities`
+- FX Rates: internal Treasury admin → FX Rates
+- Provider Priorities: internal Treasury admin → FX Rates Provider Priorities
 
 ## Tasks
 
@@ -152,7 +152,7 @@ If the required Central Bank or currency pair is not listed, reach out to the Tr
 ## Monitoring
 
 - Datadog Dashboard: `https://app.datadoghq.eu/dashboard/ypg-bzb-zkb/fx-rate-mesh`
-- Sentry: `https://sentry.io/organizations/deel/projects/fx-rate-mesh/`
+- Sentry: internal Sentry project `fx-rate-mesh`
 - Slack: **#alerts-fx-rate** — monitors big changes in currency pairs
 
 ## Database Schema

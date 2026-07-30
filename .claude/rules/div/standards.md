@@ -25,5 +25,5 @@
 ## Testing requirements
 
 - FX unit tests: cover rate conversion, exposure aggregation, hedge ratio calculation
-- Integration tests: use Deel Treasury MCP sandbox
+- Integration tests: use Treasury MCP sandbox
 - VAR model tests: validate against known historical scenarios
