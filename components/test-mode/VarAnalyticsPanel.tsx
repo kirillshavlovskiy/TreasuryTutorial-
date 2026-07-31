@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ExposureHedgePathChart } from '@/components/test-mode/ExposureHedgePathChart';
 import {
@@ -13,11 +13,17 @@ import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   hedgeBasisNotionalLocalM,
   hedgeRatioForNumber,
+  inferHedgePathBasis,
   resolveChartMonthlyFlows,
+  resyncHedgeRatiosToNearestRegime,
   type HedgePathBasisId,
 } from '@/lib/test-mode/exposure-hedge-path';
 import {
   buildHedgeVarSummary,
+  buildStripHedgedVarProfile,
+  equalVarLinearHedgeNotionalLocalM,
+  overlayRiskFromFxBook,
+  stripTicketsForCcy,
   type HedgeTicket,
 } from '@/lib/test-mode/hedge-var';
 import {
@@ -26,19 +32,56 @@ import {
   mergeRollingStripIntoBook,
   needsRollingHedges,
   proposeRollingHedgeTickets,
+  resyncBookedRollingStrips,
+  sizingForHedgePathBasis,
+  stripForwardLegsFromEdges,
+  varSetupForHedgeStructure,
+  varSetupForPathHedgeRegime,
+  type ForecastHedgeStructure,
   type RollingHedgeEdge,
+  type StripForwardLeg,
 } from '@/lib/test-mode/rolling-hedge';
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
 import {
+  RiskPerspectiveSelector,
+  riskPerspectiveMeta,
+  type RiskPerspective,
+} from '@/components/test-mode/RiskPerspectiveSelector';
+import {
   FORECAST_PERIOD_OPTIONS,
   FORECAST_UNCERTAINTY_OPTIONS,
+  accruedPositionFromScheduleM,
   forecastPeriodIdForMonths,
   growingVarByHorizonUsdM,
+  horizonMonths,
+  monthlyVolForSetup,
+  normalizeVarSetup,
   setupLabel,
   VAR_EXPOSURE_OPTIONS,
+  VAR_HORIZON_OPTIONS,
+  VAR_PROFILE_OPTIONS,
+  VAR_VOL_SOURCE_OPTIONS,
   volForHorizon,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
+
+function GearIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
 
 interface VarAnalyticsPanelProps {
   risk: CurrencyRiskRow[];
@@ -105,7 +148,7 @@ function stubRowFromBar(ccy: string, flowM: number): RowState {
  * Active VaR horizon is chosen on the evolution chart (no separate period chips).
  */
 export function VarAnalyticsPanel({
-  risk,
+  risk: seedRisk,
   setup,
   onSetupChange,
   hedgeRatios = {},
@@ -117,12 +160,65 @@ export function VarAnalyticsPanel({
   forecastProfile = DEFAULT_FORECAST_PROFILE,
   onOpenForecastProfile,
 }: VarAnalyticsPanelProps) {
-  const vol = volForHorizon(setup.horizon);
-  const profile = VAR_EXPOSURE_OPTIONS.find(o => o.id === setup.exposureBasis);
+  /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
+  const risk = useMemo(
+    () =>
+      overlayRiskFromFxBook(
+        seedRisk,
+        bookRows,
+        setup,
+        forecastProfile,
+      ),
+    [seedRisk, bookRows, setup, forecastProfile],
+  );
+  const σ1m = monthlyVolForSetup(setup);
+  const vol = volForHorizon(setup.horizon, setup);
+  const profile = VAR_PROFILE_OPTIONS.find(o => o.id === setup.exposureBasis)
+    ?? VAR_EXPOSURE_OPTIONS.find(o => o.id === setup.exposureBasis);
+  const volOpt = VAR_VOL_SOURCE_OPTIONS.find(o => o.id === setup.volSource);
   const customSchedule = forecastProfile.mode === 'custom';
+  const [varParamsOpen, setVarParamsOpen] = useState(false);
+  const [perspective, setPerspective] = useState<RiskPerspective>('fxRisk');
+  const u1m = setup.forecastUncertainty1m ?? 0;
+  const uPresetMatch = FORECAST_UNCERTAINTY_OPTIONS.find(
+    o => Math.abs(o.value - u1m) < 1e-12,
+  );
+  const [uCustomOpen, setUCustomOpen] = useState(() => uPresetMatch == null && u1m > 0);
+  const [uCustomDraft, setUCustomDraft] = useState(() =>
+    Number((u1m * 100).toFixed(2)).toString(),
+  );
+  const uncertaintyCustom =
+    uCustomOpen || (uPresetMatch == null && u1m > 0);
+
+  // Migrate Cash-only stock off the VaR profile picker; fill convention defaults.
+  useEffect(() => {
+    const next = normalizeVarSetup(setup);
+    if (
+      next.exposureBasis !== setup.exposureBasis ||
+      next.averagingConvention !== setup.averagingConvention
+    ) {
+      onSetupChange(next);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot migrate
+  }, [setup.exposureBasis, setup.averagingConvention]);
+
   /** Chart opens only when user picks a currency in the Live VaR table. */
   const [chartCcy, setChartCcy] = useState<string | null>(null);
   const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('totalExpected');
+  const [hedgeStructure, setHedgeStructure] =
+    useState<ForecastHedgeStructure>('bullet');
+  const stripAvailable = needsRollingHedges(setup);
+  /** Booked strip ⇒ Live VaR uses strip Th sizing (legs still from M0). */
+  const stripBooked = bookedHedges.some(t => Boolean(t.stripId));
+  const effectiveStructure: ForecastHedgeStructure =
+    stripAvailable && (hedgeStructure === 'strip' || stripBooked)
+      ? 'strip'
+      : 'bullet';
+  /** Path-chart / apply: bullet sizes Equal-VaR at Th = Tf. */
+  const chartSizingSetup = useMemo(
+    () => varSetupForHedgeStructure(setup, effectiveStructure),
+    [setup, effectiveStructure],
+  );
 
   const monthlyFlowsByCcy = useMemo(() => {
     const out: Record<string, number[]> = {};
@@ -142,17 +238,75 @@ export function VarAnalyticsPanel({
     return out;
   }, [bookRows, forecastProfile, risk, setup.forecastMonths]);
 
+  /**
+   * Live VaR + path modal share this book: bullet sizes Equal-VaR / open Exp at
+   * Th = Tf (e.g. 3m simple avg → Ē = 3.7), matching the path-chart VN chip.
+   * Strip keeps Analytics Th for the first roll window.
+   */
   const summary = useMemo(
     () =>
       buildHedgeVarSummary(
         risk,
         hedgeRatios,
-        setup,
+        chartSizingSetup,
         bookedHedges,
         monthlyFlowsByCcy,
       ),
-    [risk, hedgeRatios, setup, bookedHedges, monthlyFlowsByCcy],
+    [risk, hedgeRatios, chartSizingSetup, bookedHedges, monthlyFlowsByCcy],
   );
+
+  /**
+   * Profile / sizing change: re-snap Cash·VN·Target % and rebuild booked
+   * strips (all M0 legs) so Live VaR does not need the path modal.
+   */
+  const hedgeSetupSig = [
+    setup.exposureBasis,
+    setup.averagingConvention,
+    setup.forecastMonths,
+    setup.horizon,
+    setup.confidencePct,
+    setup.forecastUncertainty1m,
+    setup.volSource,
+    chartSizingSetup.horizon,
+    chartSizingSetup.exposureBasis,
+  ].join('|');
+  const prevHedgeSetupSig = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevHedgeSetupSig.current === null) {
+      prevHedgeSetupSig.current = hedgeSetupSig;
+      return;
+    }
+    if (prevHedgeSetupSig.current === hedgeSetupSig) return;
+    prevHedgeSetupSig.current = hedgeSetupSig;
+    if (onHedgeRatiosChange) {
+      const synced = resyncHedgeRatiosToNearestRegime(summary.rows, hedgeRatios);
+      if (synced) onHedgeRatiosChange(synced);
+    }
+    if (onBookedHedgesChange) {
+      const bars = risk.map(r => ({
+        ccy: r.bar.ccy,
+        stockNetM: r.bar.stockNetM,
+        flowM: r.bar.flowM,
+      }));
+      const rebuilt = resyncBookedRollingStrips(
+        bookedHedges,
+        bars,
+        setup,
+        monthlyFlowsByCcy,
+      );
+      if (rebuilt) onBookedHedgesChange(rebuilt);
+    }
+  }, [
+    hedgeSetupSig,
+    summary.rows,
+    hedgeRatios,
+    onHedgeRatiosChange,
+    onBookedHedgesChange,
+    bookedHedges,
+    risk,
+    setup,
+    monthlyFlowsByCcy,
+  ]);
 
   const chartRow = chartCcy
     ? summary.rows.find(r => r.ccy === chartCcy)
@@ -160,45 +314,68 @@ export function VarAnalyticsPanel({
   const chartBar = chartCcy
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
     : undefined;
-  const eurBar = risk.find(r => r.bar.ccy === 'EUR')?.bar;
+  /** Non-USD exposures available for the VaR evolution chart. */
+  const evolutionCcys = useMemo(
+    () =>
+      risk
+        .map(r => r.bar.ccy)
+        .filter(ccy => ccy !== 'USD'),
+    [risk],
+  );
+  const [evoCcy, setEvoCcy] = useState<string>('EUR');
+  useEffect(() => {
+    if (evolutionCcys.length === 0) return;
+    if (!evolutionCcys.includes(evoCcy)) {
+      setEvoCcy(
+        evolutionCcys.includes('EUR') ? 'EUR' : evolutionCcys[0]!,
+      );
+    }
+  }, [evolutionCcys, evoCcy]);
+  const evoBar = risk.find(r => r.bar.ccy === evoCcy)?.bar;
   const hedged =
     bookedHedges.length > 0 || summary.rows.some(r => r.hedgeRatio > 1e-9);
 
-  const applyPathBasis = (basis: HedgePathBasisId) => {
-    if (!onHedgeRatiosChange || !chartRow || !chartBar) return;
+  const applyPathBasis = (
+    basis: HedgePathBasisId,
+    structure?: ForecastHedgeStructure,
+  ) => {
+    if (!chartRow || !chartBar) return;
     setPathBasis(basis);
     const flowM =
       setup.forecastMonths > 0 && Math.abs(chartBar.flowM) > 1e-15
         ? chartBar.flowM
         : 0;
+    const flowsForCcy = monthlyFlowsByCcy[chartRow.ccy];
     const { startM, endM, flows } = resolveChartMonthlyFlows(
       chartBar.stockNetM,
       flowM,
       setup,
-      monthlyFlowsByCcy[chartRow.ccy],
+      flowsForCcy,
     );
-    // When Tf > Th: Cash → S@start; Total → E@end; VaR-neutral → mid.
-    const sizing =
-      basis === 'cash'
-        ? 'stockStart'
-        : basis === 'totalExpected'
-          ? 'windowEnd'
-          : 'varNeutral';
-    const target =
-      needsRollingHedges(setup) &&
-      (basis === 'cash' ||
-        basis === 'totalExpected' ||
-        basis === 'varNeutral')
-        ? buildRollingHedgeEdges(startM, flows, setup, sizing)[0]
-            ?.hedgeLocalM ??
-          chartRow.equalVarHedgeLocalM
-        : hedgeBasisNotionalLocalM(
-            basis,
-            startM,
-            endM,
-            chartRow.equalVarHedgeLocalM,
-          );
-    // Decision scale: 100% = Target (Total expected).
+    // Prefer structure from the chart (avoids stale parent 'bullet' on Strip click).
+    const structureNow = structure ?? hedgeStructure;
+    if (structure && structure !== hedgeStructure) {
+      setHedgeStructure(structure);
+    }
+    // Strip: preview only (Cash/VN/Target chips). Book via "Book … forwards".
+    if (structureNow === 'strip' && needsRollingHedges(setup)) {
+      return;
+    }
+    if (!onHedgeRatiosChange) return;
+    const bulletEq = equalVarLinearHedgeNotionalLocalM(
+      chartBar.stockNetM,
+      flowM,
+      chartRow.ccy,
+      varSetupForPathHedgeRegime(setup, 'bullet'),
+      undefined,
+      flowsForCcy ?? flows,
+    ).amountLocalM;
+    const target = hedgeBasisNotionalLocalM(
+      basis,
+      startM,
+      endM,
+      bulletEq,
+    );
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -228,6 +405,7 @@ export function VarAnalyticsPanel({
       edges,
       setup,
       ticketBasis,
+      monthlyFlowsByCcy[chartRow.ccy] ?? [],
     );
     onBookedHedgesChange(
       mergeRollingStripIntoBook(bookedHedges, tickets, chartRow.ccy),
@@ -236,21 +414,147 @@ export function VarAnalyticsPanel({
     closePathChart();
   };
 
-  const eurTerm = useMemo(() => {
-    if (!eurBar) return [];
-    const flowM =
-      setup.forecastMonths > 0 && Math.abs(eurBar.flowM) > 1e-15 ? eurBar.flowM : 0;
-    const flows = monthlyFlowsByCcy.EUR;
-    return growingVarByHorizonUsdM(
-      eurBar.stockNetM,
+  /**
+   * Same hedge book as path modal: booked strip → strip by pathBasis →
+   * Decision H, else Target E(Tf) preview so resid@Tf is always wired.
+   */
+  const evoHedgeLegs = useMemo((): StripForwardLeg[] => {
+    if (!evoBar) return [];
+    const Tf = setup.forecastMonths;
+    if (!(Tf > 0)) return [];
+    const flowM = Math.abs(evoBar.flowM) > 1e-15 ? evoBar.flowM : 0;
+    const flows =
+      monthlyFlowsByCcy[evoBar.ccy] ??
+      Array.from({ length: Tf }, () => flowM);
+    const endM = accruedPositionFromScheduleM(evoBar.stockNetM, flows, Tf);
+
+    const booked = stripTicketsForCcy(bookedHedges, evoBar.ccy)
+      .slice()
+      .sort((a, b) => (a.stripEdgeIndex ?? 0) - (b.stripEdgeIndex ?? 0));
+    if (booked.length > 0) {
+      let cumul = 0;
+      return booked.map((t, i) => {
+        cumul += t.amountLocalM;
+        const tenureMonths = horizonMonths(t.maturity ?? setup.horizon);
+        return {
+          index: t.stripEdgeIndex ?? i,
+          label: `M0–M${Math.round(tenureMonths)}`,
+          tenureMonths,
+          amountLocalM: t.amountLocalM,
+          cumulCoverLocalM: cumul,
+          endExposureM: endM,
+          stockStartM: evoBar.stockNetM,
+        };
+      });
+    }
+
+    if (effectiveStructure === 'strip' && needsRollingHedges(setup)) {
+      return stripForwardLegsFromEdges(
+        buildRollingHedgeEdges(
+          evoBar.stockNetM,
+          flows,
+          setup,
+          sizingForHedgePathBasis(pathBasis),
+        ),
+      );
+    }
+
+    const row = summary.rows.find(r => r.ccy === evoBar.ccy);
+    const decisionH = row?.hedgeNotionalLocalM ?? 0;
+    const H = Math.abs(decisionH) > 1e-12 ? decisionH : endM;
+    return [
+      {
+        index: 0,
+        label: `M0–M${Math.round(Tf)}`,
+        tenureMonths: Tf,
+        amountLocalM: H,
+        cumulCoverLocalM: H,
+        endExposureM: endM,
+        stockStartM: evoBar.stockNetM,
+      },
+    ];
+  }, [
+    evoBar,
+    bookedHedges,
+    effectiveStructure,
+    setup,
+    monthlyFlowsByCcy,
+    pathBasis,
+    summary.rows,
+  ]);
+
+  /** Open + resid VaR through the longest horizon chip (post-Tf e flat; VN gap stays). */
+  const evoProfile = useMemo(() => {
+    if (!evoBar || evoHedgeLegs.length === 0) return [];
+    const Tf = setup.forecastMonths;
+    if (!(Tf > 0)) return [];
+    const flowM = Math.abs(evoBar.flowM) > 1e-15 ? evoBar.flowM : 0;
+    const schedule =
+      monthlyFlowsByCcy[evoBar.ccy] ??
+      Array.from({ length: Math.ceil(Tf) }, () => flowM);
+    const Eref = Math.abs(
+      accruedPositionFromScheduleM(evoBar.stockNetM, schedule, Tf),
+    );
+    const throughMonths = Math.max(
+      Tf,
+      ...VAR_HORIZON_OPTIONS.map(h => h.months),
+    );
+    return buildStripHedgedVarProfile(
+      evoBar.stockNetM,
       flowM,
-      'EUR',
+      evoBar.ccy,
+      setup,
+      evoHedgeLegs.map(l => ({
+        amountLocalM: l.amountLocalM,
+        tenureMonths: l.tenureMonths,
+        recognizeFromMonths: 0,
+      })),
+      schedule,
+      1,
+      Eref > 1e-12 ? Eref : undefined,
+      throughMonths,
+    );
+  }, [evoBar, evoHedgeLegs, setup, monthlyFlowsByCcy]);
+
+  /** Horizon pickers: open VaR + resid VaR (samples past Tf when forecast is short). */
+  const evoTerm = useMemo(() => {
+    if (!evoBar) return [];
+    const flowM =
+      setup.forecastMonths > 0 && Math.abs(evoBar.flowM) > 1e-15
+        ? evoBar.flowM
+        : 0;
+    const flows = monthlyFlowsByCcy[evoBar.ccy];
+    const open = growingVarByHorizonUsdM(
+      evoBar.stockNetM,
+      flowM,
+      evoBar.ccy,
       setup,
       flows,
     );
-  }, [eurBar, setup, monthlyFlowsByCcy]);
+    const atProfile = (months: number) => {
+      if (evoProfile.length === 0) return null;
+      return (
+        evoProfile.find(p => Math.abs(p.t - months) < 1e-6) ??
+        evoProfile.reduce((best, p) =>
+          Math.abs(p.t - months) < Math.abs(best.t - months) ? p : best,
+        )
+      );
+    };
+    return open.map(t => {
+      const p = atProfile(t.months);
+      return {
+        ...t,
+        residualVarUsdM: p?.hedgedVarUsdM ?? null,
+        absResidualM: p?.residualCoverLocalM ?? null,
+      };
+    });
+  }, [evoBar, setup, monthlyFlowsByCcy, evoProfile]);
 
-  const maxTermVar = Math.max(1e-9, ...eurTerm.map(t => t.varUsdM));
+  const maxTermVar = Math.max(
+    1e-9,
+    ...evoTerm.map(t => Math.max(t.varUsdM, t.residualVarUsdM ?? 0)),
+  );
+  const showEvoHedge = evoProfile.length > 0;
 
   const patch = (partial: Partial<VarSetup>) => onSetupChange({ ...setup, ...partial });
 
@@ -264,21 +568,50 @@ export function VarAnalyticsPanel({
         </p>
       </div>
 
+      <RiskPerspectiveSelector value={perspective} onChange={setPerspective} />
+
+      {perspective !== 'fxRisk' ? (
+        <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
+          {riskPerspectiveMeta(perspective).label} view is coming soon on Analytics.
+        </div>
+      ) : (
+      <>
       {/* ── Input exposure metrics ── */}
-      <section className="space-y-3 rounded-lg border border-violet-700/40 bg-violet-950/20 p-3">
-        <div>
-          <div className="text-[11px] font-semibold uppercase tracking-wide text-violet-300">
-            Input exposure metrics
+      <section className="space-y-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+              Input exposure metrics
+            </div>
+            <p className="mt-0.5 text-[10px] text-slate-500">
+              Forecast period (Tf) and optional 1m forecast uncertainty — shape Exp and VaR
+              curvature vs tenure.
+              {customSchedule ? ' Profile: custom.' : ''}
+            </p>
           </div>
-          <p className="mt-0.5 text-[10px] text-slate-500">
-            Forecast period (Tf), profile, and optional 1m forecast uncertainty — shape Exp and
-            VaR curvature vs tenure.
-          </p>
+          <button
+            type="button"
+            onClick={() => onOpenForecastProfile?.()}
+            disabled={!onOpenForecastProfile || setup.forecastMonths === 0}
+            title={
+              setup.forecastMonths === 0
+                ? 'No forecast period — pick 1 month+ to edit Revenue / Expenses profile'
+                : 'Forecast profile — flat or custom per-period Revenue / Expenses'
+            }
+            aria-label="Open forecast profile setup"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <GearIcon className="h-3.5 w-3.5" />
+          </button>
         </div>
 
         <div>
           <div className="mb-1.5 text-[11px] font-medium text-slate-400">Forecast period</div>
-          <div className="flex flex-wrap gap-2">
+          <div
+            className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+            role="group"
+            aria-label="Forecast period"
+          >
             {FORECAST_PERIOD_OPTIONS.map(opt => {
               const on = forecastPeriodIdForMonths(setup.forecastMonths) === opt.id;
               return (
@@ -291,10 +624,10 @@ export function VarAnalyticsPanel({
                       : `Revenue path builds for ${opt.months}m (caps growth / sets average area)`
                   }
                   onClick={() => patch({ forecastMonths: opt.months })}
-                  className={`rounded-lg border px-3 py-2 text-xs font-semibold transition-colors ${
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
                     on
-                      ? 'border-violet-500 bg-violet-500/20 text-violet-100'
-                      : 'border-slate-700 text-slate-400 hover:border-slate-500'
+                      ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
                   }`}
                 >
                   {opt.label}
@@ -302,67 +635,119 @@ export function VarAnalyticsPanel({
               );
             })}
           </div>
-        </div>
-
-        <div>
-          <div className="mb-1.5 text-[11px] font-medium text-slate-400">
-            Forecast profile
-          </div>
-          <button
-            type="button"
-            onClick={() => onOpenForecastProfile?.()}
-            disabled={!onOpenForecastProfile || setup.forecastMonths === 0}
-            className="rounded-lg border border-violet-500/50 bg-violet-500/10 px-3 py-2 text-xs font-semibold text-violet-100 hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-            title={
-              setup.forecastMonths === 0
-                ? 'No forecast period — pick 1 month+ to edit Revenue / Expenses profile'
-                : 'Edit flat or custom per-period Revenue / Expenses'
-            }
-          >
-            Forecast profile…
-            {customSchedule && (
-              <span className="ml-1 text-[10px] font-semibold text-violet-300">
-                custom
-              </span>
-            )}
-          </button>
         </div>
 
         <div>
           <div className="mb-1.5 text-[11px] font-medium text-slate-400">
             Incremental forecast uncertainty (1m)
           </div>
-          <div className="flex flex-wrap gap-2">
-            {FORECAST_UNCERTAINTY_OPTIONS.map(opt => {
-              const on =
-                Math.abs((setup.forecastUncertainty1m ?? 0) - opt.value) < 1e-12;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  title={
-                    opt.value === 0
-                      ? 'FX path only — no quantity uncertainty on the forecast'
-                      : `1m relative vol of monthly flow F. Accrues as √g over g=min(Th,Tf); folds into FX √T as √(E²+σ_E²).`
+          <div className="flex flex-wrap items-center gap-2">
+            <div
+              className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+              role="group"
+              aria-label="Forecast uncertainty"
+            >
+              {FORECAST_UNCERTAINTY_OPTIONS.map(opt => {
+                const on = !uncertaintyCustom && Math.abs(u1m - opt.value) < 1e-12;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    title={
+                      opt.value === 0
+                        ? 'FX path only — no quantity uncertainty on the forecast'
+                        : `1m relative vol of monthly flow F. Accrues as √g over g=min(Th,Tf); folds into FX √T as √(E²+σ_E²).`
+                    }
+                    disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
+                    onClick={() => {
+                      setUCustomOpen(false);
+                      patch({ forecastUncertainty1m: opt.value });
+                    }}
+                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                      on
+                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                title="Enter an exact 1m forecast uncertainty (%)"
+                disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
+                onClick={() => {
+                  setUCustomOpen(true);
+                  setUCustomDraft(Number((u1m * 100).toFixed(2)).toString());
+                  if (u1m <= 0) {
+                    const starter = 0.15;
+                    setUCustomDraft('15');
+                    patch({ forecastUncertainty1m: starter });
                   }
+                }}
+                className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                  uncertaintyCustom
+                    ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                    : 'text-slate-500 hover:text-slate-300'
+                }`}
+              >
+                Custom
+              </button>
+            </div>
+            {uncertaintyCustom && (
+              <label
+                className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-950/60 px-2 py-1 text-[11px] text-slate-300"
+                title="Exact 1m relative forecast uncertainty"
+              >
+                <input
+                  type="number"
+                  min={0}
+                  step={0.1}
                   disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
-                  onClick={() => patch({ forecastUncertainty1m: opt.value })}
-                  className={`rounded-lg border px-3 py-2 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                    on
-                      ? 'border-amber-500 bg-amber-500/20 text-amber-100'
-                      : 'border-slate-700 text-slate-400 hover:border-slate-500'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
+                  className="w-16 rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 text-right font-mono text-[11px] text-slate-100 disabled:opacity-40"
+                  value={uCustomDraft}
+                  onChange={e => {
+                    setUCustomDraft(e.target.value);
+                    const pct = Number(e.target.value);
+                    if (!Number.isFinite(pct) || pct < 0) return;
+                    setUCustomOpen(true);
+                    patch({ forecastUncertainty1m: pct / 100 });
+                  }}
+                />
+                <span className="text-slate-500">%</span>
+              </label>
+            )}
           </div>
           <p className="mt-1.5 text-[10px] text-slate-500">
-            {setup.exposureBasis === 'stock' || setup.forecastMonths === 0
-              ? 'Applies to simple/weighted avg / growth path when Tf > 0 (stock ignores forecast u).'
-              : `σ_E = |F|×${((setup.forecastUncertainty1m ?? 0) * 100).toFixed(0)}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — higher u steepens VaR vs tenure.`}
+            {setup.forecastMonths === 0
+              ? 'Pick a forecast period &gt; 0 to enable quantity uncertainty.'
+              : `σ_E = |F|×${(u1m * 100).toFixed(2).replace(/\.?0+$/, '')}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — higher u steepens VaR vs tenure.`}
           </p>
+        </div>
+      </section>
+
+      {/* ── VaR setup: profile chips + gear modal (avg + σ) ── */}
+      <section className="space-y-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+              VaR setup
+            </div>
+            <p className="mt-0.5 text-[10px] text-slate-500">
+              Pick the exposure profile. Gear opens averaging convention, σ₁ₘ source, and
+              future VaR parameters.
+            </p>
+          </div>
+          <button
+            type="button"
+            title="VaR parameters — averaging & volatility"
+            aria-label="Open VaR parameters"
+            onClick={() => setVarParamsOpen(true)}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white"
+          >
+            <GearIcon className="h-3.5 w-3.5" />
+          </button>
         </div>
 
         <div>
@@ -374,14 +759,16 @@ export function VarAnalyticsPanel({
             role="group"
             aria-label="VaR profile"
           >
-            {VAR_EXPOSURE_OPTIONS.map(opt => {
+            {VAR_PROFILE_OPTIONS.map(opt => {
               const on = setup.exposureBasis === opt.id;
               return (
                 <button
                   key={opt.id}
                   type="button"
                   title={opt.description}
-                  onClick={() => patch({ exposureBasis: opt.id })}
+                  onClick={() => {
+                    patch({ exposureBasis: opt.id });
+                  }}
                   className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
                     on
                       ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
@@ -397,92 +784,305 @@ export function VarAnalyticsPanel({
             })}
           </div>
           <p className="mt-1.5 text-[10px] text-slate-500">
-            {profile?.description}
+            {profile?.description} σ₁ₘ {(σ1m * 100).toFixed(1)}% (
+            {volOpt?.label ?? setup.volSource}).
           </p>
         </div>
       </section>
 
+      {varParamsOpen &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="var-params-title"
+            onClick={e => {
+              if (e.target === e.currentTarget) setVarParamsOpen(false);
+            }}
+          >
+            <div className="w-full max-w-lg rounded-xl border border-slate-600 bg-slate-900 p-5 shadow-2xl">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h4
+                    id="var-params-title"
+                    className="text-sm font-semibold text-slate-100"
+                  >
+                    VaR parameters
+                  </h4>
+                  <p className="mt-1 text-[11px] text-slate-400">
+                    σ₁ₘ source and future computational parameters. VaR profile
+                    (simple / time-weighted / growth path) is set on the main
+                    Analytics panel.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setVarParamsOpen(false)}
+                  className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-5">
+                <div>
+                  <div className="mb-1.5 text-[11px] font-medium text-slate-400">
+                    Volatility σ₁ₘ
+                  </div>
+                  <div
+                    className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+                    role="group"
+                    aria-label="Volatility source"
+                  >
+                    {VAR_VOL_SOURCE_OPTIONS.map(opt => {
+                      const on = setup.volSource === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          title={opt.description}
+                          onClick={() => patch({ volSource: opt.id })}
+                          className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+                            on
+                              ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                              : 'text-slate-500 hover:text-slate-300'
+                          }`}
+                        >
+                          {opt.label}
+                          <span className="ml-1 font-mono text-[10px] font-normal opacity-80">
+                            {(opt.monthlyVol * 100).toFixed(1)}%
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-slate-500">
+                    {volOpt?.description ?? ''} Active σ₁ₘ = {(σ1m * 100).toFixed(2)}% ·
+                    σ_T = {(vol * 100).toFixed(2)}% at {setup.horizon}.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+
       {/* ── VaR evolution: bar chart (pick horizon) + confidence on the right ── */}
       <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="mb-3">
-          <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
-            EUR VaR evolution · select horizon
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+              VaR evolution · select horizon
+            </div>
+            {evolutionCcys.length > 0 && (
+              <div
+                className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+                role="group"
+                aria-label="Evolution currency"
+              >
+                {evolutionCcys.map(ccy => {
+                  const on = evoCcy === ccy;
+                  return (
+                    <button
+                      key={ccy}
+                      type="button"
+                      title={`Show ${ccy} VaR vs tenure`}
+                      onClick={() => setEvoCcy(ccy)}
+                      className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+                        on
+                          ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                          : 'text-slate-500 hover:text-slate-300'
+                      }`}
+                    >
+                      {ccy}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
-          <p className="mt-0.5 text-[10px] text-slate-500">
-            Profile: {profile?.label ?? setup.exposureBasis}
+          <p className="mt-1.5 text-[10px] text-slate-500">
+            {evoCcy} · Profile: {profile?.label ?? setup.exposureBasis}
             {' · '}
             Tf = {setup.forecastMonths === 0 ? '0 (stock)' : `${setup.forecastMonths}m`}
             {customSchedule ? ' · custom schedule' : ''}
-            {(setup.forecastUncertainty1m ?? 0) > 0
-              ? ` · u₁ₘ ${((setup.forecastUncertainty1m ?? 0) * 100).toFixed(0)}%`
-              : ''}
-            {' — click a column to set the active VaR horizon for all tabs.'}
+            {showEvoHedge
+              ? ' · stacked bar: green reduction / yellow remaining · columns after Tf = beyond forecast (e flat, resid still grows)'
+              : ' — click a column to set the active VaR horizon.'}
           </p>
         </div>
 
         <div className="flex items-start gap-4">
           <div className="min-w-0 flex-1">
-            {eurTerm.length === 0 ? (
-              <p className="py-6 text-center text-xs text-slate-500">No EUR book to project.</p>
+            {evoTerm.length === 0 ? (
+              <p className="py-6 text-center text-xs text-slate-500">
+                No FX book to project.
+              </p>
             ) : (
               <>
                 <div
                   className="grid gap-1"
-                  style={{ gridTemplateColumns: `repeat(${eurTerm.length}, minmax(0, 1fr))` }}
+                  style={{
+                    gridTemplateColumns: `repeat(${evoTerm.length}, minmax(0, 1fr))`,
+                  }}
                 >
-                  {eurTerm.map(t => {
-                    const barH = Math.max(10, Math.round((t.varUsdM / maxTermVar) * 120));
+                  {evoTerm.map(t => {
+                    const openH = Math.max(
+                      8,
+                      Math.round((t.varUsdM / maxTermVar) * 100),
+                    );
+                    const residH =
+                      t.residualVarUsdM != null
+                        ? Math.min(
+                            openH,
+                            Math.max(
+                              t.residualVarUsdM > 1e-12 ? 3 : 0,
+                              Math.round(
+                                (t.residualVarUsdM / maxTermVar) * 100,
+                              ),
+                            ),
+                          )
+                        : 0;
+                    const coveredH = Math.max(0, openH - residH);
                     const on = setup.horizon === t.id;
+                    const beyondForecast =
+                      setup.forecastMonths > 0 &&
+                      t.months > setup.forecastMonths + 1e-9;
                     return (
                       <button
                         key={t.id}
                         type="button"
-                        title={`${t.label}: ${fmtVarK(t.varUsdM)} — set as active horizon`}
+                        title={
+                          t.residualVarUsdM != null
+                            ? `${evoCcy} ${t.label}: open ${fmtVarK(t.varUsdM)} · resid ${fmtVarK(t.residualVarUsdM)} · |e−H| ${t.absResidualM != null ? fmtSignedM(t.absResidualM) : '—'}${beyondForecast ? ' · beyond forecast (e flat)' : ''}`
+                            : `${evoCcy} ${t.label}: ${fmtVarK(t.varUsdM)}`
+                        }
                         onClick={() => patch({ horizon: t.id })}
                         className={`flex flex-col items-center rounded-md px-0.5 py-1 transition-colors ${
-                          on ? 'bg-emerald-500/10' : 'hover:bg-slate-800/50'
+                          on
+                            ? 'bg-emerald-500/10'
+                            : beyondForecast
+                              ? 'bg-slate-800/40 hover:bg-slate-800/70'
+                              : 'hover:bg-slate-800/50'
                         }`}
                       >
-                        <span
-                          className={`mb-1 h-4 font-mono text-[10px] tabular-nums leading-none ${
-                            on ? 'text-emerald-300' : 'text-slate-400'
+                        <div className="mb-1 flex min-h-[2rem] flex-col items-center justify-end gap-0.5 font-mono text-[9px] tabular-nums leading-none">
+                          <span
+                            className={
+                              on ? 'text-slate-200' : 'text-slate-400'
+                            }
+                          >
+                            {fmtVarK(t.varUsdM)}
+                          </span>
+                          {t.residualVarUsdM != null && (
+                            <span className="text-amber-300/90">
+                              {fmtVarK(t.residualVarUsdM)}
+                            </span>
+                          )}
+                        </div>
+                        {/* One wide stacked bar: yellow remaining + green reduction */}
+                        <div
+                          className={`flex h-[100px] w-full items-end justify-center border-b ${
+                            beyondForecast
+                              ? 'border-slate-600/80 bg-slate-800/20'
+                              : 'border-slate-700/80'
                           }`}
                         >
-                          {fmtVarK(t.varUsdM)}
-                        </span>
-                        <div className="flex h-[120px] w-full items-end justify-center border-b border-slate-700/80">
                           <div
-                            className={`w-6 rounded-t-sm sm:w-7 ${
-                              on
-                                ? 'bg-emerald-500 shadow-[0_0_0_1px_rgba(110,231,183,0.45)]'
-                                : 'bg-slate-500 hover:bg-slate-400'
+                            className={`flex w-7 flex-col justify-end overflow-hidden rounded-t-sm sm:w-8 ${
+                              on ? 'ring-1 ring-emerald-400/40' : ''
                             }`}
-                            style={{ height: barH }}
-                          />
+                            style={{ height: openH }}
+                          >
+                            {coveredH > 0 && (
+                              <div
+                                className="w-full bg-emerald-400/80"
+                                style={{ height: coveredH }}
+                                title="VaR reduction"
+                              />
+                            )}
+                            {residH > 0 && (
+                              <div
+                                className={`w-full ${
+                                  beyondForecast
+                                    ? 'bg-amber-200/70'
+                                    : 'bg-amber-300/90'
+                                }`}
+                                style={{ height: residH }}
+                                title={
+                                  beyondForecast
+                                    ? 'Remaining resid VaR (beyond forecast)'
+                                    : 'Remaining resid VaR'
+                                }
+                              />
+                            )}
+                          </div>
                         </div>
                         <span
-                          className={`mt-1.5 inline-flex h-5 min-w-[1.75rem] items-center justify-center rounded px-1.5 text-[10px] font-semibold ${
+                          className={`mt-1 inline-flex h-5 min-w-[1.75rem] items-center justify-center rounded px-1.5 text-[10px] font-semibold ${
                             on
                               ? 'bg-emerald-500/30 text-emerald-100 ring-1 ring-emerald-400/50'
-                              : 'text-slate-500'
+                              : beyondForecast
+                                ? 'text-slate-400'
+                                : 'text-slate-500'
                           }`}
                         >
                           {shortHorizonLabel(t.label)}
                         </span>
+                        {beyondForecast && (
+                          <span className="mt-0.5 text-[8px] font-medium uppercase tracking-wide text-slate-500">
+                            post-Tf
+                          </span>
+                        )}
                       </button>
                     );
                   })}
                 </div>
                 <p className="mt-2 text-center text-[10px] text-slate-500">
-                  Active:{' '}
+                  {evoCcy} · Active:{' '}
                   <span className="font-medium text-emerald-300">
-                    {eurTerm.find(t => t.id === setup.horizon)?.label ?? setup.horizon}
+                    {evoTerm.find(t => t.id === setup.horizon)?.label ??
+                      setup.horizon}
                   </span>
                   {' · '}
-                  σ = {(vol * 100).toFixed(2)}%
-                  {profile?.varProfile === 'sqrtT'
-                    ? ' · √T curvature'
-                    : ' · path curvature'}
+                  <span className="text-emerald-300/90">green = reduction</span>
+                  {' · '}
+                  <span className="text-amber-300/90">yellow = remaining</span>
+                  {showEvoHedge && evoProfile.length > 0 && (() => {
+                    const Tf = setup.forecastMonths;
+                    const atTf =
+                      evoProfile.find(p => Math.abs(p.t - Tf) < 1e-6) ??
+                      evoProfile.reduce((best, p) =>
+                        Math.abs(p.t - Tf) < Math.abs(best.t - Tf) ? p : best,
+                      );
+                    const atEnd = evoProfile[evoProfile.length - 1]!;
+                    const pastTf = atEnd.t > Tf + 1e-9;
+                    return (
+                      <>
+                        {' · resid @ Tf '}
+                        <span className="font-mono text-amber-300">
+                          {fmtVarK(atTf.hedgedVarUsdM)}
+                        </span>
+                        {pastTf && (
+                          <>
+                            {' · resid @ '}
+                            {Number.isInteger(atEnd.t)
+                              ? `${atEnd.t}m`
+                              : `${atEnd.t.toFixed(1)}m`}{' '}
+                            <span className="font-mono text-amber-300">
+                              {fmtVarK(atEnd.hedgedVarUsdM)}
+                            </span>
+                            <span className="text-slate-600">
+                              {' '}
+                              (e flat · VN gap stays)
+                            </span>
+                          </>
+                        )}
+                      </>
+                    );
+                  })()}
                 </p>
               </>
             )}
@@ -529,7 +1129,11 @@ export function VarAnalyticsPanel({
         <Stat
           label="VaR after hedge"
           value={fmtVarK(summary.totalVarAfterUsdM)}
-          hint={hedged ? 'Residual from Decision layer' : 'No hedge yet'}
+          hint={
+            hedged
+              ? 'Σ resid VaR = V·|e−H|/E (same as evolution yellow)'
+              : 'No hedge yet'
+          }
           accent
         />
         <Stat
@@ -547,6 +1151,11 @@ export function VarAnalyticsPanel({
         <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
           Live VaR · {setupLabel(setup)}
           {hedged ? ' · after Hedging Decision' : ' · Δ = 1 (unhedged)'}
+          {stripBooked
+            ? ' · strip: each forward from M0 (own size + tenure VaR)'
+            : effectiveStructure === 'strip'
+              ? ' · strip sizing (Th windows)'
+              : ''}
           {customSchedule ? ' · custom schedule' : ''}
           <span className="ml-2 font-normal normal-case text-slate-600">
             — click a currency row to open the path chart
@@ -558,27 +1167,55 @@ export function VarAnalyticsPanel({
             <thead>
               <tr className="border-b border-slate-800 text-slate-500">
                 <th className="py-2 pr-3 font-medium">CCY</th>
-                <th className="py-2 pr-3 font-medium">Exposure @ Δ1</th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="VaR-neutral Equal-VaR bullet (Decision mid)"
+                  title="Cash / Net FX stock at t=0 (not path-end or Target)"
+                >
+                  Stock
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Equal-VaR bullet on the open book (Decision mid). Does not shrink when you hedge."
                 >
                   VaR-neutral N
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Total expected — Decision 100% Target"
+                  title="Total expected path-end — Decision 100% Target (exposure-signed)"
                 >
                   Target N
                 </th>
-                <th className="py-2 pr-3 font-medium" title="% of Target">
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="% of |Target|. Strip booked → |strip cover| / |Target| (Decision % ignored)."
+                >
                   Hedge %
                 </th>
-                <th className="py-2 pr-3 font-medium">Hedge N</th>
-                <th className="py-2 pr-3 font-medium">Δ</th>
-                <th className="py-2 pr-3 font-medium">Residual</th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Hedge cover (same sign as Target). 100% Target / Target strip → Hedge N = Target N."
+                >
+                  Hedge N
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="VaR after / VaR @ Δ1 — 0 = fully offset, 1 = unhedged"
+                >
+                  Δ
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Path e(Th) − H — same |e−H| as VaR evolution / path modal"
+                >
+                  Residual
+                </th>
                 <th className="py-2 pr-3 font-medium">VaR @ Δ1</th>
-                <th className="py-2 font-medium">VaR after</th>
+                <th
+                  className="py-2 font-medium"
+                  title="Resid VaR = V·|e−H|/E(Tf) after bullet (Analytics weighted-avg profile) — same as evolution yellow"
+                >
+                  VaR after
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -587,9 +1224,18 @@ export function VarAnalyticsPanel({
                   key={r.ccy}
                   className="cursor-pointer border-b border-slate-800/80 hover:bg-violet-500/10"
                   onClick={() => {
-                    setPathBasis(
-                      needsRollingHedges(setup) ? 'totalExpected' : 'varNeutral',
-                    );
+                    // Bullet P&L / path default = VaR-neutral (not Target).
+                    // Strip may infer from an applied hedge; else start at VN too.
+                    const inferred =
+                      Math.abs(r.hedgeNotionalLocalM) > 1e-9
+                        ? inferHedgePathBasis(
+                            r.hedgeNotionalLocalM,
+                            r.stockHedgeLocalM,
+                            r.targetHedgeLocalM,
+                            r.equalVarHedgeLocalM,
+                          )
+                        : 'varNeutral';
+                    setPathBasis(inferred);
                     setChartCcy(r.ccy);
                   }}
                   title={`Open ${r.ccy} exposure path vs hedge`}
@@ -601,14 +1247,14 @@ export function VarAnalyticsPanel({
                     </span>
                   </td>
                   <td className="py-2 pr-3 font-mono text-slate-300">
-                    {fmtSignedM(r.openExposureLocalM)}
+                    {fmtSignedM(r.stockHedgeLocalM)}
                   </td>
                   <td
                     className="py-2 pr-3 font-mono text-sky-300/90"
                     title={
                       r.hedgeCapped
-                        ? 'Capped by accrued forecast position at Th'
-                        : 'Linear bullet notional matching open VaR'
+                        ? 'Equal-VaR on open book — capped by accrued position at Th'
+                        : 'Equal-VaR bullet matching open-book VaR @ Δ1 (Decision mid)'
                     }
                   >
                     {fmtSignedM(r.equalVarHedgeLocalM)}
@@ -687,7 +1333,7 @@ export function VarAnalyticsPanel({
                 </button>
               </div>
               <ExposureHedgePathChart
-                key={`${chartRow.ccy}-${chartRow.hedgeRatio.toFixed(4)}-${chartRow.hedgeNotionalLocalM.toFixed(3)}-${setup.horizon}-${setup.forecastMonths}-${setup.exposureBasis}`}
+                key={`${chartRow.ccy}-${pathBasis}-${effectiveStructure}-${setup.horizon}-${chartSizingSetup.horizon}-${setup.forecastMonths}-${setup.exposureBasis}-${hasRollingStripForCcy(bookedHedges, chartRow.ccy) ? 'strip' : 'open'}`}
                 ccy={chartRow.ccy}
                 stockM={chartBar.stockNetM}
                 monthlyFlowM={
@@ -705,18 +1351,24 @@ export function VarAnalyticsPanel({
                 onSelectedBasisChange={setPathBasis}
                 onApplyBasis={applyPathBasis}
                 onBookRollingStrip={
-                  onBookedHedgesChange ? bookRollingStrip : undefined
+                  onBookedHedgesChange && hedgeStructure === 'strip'
+                    ? bookRollingStrip
+                    : undefined
                 }
                 stripAlreadyBooked={
                   chartRow
                     ? hasRollingStripForCcy(bookedHedges, chartRow.ccy)
                     : false
                 }
+                hedgeStructure={hedgeStructure}
+                onHedgeStructureChange={setHedgeStructure}
               />
             </div>
           </div>,
           document.body,
         )}
+      </>
+      )}
     </div>
   );
 }

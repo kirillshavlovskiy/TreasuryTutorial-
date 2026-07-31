@@ -438,18 +438,22 @@ export function UnifiedSimulator({
     (mode: ForecastFlowMode) => {
       if (!onForecastProfileChange) return;
       if (mode === 'custom') {
-        const seeded = ensureProfileForRows(
-          { ...forecastProfile, mode: 'custom' },
-          rows,
-          forecastMonths,
-        );
-        // Re-seed months from current flat scalars when entering custom.
-        const byCcy: Record<string, ForecastMonthFlow[]> = { ...seeded.byCcy };
+        const g = Number.isFinite(forecastProfile.growthRateMoM)
+          ? forecastProfile.growthRateMoM
+          : 0;
+        // Prefill custom months from flat Rev/Exp with default MoM growth.
+        const byCcy: Record<string, ForecastMonthFlow[]> = {};
         for (const r of rows) {
           if (r.ccy === 'USD') continue;
-          byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths);
+          byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths, g);
         }
-        onForecastProfileChange({ ...seeded, mode: 'custom', byCcy });
+        onForecastProfileChange({
+          ...forecastProfile,
+          mode: 'custom',
+          byCcy,
+          formulas: {},
+          growthRateMoM: g,
+        });
         return;
       }
       onForecastProfileChange({ ...forecastProfile, mode: 'flat' });
@@ -520,16 +524,20 @@ export function UnifiedSimulator({
 
   const fillCustomFromFlat = useCallback(() => {
     if (!onForecastProfileChange) return;
+    const g = Number.isFinite(forecastProfile.growthRateMoM)
+      ? forecastProfile.growthRateMoM
+      : 0;
     const byCcy: Record<string, ForecastMonthFlow[]> = {};
     for (const r of rows) {
       if (r.ccy === 'USD') continue;
-      byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths);
+      byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths, g);
     }
     onForecastProfileChange({
       ...forecastProfile,
       mode: 'custom',
       byCcy,
       formulas: {},
+      growthRateMoM: g,
     });
   }, [onForecastProfileChange, forecastProfile, rows, forecastMonths]);
 
@@ -888,8 +896,16 @@ export function UnifiedSimulator({
                     </h4>
                     <p className="mt-1 text-[11px] text-gray-500">
                       {forecastProfile.mode === 'flat'
-                        ? `Workspace formula: Net FX Forecast = book + monthly net × ${forecastMonths}${forecastMonths === 1 ? ' month' : ' months'}.`
-                        : `Custom profile: one Revenue / Expense input per month (M1…M${forecastMonths}). Period net = Σ months. Cells accept numbers or =formulas (rev, exp, prev, m1…).`}
+                        ? `Workspace formula: Net FX Forecast = book + monthly net path over ${forecastMonths}${forecastMonths === 1 ? ' month' : ' months'}${
+                            Math.abs(forecastProfile.growthRateMoM ?? 0) > 1e-15
+                              ? ` with ${(forecastProfile.growthRateMoM * 100).toFixed(1)}% MoM growth`
+                              : ''
+                          }.`
+                        : `Custom profile: months prefilled from flat Rev/Exp${
+                            Math.abs(forecastProfile.growthRateMoM ?? 0) > 1e-15
+                              ? ` at ${(forecastProfile.growthRateMoM * 100).toFixed(1)}% MoM growth`
+                              : ''
+                          }. Period net = Σ months. Cells accept numbers or =formulas (rev, exp, prev, m1…).`}
                     </p>
                   </div>
                   <button
@@ -936,13 +952,58 @@ export function UnifiedSimulator({
                       );
                     })}
                   </div>
+                  {onForecastProfileChange && (
+                    <label
+                      className="inline-flex items-center gap-1.5 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-700"
+                      title="Month-on-month growth from flat Rev/Exp. Flat mode uses it for the path; Custom mode prefills each month as M_k = M₀×(1+g)^k."
+                    >
+                      <span className="whitespace-nowrap text-gray-500">
+                        Default growth
+                      </span>
+                      <input
+                        type="number"
+                        step={0.1}
+                        className="w-16 rounded border border-gray-300 bg-white px-1.5 py-0.5 text-right font-mono text-[11px] text-gray-900"
+                        value={Number(
+                          (
+                            (Number.isFinite(forecastProfile.growthRateMoM)
+                              ? forecastProfile.growthRateMoM
+                              : 0) * 100
+                          ).toFixed(2),
+                        )}
+                        onChange={e => {
+                          const pct = Number(e.target.value);
+                          const g = Number.isFinite(pct) ? pct / 100 : 0;
+                          if (forecastProfile.mode === 'custom') {
+                            const byCcy: Record<string, ForecastMonthFlow[]> = {};
+                            for (const r of rows) {
+                              if (r.ccy === 'USD') continue;
+                              byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths, g);
+                            }
+                            onForecastProfileChange({
+                              ...forecastProfile,
+                              growthRateMoM: g,
+                              byCcy,
+                              formulas: {},
+                            });
+                            return;
+                          }
+                          onForecastProfileChange({
+                            ...forecastProfile,
+                            growthRateMoM: g,
+                          });
+                        }}
+                      />
+                      <span className="text-gray-500">% MoM</span>
+                    </label>
+                  )}
                   {forecastProfile.mode === 'custom' && (
                     <>
                       <button
                         type="button"
                         onClick={fillCustomFromFlat}
                         className="rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
-                        title="Fill every month from the current flat monthly Revenue / Expenses"
+                        title="Refill every month from flat Rev/Exp with the current default growth rate"
                       >
                         Fill from flat formula
                       </button>

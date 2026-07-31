@@ -41,6 +41,10 @@ export interface TaskAnswers {
    * Empty / omitted → 0 (off).
    */
   varForecastUncertainty: string;
+  /** FX vol source for σ₁ₘ: historical | implied. */
+  varVolSource: string;
+  /** Average sampling: midMonth | monthEnd. */
+  varAveragingConvention: string;
   /**
    * EUR VaR at Δ=1 in USD thousands — must match Analytics setup
    * (confidence × horizon × exposure basis) within ±5%.

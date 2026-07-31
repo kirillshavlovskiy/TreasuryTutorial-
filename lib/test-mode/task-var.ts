@@ -4,6 +4,7 @@ import {
   VAR_HORIZON_OPTIONS,
   computeParametricVarUsdM,
   exposureLocalMForBasis,
+  monthlyVolForSetup,
   type VarExposureBasis,
   type VarSetup,
   volForHorizon,
@@ -64,7 +65,7 @@ export function computeTaskVar(
     setup.forecastMonths,
   );
   const spotUsd = NORDTECH_VAR.spotUsd[bar.ccy] ?? 1;
-  const horizonVol = volForHorizon(setup.horizon);
+  const horizonVol = volForHorizon(setup.horizon, setup);
   const varUsdM = computeParametricVarUsdM(exposureLocalM, bar.ccy, setup);
   const z = varUsdM / (Math.abs(exposureLocalM) * spotUsd * horizonVol || 1);
 
@@ -73,7 +74,7 @@ export function computeTaskVar(
     exposureLocalM,
     exposureBasis: setup.exposureBasis,
     spotUsd,
-    monthlyVol: NORDTECH_VAR.monthlyVol,
+    monthlyVol: monthlyVolForSetup(setup),
     horizonVol,
     z: Number.isFinite(z) ? z : NORDTECH_VAR.z95,
     confidencePct: setup.confidencePct,

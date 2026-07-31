@@ -30,10 +30,13 @@ import {
   markStep,
   parseForecastMonths,
   parseForecastUncertainty1m,
+  normalizeVarSetup,
+  parseVarAveragingConvention,
   parseVarConfidencePct,
   parseVarExposureBasis,
   parseVarHorizonId,
   parseVarSetup,
+  parseVarVolSource,
   resetSandboxPersistent,
   saveSandboxPersistent,
   scoreTask01,
@@ -431,7 +434,7 @@ export function Task01App({
     return workspace.entities.filter(e => set.has(e.id));
   })();
 
-  const varSetup: VarSetup = {
+  const varSetup: VarSetup = normalizeVarSetup({
     confidencePct:
       parseVarConfidencePct(answers.varConfidencePct) ?? DEFAULT_VAR_SETUP.confidencePct,
     exposureBasis:
@@ -442,19 +445,27 @@ export function Task01App({
     forecastUncertainty1m:
       parseForecastUncertainty1m(answers.varForecastUncertainty) ??
       DEFAULT_VAR_SETUP.forecastUncertainty1m,
-  };
+    volSource:
+      parseVarVolSource(answers.varVolSource ?? '') ?? DEFAULT_VAR_SETUP.volSource,
+    averagingConvention:
+      parseVarAveragingConvention(answers.varAveragingConvention ?? '') ??
+      DEFAULT_VAR_SETUP.averagingConvention,
+  });
 
   const setVarSetup = (setup: VarSetup) => {
+    const next = normalizeVarSetup(setup);
     update({
       ...state,
       answers: {
         ...answers,
-        varConfidencePct: String(setup.confidencePct),
-        varExposureBasis: setup.exposureBasis,
-        varHorizon: setup.horizon,
-        varForecastMonths: String(setup.forecastMonths),
+        varConfidencePct: String(next.confidencePct),
+        varExposureBasis: next.exposureBasis,
+        varHorizon: next.horizon,
+        varForecastMonths: String(next.forecastMonths),
         varForecastUncertainty:
-          setup.forecastUncertainty1m > 0 ? String(setup.forecastUncertainty1m) : '',
+          next.forecastUncertainty1m > 0 ? String(next.forecastUncertainty1m) : '',
+        varVolSource: next.volSource,
+        varAveragingConvention: next.averagingConvention,
       },
       progress: markStep(progress, 'setVarConfidence'),
     });
@@ -1080,22 +1091,11 @@ function GroupConsolidatedView({
     });
   };
 
-  const entityTicketCount = bookedHedges.filter(
-    t => t.entityId && t.entityId !== GROUP_HEDGE_SCOPE,
-  ).length;
-
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-white">{groupDashboardName}</h2>
-          <p className="text-xs text-slate-500">
-            Parent · consolidating {entities.length}/{allEntities.length} entities · VaR{' '}
-            {setupLabel(varSetup)} · Hedging (Δ = 1)
-            {entityTicketCount > 0
-              ? ` · ${entityTicketCount} local hedge${entityTicketCount === 1 ? '' : 's'}`
-              : ''}
-          </p>
           <p className="mt-1 text-[11px] text-slate-400">Included: {includedNames}</p>
         </div>
         <button

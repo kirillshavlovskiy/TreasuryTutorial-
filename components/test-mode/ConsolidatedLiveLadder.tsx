@@ -11,6 +11,7 @@ import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   bookedNotionalLocalM,
   buildHedgeVarSummary,
+  overlayRiskFromFxBook,
   type HedgeTicket,
   type HedgeVarRow,
 } from '@/lib/test-mode/hedge-var';
@@ -19,46 +20,14 @@ import {
   exposureLocalMForBasis,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
+import {
+  RiskPerspectiveSelector,
+  riskPerspectiveMeta,
+  type RiskPerspective,
+} from '@/components/test-mode/RiskPerspectiveSelector';
 
-export type LadderPerspective = 'fxRisk' | 'cashCarry' | 'dv01' | 'greeks';
-
-const PERSPECTIVES: {
-  id: LadderPerspective;
-  label: string;
-  active: boolean;
-  description: string;
-  yLabel: string;
-}[] = [
-  {
-    id: 'fxRisk',
-    label: 'FX Risk',
-    active: true,
-    description:
-      'Original stock (and avg buildup when Analytics includes it) vs hedge structure. Residual = exposure − hedge.',
-    yLabel: 'Exposure (M)',
-  },
-  {
-    id: 'cashCarry',
-    label: 'Cash Carry',
-    active: false,
-    description: 'Carry / translation remeasurement by source (preview).',
-    yLabel: 'Carry / mo (M)',
-  },
-  {
-    id: 'dv01',
-    label: 'DV01',
-    active: false,
-    description: 'Rate sensitivity stack on debt / investments (preview).',
-    yLabel: 'DV01 / bp (M)',
-  },
-  {
-    id: 'greeks',
-    label: 'Greeks',
-    active: false,
-    description: 'δ-effective stack vs hedge overlay (preview).',
-    yLabel: 'δ-notional (M)',
-  },
-];
+/** @deprecated Use RiskPerspective — kept for existing imports. */
+export type LadderPerspective = RiskPerspective;
 
 const SEG_META = {
   cashFx: { label: 'Cash FX', color: '#0ea5e9' },
@@ -136,14 +105,19 @@ function niceMax(v: number): number {
 
 export function ConsolidatedLiveLadder({
   rows,
-  risk,
+  risk: seedRisk,
   hedgeRatios: controlledRatios,
   bookedHedges = [],
   varSetup = DEFAULT_VAR_SETUP,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
   title = 'Consolidated Live Ladder',
 }: ConsolidatedLiveLadderProps) {
-  const [perspective, setPerspective] = useState<LadderPerspective>('fxRisk');
+  const risk = useMemo(
+    () =>
+      overlayRiskFromFxBook(seedRisk, rows, varSetup, forecastProfile),
+    [seedRisk, rows, varSetup, forecastProfile],
+  );
+  const [perspective, setPerspective] = useState<RiskPerspective>('fxRisk');
   const [unit, setUnit] = useState<'local' | 'usd'>('local');
 
   // Hedge-add % is edited on Hedging Decision only — ladder displays the result.
@@ -333,8 +307,7 @@ export function ConsolidatedLiveLadder({
     bookedHedges,
   ]);
 
-  const persMeta = PERSPECTIVES.find(p => p.id === perspective)!;
-  const inactive = !persMeta.active;
+  const persMeta = riskPerspectiveMeta(perspective);
 
   const legendIds = useMemo(() => {
     const ids = new Set<SegId>();
@@ -382,30 +355,7 @@ export function ConsolidatedLiveLadder({
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
-        {PERSPECTIVES.map(p => (
-          <button
-            key={p.id}
-            type="button"
-            onClick={() => setPerspective(p.id)}
-            className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-              perspective === p.id
-                ? 'border-blue-500 bg-blue-500/15 text-blue-100'
-                : 'border-slate-700 text-slate-400 hover:border-slate-500'
-            } ${!p.active ? 'opacity-70' : ''}`}
-          >
-            {p.label}
-            {!p.active && (
-              <span className="ml-1 text-[9px] uppercase text-slate-600">soon</span>
-            )}
-          </button>
-        ))}
-      </div>
-
-      <p className="text-[11px] text-slate-500">
-        {persMeta.description}
-        {inactive ? ' Values are illustrative until the metric is activated on the risk profile.' : ''}
-      </p>
+      <RiskPerspectiveSelector value={perspective} onChange={setPerspective} />
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Stat

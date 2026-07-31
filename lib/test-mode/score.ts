@@ -41,7 +41,7 @@ const HINTS = {
   mismatchCcy:
     'Largest stock mismatch is EUR long Net FX (cash + receivables − venture debt ≈ €1.9M). Enter currency code EUR.',
   mismatchAmt:
-    'EUR exposure for your Analytics basis: Stock now ≈ Net FX (cash + receivables − debt ≈ 1.9); Weighted avg ≈ stock + ½×F×min(Th,Tf); Growth path accrued ≈ stock + F×min(Th,Tf). Match Analytics Exposure @ Δ1 (±5%).',
+    'EUR exposure for your Analytics basis: Simple avg ≈ (S+E)/2; Time-weighted ≈ (1/T)∫e; Growth path accrued ≈ stock + F×min(Th,Tf). Match Analytics Exposure @ Δ1 (±5%).',
   varSetup:
     'In Analytics choose confidence (90/95/99), VaR analysis horizon (vol √T), and exposure basis. Set forecast period on FX Risk. Copy those into Your answers.',
   varAmt:
@@ -310,9 +310,9 @@ export function scoreTask01(
     exposureBasis === 'simpleAvg'
       ? 'simple average'
       : exposureBasis === 'avgBuildup'
-        ? 'weighted average'
+        ? 'time-weighted average'
         : exposureBasis === 'totalBuildup'
-          ? 'total forecast buildup'
+          ? 'growth path average'
           : 'stock now';
   checks.push({
     id: 'answerAmount',

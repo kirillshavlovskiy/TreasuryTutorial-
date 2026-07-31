@@ -24,12 +24,18 @@ export interface ForecastProfileState {
    * (payout formulas are entered as positive outflows, same as the modal).
    */
   formulas: Record<string, string>;
+  /**
+   * Default month-on-month growth (0.05 = +5% MoM).
+   * Flat: compounds the monthly net path. Custom: seeds M_k = M₀×(1+g)^k.
+   */
+  growthRateMoM: number;
 }
 
 export const DEFAULT_FORECAST_PROFILE: ForecastProfileState = {
   mode: 'flat',
   byCcy: {},
   formulas: {},
+  growthRateMoM: 0,
 };
 
 export function monthNet(m: ForecastMonthFlow): number {
@@ -40,16 +46,37 @@ export function sumPeriodFlow(months: readonly ForecastMonthFlow[]): number {
   return roundMoney(months.reduce((s, m) => s + monthNet(m), 0));
 }
 
-/** Seed T months from the row’s flat monthly Revenue / Expenses (+ invoice fcast). */
-export function seedMonthsFromRow(row: RowState, months: number): ForecastMonthFlow[] {
+/**
+ * Seed T months from the row’s flat monthly Revenue / Expenses (+ invoice fcast).
+ * Optional MoM growth compounds both legs: M_k = M_0 × (1+g)^k.
+ */
+export function seedMonthsFromRow(
+  row: RowState,
+  months: number,
+  growthRateMoM: number = 0,
+): ForecastMonthFlow[] {
   const T = Math.max(0, Math.floor(months));
   if (T === 0) return [];
   const fcast = row.fcastFX ?? 0;
-  const point: ForecastMonthFlow = {
-    collections: roundMoney(row.collections + fcast),
-    payout: roundMoney(row.payout),
-  };
-  return Array.from({ length: T }, () => ({ ...point }));
+  const baseCollections = roundMoney(row.collections + fcast);
+  const basePayout = roundMoney(row.payout);
+  const g =
+    typeof growthRateMoM === 'number' && Number.isFinite(growthRateMoM)
+      ? growthRateMoM
+      : 0;
+  if (Math.abs(g) < 1e-15) {
+    return Array.from({ length: T }, () => ({
+      collections: baseCollections,
+      payout: basePayout,
+    }));
+  }
+  return Array.from({ length: T }, (_, k) => {
+    const factor = Math.pow(1 + g, k);
+    return {
+      collections: roundMoney(baseCollections * factor),
+      payout: roundMoney(basePayout * factor),
+    };
+  });
 }
 
 /** Resize a series when the forecasting period changes. */
@@ -80,7 +107,15 @@ export function ensureProfileForRows(
     if (r.ccy === 'USD') continue;
     byCcy[r.ccy] = resizeMonthSeries(byCcy[r.ccy], months, r);
   }
-  return { ...profile, byCcy };
+  return {
+    ...profile,
+    byCcy,
+    growthRateMoM:
+      typeof profile.growthRateMoM === 'number' && Number.isFinite(profile.growthRateMoM)
+        ? profile.growthRateMoM
+        : 0,
+    formulas: profile.formulas ?? {},
+  };
 }
 
 /**
@@ -99,7 +134,8 @@ export function periodFlowSumLocalM(
     const months = resizeMonthSeries(profile.byCcy[row.ccy], T, row);
     return sumPeriodFlow(months);
   }
-  return roundMoney((row.collections + row.payout + (row.fcastFX ?? 0)) * T);
+  const series = monthlyFlowSeriesLocalM(row, T, profile);
+  return roundMoney(series.reduce((s, f) => s + f, 0));
 }
 
 /** Effective monthly flow for APIs that still multiply by T (VaR basis helpers). */
@@ -131,7 +167,16 @@ export function monthlyFlowSeriesLocalM(
     return months.map(m => roundMoney(monthNet(m)));
   }
   const flat = roundMoney(row.collections + row.payout + (row.fcastFX ?? 0));
-  return Array.from({ length: T }, () => flat);
+  const g =
+    typeof profile?.growthRateMoM === 'number' && Number.isFinite(profile.growthRateMoM)
+      ? profile.growthRateMoM
+      : 0;
+  if (Math.abs(g) < 1e-15) {
+    return Array.from({ length: T }, () => flat);
+  }
+  return Array.from({ length: T }, (_, k) =>
+    roundMoney(flat * Math.pow(1 + g, k)),
+  );
 }
 
 /** Same series from a bare flat monthly rate (consolidate / tests without RowState). */

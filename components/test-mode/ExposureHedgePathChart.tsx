@@ -1,26 +1,27 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   HEDGE_PATH_BASIS_OPTIONS,
   buildExposurePathPoints,
-  buildResidualPath,
   hedgeBasisNotionalLocalM,
   hedgeBreakevenMonths,
-  inferHedgePathBasis,
   overhedgeGapM,
-  residualPathVarUsdM,
   resolveChartMonthlyFlows,
   type HedgePathBasisId,
 } from '@/lib/test-mode/exposure-hedge-path';
 import {
+  buildStripHedgedVarProfile,
+  equalVarLinearHedgeNotionalLocalM,
+} from '@/lib/test-mode/hedge-var';
+import {
   buildRollingHedgeEdges,
-  buildRollingHedgePathPoints,
-  hedgeBreakevensForStrip,
+  stripForwardLegsFromEdges,
   needsRollingHedges,
-  rollingHedgeAtMonth,
-  type RollingEdgeSizing,
+  varSetupForPathHedgeRegime,
+  type ForecastHedgeStructure,
   type RollingHedgeEdge,
+  type StripForwardLeg,
 } from '@/lib/test-mode/rolling-hedge';
 import { horizonMonths, type VarSetup } from '@/lib/test-mode/var-setup';
 
@@ -38,11 +39,21 @@ interface ExposureHedgePathChartProps {
   endExposureM: number;
   selectedBasis: HedgePathBasisId;
   onSelectedBasisChange: (b: HedgePathBasisId) => void;
-  onApplyBasis: (b: HedgePathBasisId) => void;
-  /** Book M0 live + later scheduled edges (when Tf > Th). */
+  /**
+   * Apply Cash / VN / Target. Pass the chart's structure so strip booking does
+   * not race parent's hedgeStructure state (stale 'bullet' → Cash % only).
+   */
+  onApplyBasis: (
+    b: HedgePathBasisId,
+    structure?: ForecastHedgeStructure,
+  ) => void;
+  /** Book staggered strip from M0 (when Tf > Th and structure=strip). */
   onBookRollingStrip?: (edges: RollingHedgeEdge[]) => void;
   /** Disable book when a strip for this CCY is already on the book. */
   stripAlreadyBooked?: boolean;
+  /** bullet = one Tf forward; strip = rolling Th windows (enabled when Tf &gt; Th). */
+  hedgeStructure?: ForecastHedgeStructure;
+  onHedgeStructureChange?: (s: ForecastHedgeStructure) => void;
 }
 
 function fmtM(v: number): string {
@@ -104,9 +115,61 @@ export function ExposureHedgePathChart({
   onApplyBasis,
   onBookRollingStrip,
   stripAlreadyBooked = false,
+  hedgeStructure: hedgeStructureProp,
+  onHedgeStructureChange,
 }: ExposureHedgePathChartProps) {
+  const [localStructure, setLocalStructure] =
+    useState<ForecastHedgeStructure>('bullet');
+  /** Manual strip leg count (min 2 when strip). null = default ceil(Tf/Th). */
+  const [stripLegCount, setStripLegCount] = useState<number | null>(null);
+  /** Which forward legs contribute to the resid VaR profile (checkbox). */
+  const [enabledLegIds, setEnabledLegIds] = useState<Record<number, boolean>>(
+    {},
+  );
+  const controlled = hedgeStructureProp != null;
+  const hedgeStructure = controlled ? hedgeStructureProp : localStructure;
+  useEffect(() => {
+    if (controlled) setLocalStructure(hedgeStructureProp);
+  }, [controlled, hedgeStructureProp]);
+  const setStructure = (s: ForecastHedgeStructure) => {
+    if (!controlled) setLocalStructure(s);
+    onHedgeStructureChange?.(s);
+  };
   const Th = horizonMonths(setup.horizon);
-  const rolling = needsRollingHedges(setup);
+  const Tf =
+    typeof setup.forecastMonths === 'number' && setup.forecastMonths > 0
+      ? setup.forecastMonths
+      : 0;
+  const rollingAvailable = needsRollingHedges(setup);
+  const showStructurePicker = Tf > 0;
+  const effectiveStructure: ForecastHedgeStructure =
+    hedgeStructure === 'strip' && rollingAvailable ? 'strip' : 'bullet';
+  useEffect(() => {
+    if (!rollingAvailable && hedgeStructure === 'strip') {
+      if (!controlled) setLocalStructure('bullet');
+      onHedgeStructureChange?.('bullet');
+    }
+  }, [
+    rollingAvailable,
+    hedgeStructure,
+    controlled,
+    onHedgeStructureChange,
+  ]);
+  const rolling = effectiveStructure === 'strip';
+  /** When switching strip → bullet, drop Target default so residual P&L uses VN. */
+  const prevStructureRef = useRef(effectiveStructure);
+  useEffect(() => {
+    const prev = prevStructureRef.current;
+    prevStructureRef.current = effectiveStructure;
+    if (prev === 'strip' && effectiveStructure === 'bullet') {
+      onSelectedBasisChange('varNeutral');
+    }
+  }, [effectiveStructure, onSelectedBasisChange]);
+  /** Bullet Th=Tf; stock profile → path totalBuildup so VN ≠ Cash. */
+  const sizingSetup = useMemo(
+    () => varSetupForPathHedgeRegime(setup, effectiveStructure),
+    [setup, effectiveStructure],
+  );
 
   const { flows, windowMonths, startM, endM: pathEndM } = useMemo(
     () => resolveChartMonthlyFlows(stockM, monthlyFlowM, setup, monthlyFlows),
@@ -118,27 +181,73 @@ export function ExposureHedgePathChart({
     [startM, flows, windowMonths],
   );
 
-  const rollingSizing: RollingEdgeSizing =
-    selectedBasis === 'cash'
-      ? 'stockStart'
-      : selectedBasis === 'totalExpected'
-        ? 'windowEnd'
-        : 'varNeutral';
+  /**
+   * Equal-VaR for chips / flat hedge line. Bullet forces Th=Tf so this matches
+   * the Th=forecast case exactly (ignore stale Analytics-Th prop).
+   */
+  const matchedEqualVarLocalM = useMemo(() => {
+    if (rolling) return equalVarHedgeLocalM;
+    return equalVarLinearHedgeNotionalLocalM(
+      stockM,
+      monthlyFlowM,
+      ccy,
+      sizingSetup,
+      undefined,
+      flows,
+    ).amountLocalM;
+  }, [
+    rolling,
+    equalVarHedgeLocalM,
+    stockM,
+    monthlyFlowM,
+    ccy,
+    sizingSetup,
+    flows,
+  ]);
+
+  const defaultStripLegs = useMemo(() => {
+    if (!(Tf > 0) || !(Th > 0)) return 2;
+    return Math.max(2, Math.ceil(Tf / Th - 1e-12));
+  }, [Tf, Th]);
+  const maxStripLegs = useMemo(
+    () => Math.max(2, Math.min(24, Math.ceil(Tf) || 2)),
+    [Tf],
+  );
+  const effectiveStripLegs = Math.min(
+    maxStripLegs,
+    Math.max(2, stripLegCount ?? defaultStripLegs),
+  );
+  const stripEdgeOpts = useMemo(
+    () => (rolling ? { legCount: effectiveStripLegs } : undefined),
+    [rolling, effectiveStripLegs],
+  );
 
   const rollingEdgesCash = useMemo(
     () =>
-      rolling ? buildRollingHedgeEdges(startM, flows, setup, 'stockStart') : [],
-    [rolling, startM, flows, setup],
+      rolling
+        ? buildRollingHedgeEdges(startM, flows, setup, 'stockStart', stripEdgeOpts)
+        : [],
+    [rolling, startM, flows, setup, stripEdgeOpts],
   );
   const rollingEdgesVarNeutral = useMemo(
     () =>
-      rolling ? buildRollingHedgeEdges(startM, flows, setup, 'varNeutral') : [],
-    [rolling, startM, flows, setup],
+      rolling
+        ? buildRollingHedgeEdges(
+            startM,
+            flows,
+            setup,
+            'varNeutral',
+            stripEdgeOpts,
+          )
+        : [],
+    [rolling, startM, flows, setup, stripEdgeOpts],
   );
   const rollingEdgesTotal = useMemo(
     () =>
-      rolling ? buildRollingHedgeEdges(startM, flows, setup, 'windowEnd') : [],
-    [rolling, startM, flows, setup],
+      rolling
+        ? buildRollingHedgeEdges(startM, flows, setup, 'windowEnd', stripEdgeOpts)
+        : [],
+    [rolling, startM, flows, setup, stripEdgeOpts],
   );
   const rollingEdges =
     selectedBasis === 'cash'
@@ -154,41 +263,402 @@ export function ExposureHedgePathChart({
       selectedBasis === 'totalExpected' ||
       selectedBasis === 'varNeutral');
 
+  /**
+   * Forwards for the VaR-over-time panel:
+   * - Strip → incremental M0 legs (all live from day 0)
+   * - Bullet → one M0–Tf forward (same instantaneous cover model)
+   */
+  const hedgeLegs = useMemo((): StripForwardLeg[] => {
+    if (showRollingStrip) return stripForwardLegsFromEdges(rollingEdges);
+    if (!(Tf > 0)) return [];
+    const amount = hedgeBasisNotionalLocalM(
+      selectedBasis,
+      startM,
+      pathEndM,
+      matchedEqualVarLocalM,
+    );
+    if (Math.abs(amount) < 1e-12) return [];
+    return [
+      {
+        index: 0,
+        label: `M0–M${Math.round(Tf)}`,
+        tenureMonths: Tf,
+        amountLocalM: amount,
+        cumulCoverLocalM: amount,
+        endExposureM: pathEndM,
+        stockStartM: startM,
+      },
+    ];
+  }, [
+    showRollingStrip,
+    rollingEdges,
+    Tf,
+    selectedBasis,
+    startM,
+    pathEndM,
+    matchedEqualVarLocalM,
+  ]);
+
+  /** Σ all strip legs (full program). */
+  const stripTotalCoverM = showRollingStrip
+    ? hedgeLegs.reduce((s, l) => s + l.amountLocalM, 0)
+    : 0;
+
+  const showHedgePerf = hedgeLegs.length > 0 && Tf > 0;
+
+  // Keep checkbox map in sync when legs change (default: all on).
+  useEffect(() => {
+    setEnabledLegIds(prev => {
+      const next: Record<number, boolean> = {};
+      let changed = false;
+      for (const l of hedgeLegs) {
+        const on = prev[l.index] !== false;
+        next[l.index] = on;
+        if (prev[l.index] === undefined) changed = true;
+      }
+      for (const k of Object.keys(prev)) {
+        if (!(Number(k) in next)) changed = true;
+      }
+      return changed || Object.keys(prev).length !== Object.keys(next).length
+        ? next
+        : prev;
+    });
+  }, [hedgeLegs]);
+
+  const activeHedgeLegs = useMemo(
+    () => hedgeLegs.filter(l => enabledLegIds[l.index] !== false),
+    [hedgeLegs, enabledLegIds],
+  );
+
+  /**
+   * Resid VaR profile from checked trades.
+   * Window = chart horizon (max(Th,Tf)) so when Tf is short, post-forecast
+   * VN residual (|E_end−H_VN| flat, V(t) still growing) stays on the track.
+   */
+  const hedgedVarProfile = useMemo(() => {
+    if (!showHedgePerf) return [];
+    const Eref = Math.abs(pathEndM);
+    const through = Math.max(Tf, windowMonths);
+    if (activeHedgeLegs.length === 0) {
+      // No trades on → remaining = full open VaR.
+      const bare = buildStripHedgedVarProfile(
+        startM,
+        monthlyFlowM,
+        ccy,
+        setup,
+        [
+          {
+            amountLocalM: Eref > 1e-12 ? Eref : 1,
+            tenureMonths: Tf,
+            recognizeFromMonths: 0,
+          },
+        ],
+        flows,
+        1,
+        Eref > 1e-12 ? Eref : undefined,
+        through,
+      );
+      return bare.map(p => ({
+        ...p,
+        hedgedVarUsdM: p.openVarUsdM,
+        cumulCoverLocalM: 0,
+        residualCoverLocalM: Math.abs(p.exposureLocalM),
+      }));
+    }
+    // Flat Σ ticked fractions from M0 (same as VaR Evolution) — after Tf,
+    // e stays at E_end and resid VaR = V(t)·|E_end−H|/|E_end| keeps evolving.
+    return buildStripHedgedVarProfile(
+      startM,
+      monthlyFlowM,
+      ccy,
+      setup,
+      activeHedgeLegs.map(l => ({
+        amountLocalM: l.amountLocalM,
+        tenureMonths: l.tenureMonths,
+        recognizeFromMonths: 0,
+      })),
+      flows,
+      1,
+      Eref > 1e-12 ? Eref : undefined,
+      through,
+    );
+  }, [
+    showHedgePerf,
+    activeHedgeLegs,
+    startM,
+    monthlyFlowM,
+    ccy,
+    setup,
+    flows,
+    pathEndM,
+    Tf,
+    windowMonths,
+  ]);
+
+  /** Full-program resid VaR (all legs on) — locks VaR chart Y scale vs checkboxes. */
+  const hedgedVarProfileFull = useMemo(() => {
+    if (!showHedgePerf || hedgeLegs.length === 0) return [];
+    const Eref = Math.abs(pathEndM);
+    const through = Math.max(Tf, windowMonths);
+    return buildStripHedgedVarProfile(
+      startM,
+      monthlyFlowM,
+      ccy,
+      setup,
+      hedgeLegs.map(l => ({
+        amountLocalM: l.amountLocalM,
+        tenureMonths: l.tenureMonths,
+        recognizeFromMonths: 0,
+      })),
+      flows,
+      1,
+      Eref > 1e-12 ? Eref : undefined,
+      through,
+    );
+  }, [
+    showHedgePerf,
+    hedgeLegs,
+    pathEndM,
+    Tf,
+    windowMonths,
+    startM,
+    monthlyFlowM,
+    ccy,
+    setup,
+    flows,
+  ]);
+
+  const hedgedVarProfileGeom = useMemo(() => {
+    const W = 640;
+    const H = 160;
+    const padL = 48;
+    const padR = 56;
+    const padT = 22;
+    const padB = 34;
+    if (hedgedVarProfile.length === 0) {
+      return {
+        W,
+        H,
+        padL,
+        padR,
+        padT,
+        padB,
+        openLine: '',
+        residLine: '',
+        reductionArea: '',
+        maxVar: 1,
+        endResidVarUsdM: 0,
+        xScale: (_t: number) => padL,
+        yScale: (_v: number) => padT,
+        monthTicks: [] as number[],
+        legMarks: [] as { t: number; hedgedVarUsdM: number; label: string }[],
+      };
+    }
+    const TfChart = hedgedVarProfile[hedgedVarProfile.length - 1]!.t;
+    const endResidVarUsdM =
+      hedgedVarProfile[hedgedVarProfile.length - 1]!.hedgedVarUsdM;
+    // Y max from open VaR + full-program resid (not the ticked subset).
+    const scaleSrc =
+      hedgedVarProfileFull.length > 0 ? hedgedVarProfileFull : hedgedVarProfile;
+    const maxVar =
+      Math.max(
+        0.01,
+        ...scaleSrc.map(p => Math.max(p.openVarUsdM, p.hedgedVarUsdM)),
+        ...hedgedVarProfile.map(p => Math.max(p.openVarUsdM, p.hedgedVarUsdM)),
+      ) * 1.12;
+    const xScale = (t: number) =>
+      padL + (TfChart <= 0 ? 0 : (t / TfChart) * (W - padL - padR));
+    const yScale = (v: number) =>
+      padT + (1 - v / maxVar) * (H - padT - padB);
+    // Dashed slate = open VaR; yellow = resid; green fill = reduction band.
+    const openPts = hedgedVarProfile.map(p => ({
+      x: xScale(p.t),
+      y: yScale(p.openVarUsdM),
+    }));
+    const residPts = hedgedVarProfile.map(p => ({
+      x: xScale(p.t),
+      y: yScale(p.hedgedVarUsdM),
+    }));
+    const openLine = smoothSplinePath(openPts);
+    const residLine = smoothSplinePath(residPts);
+    const residBack = smoothSplinePath([...residPts].reverse()).replace(
+      /^M/,
+      'L',
+    );
+    const reductionArea =
+      openLine && residBack ? `${openLine} ${residBack} Z` : '';
+    const monthTicks: number[] = [];
+    for (let m = 0; m <= Math.ceil(TfChart); m++) {
+      if (m <= TfChart + 1e-9) monthTicks.push(m);
+    }
+    if (
+      monthTicks.length === 0 ||
+      Math.abs(monthTicks[monthTicks.length - 1]! - TfChart) > 1e-9
+    ) {
+      monthTicks.push(TfChart);
+    }
+    const legMarks = activeHedgeLegs.map(leg => {
+      const pt =
+        hedgedVarProfile.find(p => Math.abs(p.t - leg.tenureMonths) < 1e-6) ??
+        hedgedVarProfile.reduce((best, p) =>
+          Math.abs(p.t - leg.tenureMonths) < Math.abs(best.t - leg.tenureMonths)
+            ? p
+            : best,
+        );
+      return {
+        t: leg.tenureMonths,
+        hedgedVarUsdM: pt.hedgedVarUsdM,
+        label: leg.label,
+      };
+    });
+    return {
+      W,
+      H,
+      padL,
+      padR,
+      padT,
+      padB,
+      openLine,
+      residLine,
+      reductionArea,
+      maxVar,
+      endResidVarUsdM,
+      xScale,
+      yScale,
+      monthTicks,
+      legMarks,
+    };
+  }, [hedgedVarProfile, hedgedVarProfileFull, activeHedgeLegs]);
+
+  const resetStripToDefault = () => {
+    setStripLegCount(null);
+    setEnabledLegIds({});
+  };
+
+  /** Detail rows under the chart: each FWD (checkbox) + Tf. */
+  const hedgePerfRows = useMemo(() => {
+    if (hedgeLegs.length === 0) return [];
+    type Row = {
+      key: string;
+      label: string;
+      kind: 'leg' | 'end';
+      legIndex: number | null;
+      hedgeDeltaM: number | null;
+      cumulCoverLocalM: number;
+      endExposureM: number | null;
+      residualLocalM: number;
+      openVarUsdM: number;
+      hedgedVarUsdM: number;
+      enabled: boolean;
+    };
+    const at = (t: number) =>
+      hedgedVarProfile.find(p => Math.abs(p.t - t) < 1e-6) ??
+      (hedgedVarProfile.length
+        ? hedgedVarProfile.reduce((best, p) =>
+            Math.abs(p.t - t) < Math.abs(best.t - t) ? p : best,
+          )
+        : null);
+    const rows: Row[] = [];
+    for (const leg of hedgeLegs) {
+      const p = at(leg.tenureMonths);
+      const enabled = enabledLegIds[leg.index] !== false;
+      rows.push({
+        key: `leg-${leg.index}`,
+        label: leg.label,
+        kind: 'leg',
+        legIndex: leg.index,
+        hedgeDeltaM: leg.amountLocalM,
+        cumulCoverLocalM: enabled
+          ? (p?.cumulCoverLocalM ?? leg.cumulCoverLocalM)
+          : 0,
+        endExposureM: p?.exposureLocalM ?? leg.endExposureM,
+        residualLocalM: p?.residualCoverLocalM ?? 0,
+        openVarUsdM: p?.openVarUsdM ?? 0,
+        hedgedVarUsdM: p?.hedgedVarUsdM ?? 0,
+        enabled,
+      });
+    }
+    const endT = hedgedVarProfile[hedgedVarProfile.length - 1]?.t;
+    if (
+      endT != null &&
+      !hedgeLegs.some(l => Math.abs(l.tenureMonths - endT) < 1e-6)
+    ) {
+      const pEnd = at(endT);
+      rows.push({
+        key: 'tf',
+        label: `M${Math.round(endT)}`,
+        kind: 'end',
+        legIndex: null,
+        hedgeDeltaM: null,
+        cumulCoverLocalM: pEnd?.cumulCoverLocalM ?? 0,
+        endExposureM: pEnd?.exposureLocalM ?? pathEndM,
+        residualLocalM: pEnd?.residualCoverLocalM ?? 0,
+        openVarUsdM: pEnd?.openVarUsdM ?? 0,
+        hedgedVarUsdM: pEnd?.hedgedVarUsdM ?? 0,
+        enabled: true,
+      });
+    }
+    return rows;
+  }, [hedgeLegs, hedgedVarProfile, pathEndM, enabledLegIds]);
+
+  /** Cover from ticked legs only (unticked legs excluded from green H & resid). */
+  const activeStripCoverM = showRollingStrip
+    ? activeHedgeLegs.reduce((s, l) => s + l.amountLocalM, 0)
+    : 0;
+
   const basisTarget = showRollingStrip
-    ? rollingEdges[0]!.hedgeLocalM
+    ? activeStripCoverM
     : hedgeBasisNotionalLocalM(
         selectedBasis,
         startM,
         pathEndM,
-        equalVarHedgeLocalM,
+        matchedEqualVarLocalM,
       );
 
-  const hedgeLevel =
-    Math.abs(appliedHedgeLocalM) < 1e-12
-      ? 0
-      : Math.sign(pathEndM || startM || 1) * Math.abs(appliedHedgeLocalM);
+  // Bullet only: sync Decision % when Cash/VN/Target or structure changes.
+  // Strip must not auto-apply here — booking is explicit via "Book … forwards".
+  const onApplyBasisRef = useRef(onApplyBasis);
+  onApplyBasisRef.current = onApplyBasis;
+  const applySigRef = useRef('');
+  useEffect(() => {
+    if (effectiveStructure === 'strip') return;
+    const sig = `${effectiveStructure}|${selectedBasis}|${matchedEqualVarLocalM.toFixed(6)}|${pathEndM.toFixed(6)}`;
+    if (applySigRef.current === sig) return;
+    applySigRef.current = sig;
+    onApplyBasisRef.current(selectedBasis, effectiveStructure);
+  }, [
+    effectiveStructure,
+    selectedBasis,
+    matchedEqualVarLocalM,
+    pathEndM,
+  ]);
 
-  const stripBreakevens = useMemo(
-    () =>
-      showRollingStrip
-        ? hedgeBreakevensForStrip(path, rollingEdges, rollingSizing)
-        : [],
-    [showRollingStrip, path, rollingEdges, rollingSizing],
+  /**
+   * Flat H = Σ ticked strip fractions (all live from M0) or bullet level.
+   * Fraction-of-target strip → one cover level → one breakeven.
+   */
+  const hedgeLevel = showRollingStrip
+    ? Math.abs(activeStripCoverM) > 1e-12
+      ? activeStripCoverM
+      : 0
+    : Math.abs(basisTarget) > 1e-12
+      ? basisTarget
+      : Math.abs(appliedHedgeLocalM) < 1e-12
+        ? 0
+        : Math.sign(pathEndM || startM || 1) * Math.abs(appliedHedgeLocalM);
+
+  const hasFlatHedge = Math.abs(hedgeLevel) > 1e-9;
+
+  /** Single BE where |e| crosses flat H (strip fractions sum or bullet). */
+  const breakevenT = useMemo(
+    () => (hasFlatHedge ? hedgeBreakevenMonths(path, hedgeLevel) : null),
+    [hasFlatHedge, path, hedgeLevel],
   );
 
-  const breakevenT = useMemo(() => {
-    if (showRollingStrip) {
-      return stripBreakevens[0]?.t ?? null;
-    }
-    return hedgeBreakevenMonths(path, hedgeLevel);
-  }, [showRollingStrip, stripBreakevens, path, hedgeLevel]);
-
-  const rollingHedgePts = useMemo(
-    () => (showRollingStrip ? buildRollingHedgePathPoints(rollingEdges) : []),
-    [showRollingStrip, rollingEdges],
-  );
-
-  const hasHedge = Math.abs(appliedHedgeLocalM) > 1e-9;
+  /** Preview residual when bullet H set or any strip leg ticked. */
+  const hasHedge = showRollingStrip
+    ? activeHedgeLegs.length > 0
+    : hasFlatHedge;
 
   const geom = useMemo(() => {
     const W = 640;
@@ -197,14 +667,25 @@ export function ExposureHedgePathChart({
     const padR = 72;
     const padT = 28;
     const padB = 36;
+    // Stable Y domain from exposure path + full strip program (not ticked subset).
+    const fullProgramCover = showRollingStrip
+      ? stripTotalCoverM
+      : Math.abs(appliedHedgeLocalM) > 1e-12
+        ? Math.sign(pathEndM || startM || 1) * Math.abs(appliedHedgeLocalM)
+        : hedgeBasisNotionalLocalM(
+            selectedBasis,
+            startM,
+            pathEndM,
+            matchedEqualVarLocalM,
+          );
     const values = [
       ...path.map(p => p.exposureM),
-      hedgeLevel,
-      basisTarget,
       startM,
       pathEndM,
+      fullProgramCover,
       ...rollingEdges.map(e => e.hedgeLocalM),
       ...rollingEdges.map(e => e.endExposureM),
+      ...hedgeLegs.map(l => l.cumulCoverLocalM),
     ];
     const dataMin = Math.min(...values);
     const dataMax = Math.max(...values);
@@ -221,20 +702,6 @@ export function ExposureHedgePathChart({
     const expLine = smoothSplinePath(
       path.map(p => ({ x: xScale(p.t), y: yScale(p.exposureM) })),
     );
-    // Stepped rolling hedge polyline (horizontal + vertical joins)
-    let rollLine = '';
-    if (rollingHedgePts.length > 0) {
-      rollLine = `M${xScale(rollingHedgePts[0]!.t).toFixed(1)},${yScale(rollingHedgePts[0]!.hedgeM).toFixed(1)}`;
-      for (let i = 1; i < rollingHedgePts.length; i++) {
-        const prev = rollingHedgePts[i - 1]!;
-        const cur = rollingHedgePts[i]!;
-        if (Math.abs(cur.hedgeM - prev.hedgeM) > 1e-9) {
-          // vertical step at cur.t (after flat to prev)
-          rollLine += ` L${xScale(cur.t).toFixed(1)},${yScale(prev.hedgeM).toFixed(1)}`;
-        }
-        rollLine += ` L${xScale(cur.t).toFixed(1)},${yScale(cur.hedgeM).toFixed(1)}`;
-      }
-    }
 
     const monthTicks: number[] = [];
     for (let m = 0; m <= Math.ceil(windowMonths); m++) {
@@ -261,19 +728,21 @@ export function ExposureHedgePathChart({
       xScale,
       yScale,
       expLine,
-      rollLine,
       monthTicks,
       yTickVals,
     };
   }, [
     path,
     windowMonths,
-    hedgeLevel,
-    basisTarget,
     startM,
     pathEndM,
+    showRollingStrip,
+    stripTotalCoverM,
+    appliedHedgeLocalM,
+    selectedBasis,
+    matchedEqualVarLocalM,
     rollingEdges,
-    rollingHedgePts,
+    hedgeLegs,
   ]);
 
   const {
@@ -286,120 +755,12 @@ export function ExposureHedgePathChart({
     xScale,
     yScale,
     expLine,
-    rollLine,
     monthTicks,
     yTickVals,
   } = geom;
 
   const startGap = overhedgeGapM(startM, hedgeLevel);
-  const endGap = overhedgeGapM(
-    pathEndM,
-    showRollingStrip
-      ? rollingHedgeAtMonth(rollingEdges, windowMonths)
-      : hedgeLevel,
-  );
-
-  const residualBasis = useMemo(() => {
-    if (!hasHedge) return selectedBasis;
-    const inferred = inferHedgePathBasis(
-      hedgeLevel,
-      startM,
-      pathEndM,
-      equalVarHedgeLocalM,
-    );
-    // Prefer the chip the user applied when it still matches H
-    const chipN = hedgeBasisNotionalLocalM(
-      selectedBasis,
-      startM,
-      pathEndM,
-      equalVarHedgeLocalM,
-    );
-    return Math.abs(Math.abs(hedgeLevel) - Math.abs(chipN)) < 0.05
-      ? selectedBasis
-      : inferred;
-  }, [
-    hasHedge,
-    hedgeLevel,
-    startM,
-    pathEndM,
-    equalVarHedgeLocalM,
-    selectedBasis,
-  ]);
-
-  const residual = useMemo(() => {
-    if (showRollingStrip) {
-      return buildResidualPath(path, rollingEdges[0]!.hedgeLocalM, {
-        basis: selectedBasis,
-        startM,
-        endM: pathEndM,
-        hedgeAt: t => rollingHedgeAtMonth(rollingEdges, t),
-      });
-    }
-    if (!hasHedge) return [];
-    return buildResidualPath(path, hedgeLevel, {
-      basis: residualBasis,
-      startM,
-      endM: pathEndM,
-    });
-  }, [
-    showRollingStrip,
-    rollingEdges,
-    selectedBasis,
-    hasHedge,
-    path,
-    hedgeLevel,
-    residualBasis,
-    startM,
-    pathEndM,
-  ]);
-  const budgetNetM = residual[0]?.budgetNetM ?? 0;
-
-  const residualGeom = useMemo(() => {
-    const W = 640;
-    const H = 160;
-    const padL = 52;
-    const padR = 56;
-    const padT = 22;
-    const padB = 28;
-    if (residual.length === 0) {
-      return { W, H, padL, padR, padT, padB, absLine: '', cumLine: '', maxAbs: 1, maxCum: 1, xScale: () => padL, yAbs: () => padT, yCum: () => padT, monthTicks: [] as number[] };
-    }
-    const maxAbs = Math.max(0.2, ...residual.map(p => p.absResidualM)) * 1.1;
-    const maxCum = Math.max(0.2, ...residual.map(p => p.cumPathFactor)) * 1.1;
-    const xScale = (t: number) =>
-      padL + (windowMonths <= 0 ? 0 : (t / windowMonths) * (W - padL - padR));
-    const yAbs = (v: number) => padT + (1 - v / maxAbs) * (H - padT - padB);
-    const yCum = (v: number) => padT + (1 - v / maxCum) * (H - padT - padB);
-    const absLine = smoothSplinePath(
-      residual.map(p => ({ x: xScale(p.t), y: yAbs(p.absResidualM) })),
-    );
-    const cumLine = smoothSplinePath(
-      residual.map(p => ({ x: xScale(p.t), y: yCum(p.cumPathFactor) })),
-    );
-    const monthTicks: number[] = [];
-    for (let m = 0; m <= Math.ceil(windowMonths); m++) {
-      if (m <= windowMonths + 1e-9) monthTicks.push(m);
-    }
-    return { W, H, padL, padR, padT, padB, absLine, cumLine, maxAbs, maxCum, xScale, yAbs, yCum, monthTicks };
-  }, [residual, windowMonths]);
-
-  const peakAbsR = residual.reduce((m, p) => Math.max(m, p.absResidualM), 0);
-  const totalPathFactor = residual[residual.length - 1]?.cumPathFactor ?? 0;
-  const totalResVarUsdM = residualPathVarUsdM(
-    totalPathFactor,
-    ccy,
-    setup.confidencePct,
-  );
-  const beIdx =
-    breakevenT == null
-      ? -1
-      : residual.findIndex(p => p.t >= breakevenT - 1e-9);
-  const cumAtBe =
-    beIdx >= 0 ? residual[beIdx]!.cumPathFactor : null;
-  const varAtBe =
-    cumAtBe != null
-      ? residualPathVarUsdM(cumAtBe, ccy, setup.confidencePct)
-      : null;
+  const endGap = overhedgeGapM(pathEndM, hedgeLevel);
 
   return (
     <div className="rounded-lg border border-slate-700 bg-slate-950/50 p-3">
@@ -418,86 +779,609 @@ export function ExposureHedgePathChart({
         </div>
         <div className="rounded border border-emerald-700/40 bg-emerald-950/30 px-2 py-1.5">
           <div className="text-[9px] uppercase text-emerald-400/80">
-            Applied hedge ({Math.round(hedgeRatio * 100)}%)
+            {showRollingStrip
+              ? `Strip cover · ${
+                  selectedBasis === 'cash'
+                    ? 'Cash'
+                    : selectedBasis === 'varNeutral'
+                      ? 'VaR-neutral'
+                      : 'Target'
+                }${stripAlreadyBooked ? ' · booked' : ''}`
+              : `Hedge · ${
+                  selectedBasis === 'cash'
+                    ? 'Cash'
+                    : selectedBasis === 'varNeutral'
+                      ? 'VaR-neutral'
+                      : 'Target'
+                }`}
           </div>
           <div className="font-mono text-sm font-semibold text-emerald-200">
-            {hasHedge ? fmtM(appliedHedgeLocalM) : '—'}
+            {showRollingStrip
+              ? (() => {
+                  // Full stacked cover = last absolute edge level (≠ Decision % of Tf).
+                  const last = rollingEdges[rollingEdges.length - 1];
+                  const cover =
+                    last != null
+                      ? Math.sign(pathEndM || startM || 1) *
+                        Math.abs(last.hedgeLocalM)
+                      : hedgeLevel;
+                  return Math.abs(cover) > 1e-9 ? fmtM(cover) : '—';
+                })()
+              : hasHedge
+                ? fmtM(hedgeLevel)
+                : '—'}
           </div>
+          {showRollingStrip && rollingEdges.length > 1 && (
+            <div className="mt-0.5 text-[9px] text-emerald-200/60">
+              {rollingEdges.length} legs from M0 · M0{' '}
+              {fmtM(
+                Math.sign(pathEndM || startM || 1) *
+                  Math.abs(rollingEdges[0]!.hedgeLocalM),
+              )}
+            </div>
+          )}
         </div>
         <div className="rounded border border-amber-700/40 bg-amber-950/30 px-2 py-1.5">
           <div className="text-[9px] uppercase text-amber-400/80">
-            {showRollingStrip ? 'Breakevens' : 'Breakeven'}
+            Breakeven
           </div>
           <div className="font-mono text-sm font-semibold text-amber-200">
-            {showRollingStrip
-              ? stripBreakevens.length > 0
-                ? `${stripBreakevens.length}× strip`
-                : '—'
-              : !hasHedge
-                ? '—'
-                : breakevenT != null
-                  ? fmtMonths(breakevenT)
-                  : startGap > 0
-                    ? 'always over'
-                    : 'always under'}
+            {!hasHedge
+              ? '—'
+              : breakevenT != null
+                ? fmtMonths(breakevenT)
+                : startGap > 0
+                  ? 'always over'
+                  : 'always under'}
           </div>
-          {showRollingStrip && stripBreakevens.length > 0 && (
+          {showRollingStrip && hasHedge && (
             <div className="mt-0.5 text-[9px] text-amber-200/70">
-              {stripBreakevens.map(b => fmtMonths(b.t)).join(' · ')}
+              vs Σ ticked = {fmtM(hedgeLevel)}
             </div>
           )}
         </div>
       </div>
 
-      {rolling && rollingEdgesVarNeutral.length > 1 && (
-        <div className="mb-2 rounded-md border border-violet-700/40 bg-violet-950/30 px-2.5 py-2">
-          <div className="mb-1 text-[10px] font-semibold text-violet-200">
-            Rolling edges — VaR {Th}m &lt; forecast {setup.forecastMonths}m
-            {showRollingStrip
-              ? selectedBasis === 'cash'
-                ? ' · Cash / stock (S@start)'
-                : selectedBasis === 'totalExpected'
-                  ? ' · Total (window-end)'
-                  : ' · VaR-neutral (mid)'
-              : ' · pick Cash / VaR-neutral / Total → rolling'}
+      {showStructurePicker && (
+        <div className="mb-2 space-y-2 rounded-md border border-slate-700 bg-slate-950/40 px-2.5 py-2">
+          <div className="text-[10px] font-medium text-slate-400">
+            Hedge structure · VaR {Th}m · forecast {Tf}m
           </div>
-          <p className="mb-2 text-[10px] leading-relaxed text-slate-400">
-            One flat hedge cannot cover the full forecast. Select{' '}
-            <span className="text-slate-200">Cash</span> (stock at each roll),{' '}
-            <span className="text-slate-200">VaR-neutral strip</span> (mid), or{' '}
-            <span className="text-slate-200">Total → rolling</span> (E@end). Path
-            end {fmtM(pathEndM)}.
-          </p>
-          {showRollingStrip && (
+          <div
+            className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+            role="group"
+            aria-label="Hedge structure"
+          >
+            {(
+              [
+                {
+                  id: 'bullet' as const,
+                  label: 'Bullet',
+                  hint: 'One forward at t=0 for Cash / VaR-neutral / Target over full Tf',
+                  enabled: true,
+                },
+                {
+                  id: 'strip' as const,
+                  label: 'Rolling strip',
+                  hint: rollingAvailable
+                    ? 'Staggered forwards from M0 — each leg own size + tenure'
+                    : `Needs VaR tenor < forecast (now ${Th}m ≥ ${Tf}m)`,
+                  enabled: rollingAvailable,
+                },
+              ] as const
+            ).map(opt => {
+              const on = effectiveStructure === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  title={opt.hint}
+                  aria-pressed={on}
+                  disabled={!opt.enabled}
+                  onClick={() => setStructure(opt.id)}
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                    on
+                      ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          {effectiveStructure === 'bullet' ? (
+            <p className="text-[10px] leading-relaxed text-slate-400">
+              <span className="text-slate-200">Bullet</span> — Equal-VaR sized at
+              forecast {Tf}m. VaR-neutral = mid (Ē / RMS); Target = E_end — pick
+              the chip below for path / residual P&L. One forward at t=0.
+            </p>
+          ) : (
+            <p className="text-[10px] leading-relaxed text-slate-400">
+              <span className="text-slate-200">Rolling strip</span> — picking
+              Cash / VN / Target <span className="text-slate-300">books</span>{' '}
+              every forward from M0 (own size + tenure). Live VaR uses Σ leg
+              VaRs — not Decision % of Target.
+            </p>
+          )}
+
+          <div className="border-t border-slate-800 pt-2">
+            <div className="mb-1 text-[10px] text-slate-500">Apply hedge path</div>
+            <div
+              className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+              role="group"
+              aria-label="Apply hedge path"
+            >
+              {HEDGE_PATH_BASIS_OPTIONS.map(opt => {
+                const on = selectedBasis === opt.id;
+                const stripEdges =
+                  opt.id === 'cash'
+                    ? rollingEdgesCash
+                    : opt.id === 'totalExpected'
+                      ? rollingEdgesTotal
+                      : opt.id === 'varNeutral'
+                        ? rollingEdgesVarNeutral
+                        : [];
+                const useStrip = rolling && stripEdges.length > 1;
+                const n = useStrip
+                  ? stripEdges[stripEdges.length - 1]!.hedgeLocalM
+                  : hedgeBasisNotionalLocalM(
+                      opt.id,
+                      startM,
+                      pathEndM,
+                      matchedEqualVarLocalM,
+                    );
+                const n0 = useStrip ? stripEdges[0]!.hedgeLocalM : n;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    title={
+                      useStrip
+                        ? `${opt.description} → preview ${stripEdges.length}-leg strip from M0 (cover ${fmtM(n)}, M0 ${fmtM(n0)}); use Book to commit`
+                        : `${opt.description} → set Hedge N = ${fmtM(n)}`
+                    }
+                    disabled={
+                      Math.abs(matchedEqualVarLocalM) < 1e-9 &&
+                      Math.abs(startM) < 1e-9
+                    }
+                    onClick={() => {
+                      onSelectedBasisChange(opt.id);
+                      onApplyBasis(opt.id, effectiveStructure);
+                    }}
+                    aria-pressed={on}
+                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                      on
+                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    {opt.id === 'cash'
+                      ? useStrip
+                        ? 'Cash → rolling'
+                        : 'Cash (stock)'
+                      : opt.id === 'varNeutral'
+                        ? useStrip
+                          ? 'VaR-neutral → strip'
+                          : 'VaR-neutral'
+                        : useStrip
+                          ? 'Target → rolling'
+                          : 'Target (Total)'}
+                    <span
+                      className={`ml-1 font-mono text-[10px] font-normal ${
+                        on ? 'text-emerald-200/80' : 'text-slate-500'
+                      }`}
+                    >
+                      {fmtM(n)}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {showHedgePerf && (
             <>
-              <div className="mb-2 overflow-x-auto">
-                <table className="w-full min-w-[320px] text-left text-[10px]">
-                  <thead>
-                    <tr className="text-slate-500">
-                      <th className="py-1 pr-2 font-medium">Edge</th>
-                      <th className="py-1 pr-2 font-medium">Stock @ start</th>
-                      <th className="py-1 pr-2 font-medium">Hedge N</th>
-                      <th className="py-1 font-medium">E @ end</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rollingEdges.map(e => (
-                      <tr
-                        key={e.index}
-                        className="border-t border-slate-800/80 font-mono text-slate-300"
+              <div className="mb-2 rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
+                <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                  {showRollingStrip ? 'Strip' : 'Bullet'} · resid VaR profile
+                </div>
+                <p className="mb-2 text-[9px] leading-relaxed text-slate-500">
+                  Same resid formula as VaR Evolution: V(t)·|e−H|/E. Shaded right
+                  = beyond forecast (e flat at E_end; yellow resid keeps growing
+                  with tenure when H &lt; E_end).
+                </p>
+
+                {hedgedVarProfile.length > 0 && (
+                  <>
+                    <svg
+                      viewBox={`0 0 ${hedgedVarProfileGeom.W} ${hedgedVarProfileGeom.H}`}
+                      className="mb-1 h-auto w-full max-w-full rounded border border-slate-800 bg-slate-950"
+                      role="img"
+                      aria-label={`${ccy} open VaR before hedge vs residual VaR`}
+                    >
+                      {hedgedVarProfileGeom.monthTicks.map(m => (
+                        <g key={`hv-m-${m}`}>
+                          <line
+                            x1={hedgedVarProfileGeom.xScale(m)}
+                            x2={hedgedVarProfileGeom.xScale(m)}
+                            y1={hedgedVarProfileGeom.padT}
+                            y2={
+                              hedgedVarProfileGeom.H - hedgedVarProfileGeom.padB
+                            }
+                            stroke={
+                              m === 0 ||
+                              Math.abs(
+                                m -
+                                  (hedgedVarProfile[hedgedVarProfile.length - 1]
+                                    ?.t ?? 0),
+                              ) < 1e-9
+                                ? '#475569'
+                                : '#1e293b'
+                            }
+                          />
+                          <text
+                            x={hedgedVarProfileGeom.xScale(m)}
+                            y={
+                              hedgedVarProfileGeom.H -
+                              hedgedVarProfileGeom.padB +
+                              14
+                            }
+                            textAnchor="middle"
+                            className="fill-slate-400"
+                            style={{ fontSize: 9 }}
+                          >
+                            {Number.isInteger(m) ? `M${m}` : `${m.toFixed(1)}m`}
+                          </text>
+                        </g>
+                      ))}
+                      {/* Forecast vs beyond-forecast regions */}
+                      {Tf > 0 &&
+                        hedgedVarProfile[hedgedVarProfile.length - 1]!.t >
+                          Tf + 1e-9 && (
+                          <g>
+                            <rect
+                              x={hedgedVarProfileGeom.xScale(Tf)}
+                              y={hedgedVarProfileGeom.padT}
+                              width={Math.max(
+                                0,
+                                hedgedVarProfileGeom.xScale(
+                                  hedgedVarProfile[
+                                    hedgedVarProfile.length - 1
+                                  ]!.t,
+                                ) - hedgedVarProfileGeom.xScale(Tf),
+                              )}
+                              height={
+                                hedgedVarProfileGeom.H -
+                                hedgedVarProfileGeom.padT -
+                                hedgedVarProfileGeom.padB
+                              }
+                              fill="rgba(148, 163, 184, 0.1)"
+                              stroke="none"
+                            />
+                            <line
+                              x1={hedgedVarProfileGeom.xScale(Tf)}
+                              x2={hedgedVarProfileGeom.xScale(Tf)}
+                              y1={hedgedVarProfileGeom.padT}
+                              y2={
+                                hedgedVarProfileGeom.H -
+                                hedgedVarProfileGeom.padB
+                              }
+                              stroke="#94a3b8"
+                              strokeWidth={1.25}
+                              strokeDasharray="3 3"
+                            />
+                            <text
+                              x={
+                                (hedgedVarProfileGeom.padL +
+                                  hedgedVarProfileGeom.xScale(Tf)) /
+                                2
+                              }
+                              y={hedgedVarProfileGeom.padT - 4}
+                              textAnchor="middle"
+                              className="fill-slate-500"
+                              style={{ fontSize: 8 }}
+                            >
+                              forecast
+                            </text>
+                            <text
+                              x={
+                                (hedgedVarProfileGeom.xScale(Tf) +
+                                  hedgedVarProfileGeom.W -
+                                  hedgedVarProfileGeom.padR) /
+                                2
+                              }
+                              y={hedgedVarProfileGeom.padT - 4}
+                              textAnchor="middle"
+                              className="fill-slate-400"
+                              style={{ fontSize: 8, fontWeight: 600 }}
+                            >
+                              beyond Tf · resid evolves
+                            </text>
+                          </g>
+                        )}
+                      {/* End resid level — light horizontal guide */}
+                      <line
+                        x1={hedgedVarProfileGeom.padL}
+                        x2={
+                          hedgedVarProfileGeom.W - hedgedVarProfileGeom.padR
+                        }
+                        y1={hedgedVarProfileGeom.yScale(
+                          hedgedVarProfileGeom.endResidVarUsdM,
+                        )}
+                        y2={hedgedVarProfileGeom.yScale(
+                          hedgedVarProfileGeom.endResidVarUsdM,
+                        )}
+                        stroke="#e2e8f0"
+                        strokeWidth={1}
+                        strokeDasharray="4 3"
+                        opacity={0.4}
+                      />
+                      {/* Reduction band: open VaR − resid */}
+                      {hedgedVarProfileGeom.reductionArea && (
+                        <path
+                          d={hedgedVarProfileGeom.reductionArea}
+                          fill="rgba(52, 211, 153, 0.22)"
+                          stroke="none"
+                        />
+                      )}
+                      {/* Original open VaR before hedge (dashed) */}
+                      <path
+                        d={hedgedVarProfileGeom.openLine}
+                        fill="none"
+                        stroke="#94a3b8"
+                        strokeWidth={1.75}
+                        strokeDasharray="4 3"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        opacity={0.95}
+                      />
+                      <path
+                        d={hedgedVarProfileGeom.residLine}
+                        fill="none"
+                        stroke="#fcd34d"
+                        strokeWidth={2.25}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        opacity={0.95}
+                      />
+                      {/* Single BE (same t as exposure path chart) */}
+                      {breakevenT != null &&
+                        (() => {
+                          const residAtBe =
+                            hedgedVarProfile.find(
+                              p => Math.abs(p.t - breakevenT) < 1e-6,
+                            ) ??
+                            hedgedVarProfile.reduce((best, p) =>
+                              Math.abs(p.t - breakevenT) <
+                              Math.abs(best.t - breakevenT)
+                                ? p
+                                : best,
+                            );
+                          return (
+                            <g key={`var-be-${breakevenT}`}>
+                              <line
+                                x1={hedgedVarProfileGeom.xScale(breakevenT)}
+                                x2={hedgedVarProfileGeom.xScale(breakevenT)}
+                                y1={hedgedVarProfileGeom.padT}
+                                y2={
+                                  hedgedVarProfileGeom.H -
+                                  hedgedVarProfileGeom.padB
+                                }
+                                stroke="#fbbf24"
+                                strokeWidth={1.25}
+                                strokeDasharray="4 3"
+                              />
+                              <circle
+                                cx={hedgedVarProfileGeom.xScale(breakevenT)}
+                                cy={hedgedVarProfileGeom.yScale(
+                                  residAtBe.hedgedVarUsdM,
+                                )}
+                                r={4}
+                                fill="#fbbf24"
+                                stroke="#0f172a"
+                                strokeWidth={1}
+                              />
+                              <text
+                                x={hedgedVarProfileGeom.xScale(breakevenT)}
+                                y={hedgedVarProfileGeom.padT - 4}
+                                textAnchor="middle"
+                                className="fill-amber-300"
+                                style={{ fontSize: 8, fontWeight: 600 }}
+                              >
+                                BE {fmtMonths(breakevenT)}
+                              </text>
+                            </g>
+                          );
+                        })()}
+                      <text
+                        x={hedgedVarProfileGeom.padL}
+                        y={hedgedVarProfileGeom.padT + 8}
+                        className="fill-slate-500"
+                        style={{ fontSize: 8 }}
                       >
-                        <td className="py-1 pr-2 text-violet-200">{e.label}</td>
-                        <td className="py-1 pr-2">{fmtM(e.stockStartM)}</td>
-                        <td className="py-1 pr-2 font-semibold text-emerald-300">
-                          {fmtM(e.hedgeLocalM)}
-                        </td>
-                        <td className="py-1">{fmtM(e.endExposureM)}</td>
+                        {fmtVarK(hedgedVarProfileGeom.maxVar)}
+                      </text>
+                      <text
+                        x={hedgedVarProfileGeom.padL + 4}
+                        y={
+                          hedgedVarProfileGeom.yScale(
+                            hedgedVarProfileGeom.endResidVarUsdM,
+                          ) - 4
+                        }
+                        textAnchor="start"
+                        className="fill-slate-300"
+                        style={{ fontSize: 8 }}
+                      >
+                        resid @ M
+                        {Math.round(
+                          hedgedVarProfile[hedgedVarProfile.length - 1]?.t ??
+                            Tf,
+                        )}{' '}
+                        {fmtVarK(hedgedVarProfileGeom.endResidVarUsdM)}
+                      </text>
+                    </svg>
+                    <div className="mt-1.5 flex flex-wrap gap-3 text-[9px] text-slate-500">
+                      <span>
+                        <span className="mr-1 inline-block h-0.5 w-3 border-t border-dashed border-slate-400 align-middle" />
+                        Open VaR (before hedge)
+                      </span>
+                      <span>
+                        <span className="mr-1 inline-block h-2 w-3 rounded-sm bg-emerald-400/30 align-middle" />
+                        Reduction
+                      </span>
+                      <span>
+                        <span className="mr-1 inline-block h-0.5 w-3 bg-amber-300 align-middle" />
+                        Remaining resid
+                      </span>
+                      <span className="text-amber-300/80">· BE</span>
+                      <span className="text-slate-400">
+                        · light line = resid @ window end
+                      </span>
+                    </div>
+                  </>
+                )}
+
+                <div className="mt-2 overflow-x-auto">
+                  <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-[9px] font-medium uppercase tracking-wide text-slate-500">
+                      Performance · tick trades to show/hide green hedge
+                    </div>
+                    {showRollingStrip && (
+                      <div className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-0.5">
+                        <button
+                          type="button"
+                          onClick={resetStripToDefault}
+                          className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+                          title={`Reset to default ${defaultStripLegs} legs (ceil(Tf/Th)) for current parameters, all trades on`}
+                        >
+                          Reset
+                        </button>
+                        <span className="text-[9px] text-slate-600">|</span>
+                        <span className="text-[9px] text-slate-500">
+                          Strip legs
+                        </span>
+                        <button
+                          type="button"
+                          disabled={effectiveStripLegs <= 2}
+                          onClick={() =>
+                            setStripLegCount(
+                              Math.max(2, effectiveStripLegs - 1),
+                            )
+                          }
+                          className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-30"
+                          title="Fewer strip forwards (min 2)"
+                        >
+                          −
+                        </button>
+                        <span className="min-w-[1.25rem] text-center font-mono text-[11px] text-amber-200">
+                          {effectiveStripLegs}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={effectiveStripLegs >= maxStripLegs}
+                          onClick={() =>
+                            setStripLegCount(
+                              Math.min(maxStripLegs, effectiveStripLegs + 1),
+                            )
+                          }
+                          className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-30"
+                          title={`More strip forwards (max ${maxStripLegs})`}
+                        >
+                          +
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <table className="w-full min-w-[420px] text-left text-[10px]">
+                    <thead>
+                      <tr className="text-slate-500">
+                        <th className="py-1 pr-1 font-medium" title="Include in resid VaR profile">
+                          On
+                        </th>
+                        <th className="py-1 pr-2 font-medium">
+                          {showRollingStrip ? 'Forward / t' : 'Forward'}
+                        </th>
+                        <th className="py-1 pr-2 font-medium">Hedge N</th>
+                        <th className="py-1 pr-2 font-medium">e @ t</th>
+                        <th className="py-1 pr-2 font-medium">|e−H|</th>
+                        <th className="py-1 pr-2 font-medium">Open VaR</th>
+                        <th className="py-1 font-medium">Resid VaR</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {hedgePerfRows.map(row => (
+                        <tr
+                          key={row.key}
+                          className={`border-t border-slate-800/80 font-mono text-slate-300 ${
+                            row.kind === 'leg' && !row.enabled
+                              ? 'opacity-40'
+                              : ''
+                          }`}
+                        >
+                          <td className="py-1 pr-1">
+                            {row.legIndex != null ? (
+                              <input
+                                type="checkbox"
+                                checked={row.enabled}
+                                onChange={() =>
+                                  setEnabledLegIds(prev => ({
+                                    ...prev,
+                                    [row.legIndex!]: !row.enabled,
+                                  }))
+                                }
+                                className="h-3.5 w-3.5 cursor-pointer rounded border-slate-600 bg-slate-900 text-emerald-500 focus:ring-emerald-500/40"
+                                title={
+                                  row.enabled
+                                    ? 'Exclude trade from resid VaR profile'
+                                    : 'Include trade in resid VaR profile'
+                                }
+                              />
+                            ) : (
+                              <span className="text-slate-600">—</span>
+                            )}
+                          </td>
+                          <td className="py-1 pr-2 text-slate-300">
+                            {row.label}
+                            {row.kind === 'end' ? (
+                              <span className="ml-1 text-[8px] text-slate-500">
+                                Tf
+                              </span>
+                            ) : null}
+                          </td>
+                          <td className="py-1 pr-2 text-emerald-300/90">
+                            {row.hedgeDeltaM != null
+                              ? fmtM(row.hedgeDeltaM)
+                              : '—'}
+                          </td>
+                          <td className="py-1 pr-2 text-slate-400">
+                            {row.endExposureM != null
+                              ? fmtM(row.endExposureM)
+                              : '—'}
+                          </td>
+                          <td className="py-1 pr-2 text-amber-300/90">
+                            {fmtM(row.residualLocalM)}
+                          </td>
+                          <td className="py-1 pr-2 text-slate-400">
+                            {fmtVarK(row.openVarUsdM)}
+                          </td>
+                          <td
+                            className={`py-1 font-semibold ${
+                              row.hedgedVarUsdM < 1e-6
+                                ? 'text-emerald-300'
+                                : 'text-amber-200'
+                            }`}
+                          >
+                            {fmtVarK(row.hedgedVarUsdM)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-              {onBookRollingStrip && (
+
+              {showRollingStrip && onBookRollingStrip && (
                 <button
                   type="button"
                   disabled={stripAlreadyBooked}
@@ -506,18 +1390,18 @@ export function ExposureHedgePathChart({
                   title={
                     stripAlreadyBooked
                       ? 'Strip already on the book — cancel it to rebook'
-                      : 'Book M0 forward now; later edges stay scheduled until roll date'
+                      : `Book ${rollingEdges.length} forwards from M0 (incremental size, tenure to each edge end)`
                   }
                 >
                   {stripAlreadyBooked
-                    ? 'Strip booked'
+                    ? 'Strip booked (re-apply chip to replace)'
                     : `Book ${
                         selectedBasis === 'cash'
                           ? 'Cash/stock'
                           : selectedBasis === 'totalExpected'
                             ? 'Total'
                             : 'VaR-neutral'
-                      } M0 + ${rollingEdges.length - 1} scheduled`}
+                      } ${rollingEdges.length}-leg strip`}
                 </button>
               )}
             </>
@@ -525,75 +1409,67 @@ export function ExposureHedgePathChart({
         </div>
       )}
 
-      <div className="mb-2 flex flex-wrap items-center gap-1.5">
-        <span className="text-[10px] text-slate-500">Apply hedge path</span>
-        {HEDGE_PATH_BASIS_OPTIONS.map(opt => {
-          const on = selectedBasis === opt.id;
-          const stripEdges =
-            opt.id === 'cash'
-              ? rollingEdgesCash
-              : opt.id === 'totalExpected'
-                ? rollingEdgesTotal
-                : opt.id === 'varNeutral'
-                  ? rollingEdgesVarNeutral
-                  : [];
-          const useStrip = rolling && stripEdges.length > 1;
-          const n = useStrip
-            ? stripEdges[0]!.hedgeLocalM
-            : hedgeBasisNotionalLocalM(
+      {!showStructurePicker && (
+        <div className="mb-2">
+          <div className="mb-1 text-[10px] text-slate-500">Apply hedge path</div>
+          <div
+            className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+            role="group"
+            aria-label="Apply hedge path"
+          >
+            {HEDGE_PATH_BASIS_OPTIONS.map(opt => {
+              const on = selectedBasis === opt.id;
+              const n = hedgeBasisNotionalLocalM(
                 opt.id,
                 startM,
                 pathEndM,
-                equalVarHedgeLocalM,
+                matchedEqualVarLocalM,
               );
-          return (
-            <button
-              key={opt.id}
-              type="button"
-              title={
-                useStrip
-                  ? `${opt.description} → first edge ${fmtM(n)}; full strip in table above`
-                  : `${opt.description} → set Hedge N = ${fmtM(n)}`
-              }
-              disabled={Math.abs(equalVarHedgeLocalM) < 1e-9 && Math.abs(startM) < 1e-9}
-              onClick={() => {
-                onSelectedBasisChange(opt.id);
-                onApplyBasis(opt.id);
-              }}
-              aria-pressed={on}
-              className={`rounded-md border px-2.5 py-1.5 text-[10px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                on
-                  ? 'border-violet-400 bg-violet-500/25 text-violet-50 ring-2 ring-violet-400/80 shadow-[0_0_0_1px_rgba(167,139,250,0.45)]'
-                  : 'border-slate-700 text-slate-300 hover:border-violet-600/50 hover:bg-violet-500/10'
-              }`}
-            >
-              {opt.id === 'cash'
-                ? useStrip
-                  ? 'Cash (stock) → rolling'
-                  : 'Cash (stock)'
-                : opt.id === 'varNeutral'
-                  ? useStrip
-                    ? 'VaR-neutral → strip'
-                    : 'VaR-neutral'
-                  : useStrip
-                    ? 'Target (Total) → rolling'
-                    : 'Target (Total)'}
-              {on ? (
-                <span className="ml-1 rounded bg-violet-400/30 px-1 text-[9px] uppercase tracking-wide">
-                  on
-                </span>
-              ) : null}
-              <span className="ml-1 font-mono font-normal opacity-90">{fmtM(n)}</span>
-            </button>
-          );
-        })}
-      </div>
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  title={`${opt.description} → set Hedge N = ${fmtM(n)}`}
+                  disabled={
+                    Math.abs(matchedEqualVarLocalM) < 1e-9 &&
+                    Math.abs(startM) < 1e-9
+                  }
+                  onClick={() => {
+                    onSelectedBasisChange(opt.id);
+                    onApplyBasis(opt.id, effectiveStructure);
+                  }}
+                  aria-pressed={on}
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                    on
+                      ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {opt.id === 'cash'
+                    ? 'Cash (stock)'
+                    : opt.id === 'varNeutral'
+                      ? 'VaR-neutral'
+                      : 'Target (Total)'}
+                  <span
+                    className={`ml-1 font-mono text-[10px] font-normal ${
+                      on ? 'text-emerald-200/80' : 'text-slate-500'
+                    }`}
+                  >
+                    {fmtM(n)}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <p className="mb-1.5 text-[10px] text-slate-500">
-        Blue = expected exposure e(t) over {windowMonths}m
-        {Th !== windowMonths ? ` (VaR horizon ${Th}m)` : ''}. Purple dashed =
-        selected regime / strip. Green = applied Decision hedge. Amber band =
-        overhedged (|H| &gt; |e|).
+        Blue = e(t) over {windowMonths}m (forecast to Tf={Tf}m
+        {windowMonths > Tf + 1e-9 ? ', then flat beyond forecast' : ''}
+        ). Strip ladder: each forward on its window only. Tick → green segment;
+        untick → purple dashed. Roll connectors stay purple. Amber = overhedged
+        vs Σ ticked H.
       </p>
 
       <svg
@@ -648,7 +1524,49 @@ export function ExposureHedgePathChart({
           </g>
         ))}
 
-        {/* Overhedge band */}
+        {/* Post-forecast band: e flat, resid VaR still evolves (same as Evolution) */}
+        {Tf > 0 && windowMonths > Tf + 1e-9 && (
+          <g>
+            <rect
+              x={xScale(Tf)}
+              y={padT}
+              width={Math.max(0, xScale(windowMonths) - xScale(Tf))}
+              height={H - padT - padB}
+              fill="rgba(148, 163, 184, 0.08)"
+              stroke="none"
+            />
+            <line
+              x1={xScale(Tf)}
+              x2={xScale(Tf)}
+              y1={padT}
+              y2={H - padB}
+              stroke="#94a3b8"
+              strokeWidth={1.25}
+              strokeDasharray="4 3"
+            />
+            <text
+              x={(xScale(Tf) + xScale(windowMonths)) / 2}
+              y={padT + 12}
+              textAnchor="middle"
+              fill="#94a3b8"
+              fontSize={9}
+              fontWeight={600}
+            >
+              beyond forecast
+            </text>
+            <text
+              x={(xScale(0) + xScale(Tf)) / 2}
+              y={padT + 12}
+              textAnchor="middle"
+              fill="#64748b"
+              fontSize={9}
+            >
+              forecast
+            </text>
+          </g>
+        )}
+
+        {/* Overhedge band vs flat H (Σ ticked fractions or bullet) */}
         {hasHedge &&
           path.slice(0, -1).map((p, i) => {
             const n = path[i + 1]!;
@@ -665,35 +1583,87 @@ export function ExposureHedgePathChart({
             );
           })}
 
-        {/* Rolling strip (Tf > Th): stepped VaR-window hedges */}
-        {showRollingStrip && rollLine && (
-          <>
-            <path
-              d={rollLine}
-              fill="none"
-              stroke="#a78bfa"
-              strokeWidth={2}
-              strokeDasharray="6 3"
-              strokeLinejoin="round"
-              strokeLinecap="round"
-            />
-            {rollingEdges.map(e => (
-              <text
-                key={`rl-${e.index}`}
-                x={xScale((e.startMonth + e.endMonth) / 2)}
-                y={yScale(e.hedgeLocalM) - 6}
-                textAnchor="middle"
-                fill="#c4b5fd"
-                fontSize={9}
-                fontWeight={600}
-              >
-                {e.label} {fmtM(e.hedgeLocalM)}
-              </text>
-            ))}
-          </>
-        )}
+        {/* Strip ladder: each forward only on its window [start,end] — not from Y-axis.
+            Green solid = ticked; purple dashed = unticked. Vertical rolls stay purple. */}
+        {showRollingStrip &&
+          rollingEdges.map(e => {
+            const leg = hedgeLegs.find(l => l.index === e.index);
+            const on = enabledLegIds[e.index] !== false;
+            const x0 = xScale(e.startMonth);
+            const x1 = xScale(Math.max(e.startMonth, e.endMonth));
+            const y = yScale(e.hedgeLocalM);
+            const delta = leg?.amountLocalM ?? e.hedgeLocalM;
+            const label = leg?.label ?? e.label;
+            return (
+              <g key={`fwd-${e.index}`}>
+                <line
+                  x1={x0}
+                  x2={x1}
+                  y1={y}
+                  y2={y}
+                  stroke={on ? '#34d399' : '#a78bfa'}
+                  strokeWidth={on ? 2.25 : 2}
+                  strokeDasharray={on ? undefined : '6 3'}
+                  strokeLinecap="round"
+                />
+                <text
+                  x={(x0 + x1) / 2}
+                  y={y - 6}
+                  textAnchor="middle"
+                  fill={on ? '#6ee7b7' : '#c4b5fd'}
+                  fontSize={9}
+                  fontWeight={600}
+                >
+                  {label} {fmtM(delta)}
+                </text>
+              </g>
+            );
+          })}
 
-        {/* Purple dashed = selected regime target (flat) */}
+        {/* Purple vertical ladder connectors at roll / next-forward switch */}
+        {showRollingStrip &&
+          rollingEdges.slice(0, -1).map((e, i) => {
+            const next = rollingEdges[i + 1]!;
+            const t = e.endMonth;
+            if (!(t > 1e-9) || !(t < windowMonths + 1e-9)) return null;
+            const y0 = yScale(e.hedgeLocalM);
+            const y1 = yScale(next.hedgeLocalM);
+            return (
+              <g key={`roll-${e.index}`}>
+                <line
+                  x1={xScale(t)}
+                  x2={xScale(t)}
+                  y1={padT}
+                  y2={H - padB}
+                  stroke="#a78bfa"
+                  strokeWidth={1}
+                  strokeDasharray="3 4"
+                  opacity={0.35}
+                />
+                <line
+                  x1={xScale(t)}
+                  x2={xScale(t)}
+                  y1={Math.min(y0, y1)}
+                  y2={Math.max(y0, y1)}
+                  stroke="#a78bfa"
+                  strokeWidth={2}
+                  strokeDasharray="4 3"
+                  strokeLinecap="round"
+                />
+                <text
+                  x={xScale(t) + 4}
+                  y={(y0 + y1) / 2 + 3}
+                  fill="#c4b5fd"
+                  fontSize={8}
+                  fontWeight={600}
+                >
+                  →{Number.isInteger(t) ? `M${t}` : t.toFixed(1)}
+                </text>
+              </g>
+            );
+          })}
+
+        {/* Purple dashed = bullet regime target when it differs from applied */}
         {!showRollingStrip && Math.abs(basisTarget) > 1e-9 && (
           <>
             <line
@@ -721,7 +1691,7 @@ export function ExposureHedgePathChart({
           </>
         )}
 
-        {/* Green = applied Decision hedge — always when set (incl. after regime switch) */}
+        {/* Bullet: green = applied cover (strip greens are per ticked forward above) */}
         {hasHedge && !showRollingStrip && (
           <>
             <line
@@ -748,26 +1718,16 @@ export function ExposureHedgePathChart({
           </>
         )}
         {hasHedge && showRollingStrip && (
-          <>
-            <line
-              x1={padL}
-              x2={xScale(rollingEdges[0]?.endMonth ?? Th)}
-              y1={yScale(hedgeLevel)}
-              y2={yScale(hedgeLevel)}
-              stroke="#34d399"
-              strokeWidth={2.25}
-            />
-            <text
-              x={W - padR - 4}
-              y={yScale(hedgeLevel) - 4}
-              textAnchor="end"
-              fill="#6ee7b7"
-              fontSize={10}
-              fontWeight={600}
-            >
-              Hedge @M0 {fmtM(hedgeLevel)}
-            </text>
-          </>
+          <text
+            x={W - padR - 4}
+            y={yScale(hedgeLevel) - 4}
+            textAnchor="end"
+            fill="#6ee7b7"
+            fontSize={9}
+            fontWeight={600}
+          >
+            Σ H {fmtM(hedgeLevel)}
+          </text>
         )}
 
         {/* Exposure path */}
@@ -792,13 +1752,15 @@ export function ExposureHedgePathChart({
           S {fmtM(startM)}
         </text>
         <circle
-          cx={xScale(windowMonths)}
+          cx={xScale(Tf > 0 && windowMonths > Tf + 1e-9 ? Tf : windowMonths)}
           cy={yScale(pathEndM)}
           r={5}
           fill="#38bdf8"
         />
         <text
-          x={xScale(windowMonths) - 8}
+          x={
+            xScale(Tf > 0 && windowMonths > Tf + 1e-9 ? Tf : windowMonths) - 8
+          }
           y={yScale(pathEndM) - 8}
           textAnchor="end"
           fill="#7dd3fc"
@@ -808,71 +1770,38 @@ export function ExposureHedgePathChart({
           E {fmtM(pathEndM)}
         </text>
 
-        {/* Breakeven(s) — one per strip edge, or single flat BE */}
-        {showRollingStrip
-          ? stripBreakevens.map(be => (
-              <g key={`be-${be.edgeIndex}`}>
-                <line
-                  x1={xScale(be.t)}
-                  x2={xScale(be.t)}
-                  y1={padT}
-                  y2={H - padB}
-                  stroke="#fbbf24"
-                  strokeWidth={1.25}
-                  strokeDasharray="4 3"
-                />
-                <circle
-                  cx={xScale(be.t)}
-                  cy={yScale(rollingHedgeAtMonth(rollingEdges, be.t))}
-                  r={4}
-                  fill="#fbbf24"
-                  stroke="#0f172a"
-                  strokeWidth={1}
-                />
-                <text
-                  x={xScale(be.t)}
-                  y={padT - 6}
-                  textAnchor="middle"
-                  fill="#fcd34d"
-                  fontSize={8}
-                  fontWeight={600}
-                >
-                  BE {be.label}
-                </text>
-              </g>
-            ))
-          : breakevenT != null &&
-            hasHedge && (
-              <>
-                <line
-                  x1={xScale(breakevenT)}
-                  x2={xScale(breakevenT)}
-                  y1={padT}
-                  y2={H - padB}
-                  stroke="#fbbf24"
-                  strokeWidth={1.5}
-                  strokeDasharray="4 3"
-                />
-                <circle
-                  cx={xScale(breakevenT)}
-                  cy={yScale(hedgeLevel)}
-                  r={5}
-                  fill="#fbbf24"
-                  stroke="#0f172a"
-                  strokeWidth={1}
-                />
-                <text
-                  x={xScale(breakevenT)}
-                  y={padT - 6}
-                  textAnchor="middle"
-                  fill="#fcd34d"
-                  fontSize={10}
-                  fontWeight={600}
-                >
-                  BE {fmtMonths(breakevenT)}
-                </text>
-              </>
-            )}
+        {/* Single breakeven vs flat H */}
+        {breakevenT != null && hasHedge && (
+          <>
+            <line
+              x1={xScale(breakevenT)}
+              x2={xScale(breakevenT)}
+              y1={padT}
+              y2={H - padB}
+              stroke="#fbbf24"
+              strokeWidth={1.5}
+              strokeDasharray="4 3"
+            />
+            <circle
+              cx={xScale(breakevenT)}
+              cy={yScale(hedgeLevel)}
+              r={5}
+              fill="#fbbf24"
+              stroke="#0f172a"
+              strokeWidth={1}
+            />
+            <text
+              x={xScale(breakevenT)}
+              y={padT - 6}
+              textAnchor="middle"
+              fill="#fcd34d"
+              fontSize={10}
+              fontWeight={600}
+            >
+              BE {fmtMonths(breakevenT)}
+            </text>
+          </>
+        )}
 
         <text
           x={(padL + W - padR) / 2}
@@ -891,11 +1820,18 @@ export function ExposureHedgePathChart({
         </span>
         <span className="inline-flex items-center gap-1">
           <span className="inline-block h-0.5 w-3 border-t-2 border-dashed border-violet-400" />{' '}
-          {showRollingStrip ? 'Rolling strip' : 'Selected target'}
+          Unticked / planned
         </span>
         <span className="inline-flex items-center gap-1">
-          <span className="inline-block h-0.5 w-3 bg-emerald-400" /> Applied hedge
+          <span className="inline-block h-0.5 w-3 bg-emerald-400" />{' '}
+          {showRollingStrip ? 'Ticked forward' : 'Applied hedge'}
         </span>
+        {showRollingStrip && (
+          <span className="inline-flex items-center gap-1">
+            <span className="inline-block h-3 w-0 border-l-2 border-dashed border-violet-400" />{' '}
+            Roll / next forward
+          </span>
+        )}
         <span className="inline-flex items-center gap-1">
           <span className="inline-block h-2 w-2 rounded-sm bg-amber-500/40" /> Overhedged
         </span>
@@ -909,152 +1845,6 @@ export function ExposureHedgePathChart({
         )}
       </div>
 
-      {hasHedge && residual.length > 0 && (
-        <div className="mt-4 border-t border-slate-800 pt-3">
-          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-300">
-            What the bottom chart shows
-          </div>
-          <div className="mb-3 space-y-1.5 text-[11px] leading-relaxed text-slate-400">
-            <p>
-              A <span className="text-slate-200">flat hedge</span> is a constant
-              notional offset vs growing e(t). Residual risk accrues from{' '}
-              <span className="text-slate-200">t=0</span> as{' '}
-              <span className="text-orange-300">√∫(e−H)²</span> — when |e−H| is
-              roughly constant that tracks <span className="text-slate-200">|r|√t</span>
-              , so orange cannot stay flat in month 1.
-            </p>
-            <p>
-              <span className="font-semibold text-rose-300">Rose — |e−H|</span>
-              : mismatch path (U-shaped for VaR-neutral: over → BE → under; Total
-              falls to ~0 at maturity).
-            </p>
-            <p>
-              <span className="font-semibold text-orange-300">Orange — √∫r²</span>
-              : path residual factor from t=0 (over- and under-hedge). End |e−H|
-              can be ~0 for Cash/Total while path residual VaR is still &gt; 0.
-            </p>
-          </div>
-          <div className="mb-2 grid gap-2 sm:grid-cols-3">
-            <div className="rounded border border-rose-700/40 bg-rose-950/25 px-2 py-1.5">
-              <div className="text-[9px] uppercase text-rose-400/80">
-                Peak |e−H|
-              </div>
-              <div className="font-mono text-sm font-semibold text-rose-200">
-                {fmtM(peakAbsR)}
-              </div>
-            </div>
-            <div className="rounded border border-orange-700/40 bg-orange-950/25 px-2 py-1.5">
-              <div className="text-[9px] uppercase text-orange-400/80">
-                Residual VaR @ end
-              </div>
-              <div className="font-mono text-sm font-semibold text-orange-200">
-                {fmtVarK(totalResVarUsdM)}
-              </div>
-              <div className="mt-0.5 text-[9px] text-orange-200/60">
-                path √∫r² · end gap {fmtM(budgetNetM)}
-              </div>
-            </div>
-            <div className="rounded border border-amber-700/40 bg-amber-950/25 px-2 py-1.5">
-              <div className="text-[9px] uppercase text-amber-400/80">
-                Residual VaR @ BE
-              </div>
-              <div className="font-mono text-sm font-semibold text-amber-200">
-                {varAtBe != null ? fmtVarK(varAtBe) : '—'}
-              </div>
-              <div className="mt-0.5 text-[9px] text-amber-200/60">
-                accrued from t=0 to BE
-              </div>
-            </div>
-          </div>
-          <svg
-            viewBox={`0 0 ${residualGeom.W} ${residualGeom.H}`}
-            className="h-auto w-full max-w-full rounded border border-slate-800 bg-slate-950"
-            role="img"
-            aria-label={`${ccy} residual mismatch path`}
-          >
-            {residualGeom.monthTicks.map(m => (
-              <line
-                key={`rm-${m}`}
-                x1={residualGeom.xScale(m)}
-                x2={residualGeom.xScale(m)}
-                y1={residualGeom.padT}
-                y2={residualGeom.H - residualGeom.padB}
-                stroke="#1e293b"
-              />
-            ))}
-            <path
-              d={residualGeom.absLine}
-              fill="none"
-              stroke="#fb7185"
-              strokeWidth={2.25}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-            <path
-              d={residualGeom.cumLine}
-              fill="none"
-              stroke="#fb923c"
-              strokeWidth={2}
-              strokeDasharray="5 3"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-            {showRollingStrip
-              ? stripBreakevens.map(be => (
-                  <line
-                    key={`rbe-${be.edgeIndex}`}
-                    x1={residualGeom.xScale(be.t)}
-                    x2={residualGeom.xScale(be.t)}
-                    y1={residualGeom.padT}
-                    y2={residualGeom.H - residualGeom.padB}
-                    stroke="#fbbf24"
-                    strokeDasharray="3 2"
-                  />
-                ))
-              : breakevenT != null && (
-                  <line
-                    x1={residualGeom.xScale(breakevenT)}
-                    x2={residualGeom.xScale(breakevenT)}
-                    y1={residualGeom.padT}
-                    y2={residualGeom.H - residualGeom.padB}
-                    stroke="#fbbf24"
-                    strokeDasharray="3 2"
-                  />
-                )}
-            <text
-              x={residualGeom.padL}
-              y={12}
-              fill="#fb7185"
-              fontSize={9}
-            >
-              |e−H| (→ {residualGeom.maxAbs.toFixed(1)})
-            </text>
-            <text
-              x={residualGeom.W - residualGeom.padR}
-              y={12}
-              textAnchor="end"
-              fill="#fb923c"
-              fontSize={9}
-            >
-              √∫(e−H)² (→ {residualGeom.maxCum.toFixed(1)})
-            </text>
-            {residualGeom.monthTicks
-              .filter(m => Number.isInteger(m))
-              .map(m => (
-                <text
-                  key={`rl-${m}`}
-                  x={residualGeom.xScale(m)}
-                  y={residualGeom.H - 8}
-                  textAnchor="middle"
-                  fill="#94a3b8"
-                  fontSize={9}
-                >
-                  M{m}
-                </text>
-              ))}
-          </svg>
-        </div>
-      )}
     </div>
   );
 }

@@ -53,7 +53,13 @@ export interface ExposurePathPoint {
   exposureM: number;
 }
 
-/** Chart window: long enough to show both VaR horizon and forecast buildup. */
+/** Longest Analytics VaR tenure chip (1y) — used to keep post-Tf resid visible. */
+const MAX_VAR_EVOLUTION_MONTHS = 12;
+
+/**
+ * Chart window: forecast buildup + active Th + full VaR-evolution span so
+ * residual after Tf (e flat, V(t) still growing) stays on the path / VaR charts.
+ */
 export function chartHorizonMonths(
   setup: Pick<VarSetup, 'horizon' | 'forecastMonths'>,
   monthlyFlows?: readonly number[],
@@ -64,7 +70,7 @@ export function chartHorizonMonths(
       ? setup.forecastMonths
       : 0;
   const sched = monthlyFlows?.length ?? 0;
-  return Math.max(Th, Tf, sched, 1);
+  return Math.max(Th, Tf, sched, MAX_VAR_EVOLUTION_MONTHS, 1);
 }
 
 /** Piecewise-linear exposure path from stock + monthly nets. */
@@ -200,22 +206,25 @@ export interface ResidualPathPoint {
   /** |e − H| — path shape / recognition timing. */
   absResidualM: number;
   /**
-   * Accrued residual-VaR path factor √∫₀ᵗ (e−H)² dt.
-   * Flat hedge leaves an offset from t=0, so this grows immediately
-   * (≈ |r|√t when |e−H| is roughly constant) — not flat until BE.
+   * USD Budget Risk vs T0 spot from t to settle T:
+   * |e−H| × S₀ × σ₁ₘ × z × √max(T−t, 0). Zero when matched at settle.
    */
-  cumPathFactor: number;
+  budgetRiskUsdM: number;
   /** End unmatched notional e(T)−H(T). */
   budgetNetM: number;
 }
 
 export interface ResidualPathOpts {
-  /** Strategy that sized H (label / inference); accrual is always √∫(e−H)² from 0. */
+  /** Strategy that sized H (label / inference). */
   basis: HedgePathBasisId;
   startM: number;
   endM: number;
   /** Time-varying hedge (rolling strip). When set, r(t)=e(t)−H(t). */
   hedgeAt?: (t: number) => number;
+  /** Currency for T0 spot → USD budget risk. */
+  ccy?: string;
+  /** VaR confidence for z in budget risk. */
+  confidencePct?: VarConfidencePct | number;
 }
 
 /** Nearest chip basis for an applied hedge notional. */
@@ -243,34 +252,86 @@ export function inferHedgePathBasis(
   return best.id;
 }
 
-/** ∫_a^b r(t)² dt on a linear residual segment r(t)=r0+(r1-r0)·(t-t0)/(t1-t0). */
-function integrateR2Segment(
-  t0: number,
-  t1: number,
-  r0: number,
-  r1: number,
-  a: number,
-  b: number,
+/**
+ * After Analytics VaR profile / sizing changes, Hedge % is still “of Target”
+ * and goes stale vs Cash / VaR-neutral / Target chips. Re-snap each active
+ * currency to the nearest chip under the new book (same as opening the path
+ * modal and re-applying the regime).
+ */
+export function resyncHedgeRatiosToNearestRegime(
+  rows: readonly {
+    ccy: string;
+    hedgeRatio: number;
+    stockHedgeLocalM: number;
+    targetHedgeLocalM: number;
+    equalVarHedgeLocalM: number;
+  }[],
+  ratios: Record<string, number>,
+): Record<string, number> | null {
+  const next = { ...ratios };
+  let changed = false;
+  for (const r of rows) {
+    const ratio = next[r.ccy] ?? r.hedgeRatio;
+    if (!(ratio > 1e-9)) continue;
+    if (Math.abs(r.targetHedgeLocalM) < 1e-9) {
+      if (Math.abs(next[r.ccy] ?? 0) > 1e-9) {
+        next[r.ccy] = 0;
+        changed = true;
+      }
+      continue;
+    }
+    // Cover notional implied by preserved % under the new Target.
+    const cover = r.targetHedgeLocalM * ratio;
+    const basis = inferHedgePathBasis(
+      cover,
+      r.stockHedgeLocalM,
+      r.targetHedgeLocalM,
+      r.equalVarHedgeLocalM,
+    );
+    const desired = hedgeBasisNotionalLocalM(
+      basis,
+      r.stockHedgeLocalM,
+      r.targetHedgeLocalM,
+      r.equalVarHedgeLocalM,
+    );
+    const newRatio = Math.min(
+      1,
+      hedgeRatioForNumber(desired, r.targetHedgeLocalM),
+    );
+    if (Math.abs(newRatio - ratio) > 1e-9) {
+      next[r.ccy] = newRatio;
+      changed = true;
+    }
+  }
+  return changed ? next : null;
+}
+
+/**
+ * USD Budget Risk vs T0 (USD M):
+ *   |e−H| × S₀ × σ₁ₘ × z × √max(τ, 0)
+ * where τ = remaining months to settle. Matched at settle → 0.
+ */
+export function budgetRiskUsdM(
+  absResidualM: number,
+  remainingMonths: number,
+  ccy: string,
+  confidencePct: VarConfidencePct | number,
 ): number {
-  if (b <= a + 1e-15 || t1 <= t0 + 1e-15) return 0;
-  const lo = Math.max(a, t0);
-  const hi = Math.min(b, t1);
-  if (hi <= lo + 1e-15) return 0;
-  const span = t1 - t0;
-  const u0 = (lo - t0) / span;
-  const u1 = (hi - t0) / span;
-  const ru0 = r0 + (r1 - r0) * u0;
-  const ru1 = r0 + (r1 - r0) * u1;
-  const dt = hi - lo;
-  const dr = ru1 - ru0;
-  return ru0 * ru0 * dt + ru0 * dr * dt + (dr * dr * dt) / 3;
+  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const tau = Math.max(0, remainingMonths);
+  return (
+    Math.abs(absResidualM) *
+    spotUsd *
+    NORDTECH_VAR.monthlyVol *
+    zForConfidence(confidencePct as VarConfidencePct) *
+    Math.sqrt(tau)
+  );
 }
 
 /**
  * Rose = |e−H| path shape (H flat or H(t) via opts.hedgeAt).
- * Orange = √∫₀ᵗ (e−H)² — residual path factor from t=0.
- * A constant (linear) hedge vs growing e(t) leaves an offset immediately, so
- * residual VaR cannot stay flat in the first month; when |r|≈const it tracks |r|√t.
+ * Orange = USD Budget Risk vs T0: |e−H| × S₀ × σ × z × √(T−t).
+ * Target with e(T)=H → budget risk at T is 0.
  */
 export function buildResidualPath(
   path: readonly ExposurePathPoint[],
@@ -298,32 +359,31 @@ export function buildResidualPath(
   const Hof = (t: number) => (hedgeAt != null ? hedgeAt(t) : Hflat);
   const endExposure = path[path.length - 1]?.exposureM ?? 0;
   const budgetNetM = endExposure - Hof(endT);
+  const ccy = resolved.ccy;
+  const confidencePct = resolved.confidencePct;
 
   const out: ResidualPathPoint[] = [];
-  let integ = 0;
   for (let i = 0; i < path.length; i++) {
     const p = path[i]!;
     const Hp = Hof(p.t);
     const r = p.exposureM - Hp;
-    if (i > 0) {
-      const prev = path[i - 1]!;
-      const Hprev = Hof(prev.t);
-      const r0 = prev.exposureM - Hprev;
-      // Full residual (over- and under-hedge) from t=0 — not gated on BE.
-      integ += integrateR2Segment(prev.t, p.t, r0, r, prev.t, p.t);
-    }
+    const absR = Math.abs(r);
+    const remaining = Math.max(0, endT - p.t);
     out.push({
       t: p.t,
       residualM: r,
-      absResidualM: Math.abs(r),
+      absResidualM: absR,
       budgetNetM,
-      cumPathFactor: Math.sqrt(Math.max(0, integ)),
+      budgetRiskUsdM:
+        ccy != null && confidencePct != null
+          ? budgetRiskUsdM(absR, remaining, ccy, confidencePct)
+          : 0,
     });
   }
   return out;
 }
 
-/** Residual VaR (USD M): path factor × spot × σ_1m × z. */
+/** @deprecated Prefer budgetRiskUsdM — path-factor residual VaR (legacy). */
 export function residualPathVarUsdM(
   cumPathFactorAtT: number,
   ccy: string,

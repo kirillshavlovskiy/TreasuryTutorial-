@@ -22,6 +22,15 @@ export type VarHorizonId = '1w' | '1m' | '3m' | '6m' | '9m' | '1y';
  */
 export type ForecastPeriodId = '0m' | '1m' | '3m' | '6m' | '9m' | '1y';
 
+/** Where σ₁ₘ comes from for parametric VaR. */
+export type VarVolSource = 'historical' | 'implied';
+
+/**
+ * @deprecated Not a VaR profile. Profiles are simpleAvg / avgBuildup (time-weighted)
+ * / totalBuildup. Kept on VarSetup for persisted answers only.
+ */
+export type VarAveragingConvention = 'midMonth' | 'monthEnd';
+
 export interface VarSetup {
   confidencePct: VarConfidencePct;
   exposureBasis: VarExposureBasis;
@@ -35,6 +44,13 @@ export interface VarSetup {
    * g = min(Th, Tf). 0 = off (FX path only).
    */
   forecastUncertainty1m: number;
+  /** Historical (realized) vs option-implied FX vol for σ₁ₘ. */
+  volSource: VarVolSource;
+  /**
+   * @deprecated Ignored by the engine — profile id selects the average method.
+   * Retained so older saved answers still parse.
+   */
+  averagingConvention: VarAveragingConvention;
 }
 
 export const VAR_EXPOSURE_OPTIONS: {
@@ -55,22 +71,72 @@ export const VAR_EXPOSURE_OPTIONS: {
     id: 'simpleAvg',
     label: 'Simple average',
     description:
-      'Mid-point of start and end: Ē=(S+E_end)/2 = S+½×ΣF over g=min(Th,Tf). Classic √T average — same as flat F half-buildup.',
+      '√T VaR on simple mid-point Ē = (S + E_end)/2 over g=min(Th,Tf). Flat F ⇒ S+½·F·g.',
     varProfile: 'sqrtT',
   },
   {
     id: 'avgBuildup',
-    label: 'Weighted average',
+    label: 'Time-weighted average',
     description:
-      'Time-weighted path average Ē=(1/T)∫e dt over g=min(Th,Tf). Differs from simple mid-point when the monthly schedule is uneven.',
+      '√T VaR on time-weighted Ē = (1/T)∫e(t) dt. Equals mid-point for flat F; differs on uneven schedules.',
     varProfile: 'sqrtT',
   },
   {
     id: 'totalBuildup',
-    label: 'Growth path',
+    label: 'Growth path average',
     description:
-      'Actual cumulative path e(t)=S+F·min(t,Tf). VaR ∝ √∫e²dt — curvature differs from √T.',
+      'Exact path e(t)=S+F·min(t,Tf). VaR ∝ √∫e²dt — curvature differs from √T.',
     varProfile: 'path',
+  },
+];
+
+/** Analytics VaR profile picker — stock is Cash-only, not offered here. */
+export const VAR_PROFILE_OPTIONS = VAR_EXPOSURE_OPTIONS.filter(
+  (o): o is (typeof VAR_EXPOSURE_OPTIONS)[number] & {
+    id: 'simpleAvg' | 'avgBuildup' | 'totalBuildup';
+  } =>
+    o.id === 'simpleAvg' || o.id === 'avgBuildup' || o.id === 'totalBuildup',
+);
+
+export const VAR_AVERAGING_OPTIONS: {
+  id: VarAveragingConvention;
+  label: string;
+  description: string;
+}[] = [
+  {
+    id: 'midMonth',
+    label: 'Mid-month',
+    description: 'Ē = (S + E_end) / 2 = S + ½×ΣF over the accrual window.',
+  },
+  {
+    id: 'monthEnd',
+    label: 'Month-end',
+    description:
+      'Ē = mean of month-end exposures e(1)…e(n). On flat F: S + F×(n+1)/2.',
+  },
+];
+
+/** σ₁ₘ sources for the VaR engine (monthly relative FX vol). */
+export const VAR_VOL_SOURCE_OPTIONS: {
+  id: VarVolSource;
+  label: string;
+  /** 1-month FX volatility (relative). */
+  monthlyVol: number;
+  description: string;
+}[] = [
+  {
+    id: 'historical',
+    label: 'Historical',
+    monthlyVol: NORDTECH_VAR.monthlyVol, // 2.5% curriculum realized
+    description:
+      'Realized / historical FX vol — curriculum σ₁ₘ = 2.5% (scales as √T with horizon).',
+  },
+  {
+    id: 'implied',
+    label: 'Implied',
+    monthlyVol: 0.03,
+    description:
+      'Option-implied ATM FX vol — sandbox σ₁ₘ = 3.0% (typically above realized).',
   },
 ];
 
@@ -118,13 +184,71 @@ export const FORECAST_UNCERTAINTY_OPTIONS: {
   { id: '30', label: '30%', value: 0.3 },
 ];
 
+/** Default Analytics: simple average + bullet-friendly profile. */
 export const DEFAULT_VAR_SETUP: VarSetup = {
   confidencePct: 95,
-  exposureBasis: 'stock',
+  exposureBasis: 'simpleAvg',
   horizon: '1m',
   forecastMonths: 1,
   forecastUncertainty1m: 0,
+  volSource: 'historical',
+  averagingConvention: 'midMonth',
 };
+
+export function isVarAveragingConvention(v: unknown): v is VarAveragingConvention {
+  return v === 'midMonth' || v === 'monthEnd';
+}
+
+export function parseVarAveragingConvention(
+  raw: string | undefined | null,
+): VarAveragingConvention | null {
+  if (raw == null || raw === '') return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'midmonth' || s === 'mid' || s === 'mid-month' || s === 'mid_month') {
+    return 'midMonth';
+  }
+  if (s === 'monthend' || s === 'end' || s === 'month-end' || s === 'month_end') {
+    return 'monthEnd';
+  }
+  return null;
+}
+
+/** Migrate Cash-only stock off the VaR profile picker. Simple / Weighted stay. */
+export function normalizeVarSetup(setup: VarSetup): VarSetup {
+  if (setup.exposureBasis === 'stock') {
+    return {
+      ...setup,
+      exposureBasis: 'simpleAvg',
+      averagingConvention: setup.averagingConvention ?? 'midMonth',
+    };
+  }
+  return setup;
+}
+
+export function isVarVolSource(v: unknown): v is VarVolSource {
+  return v === 'historical' || v === 'implied';
+}
+
+export function parseVarVolSource(
+  raw: string | undefined | null,
+): VarVolSource | null {
+  if (raw == null || raw === '') return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'historical' || s === 'realized' || s === 'hist') return 'historical';
+  if (s === 'implied' || s === 'iv' || s === 'option') return 'implied';
+  return null;
+}
+
+/** Resolve σ₁ₘ from setup (defaults to historical curriculum vol). */
+export function monthlyVolForSetup(
+  setup?: Partial<Pick<VarSetup, 'volSource'>> | null,
+): number {
+  const id = setup?.volSource ?? 'historical';
+  return (
+    VAR_VOL_SOURCE_OPTIONS.find(o => o.id === id)?.monthlyVol ??
+    NORDTECH_VAR.monthlyVol
+  );
+}
 
 /** Curriculum EUR stock / monthly flow for reference scoring (Net FX = S − debt). */
 export const EUR_REF_STOCK_M = 1.9; // 4.9 cash+receivables − 3.0 venture debt
@@ -202,20 +326,42 @@ export function forecastPeriodIdForMonths(months: number): ForecastPeriodId {
   return hit?.id ?? '1m';
 }
 
-/** σ_T = σ_1m × √(T / 1m). */
-export function volForHorizon(horizon: VarHorizonId): number {
-  return NORDTECH_VAR.monthlyVol * Math.sqrt(horizonMonths(horizon));
+/** σ_T = σ_1m × √(T / 1m). Optional 2nd arg: σ₁ₘ or a setup with volSource. */
+export function volForHorizon(
+  horizon: VarHorizonId,
+  monthlyVolOrSetup?: number | Partial<Pick<VarSetup, 'volSource'>>,
+): number {
+  const σ =
+    typeof monthlyVolOrSetup === 'number'
+      ? monthlyVolOrSetup
+      : monthlyVolForSetup(monthlyVolOrSetup);
+  return σ * Math.sqrt(horizonMonths(horizon));
 }
 
 /**
  * Exposure for an Analytics basis.
  * - stock: S
- * - simpleAvg / avgBuildup (flat F): S + ½×F×T (mid-point / half-buildup)
- * - totalBuildup: S + F×T where T is the FX Risk forecast period in months
+ * - simpleAvg: (S+E_end)/2 = S + ½×F×T (flat)
+ * - avgBuildup: time-weighted (1/T)∫e dt (= mid-point on flat F)
+ * - totalBuildup: S + F×T
  */
 function roundExposure(v: number): number {
   if (!Number.isFinite(v)) return v;
   return Math.round(v * 1e8) / 1e8;
+}
+
+/** Flat-F month-end average over T months: mean of e(1)…e(⌊T⌋)[, e(T)]. */
+export function monthEndAverageFlatM(
+  stockM: number,
+  monthlyFlowM: number,
+  months: number,
+): number {
+  const T = months > 0 && Number.isFinite(months) ? months : 0;
+  const S = Number.isFinite(stockM) ? stockM : 0;
+  const F = T > 0 && Number.isFinite(monthlyFlowM) ? monthlyFlowM : 0;
+  if (T <= 0) return S;
+  const flows = Array.from({ length: Math.max(1, Math.ceil(T)) }, () => F);
+  return monthEndAverageFromScheduleM(S, flows, T);
 }
 
 export function exposureLocalMForBasis(
@@ -228,6 +374,7 @@ export function exposureLocalMForBasis(
   const T = Number.isFinite(forecastMonths) && forecastMonths >= 0 ? forecastMonths : 1;
   if (basis === 'stock') return roundExposure(stockM);
   if (basis === 'simpleAvg' || basis === 'avgBuildup') {
+    // Flat F: simple mid-point ≡ time-weighted integral.
     return roundExposure(stockM + 0.5 * T * flowM);
   }
   return roundExposure(stockM + T * flowM);
@@ -269,6 +416,8 @@ export function parseVarSetup(partial: {
   varHorizon?: string;
   varForecastMonths?: string;
   varForecastUncertainty?: string;
+  varVolSource?: string;
+  varAveragingConvention?: string;
 }): VarSetup | null {
   const confidencePct = (() => {
     const n = Number(String(partial.varConfidencePct ?? '').replace(/%/g, '').trim());
@@ -281,13 +430,53 @@ export function parseVarSetup(partial: {
   const forecastMonths = parseForecastMonths(partial.varForecastMonths) ?? 1;
   const forecastUncertainty1m =
     parseForecastUncertainty1m(partial.varForecastUncertainty) ?? 0;
+  const volSource =
+    parseVarVolSource(partial.varVolSource) ?? DEFAULT_VAR_SETUP.volSource;
+  const basis = exposureBasis === 'stock' ? 'simpleAvg' : exposureBasis;
+  const averagingConvention =
+    parseVarAveragingConvention(partial.varAveragingConvention) ??
+    DEFAULT_VAR_SETUP.averagingConvention;
   return {
     confidencePct,
-    exposureBasis,
+    exposureBasis: basis,
     horizon,
     forecastMonths,
     forecastUncertainty1m,
+    volSource,
+    averagingConvention,
   };
+}
+
+/**
+ * Average exposure Ē for √T VaR / VaR-neutral:
+ * - simpleAvg → (S + E_end)/2
+ * - avgBuildup → time-weighted (1/T)∫e dt
+ * Flat F: both equal S+½·F·T.
+ */
+export function averageExposureForVaR(
+  stockM: number,
+  monthlyFlowM: number,
+  setup: Pick<VarSetup, 'horizon' | 'forecastMonths' | 'exposureBasis'> &
+    Partial<Pick<VarSetup, 'averagingConvention'>>,
+  monthlyFlows?: readonly number[],
+  /** Override Analytics Th (months) — used for strip edge tenures. */
+  horizonMonthsT?: number,
+): number {
+  const Th =
+    typeof horizonMonthsT === 'number' && horizonMonthsT > 0
+      ? horizonMonthsT
+      : horizonMonths(setup.horizon);
+  const g = accruedForecastMonths(Th, setup.forecastMonths);
+  const window = g > 0 ? g : 0;
+  if (window <= 0) return Number.isFinite(stockM) ? stockM : 0;
+  const timeWeighted = setup.exposureBasis === 'avgBuildup';
+  if (monthlyFlows && monthlyFlows.length > 0) {
+    return timeWeighted
+      ? averageExposureFromScheduleM(stockM, monthlyFlows, window)
+      : simpleAverageFromScheduleM(stockM, monthlyFlows, window);
+  }
+  // Flat F: simple mid-point ≡ time-weighted integral.
+  return areaEquivalentAverageExposureM(stockM, monthlyFlowM, window);
 }
 
 /**
@@ -300,11 +489,12 @@ export function parseVarSetup(partial: {
 export function computeParametricVarUsdM(
   exposureLocalM: number,
   ccy: string,
-  setup: Pick<VarSetup, 'confidencePct' | 'horizon'>,
+  setup: Pick<VarSetup, 'confidencePct' | 'horizon'> &
+    Partial<Pick<VarSetup, 'volSource'>>,
 ): number {
   const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
   const z = zForConfidence(setup.confidencePct);
-  const vol = volForHorizon(setup.horizon);
+  const vol = volForHorizon(setup.horizon, setup);
   return Math.abs(exposureLocalM) * spotUsd * vol * z;
 }
 
@@ -316,12 +506,15 @@ export function computeParametricVarUsdM(
 export function linearBulletNotionalFromVarUsdM(
   varUsdM: number,
   ccy: string,
-  setup: Pick<VarSetup, 'confidencePct' | 'horizon'>,
+  setup: Pick<VarSetup, 'confidencePct' | 'horizon'> &
+    Partial<Pick<VarSetup, 'volSource'>>,
 ): number {
   if (!(varUsdM > 0) || !Number.isFinite(varUsdM)) return 0;
   const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
   const unit =
-    spotUsd * NORDTECH_VAR.monthlyVol * Math.sqrt(horizonMonths(setup.horizon)) *
+    spotUsd *
+    monthlyVolForSetup(setup) *
+    Math.sqrt(horizonMonths(setup.horizon)) *
     zForConfidence(setup.confidencePct);
   if (unit < 1e-15) return 0;
   return varUsdM / unit;
@@ -389,6 +582,33 @@ export function averageExposureFromScheduleM(
     i += 1;
   }
   return area / T;
+}
+
+/**
+ * Discrete month-end sample mean (not a VaR profile):
+ *   Ē = mean of e(t) at t = 1, 2, …, ⌊T⌋ and at T if T is not integer.
+ * Kept as a helper; Analytics profiles use simple / time-weighted / path.
+ */
+export function monthEndAverageFromScheduleM(
+  stockM: number,
+  monthlyFlows: readonly number[],
+  horizonMonthsT: number,
+): number {
+  const T = horizonMonthsT > 0 && Number.isFinite(horizonMonthsT) ? horizonMonthsT : 0;
+  const S = Number.isFinite(stockM) ? stockM : 0;
+  if (T <= 0) return S;
+  const samples: number[] = [];
+  const floorT = Math.floor(T + 1e-12);
+  for (let k = 1; k <= floorT; k++) {
+    samples.push(accruedPositionFromScheduleM(S, monthlyFlows, k));
+  }
+  if (T - floorT > 1e-9) {
+    samples.push(accruedPositionFromScheduleM(S, monthlyFlows, T));
+  }
+  if (samples.length === 0) {
+    samples.push(accruedPositionFromScheduleM(S, monthlyFlows, T));
+  }
+  return samples.reduce((a, b) => a + b, 0) / samples.length;
 }
 
 /** End-of-window accrued position after min(Th, schedule) months of flows. */
@@ -459,7 +679,7 @@ export function computeGrowingExposureVarUsdM(
   stockM: number,
   monthlyFlowM: number,
   ccy: string,
-  setup: Pick<VarSetup, 'confidencePct' | 'horizon' | 'forecastMonths'>,
+  setup: Pick<VarSetup, 'confidencePct' | 'horizon' | 'forecastMonths' | 'volSource'>,
 ): number {
   const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
   const z = zForConfidence(setup.confidencePct);
@@ -469,7 +689,7 @@ export function computeGrowingExposureVarUsdM(
     horizonMonths(setup.horizon),
     setup.forecastMonths,
   );
-  return path * spotUsd * NORDTECH_VAR.monthlyVol * z;
+  return path * spotUsd * monthlyVolForSetup(setup) * z;
 }
 
 /**
@@ -562,6 +782,8 @@ export function forecastErrorStdForSetupM(
     'horizon' | 'forecastMonths' | 'forecastUncertainty1m' | 'exposureBasis'
   >,
   monthlyFlows?: readonly number[],
+  /** Override Analytics Th (months) — used for strip edge tenures. */
+  horizonMonthsT?: number,
 ): number {
   if (setup.exposureBasis === 'stock') return 0;
   const u =
@@ -569,7 +791,11 @@ export function forecastErrorStdForSetupM(
       ? setup.forecastUncertainty1m
       : 0;
   if (u <= 0) return 0;
-  const g = accruedForecastMonths(horizonMonths(setup.horizon), setup.forecastMonths);
+  const Th =
+    typeof horizonMonthsT === 'number' && horizonMonthsT > 0
+      ? horizonMonthsT
+      : horizonMonths(setup.horizon);
+  const g = accruedForecastMonths(Th, setup.forecastMonths);
   if (g <= 0) return 0;
   if (monthlyFlows && monthlyFlows.length > 0) {
     let sumSq = 0;
@@ -605,21 +831,22 @@ export function computeForecastUncertaintyVarUsdM(
     | 'forecastMonths'
     | 'forecastUncertainty1m'
     | 'exposureBasis'
-  >,
+  > &
+    Partial<Pick<VarSetup, 'volSource'>>,
 ): number {
   const σE = forecastErrorStdForSetupM(monthlyFlowM, setup);
   if (σE <= 0) return 0;
   const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
   const z = zForConfidence(setup.confidencePct);
   const Th = horizonMonths(setup.horizon);
-  return σE * spotUsd * NORDTECH_VAR.monthlyVol * Math.sqrt(Th) * z;
+  return σE * spotUsd * monthlyVolForSetup(setup) * Math.sqrt(Th) * z;
 }
 
 /**
  * Analytics VaR engine (shared across tabs) — four profiles + optional forecast u:
  * - stock:        |S| × σ × √T × z                (√T; forecast u ignored)
- * - simpleAvg:    √(Ē² + σ_E²) × σ × √T × z       (Ē = (S+E_end)/2 mid-point)
- * - avgBuildup:   √(Ē² + σ_E²) × σ × √T × z       (Ē = time-weighted ∫e/T)
+ * - simpleAvg:    √(Ē² + σ_E²) × σ × √T × z       (Ē = (S+E_end)/2)
+ * - avgBuildup:   √(Ē² + σ_E²) × σ × √T × z       (Ē = (1/T)∫e dt time-weighted)
  * - totalBuildup: σ × z × √(∫e²dt + σ_E²·T)       (path + quantity variance)
  *
  * u₁ₘ = incremental relative forecast uncertainty (1m). Independent monthly
@@ -640,17 +867,26 @@ export function computeAnalyticsVarUsdM(
     | 'forecastMonths'
     | 'exposureBasis'
     | 'forecastUncertainty1m'
-  >,
+  > &
+    Partial<Pick<VarSetup, 'volSource' | 'averagingConvention'>>,
   /** Uneven custom month nets; when set, path/avg use the schedule (not flat F). */
   monthlyFlows?: readonly number[],
+  /**
+   * Explicit tenure in months (strip edge ends / full Tf). When set, overrides
+   * `setup.horizon` so Σ incremental strip VaRs can equal VaR(Tf).
+   */
+  tenureMonths?: number,
 ): number {
   const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
   const z = zForConfidence(setup.confidencePct);
-  const Th = horizonMonths(setup.horizon);
-  const σ = NORDTECH_VAR.monthlyVol;
+  const Th =
+    typeof tenureMonths === 'number' && tenureMonths > 0
+      ? tenureMonths
+      : horizonMonths(setup.horizon);
+  const σ = monthlyVolForSetup(setup);
   const schedule =
     monthlyFlows && monthlyFlows.length > 0 ? monthlyFlows : undefined;
-  const σE = forecastErrorStdForSetupM(monthlyFlowM, setup, schedule);
+  const σE = forecastErrorStdForSetupM(monthlyFlowM, setup, schedule, Th);
 
   if (setup.exposureBasis === 'totalBuildup') {
     const path = schedule
@@ -664,19 +900,23 @@ export function computeAnalyticsVarUsdM(
     // √(∫e² dt + σ_E² · Th) — quantity variance accrues over the horizon window
     return Math.sqrt(path * path + σE * σE * Th) * spotUsd * σ * z;
   }
-  if (setup.exposureBasis === 'simpleAvg') {
-    const eSimple = schedule
-      ? simpleAverageFromScheduleM(stockM, schedule, Th)
-      : averageExposureAtHorizonM(stockM, monthlyFlowM, setup);
-    return (
-      Math.sqrt(eSimple * eSimple + σE * σE) * spotUsd * σ * Math.sqrt(Th) * z
+  if (
+    setup.exposureBasis === 'simpleAvg' ||
+    setup.exposureBasis === 'avgBuildup'
+  ) {
+    const eAvg = averageExposureForVaR(
+      stockM,
+      monthlyFlowM,
+      setup as Pick<
+        VarSetup,
+        | 'horizon'
+        | 'forecastMonths'
+        | 'averagingConvention'
+        | 'exposureBasis'
+      >,
+      schedule,
+      Th,
     );
-  }
-  if (setup.exposureBasis === 'avgBuildup') {
-    const eAvg = schedule
-      ? averageExposureFromScheduleM(stockM, schedule, Th)
-      : averageExposureAtHorizonM(stockM, monthlyFlowM, setup);
-    // √(Ē² + σ_E²) × σ × √Th × z  →  σ z √(Ē² Th + σ_E² Th)
     return Math.sqrt(eAvg * eAvg + σE * σE) * spotUsd * σ * Math.sqrt(Th) * z;
   }
   // stock — forecast uncertainty does not apply
@@ -690,7 +930,12 @@ export function growingVarByHorizonUsdM(
   ccy: string,
   setup: Pick<
     VarSetup,
-    'confidencePct' | 'forecastMonths' | 'exposureBasis' | 'forecastUncertainty1m'
+    | 'confidencePct'
+    | 'forecastMonths'
+    | 'exposureBasis'
+    | 'forecastUncertainty1m'
+    | 'volSource'
+    | 'averagingConvention'
   >,
   monthlyFlows?: readonly number[],
 ): { id: VarHorizonId; label: string; months: number; varUsdM: number }[] {
@@ -777,6 +1022,7 @@ export function setupLabel(setup: VarSetup): string {
     typeof setup.forecastUncertainty1m === 'number' && setup.forecastUncertainty1m > 0
       ? ` · u₁ₘ ${(setup.forecastUncertainty1m * 100).toFixed(0)}%`
       : '';
+  const volSrc = setup.volSource === 'implied' ? 'implied σ' : 'hist σ';
   // Vol horizon ≠ FX Risk forecast period — always show both.
-  return `${setup.confidencePct}% · vol ${h} · ${f} · ${b}${u}`;
+  return `${setup.confidencePct}% · ${volSrc} · vol ${h} · ${f} · ${b}${u}`;
 }

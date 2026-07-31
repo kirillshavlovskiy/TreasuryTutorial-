@@ -23,25 +23,39 @@ import {
   hedgeRatioForNumber,
   inferHedgePathBasis,
   resolveChartMonthlyFlows,
+  resyncHedgeRatiosToNearestRegime,
   type HedgePathBasisId,
 } from '@/lib/test-mode/exposure-hedge-path';
 import {
   buildHedgeVarSummary,
+  equalVarLinearHedgeNotionalLocalM,
   isLiveHedgeTicket,
   newHedgeTicketId,
+  overlayRiskFromFxBook,
   proposeBookHedge,
   type HedgeInstrument,
   type HedgeTicket,
 } from '@/lib/test-mode/hedge-var';
 import {
   buildRollingHedgeEdges,
+  bulletMaturityForForecast,
   hasRollingStripForCcy,
   mergeRollingStripIntoBook,
   needsRollingHedges,
   proposeRollingHedgeTickets,
   removeHedgeTicketOrStrip,
+  resyncBookedRollingStrips,
+  stripForwardLegsFromEdges,
+  varSetupForHedgeStructure,
+  varSetupForPathHedgeRegime,
+  type ForecastHedgeStructure,
   type RollingHedgeEdge,
 } from '@/lib/test-mode/rolling-hedge';
+import {
+  RiskPerspectiveSelector,
+  riskPerspectiveMeta,
+  type RiskPerspective,
+} from '@/components/test-mode/RiskPerspectiveSelector';
 import {
   DEFAULT_VAR_SETUP,
   computeAnalyticsVarUsdM,
@@ -110,19 +124,18 @@ function ExposureApplyButton({
           ? `Selected regime · ${label} · ${fmtLocal(valueLocalM, ccy)}`
           : `Click → apply ${label} as Hedge N · ${fmtLocal(valueLocalM, ccy)} · ${fmtVarK(varUsdM)}`
       }
-      className={`group w-full cursor-pointer rounded-md border px-1.5 py-1 text-left font-mono transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+      className={`group w-full cursor-pointer rounded-lg border px-1.5 py-1 text-left font-mono transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
         selected
-          ? 'border-violet-400 bg-violet-500/25 text-violet-100 ring-2 ring-violet-400/80 font-semibold shadow-[0_0_0_1px_rgba(167,139,250,0.5)]'
+          ? 'border-blue-500 bg-blue-500/20 text-blue-100 font-semibold'
           : empty
             ? 'border-transparent text-slate-500'
             : long
-              ? 'border-emerald-500/60 bg-emerald-500/10 text-emerald-300 hover:border-emerald-400 hover:bg-emerald-500/25'
-              : 'border-rose-500/60 bg-rose-500/10 text-rose-300 hover:border-rose-400 hover:bg-rose-500/25'
-      }${emphasize && !selected ? ' font-semibold ring-1 ring-sky-400/40' : ''}`}
+              ? 'border-slate-700 text-emerald-300 hover:border-slate-500'
+              : 'border-slate-700 text-rose-300 hover:border-slate-500'
+      }${emphasize && !selected ? ' border-sky-500/50' : ''}`}
     >
       <span className="block text-[9px] font-sans font-semibold uppercase tracking-wide opacity-80">
         {label}
-        {selected ? ' · on' : ''}
       </span>
       <span className="underline decoration-dotted decoration-current/40 underline-offset-2 group-hover:decoration-solid">
         {fmtLocal(valueLocalM, ccy)}
@@ -176,7 +189,7 @@ interface HedgingDecisionLayerProps {
  * and read per-currency VaR before / after on the consolidated book.
  */
 export function HedgingDecisionLayer({
-  risk,
+  risk: seedRisk,
   embedded = true,
   title = 'Decision layer — Hedging (Δ → VaR)',
   hedgeRatios: controlledRatios,
@@ -188,11 +201,25 @@ export function HedgingDecisionLayer({
   bookRows,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
 }: HedgingDecisionLayerProps) {
+  const risk = useMemo(
+    () =>
+      overlayRiskFromFxBook(
+        seedRisk,
+        bookRows,
+        varSetup,
+        forecastProfile,
+      ),
+    [seedRisk, bookRows, varSetup, forecastProfile],
+  );
   const [localRatios, setLocalRatios] = useState<Record<string, number>>({});
   const [localBooked, setLocalBooked] = useState<HedgeTicket[]>([]);
   const [draft, setDraft] = useState<HedgeTicket | null>(null);
   const [chartCcy, setChartCcy] = useState<string | null>(null);
   const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('totalExpected');
+  /** bullet = one Tf forward; strip = rolling Th windows (when Tf > Th). */
+  const [hedgeStructure, setHedgeStructure] =
+    useState<ForecastHedgeStructure>('bullet');
+  const [perspective, setPerspective] = useState<RiskPerspective>('fxRisk');
   const ratios = controlledRatios ?? localRatios;
   const booked = controlledBooked ?? localBooked;
   const setRatios = (next: Record<string, number>) => {
@@ -203,6 +230,34 @@ export function HedgingDecisionLayer({
     if (onBookedHedgesChange) onBookedHedgesChange(next);
     else setLocalBooked(next);
   };
+
+  const ThM = horizonMonths(varSetup.horizon);
+  const TfM =
+    typeof varSetup.forecastMonths === 'number' && varSetup.forecastMonths > 0
+      ? varSetup.forecastMonths
+      : 0;
+  const stripAvailable = needsRollingHedges(varSetup);
+  const stripBooked = booked.some(t => Boolean(t.stripId));
+  const effectiveStructure: ForecastHedgeStructure =
+    stripAvailable && (hedgeStructure === 'strip' || stripBooked)
+      ? 'strip'
+      : 'bullet';
+  /** Bullet sizes VaR at Th = Tf. Path VN uses totalBuildup when Analytics is stock. */
+  const hedgeSizingSetup = useMemo(
+    () => varSetupForHedgeStructure(varSetup, effectiveStructure),
+    [varSetup, effectiveStructure],
+  );
+  const pathRegimeSetup = useMemo(
+    () => varSetupForPathHedgeRegime(varSetup, effectiveStructure),
+    [varSetup, effectiveStructure],
+  );
+
+  // If strip isn't available (Tf ≤ Th), keep state on bullet.
+  useEffect(() => {
+    if (!stripAvailable && hedgeStructure === 'strip') {
+      setHedgeStructure('bullet');
+    }
+  }, [stripAvailable, hedgeStructure]);
 
   const monthlyFlowsByCcy = useMemo(() => {
     const out: Record<string, number[]> = {};
@@ -219,9 +274,52 @@ export function HedgingDecisionLayer({
   }, [bookRows, forecastProfile, risk, varSetup.forecastMonths]);
 
   const summary = useMemo(
-    () => buildHedgeVarSummary(risk, ratios, varSetup, booked, monthlyFlowsByCcy),
-    [risk, ratios, varSetup, booked, monthlyFlowsByCcy],
+    () =>
+      buildHedgeVarSummary(
+        risk,
+        ratios,
+        hedgeSizingSetup,
+        booked,
+        monthlyFlowsByCcy,
+      ),
+    [risk, ratios, hedgeSizingSetup, booked, monthlyFlowsByCcy],
   );
+
+  /** Re-snap Cash·VN·Target % and rebuild strips when Analytics setup changes. */
+  const hedgeSetupSig = [
+    varSetup.exposureBasis,
+    varSetup.averagingConvention,
+    varSetup.forecastMonths,
+    varSetup.horizon,
+    varSetup.confidencePct,
+    varSetup.forecastUncertainty1m,
+    varSetup.volSource,
+    hedgeSizingSetup.horizon,
+    hedgeSizingSetup.exposureBasis,
+  ].join('|');
+  const prevHedgeSetupSig = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevHedgeSetupSig.current === null) {
+      prevHedgeSetupSig.current = hedgeSetupSig;
+      return;
+    }
+    if (prevHedgeSetupSig.current === hedgeSetupSig) return;
+    prevHedgeSetupSig.current = hedgeSetupSig;
+    const synced = resyncHedgeRatiosToNearestRegime(summary.rows, ratios);
+    if (synced) setRatios(synced);
+    const bars = risk.map(r => ({
+      ccy: r.bar.ccy,
+      stockNetM: r.bar.stockNetM,
+      flowM: r.bar.flowM,
+    }));
+    const rebuilt = resyncBookedRollingStrips(
+      booked,
+      bars,
+      varSetup,
+      monthlyFlowsByCcy,
+    );
+    if (rebuilt) setBooked(rebuilt);
+  }, [hedgeSetupSig, summary.rows, ratios, booked, risk, varSetup, monthlyFlowsByCcy]);
 
   const riskByCcy = useMemo(() => {
     const m = new Map<string, CurrencyRiskRow>();
@@ -267,6 +365,7 @@ export function HedgingDecisionLayer({
   const openPathChart = (ccy: string) => {
     const r = summary.rows.find(row => row.ccy === ccy);
     if (!r) return;
+    // Bullet defaults to VaR-neutral — never Target just because strip is available.
     const inferred =
       Math.abs(r.hedgeNotionalLocalM) > 1e-9
         ? inferHedgePathBasis(
@@ -275,9 +374,7 @@ export function HedgingDecisionLayer({
             r.targetHedgeLocalM,
             r.equalVarHedgeLocalM,
           )
-        : needsRollingHedges(varSetup)
-          ? 'totalExpected'
-          : 'varNeutral';
+        : 'varNeutral';
     setPathBasis(inferred);
     setChartCcy(ccy);
   };
@@ -291,38 +388,46 @@ export function HedgingDecisionLayer({
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
     : undefined;
 
-  const applyPathBasis = (basis: HedgePathBasisId) => {
+  const applyPathBasis = (
+    basis: HedgePathBasisId,
+    structure?: ForecastHedgeStructure,
+  ) => {
     if (!chartRow || !chartBar) return;
     setPathBasis(basis);
     const flowM =
       varSetup.forecastMonths > 0 && Math.abs(chartBar.flowM) > 1e-15
         ? chartBar.flowM
         : 0;
+    const flowsForCcy = monthlyFlowsByCcy[chartRow.ccy];
     const { startM, endM, flows } = resolveChartMonthlyFlows(
       chartBar.stockNetM,
       flowM,
       varSetup,
-      monthlyFlowsByCcy[chartRow.ccy],
+      flowsForCcy,
     );
-    const sizing =
-      basis === 'cash'
-        ? 'stockStart'
-        : basis === 'totalExpected'
-          ? 'windowEnd'
-          : 'varNeutral';
-    const target =
-      needsRollingHedges(varSetup) &&
-      (basis === 'cash' ||
-        basis === 'totalExpected' ||
-        basis === 'varNeutral')
-        ? buildRollingHedgeEdges(startM, flows, varSetup, sizing)[0]
-            ?.hedgeLocalM ?? chartRow.equalVarHedgeLocalM
-        : hedgeBasisNotionalLocalM(
-            basis,
-            startM,
-            endM,
-            chartRow.equalVarHedgeLocalM,
-          );
+    // Prefer structure from the chart (avoids stale parent 'bullet' on Strip click).
+    const structureNow = structure ?? hedgeStructure;
+    if (structure && structure !== hedgeStructure) {
+      setHedgeStructure(structure);
+    }
+    // Strip: preview only (Cash/VN/Target chips). Book via "Book … forwards".
+    if (structureNow === 'strip' && needsRollingHedges(varSetup)) {
+      return;
+    }
+    const bulletEq = equalVarLinearHedgeNotionalLocalM(
+      chartBar.stockNetM,
+      flowM,
+      chartRow.ccy,
+      varSetupForPathHedgeRegime(varSetup, 'bullet'),
+      undefined,
+      flowsForCcy ?? flows,
+    ).amountLocalM;
+    const target = hedgeBasisNotionalLocalM(
+      basis,
+      startM,
+      endM,
+      bulletEq,
+    );
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -350,6 +455,7 @@ export function HedgingDecisionLayer({
       edges,
       varSetup,
       ticketBasis,
+      monthlyFlowsByCcy[chartRow.ccy] ?? [],
     );
     setBooked(mergeRollingStripIntoBook(booked, tickets, chartRow.ccy));
     setRatios({ ...ratios, [chartRow.ccy]: 0 });
@@ -370,10 +476,29 @@ export function HedgingDecisionLayer({
     const bookRatio = ratio > 1e-9 ? ratio : 1;
     const template = proposeBookHedge(row, varSetup.exposureBasis, varSetup);
     const amountLocalM = targetN * bookRatio;
+    // Bullet: one forward covering full forecast; else VaR-horizon tenor.
+    const useBulletTenor =
+      hedgeStructure !== 'strip' || !needsRollingHedges(varSetup);
+    const maturity = useBulletTenor
+      ? bulletMaturityForForecast(
+          varSetup.forecastMonths,
+          varSetup.horizon,
+        )
+      : varSetup.horizon;
+    const maturityLabel =
+      VAR_HORIZON_OPTIONS.find(h => h.id === maturity)?.label ?? maturity;
     const ticket: HedgeTicket = {
       ...template,
+      instrument: 'forward',
       amountLocalM,
-      varUsdM: computeParametricVarUsdM(amountLocalM, ccy, varSetup),
+      maturity,
+      maturityLabel: useBulletTenor
+        ? `${maturityLabel} · bullet Tf`
+        : maturityLabel,
+      varUsdM: computeParametricVarUsdM(amountLocalM, ccy, {
+        ...varSetup,
+        horizon: maturity,
+      }),
     };
     if (Math.abs(ticket.amountLocalM) < 1e-9) return;
     setDraft(ticket);
@@ -394,8 +519,11 @@ export function HedgingDecisionLayer({
     setRatios({ ...ratios, [ticket.ccy]: 0 });
   };
 
+  /** Show Bullet / Strip picker whenever a forecast period is on. */
+  const canChooseStructure = TfM > 0;
+
   const rollingStrip = useMemo(() => {
-    if (!needsRollingHedges(varSetup)) return null;
+    if (!stripAvailable || effectiveStructure !== 'strip') return null;
     const eur = risk.find(r => r.bar.ccy === 'EUR') ?? risk[0];
     if (!eur) return null;
     const flowM =
@@ -422,7 +550,7 @@ export function HedgingDecisionLayer({
     const edges = buildRollingHedgeEdges(startM, flows, varSetup, sizing);
     if (edges.length < 2) return null;
     return { ccy: eur.bar.ccy, edges, endM, sizing };
-  }, [risk, varSetup, bookRows, forecastProfile]);
+  }, [risk, varSetup, bookRows, forecastProfile, stripAvailable, effectiveStructure]);
 
   const stripAlreadyBooked =
     rollingStrip != null && hasRollingStripForCcy(booked, rollingStrip.ccy);
@@ -442,10 +570,11 @@ export function HedgingDecisionLayer({
       rollingStrip.edges,
       varSetup,
       ticketBasis,
+      monthlyFlowsByCcy[rollingStrip.ccy] ?? [],
     );
     setBooked(mergeRollingStripIntoBook(booked, tickets, rollingStrip.ccy));
     setRatios({ ...ratios, [rollingStrip.ccy]: 0 });
-    // Only the M0 live leg is a real trade today.
+    // All strip legs are live from M0 (staggered tenures).
     for (const t of tickets) {
       if (isLiveHedgeTicket(t)) onBookHedge?.(t);
     }
@@ -466,8 +595,14 @@ export function HedgingDecisionLayer({
           <h3 className="text-sm font-semibold">{title}</h3>
           <p className={`mt-0.5 text-xs ${muted}`}>
             Hedge-add % of Target (Total expected): Cash = min · VaR-neutral = mid ·
-            Total = 100%. Setup: {varSetup.confidencePct}% · {varSetup.horizon} ·{' '}
-            {varSetup.exposureBasis}.
+            Total = 100%. Setup: {hedgeSizingSetup.confidencePct}% ·{' '}
+            {hedgeSizingSetup.horizon}
+            {effectiveStructure === 'bullet' &&
+            hedgeSizingSetup.horizon !== varSetup.horizon
+              ? ` (bullet=forecast)`
+              : ''}{' '}
+            · {hedgeSizingSetup.exposureBasis}
+            {TfM > 0 ? ` · forecast ${TfM}m` : ''}.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -479,13 +614,13 @@ export function HedgingDecisionLayer({
               title={
                 stripAlreadyBooked
                   ? 'Strip already on the book — cancel it to rebook'
-                  : `Book M0 forward now; ${rollingStrip.edges.length - 1} later roll(s) stay scheduled (VaR ${horizonMonths(varSetup.horizon)}m windows)`
+                  : `Book ${rollingStrip.edges.length} forwards from M0 (own size + tenure each)`
               }
               className="rounded-md border border-violet-500/50 bg-violet-500/20 px-2.5 py-1 text-[11px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {stripAlreadyBooked
                 ? 'Strip booked'
-                : `Book M0 + ${rollingStrip.edges.length - 1} scheduled`}
+                : `Book ${rollingStrip.edges.length}-leg strip from M0`}
             </button>
           )}
           <button
@@ -497,6 +632,95 @@ export function HedgingDecisionLayer({
           </button>
         </div>
       </div>
+
+      <RiskPerspectiveSelector value={perspective} onChange={setPerspective} />
+
+      {perspective !== 'fxRisk' ? (
+        <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
+          {riskPerspectiveMeta(perspective).label} view is coming soon on Hedging
+          Decision.
+        </div>
+      ) : (
+      <>
+      {canChooseStructure ? (
+        <div className="rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-3">
+          <div className="mb-2 text-[11px] font-medium text-slate-400">
+            Hedge structure
+          </div>
+          <div
+            className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+            role="group"
+            aria-label="Hedge structure"
+          >
+            {(
+              [
+                {
+                  id: 'bullet' as const,
+                  label: 'Bullet',
+                  blurb: 'One forward at t=0 for full forecast (Cash / VN / Target)',
+                  enabled: true,
+                },
+                {
+                  id: 'strip' as const,
+                  label: 'Rolling strip',
+                  blurb: stripAvailable
+                    ? `Staggered forwards from M0 (${ThM}m windows) — each leg own size + tenure`
+                    : `Needs VaR tenor < forecast (now ${ThM}m ≥ ${TfM}m) — shorten horizon or lengthen forecast in Analytics`,
+                  enabled: stripAvailable,
+                },
+              ] as const
+            ).map(opt => {
+              const on = effectiveStructure === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  aria-pressed={on}
+                  disabled={!opt.enabled}
+                  title={opt.blurb}
+                  onClick={() => setHedgeStructure(opt.id)}
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                    on
+                      ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          {!stripAvailable ? (
+            <p className={`mt-2 text-[10px] ${muted}`}>
+              Rolling strip needs VaR tenor &lt; forecast (now {ThM}m ≥ {TfM}m).
+            </p>
+          ) : null}
+          {effectiveStructure === 'strip' && rollingStrip && (
+            <div className="mt-2 flex flex-wrap gap-2 font-mono text-[10px] text-violet-100/90">
+              {stripForwardLegsFromEdges(rollingStrip.edges).map(leg => (
+                <span
+                  key={leg.index}
+                  className="rounded border border-violet-700/50 bg-slate-950/40 px-1.5 py-0.5"
+                  title={`Cumul ${fmtLocal(leg.cumulCoverLocalM, rollingStrip.ccy)} · E@mat ${fmtLocal(leg.endExposureM, rollingStrip.ccy)}`}
+                >
+                  {leg.label} → {fmtLocal(leg.amountLocalM, rollingStrip.ccy)} Δ
+                </span>
+              ))}
+            </div>
+          )}
+          {effectiveStructure === 'bullet' && (
+            <p className={`mt-2 text-[10px] ${muted}`}>
+              Bullet sizes Equal-VaR at forecast tenor {TfM}m (
+              {hedgeSizingSetup.horizon}). VaR-neutral = mid (Ē / RMS); Target =
+              end buildup — they are not the same. One forward at t=0.
+            </p>
+          )}
+        </div>
+      ) : (
+        <p className={`text-[11px] ${muted}`}>
+          Set a forecast period in Analytics (&gt; 0m) to choose Bullet vs Rolling strip.
+        </p>
+      )}
 
       <div className="grid gap-3 sm:grid-cols-3">
         <Stat
@@ -528,29 +752,6 @@ export function HedgingDecisionLayer({
         />
       </div>
 
-      {rollingStrip && (
-        <div className="rounded-lg border border-violet-700/40 bg-violet-950/20 px-3 py-2 text-[11px] text-slate-300">
-          <div className="mb-1 font-semibold text-violet-200">
-            VaR {horizonMonths(varSetup.horizon)}m &lt; forecast{' '}
-            {varSetup.forecastMonths}m — roll hedges for {rollingStrip.ccy}
-          </div>
-          <p className={`mb-1.5 ${muted}`}>
-            Total expected path end {fmtLocal(rollingStrip.endM, rollingStrip.ccy)}.
-            Book successive VaR-window forwards from each new stock level:
-          </p>
-          <div className="flex flex-wrap gap-2 font-mono text-[10px] text-violet-100/90">
-            {rollingStrip.edges.map(e => (
-              <span
-                key={e.index}
-                className="rounded border border-violet-700/50 bg-slate-950/40 px-1.5 py-0.5"
-              >
-                {e.label} → {fmtLocal(e.hedgeLocalM, rollingStrip.ccy)}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
       <div className="overflow-x-auto">
         <table className="w-full min-w-[820px] text-left text-xs">
           <thead>
@@ -558,19 +759,19 @@ export function HedgingDecisionLayer({
               <th className="py-2 pr-2 font-medium">CCY</th>
               <th
                 className="max-w-[5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="Click → Cash / stock hedge (min on Target scale). Violet outline = selected."
+                title="Click → Cash / stock hedge (min on Target scale). Blue highlight = selected."
               >
                 Cash (stock)
               </th>
               <th
                 className="max-w-[5.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="Click → VaR-neutral (Equal-VaR). Violet outline = selected."
+                title="Click → VaR-neutral (Equal-VaR). Blue highlight = selected."
               >
                 VaR-neutral
               </th>
               <th
                 className="max-w-[5.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="Click → 100% Target (Total expected). Violet outline = selected."
+                title="Click → 100% Target (Total expected). Blue highlight = selected."
               >
                 Target (Total)
               </th>
@@ -597,11 +798,26 @@ export function HedgingDecisionLayer({
               const stockRaw = riskRow?.bar.stockNetM ?? r.stockHedgeLocalM;
               const flowRaw = riskRow?.bar.flowM ?? 0;
               const stockM = r.stockHedgeLocalM;
-              const varNeutralM = r.equalVarHedgeLocalM;
               const totalM = r.targetHedgeLocalM;
               // Higher-VaR pick must use the Analytics engine (path ≠ snapshot |E|×σ×√T).
               const flowForVar =
                 varSetup.forecastMonths > 0 && Math.abs(flowRaw) > 1e-15 ? flowRaw : 0;
+              // Stock Analytics ⇒ Equal-VaR ≡ Cash; ladder VN uses path totalBuildup.
+              const varNeutralM =
+                varSetup.exposureBasis === 'stock'
+                  ? (() => {
+                      const eq = equalVarLinearHedgeNotionalLocalM(
+                        stockRaw,
+                        flowForVar,
+                        r.ccy,
+                        pathRegimeSetup,
+                        undefined,
+                        monthlyFlowsByCcy[r.ccy],
+                      ).amountLocalM;
+                      const sign = totalM >= 0 || stockM >= 0 ? 1 : -1;
+                      return sign * Math.abs(eq);
+                    })()
+                  : r.equalVarHedgeLocalM;
               const varStock = computeAnalyticsVarUsdM(stockRaw, 0, r.ccy, {
                 ...varSetup,
                 exposureBasis: 'stock',
@@ -609,7 +825,7 @@ export function HedgingDecisionLayer({
               const varNeutralUsd = computeParametricVarUsdM(
                 varNeutralM,
                 r.ccy,
-                varSetup,
+                pathRegimeSetup,
               );
               const varTotal = computeAnalyticsVarUsdM(stockRaw, flowForVar, r.ccy, {
                 ...varSetup,
@@ -846,7 +1062,7 @@ export function HedgingDecisionLayer({
                 </button>
               </div>
               <ExposureHedgePathChart
-                key={`${chartRow.ccy}-${chartRow.hedgeRatio.toFixed(4)}-${chartRow.hedgeNotionalLocalM.toFixed(3)}-${varSetup.horizon}-${varSetup.forecastMonths}-${pathBasis}`}
+                key={`${chartRow.ccy}-${pathBasis}-${effectiveStructure}-${hedgeSizingSetup.horizon}-${varSetup.forecastMonths}-${varSetup.exposureBasis}-${hasRollingStripForCcy(booked, chartRow.ccy) ? 'strip' : 'open'}`}
                 ccy={chartRow.ccy}
                 stockM={chartBar.stockNetM}
                 monthlyFlowM={
@@ -864,16 +1080,24 @@ export function HedgingDecisionLayer({
                 selectedBasis={pathBasis}
                 onSelectedBasisChange={setPathBasis}
                 onApplyBasis={applyPathBasis}
-                onBookRollingStrip={bookRollingStripFromChart}
+                onBookRollingStrip={
+                  hedgeStructure === 'strip'
+                    ? bookRollingStripFromChart
+                    : undefined
+                }
                 stripAlreadyBooked={hasRollingStripForCcy(
                   booked,
                   chartRow.ccy,
                 )}
+                hedgeStructure={hedgeStructure}
+                onHedgeStructureChange={setHedgeStructure}
               />
             </div>
           </div>,
           document.body,
         )}
+      </>
+      )}
     </div>
   );
 }

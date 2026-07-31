@@ -7,10 +7,11 @@
  */
 
 import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
-import { newHedgeTicketId } from '@/lib/test-mode/hedge-var';
+import { isLiveHedgeTicket, newHedgeTicketId } from '@/lib/test-mode/hedge-var';
 import {
   accruedPositionFromScheduleM,
   computeParametricVarUsdM,
+  horizonIdForForecastMonths,
   horizonMonths,
   VAR_HORIZON_OPTIONS,
   type VarExposureBasis,
@@ -19,6 +20,13 @@ import {
 } from '@/lib/test-mode/var-setup';
 
 export type RollingEdgeSizing = 'stockStart' | 'varNeutral' | 'windowEnd';
+
+/**
+ * How to cover Tf when VaR tenor Th &lt; forecast:
+ * - bullet — one forward at t=0 for the selected regime (Cash / VN / Target)
+ * - strip  — staggered forwards from M0 (own size + tenure per edge)
+ */
+export type ForecastHedgeStructure = 'bullet' | 'strip';
 
 export interface RollingHedgeEdge {
   index: number;
@@ -85,12 +93,14 @@ export function sizeRollingEdgeLocalM(
 /**
  * Build rolling forward edges over the forecast.
  * Flat F or uneven `monthlyFlows` schedule.
+ * Optional `legCount` overrides ceil(Tf/Th) — equal windows Tf/n (min 1).
  */
 export function buildRollingHedgeEdges(
   stockM: number,
   monthlyFlows: readonly number[],
   setup: Pick<VarSetup, 'horizon' | 'forecastMonths'>,
   sizing: RollingEdgeSizing = 'varNeutral',
+  options?: { legCount?: number },
 ): RollingHedgeEdge[] {
   const Th = horizonMonths(setup.horizon);
   const Tf =
@@ -112,13 +122,18 @@ export function buildRollingHedgeEdges(
     ];
   }
   const edgeTh = Th > 1e-12 ? Th : Tf;
-  const n = Math.max(1, Math.ceil(Tf / edgeTh - 1e-12));
+  const nDefault = Math.max(1, Math.ceil(Tf / edgeTh - 1e-12));
+  const n =
+    typeof options?.legCount === 'number' && Number.isFinite(options.legCount)
+      ? Math.max(1, Math.round(options.legCount))
+      : nDefault;
+  const window = Tf / n;
   const edges: RollingHedgeEdge[] = [];
 
   for (let k = 0; k < n; k++) {
-    const startMonth = k * edgeTh;
+    const startMonth = k * window;
     if (startMonth >= Tf - 1e-12) break;
-    const endMonth = Math.min(Tf, startMonth + edgeTh);
+    const endMonth = Math.min(Tf, startMonth + window);
     const stockStartM = accruedPositionFromScheduleM(S0, monthlyFlows, startMonth);
     const endExposureM = accruedPositionFromScheduleM(S0, monthlyFlows, endMonth);
     const hedgeLocalM = sizeRollingEdgeLocalM(stockStartM, endExposureM, sizing);
@@ -255,45 +270,136 @@ export function edgeMaturityHorizonId(
   return best;
 }
 
+/** Bullet forward tenor = full forecast length (nearest horizon chip). */
+export function bulletMaturityForForecast(
+  forecastMonths: number,
+  fallback: VarHorizonId = '6m',
+): VarHorizonId {
+  return edgeMaturityHorizonId(forecastMonths, fallback);
+}
+
 /**
- * Propose strip tickets: edge 0 is live (`booked`); later edges are
- * `scheduled` rolls (not traded until their start month).
+ * Bullet covers the full forecast in one forward — size VaR / Equal-VaR at
+ * Th := Tf so VaR-neutral lines up with Target (Total expected).
+ * Strip keeps the Analytics VaR horizon (rolling Th windows).
+ */
+export function varSetupForHedgeStructure(
+  setup: VarSetup,
+  structure: ForecastHedgeStructure,
+): VarSetup {
+  if (structure !== 'bullet') return setup;
+  const Tf =
+    typeof setup.forecastMonths === 'number' && setup.forecastMonths > 0
+      ? setup.forecastMonths
+      : 0;
+  if (Tf <= 0) return setup;
+  const horizon = horizonIdForForecastMonths(Tf);
+  if (horizon === setup.horizon) return setup;
+  return { ...setup, horizon };
+}
+
+/**
+ * Setup for Cash / VaR-neutral / Target sizing on the path chart & Decision ladder.
+ * - Bullet → Th = Tf (same as matched horizon/forecast).
+ * - Stock Analytics profile makes Equal-VaR ≡ Cash; use growth-path (totalBuildup)
+ *   so VaR-neutral sits between Cash and Target like the strip mid.
+ */
+export function varSetupForPathHedgeRegime(
+  setup: VarSetup,
+  structure: ForecastHedgeStructure,
+): VarSetup {
+  const sized = varSetupForHedgeStructure(setup, structure);
+  if (sized.exposureBasis === 'stock') {
+    return { ...sized, exposureBasis: 'totalBuildup' };
+  }
+  return sized;
+}
+
+/**
+ * M0-origin forward legs from absolute edge levels.
+ * Target Tf=12 / Th=6 → 9.1 @ 6m + 7.2 @ 12m (not a deferred M6–M12 roll at 16.3).
+ */
+export interface StripForwardLeg {
+  index: number;
+  /** M0–Mk (both legs dealt today). */
+  label: string;
+  tenureMonths: number;
+  /** Incremental booked notional. */
+  amountLocalM: number;
+  /** Σ increments through this leg. */
+  cumulCoverLocalM: number;
+  /** Path exposure at maturity (context). */
+  endExposureM: number;
+  stockStartM: number;
+}
+
+/** Convert absolute edge ladder → incremental M0 forwards. */
+export function stripForwardLegsFromEdges(
+  edges: readonly RollingHedgeEdge[],
+): StripForwardLeg[] {
+  let prevAbs = 0;
+  let cumul = 0;
+  const out: StripForwardLeg[] = [];
+  for (const e of edges) {
+    const tenureMonths =
+      e.endMonth > 1e-9
+        ? e.endMonth
+        : Math.max(0, e.endMonth - e.startMonth);
+    const level = e.hedgeLocalM;
+    const sign = level >= 0 || Math.abs(level) < 1e-12 ? 1 : -1;
+    const incrAbs = Math.max(0, Math.abs(level) - prevAbs);
+    prevAbs = Math.abs(level);
+    const amountLocalM = sign * incrAbs;
+    cumul += amountLocalM;
+    out.push({
+      index: e.index,
+      label: `M0–M${Math.round(tenureMonths)}`,
+      tenureMonths,
+      amountLocalM,
+      cumulCoverLocalM: cumul,
+      endExposureM: e.endExposureM,
+      stockStartM: e.stockStartM,
+    });
+  }
+  return out;
+}
+
+/**
+ * Propose strip tickets — all live from M0 (dealt today):
+ * - size = incremental (H_k − H_{k−1}); Target 16.3 → 9.1 @ 6m + 7.2 @ 12m
+ * - tenure = M0 → edge end (not a deferred roll starting at Mk)
+ * - ticket VaR = parametric |N_k| at that tenure (linear in N)
  */
 export function proposeRollingHedgeTickets(
   ccy: string,
   edges: readonly RollingHedgeEdge[],
   setup: VarSetup,
   basis: VarExposureBasis = 'simpleAvg',
+  _monthlyFlows: readonly number[] = [],
 ): HedgeTicket[] {
   if (edges.length === 0) return [];
   const stripId = `strip-${ccy}-${newHedgeTicketId()}`;
   const tickets: HedgeTicket[] = [];
-  for (const e of edges) {
-    const w = Math.max(0, e.endMonth - e.startMonth);
-    const maturity = edgeMaturityHorizonId(
-      w > 1e-9 ? w : horizonMonths(setup.horizon),
-      setup.horizon,
-    );
+  for (const leg of stripForwardLegsFromEdges(edges)) {
+    const maturity = edgeMaturityHorizonId(leg.tenureMonths, setup.horizon);
     const maturityLabel =
       VAR_HORIZON_OPTIONS.find(h => h.id === maturity)?.label ?? maturity;
-    const amountLocalM = e.hedgeLocalM;
-    const live = e.index === 0;
     tickets.push({
       id: newHedgeTicketId(),
       ccy,
       instrument: 'forward',
       basis,
-      amountLocalM,
+      amountLocalM: leg.amountLocalM,
       maturity,
-      maturityLabel: `${e.label} · ${maturityLabel}`,
-      varUsdM: computeParametricVarUsdM(amountLocalM, ccy, {
+      maturityLabel: `${leg.label} · ${maturityLabel}`,
+      varUsdM: computeParametricVarUsdM(leg.amountLocalM, ccy, {
         ...setup,
         horizon: maturity,
       }),
       addressesHigherVar: true,
-      status: live ? 'booked' : 'scheduled',
+      status: 'booked',
       stripId,
-      stripEdgeIndex: e.index,
+      stripEdgeIndex: leg.index,
     });
   }
   return tickets;
@@ -307,6 +413,68 @@ export function hasRollingStripForCcy(
   return booked.some(t => t.ccy === ccy && Boolean(t.stripId));
 }
 
+/** Map path-chart Cash / VN / Target → edge sizing. */
+export function sizingForHedgePathBasis(
+  basis: 'cash' | 'varNeutral' | 'totalExpected',
+): RollingEdgeSizing {
+  if (basis === 'cash') return 'stockStart';
+  if (basis === 'totalExpected') return 'windowEnd';
+  return 'varNeutral';
+}
+
+/**
+ * Build + book a full M0 strip for the regime (replaces any prior strip).
+ * Apply-chip and Book-strip share this so Live VaR sees every leg immediately.
+ */
+export function bookStripForBasis(
+  ccy: string,
+  stockM: number,
+  monthlyFlows: readonly number[],
+  setup: VarSetup,
+  basis: 'cash' | 'varNeutral' | 'totalExpected',
+  booked: readonly HedgeTicket[],
+  ticketBasis: VarExposureBasis = 'totalBuildup',
+): HedgeTicket[] {
+  const edges = buildRollingHedgeEdges(
+    stockM,
+    monthlyFlows,
+    setup,
+    sizingForHedgePathBasis(basis),
+  );
+  // Same reference when unchanged — avoids setState loops from apply chips.
+  if (stripMatchesEdges(booked, ccy, edges)) return booked as HedgeTicket[];
+  const tickets = proposeRollingHedgeTickets(
+    ccy,
+    edges,
+    setup,
+    ticketBasis,
+    monthlyFlows,
+  );
+  return mergeRollingStripIntoBook(booked, tickets, ccy);
+}
+
+/** True when booked strip notionals already match these edges (incremental). */
+export function stripMatchesEdges(
+  booked: readonly HedgeTicket[],
+  ccy: string,
+  edges: readonly RollingHedgeEdge[],
+): boolean {
+  const legs = booked
+    .filter(t => t.ccy === ccy && t.stripId)
+    .slice()
+    .sort((a, b) => (a.stripEdgeIndex ?? 0) - (b.stripEdgeIndex ?? 0));
+  if (legs.length === 0 || legs.length !== edges.length) return false;
+  let prevAbs = 0;
+  for (let i = 0; i < edges.length; i++) {
+    const level = edges[i]!.hedgeLocalM;
+    const sign = level >= 0 || Math.abs(level) < 1e-12 ? 1 : -1;
+    const incr = sign * Math.max(0, Math.abs(level) - prevAbs);
+    prevAbs = Math.abs(level);
+    if (Math.abs(legs[i]!.amountLocalM - incr) > 1e-6) return false;
+  }
+  return true;
+}
+
 /**
  * Insert a new strip, replacing any prior strip for the same CCY
  * (prevents stacking duplicate strips on repeat clicks).
@@ -318,6 +486,128 @@ export function mergeRollingStripIntoBook(
 ): HedgeTicket[] {
   const withoutPrior = booked.filter(t => !(t.ccy === ccy && t.stripId));
   return [...stripTickets, ...withoutPrior];
+}
+
+/** Nearest Cash / VN / Target sizing for a live M0 hedge notional. */
+export function inferRollingEdgeSizing(
+  hedgeLocalM: number,
+  stockStartM: number,
+  endExposureM: number,
+): RollingEdgeSizing {
+  const h = Math.abs(hedgeLocalM);
+  const opts: { id: RollingEdgeSizing; n: number }[] = [
+    { id: 'stockStart', n: Math.abs(stockStartM) },
+    {
+      id: 'varNeutral',
+      n: Math.abs((stockStartM + endExposureM) / 2),
+    },
+    { id: 'windowEnd', n: Math.abs(endExposureM) },
+  ];
+  let best = opts[0]!;
+  let bestDist = Math.abs(h - best.n);
+  for (const o of opts.slice(1)) {
+    const d = Math.abs(h - o.n);
+    if (d < bestDist - 1e-12) {
+      best = o;
+      bestDist = d;
+    }
+  }
+  return best.id;
+}
+
+/**
+ * Rebuild booked rolling strips after Analytics VaR profile / Th·Tf change.
+ * All legs stay live from M0 with incremental size + own tenure; VaR is
+ * recomputed per leg. Returns null when nothing changed.
+ */
+export function resyncBookedRollingStrips(
+  booked: readonly HedgeTicket[],
+  bars: readonly { ccy: string; stockNetM: number; flowM: number }[],
+  setup: VarSetup,
+  monthlyFlowsByCcy: Record<string, readonly number[]> = {},
+): HedgeTicket[] | null {
+  const stripCcys = [
+    ...new Set(booked.filter(t => t.stripId).map(t => t.ccy)),
+  ];
+  if (stripCcys.length === 0) return null;
+
+  let next = [...booked];
+  let changed = false;
+  for (const ccy of stripCcys) {
+    // Infer regime from first edge (incremental ≡ absolute on edge 0).
+    const live =
+      next.find(
+        t => t.ccy === ccy && t.stripId && (t.stripEdgeIndex ?? 0) === 0,
+      ) ?? next.find(t => t.ccy === ccy && t.stripId);
+    if (!live) continue;
+    const bar = bars.find(b => b.ccy === ccy);
+    if (!bar) continue;
+    const Tf =
+      typeof setup.forecastMonths === 'number' && setup.forecastMonths > 0
+        ? setup.forecastMonths
+        : 0;
+    const schedule = monthlyFlowsByCcy[ccy];
+    const flows =
+      schedule && schedule.length > 0
+        ? [...schedule]
+        : Tf > 0
+          ? Array.from({ length: Tf }, () =>
+              setup.forecastMonths > 0 && Math.abs(bar.flowM) > 1e-15
+                ? bar.flowM
+                : 0,
+            )
+          : [];
+    const probe = buildRollingHedgeEdges(
+      bar.stockNetM,
+      flows,
+      setup,
+      'windowEnd',
+    );
+    if (probe.length === 0) continue;
+    const sizing = inferRollingEdgeSizing(
+      live.amountLocalM,
+      probe[0]!.stockStartM,
+      probe[0]!.endExposureM,
+    );
+    // Re-infer against the chosen sizing’s first edge for a tighter match.
+    const edges = buildRollingHedgeEdges(bar.stockNetM, flows, setup, sizing);
+    if (edges.length === 0) continue;
+    const refined = inferRollingEdgeSizing(
+      live.amountLocalM,
+      edges[0]!.stockStartM,
+      edges[0]!.endExposureM,
+    );
+    const finalEdges =
+      refined === sizing
+        ? edges
+        : buildRollingHedgeEdges(bar.stockNetM, flows, setup, refined);
+    const tickets = proposeRollingHedgeTickets(
+      ccy,
+      finalEdges,
+      setup,
+      live.basis,
+      flows,
+    ).map(t => ({
+      ...t,
+      entityId: live.entityId,
+      entityName: live.entityName,
+    }));
+    const prevStrip = next.filter(t => t.ccy === ccy && t.stripId);
+    const same =
+      prevStrip.length === tickets.length &&
+      prevStrip.every((t, i) => {
+        const n = tickets[i]!;
+        return (
+          Math.abs(t.amountLocalM - n.amountLocalM) < 1e-9 &&
+          t.status === n.status &&
+          t.maturity === n.maturity
+        );
+      });
+    if (same) continue;
+    next = mergeRollingStripIntoBook(next, tickets, ccy);
+    changed = true;
+  }
+  return changed ? next : null;
 }
 
 /** Drop an entire strip (or a single non-strip ticket) on cancellation. */

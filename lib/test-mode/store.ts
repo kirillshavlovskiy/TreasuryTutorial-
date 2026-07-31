@@ -39,10 +39,12 @@ export function emptyAnswers(): TaskAnswers {
     largestMismatchCcy: '',
     largestMismatchAmount: '',
     varConfidencePct: '',
-    varExposureBasis: '',
+    varExposureBasis: 'simpleAvg',
     varHorizon: '',
     varForecastMonths: '',
     varForecastUncertainty: '',
+    varVolSource: '',
+    varAveragingConvention: 'midMonth',
     eurVarUsdK: '',
   };
 }
