@@ -32,6 +32,11 @@ const FUNCTIONS: Record<string, (args: number[]) => number> = {
   pow:   a => Math.pow(a[0], a[1]),
   floor: a => Math.floor(a[0]),
   ceil:  a => Math.ceil(a[0]),
+  /** Natural exponential — exp(x). Bare `exp` in forecast scope is still expense. */
+  exp:   a => Math.exp(a[0] ?? 0),
+  ln:    a => Math.log(a[0] ?? NaN),
+  log:   a =>
+    a.length > 1 ? Math.log(a[0] ?? NaN) / Math.log(a[1] ?? NaN) : Math.log10(a[0] ?? NaN),
 };
 
 function tokenize(input: string): Token[] {
@@ -50,9 +55,19 @@ function tokenize(input: string): Token[] {
       i = j;
       continue;
     }
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_') {
-      let j = i + 1;
-      while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+    // Identifiers, optional Excel-like `$` absolute lock (`$m1`).
+    if (
+      c === '$' ||
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      c === '_'
+    ) {
+      let j = i + (c === '$' ? 1 : 0);
+      if (j >= s.length || !/[A-Za-z_]/.test(s[j]!)) {
+        throw new Error(`Unexpected character "${c}"`);
+      }
+      j++;
+      while (j < s.length && /[A-Za-z0-9_]/.test(s[j]!)) j++;
       tokens.push({ t: 'id', v: s.slice(i, j) });
       i = j;
       continue;
@@ -149,11 +164,75 @@ class Parser {
         if (!fn) throw new Error(`Unknown function "${tok.v}"`);
         return fn(args);
       }
-      if (!(tok.v in this.scope)) throw new Error(`Unknown field "${tok.v}"`);
-      return this.scope[tok.v];
+      // `$m1` absolute lock → look up `m1` in scope.
+      const name = tok.v.startsWith('$') ? tok.v.slice(1) : tok.v;
+      if (!(name in this.scope)) throw new Error(`Unknown field "${tok.v}"`);
+      return this.scope[name]!;
     }
     throw new Error('Unexpected token');
   }
+}
+
+/**
+ * Toggle Excel-like absolute lock on a ref token: `m1` ↔ `$m1`.
+ * Month fills leave `$…` unshifted. Returns null when `token` is not an ident.
+ */
+export function cycleAbsRefToken(token: string): string | null {
+  const t = token.trim();
+  if (!/^\$?[A-Za-z_][A-Za-z0-9_]*$/.test(t)) return null;
+  return t.startsWith('$') ? t.slice(1) : `$${t}`;
+}
+
+/**
+ * Find a lockable ref under the caret / selection (Excel F4 target).
+ * Skips idents that are function calls (`name(`).
+ */
+export function findLockableRefSpan(
+  text: string,
+  caret: number,
+  selEnd: number = caret,
+): { start: number; end: number; token: string } | null {
+  const a = Math.max(0, Math.min(caret, text.length));
+  const b = Math.max(0, Math.min(selEnd, text.length));
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+
+  if (hi > lo) {
+    const selected = text.slice(lo, hi);
+    if (/^\$?[A-Za-z_][A-Za-z0-9_]*$/.test(selected) && text[hi] !== '(') {
+      return { start: lo, end: hi, token: selected };
+    }
+  }
+
+  let pos = a;
+  // Prefer the ident immediately left of the caret (after a just-typed / picked ref).
+  if (
+    pos > 0 &&
+    !/[A-Za-z0-9_$]/.test(text[pos] ?? '') &&
+    /[A-Za-z0-9_]/.test(text[pos - 1]!)
+  ) {
+    pos -= 1;
+  } else if (
+    (pos >= text.length || !/[A-Za-z0-9_$]/.test(text[pos]!)) &&
+    pos > 0 &&
+    (text[pos - 1] === '$' || /[A-Za-z0-9_]/.test(text[pos - 1]!))
+  ) {
+    pos -= 1;
+  }
+
+  if (pos < 0 || pos >= text.length) return null;
+  if (text[pos] !== '$' && !/[A-Za-z0-9_]/.test(text[pos]!)) return null;
+
+  let start = pos;
+  let end = pos + 1;
+  while (start > 0 && /[A-Za-z0-9_]/.test(text[start - 1]!)) start -= 1;
+  if (start > 0 && text[start - 1] === '$') start -= 1;
+  while (end < text.length && /[A-Za-z0-9_]/.test(text[end]!)) end += 1;
+
+  const token = text.slice(start, end);
+  if (!/^\$?[A-Za-z_][A-Za-z0-9_]*$/.test(token)) return null;
+  if (text[end] === '(') return null;
+  return { start, end, token };
 }
 
 /**
@@ -174,10 +253,21 @@ export function lexFormula(expr: string): string[] {
       while (j < s.length && ((s[j] >= '0' && s[j] <= '9') || s[j] === '.')) j++;
       out.push(s.slice(i, j)); i = j; continue;
     }
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_') {
-      let j = i + 1;
-      while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
-      out.push(s.slice(i, j)); i = j; continue;
+    if (
+      c === '$' ||
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      c === '_'
+    ) {
+      let j = i + (c === '$' ? 1 : 0);
+      if (j >= s.length || !/[A-Za-z_]/.test(s[j]!)) {
+        throw new Error(`Unexpected character "${c}"`);
+      }
+      j++;
+      while (j < s.length && /[A-Za-z0-9_]/.test(s[j]!)) j++;
+      out.push(s.slice(i, j));
+      i = j;
+      continue;
     }
     if ('+-*/%^(),'.includes(c)) { out.push(c); i++; continue; }
     throw new Error(`Unexpected character "${c}"`);

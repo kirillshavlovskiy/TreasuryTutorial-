@@ -1,6 +1,12 @@
 'use client';
 
-import { useState, useMemo, useCallback } from 'react';
+import {
+  useState,
+  useMemo,
+  useCallback,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import {
   CURRENCY_PARAMS,
@@ -37,22 +43,51 @@ import {
   DEFAULT_FORECAST_PROFILE,
   copyMonth1ToAll,
   ensureProfileForRows,
+  EMPTY_FORECAST_EXTRAS,
+  FORECAST_FLOW_GROUPS,
+  FORECAST_FLOW_LINES,
   evalPeriodFormula,
+  flatLinePeriodSum,
+  flowFieldDisplay,
+  flowFieldFromDisplay,
+  forecastFlowLinesGrouped,
+  calcFieldKey,
+  calcIdFromFieldKey,
   forecastFormulaKey,
+  forecastFormulaPickToken,
+  hasFlatGrowthOverride,
+  isCalcFieldKey,
+  lineGrowthMoM,
+  lineUncertainty1m,
   monthNet,
+  newCalcRow,
+  normalizeExtras,
+  normalizeMonthFlow,
   periodFlowSumLocalM,
   periodFormulaScope,
+  resizeCalcSeries,
   seedMonthsFromRow,
+  seedMonthsFromRowWithLineGrowth,
+  shiftForecastFormulaMonths,
   sumPeriodFlow,
+  withFlowField,
+  withLineUncertainty1m,
+  type ForecastCalcRow,
+  type ForecastCashExtras,
+  type ForecastFlowField,
   type ForecastFlowMode,
   type ForecastMonthFlow,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
+import { FORECAST_UNCERTAINTY_OPTIONS } from '@/lib/test-mode/var-setup';
 import {
   DEFAULT_VAR_SETUP,
   FORECAST_PERIOD_OPTIONS,
   forecastPeriodIdForMonths,
+  monthlyVolForSetup,
+  VAR_EXPOSURE_OPTIONS,
   VAR_HORIZON_OPTIONS,
+  VAR_VOL_SOURCE_OPTIONS,
   type VarHorizonId,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
@@ -146,6 +181,190 @@ const POLICY_VAR_LIMITS = [
 const thBase = 'px-1.5 py-1 text-[11px] leading-tight font-semibold text-gray-600 whitespace-nowrap align-bottom text-right';
 const tdBase = 'px-1.5 py-0.5 text-right text-[11px] whitespace-nowrap tabular-nums';
 const inBase = 'text-right text-xs border-0 bg-transparent focus:bg-white focus:ring-1 focus:ring-blue-400 rounded px-0.5 outline-none';
+function forecastProfileUi(dark: boolean) {
+  if (!dark) {
+    return {
+      panel:
+        'flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-gray-200 bg-white p-5 shadow-2xl',
+      title: 'text-sm font-semibold text-gray-900',
+      desc: 'mt-0.5 font-mono text-[11px] text-gray-500',
+      close:
+        'rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50',
+      tfChip:
+        'inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-sky-800',
+      chrome:
+        'mt-3 flex shrink-0 flex-wrap items-center gap-2 border-y border-gray-200 bg-gray-50 px-1 py-2',
+      modeWrap: 'flex rounded-lg border border-gray-200 bg-gray-50 p-0.5',
+      modeOn: 'rounded-md px-2.5 py-1 text-xs font-medium bg-blue-600 text-white',
+      modeOff:
+        'rounded-md px-2.5 py-1 text-xs font-medium text-gray-600 hover:bg-white',
+      growthLabel:
+        'inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-700',
+      growthInput:
+        'w-14 rounded border border-gray-300 bg-white px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-400',
+      growthInherited:
+        'w-full max-w-[72px] border-0 bg-transparent px-1.5 py-0.5 text-right font-mono text-[11px] italic tabular-nums text-gray-400 outline-none focus:rounded focus:border focus:border-blue-500 focus:bg-white focus:not-italic focus:text-gray-900 focus:ring-1 focus:ring-blue-400',
+      actionBtn:
+        'rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-700 hover:bg-gray-50',
+      hint: 'text-[10px] text-gray-500',
+      sectionRow:
+        'sticky top-[29px] z-[5] border-t border-gray-200 bg-gray-50 px-2 py-1 text-left text-[9px] font-semibold uppercase tracking-[0.09em] text-gray-500',
+      groupHead:
+        'text-[9px] font-semibold uppercase tracking-[0.09em] text-gray-400',
+      tableWrap:
+        'mt-0 min-h-0 flex-1 overflow-auto rounded-b-lg border border-t-0 border-gray-300 bg-white',
+      th: 'border-l border-gray-200 bg-gray-50 px-2 py-1.5 text-right text-[11px] font-semibold text-gray-600 whitespace-nowrap',
+      td: 'border-l border-gray-200 border-t border-gray-100 bg-white px-1.5 py-0.5 text-right align-middle font-mono text-[11px] tabular-nums',
+      input:
+        'w-full min-w-0 rounded border border-gray-300 bg-white px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-400',
+    colAmt: 'w-[88px] max-w-[88px]',
+    colGrowth: 'w-[72px] max-w-[72px]',
+    colSum: 'w-[96px] max-w-[112px]',
+      rowIn: '',
+      rowOut: '',
+      signIn: 'border-l-2 border-emerald-600',
+      signOut: 'border-l-2 border-rose-500',
+      sideTagIn:
+        'ml-1 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-emerald-700',
+      sideTagOut:
+        'ml-1 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-rose-700',
+      formulaOverride: 'bg-sky-50 ring-1 ring-inset ring-sky-300 text-sky-800',
+      formulaCell: 'cursor-pointer hover:bg-gray-50',
+      editableTd: '',
+      footer:
+        'mt-0 flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-gray-200 pt-3',
+      done:
+        'rounded border border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100',
+      textPrimary: 'text-gray-900',
+      textSecondary: 'text-gray-600',
+      textMuted: 'text-gray-400',
+      textNegative: 'text-red-600',
+      textValue: 'text-gray-800',
+      textNet: 'font-semibold text-emerald-700',
+      sigmaSet:
+        'ml-1 rounded border border-amber-400 px-1 py-px text-[9px] font-semibold text-amber-800',
+      sigmaUnset:
+        'ml-1 rounded px-1 py-px text-[9px] font-semibold text-gray-400',
+      lineClickable:
+        'cursor-pointer underline decoration-dotted decoration-gray-400 underline-offset-2 hover:bg-sky-50 hover:decoration-sky-500',
+      gBadge:
+        'ml-1 rounded border border-gray-300 px-1 py-px text-[9px] font-semibold italic text-gray-500',
+      netRow: 'border-t-2 border-gray-400',
+    };
+  }
+  return {
+    panel:
+      'sim-dark flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 p-5 shadow-2xl text-slate-100',
+    title: 'text-sm font-semibold text-slate-100',
+    desc: 'mt-0.5 font-mono text-[11px] text-slate-400',
+    close:
+      'rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800',
+    tfChip:
+      'inline-flex items-center gap-1 rounded-md border border-sky-700/50 bg-sky-950/50 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-sky-200',
+    chrome:
+      'mt-3 flex shrink-0 flex-wrap items-center gap-2 border-y border-slate-700 bg-slate-950/40 px-1 py-2',
+    modeWrap:
+      'flex rounded-lg border border-slate-600 bg-slate-950/60 p-0.5',
+    modeOn:
+      'rounded-md px-2.5 py-1 text-xs font-medium bg-sky-600 text-white shadow-sm',
+    modeOff:
+      'rounded-md px-2.5 py-1 text-xs font-medium text-slate-400 hover:bg-slate-800 hover:text-slate-200',
+    growthLabel:
+      'inline-flex items-center gap-1.5 rounded-md border border-slate-600 bg-slate-950 px-2 py-1 text-[11px] text-slate-300',
+    growthInput:
+      'w-14 rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-sky-100 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20',
+    /** Inherited growth: bare italic — no box (design handoff). */
+    growthInherited:
+      'w-full max-w-[72px] border-0 bg-transparent px-1.5 py-0.5 text-right font-mono text-[11px] italic tabular-nums text-slate-500 outline-none placeholder:text-slate-600 focus:rounded focus:border focus:border-sky-500 focus:bg-slate-950 focus:not-italic focus:text-sky-100 focus:ring-2 focus:ring-sky-500/20',
+    actionBtn:
+      'rounded border border-slate-600 bg-slate-800 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700',
+    hint: 'text-[10px] text-slate-500',
+    sectionRow:
+      'sticky top-[29px] z-[5] border-t border-slate-800 bg-slate-900/95 px-2 py-1 text-left text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-500',
+    groupHead:
+      'text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-600',
+    tableWrap:
+      'mt-0 min-h-0 flex-1 overflow-auto rounded-b-lg border border-t-0 border-slate-700 bg-slate-950',
+    th: 'border-l border-slate-800 bg-slate-950 px-2 py-1.5 text-right text-[11px] font-semibold text-slate-400 whitespace-nowrap',
+    td: 'border-l border-slate-800 border-t border-slate-800 bg-transparent px-1.5 py-0.5 text-right align-middle font-mono text-[11px] tabular-nums text-slate-200',
+    input:
+      'w-full min-w-0 rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-sky-100 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20',
+    colAmt: 'w-[88px] max-w-[88px]',
+    colGrowth: 'w-[72px] max-w-[72px]',
+    colSum: 'w-[96px] max-w-[112px]',
+    /** Direction is the Line-cell sign rail — not a full-row wash. */
+    rowIn: '',
+    rowOut: '',
+    signIn: 'border-l-2 border-emerald-600',
+    signOut: 'border-l-2 border-rose-600',
+    sideTagIn:
+      'ml-1 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-emerald-400/90',
+    sideTagOut:
+      'ml-1 rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-rose-400/90',
+    formulaOverride:
+      'bg-sky-950/60 ring-1 ring-inset ring-sky-500/45 text-sky-200',
+    formulaCell:
+      'cursor-pointer hover:bg-slate-800/60 active:bg-slate-700/60',
+    editableTd: '',
+    footer:
+      'mt-0 flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-slate-700 bg-slate-900 px-0.5 pt-3',
+    done:
+      'rounded border border-sky-500 bg-sky-600/20 px-3 py-1.5 text-xs font-semibold text-sky-200 hover:bg-sky-600/35',
+    textPrimary: 'text-slate-100',
+    textSecondary: 'text-slate-400',
+    textMuted: 'text-slate-500',
+    textNegative: 'text-rose-400',
+    textValue: 'text-slate-300',
+    textNet: 'font-semibold text-emerald-300',
+    sigmaSet:
+      'ml-1 rounded border border-amber-500/35 px-1 py-px text-[9px] font-semibold text-amber-300',
+    sigmaUnset:
+      'ml-1 rounded px-1 py-px text-[9px] font-semibold text-slate-600',
+    lineClickable:
+      'cursor-pointer underline decoration-dotted decoration-slate-500 underline-offset-2 hover:decoration-sky-400',
+    gBadge:
+      'ml-1 rounded border border-slate-600 px-1 py-px text-[9px] font-semibold italic text-slate-400',
+    netRow: 'border-t-2 border-slate-600',
+  };
+}
+const FORECAST_FORMULA_SUGGESTIONS = [
+  'prev',
+  'k',
+  'i',
+  't',
+  'rev',
+  'revenue',
+  'collections',
+  'exp',
+  'expense',
+  'payout',
+  'fcast',
+  'fcastFX',
+  'invoice',
+  ...Array.from({ length: 12 }, (_, i) => {
+    const n = i + 1;
+    return [`m${n}`, `rev${n}`, `exp${n}`, `fcast${n}`, `$m${n}`];
+  }).flat(),
+  'abs',
+  'min',
+  'max',
+  'round',
+  'sqrt',
+  'pow',
+  'exp',
+  'ln',
+  'log',
+];
+
+function forecastSuggestionsFor(
+  calcRows: readonly ForecastCalcRow[] | undefined,
+): string[] {
+  const refs = (calcRows ?? []).flatMap(c => [
+    c.ref,
+    ...Array.from({ length: 6 }, (_, i) => `${c.ref}m${i + 1}`),
+  ]);
+  return [...refs, ...FORECAST_FORMULA_SUGGESTIONS];
+}
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -193,6 +412,10 @@ export function UnifiedSimulator({
   formulas,
   onFormulaChange,
   onFormulaChanges,
+  /** Hide FX Hedge column group + hedging-strategy/Portfolio VAR toolbar (Liquidity view). */
+  hideFxHedge = false,
+  /** 'carryOnly': P&L shows only Cash Carry + Swap Carry (drops Net Delta / Hedge Carry / Total Carry). */
+  pnlColumns = 'full',
 }: {
   shared: SharedGlobals;
   onSharedChange: (key: keyof SharedGlobals, value: number) => void;
@@ -240,20 +463,23 @@ export function UnifiedSimulator({
   onFormulaChange?: (cellKey: string, formula: string) => void;
   /** Batch formula writes (column fill-down) — prefer this over N× onFormulaChange. */
   onFormulaChanges?: (updates: Record<string, string>) => void;
+  hideFxHedge?: boolean;
+  pnlColumns?: 'full' | 'carryOnly';
 }) {
   // IR / fixed-rate book section: shown when any of its inputs are selected.
   const irCols = (showBonds ? 2 : 0) + (showInvestments ? 2 : 0) + (showLiabilities ? 2 : 0);
   const showIrBook = showAdvancedBook && irCols > 0;
   const showCarry = showAdvancedBook;
   const showSwap = showAdvancedBook;
-  const showFxHedge = showAdvancedBook;
+  const showFxHedge = showAdvancedBook && !hideFxHedge;
   const showPnl = showAdvancedBook;
+  const pnlCarryOnly = pnlColumns === 'carryOnly';
   // Rates / IR only apply in the full book (Task Mode simplified view omits them).
   const ratesOn = showAdvancedBook && showRates;
   /** Task Mode: Debt + Investments live in FX POSITION; every FX cell is editable. */
   const simplifiedFx = !showAdvancedBook;
   const fxPosColSpan = simplifiedFx ? 16 : 12;
-  /** Exp · Fwd hedge · Residual · VaR (spot booked hedges still fold into Residual) */
+  /** Exp · Booked H · Residual · VaR (after booked hedges; no Decision-% staging) */
   const riskMetricCols = 4;
   const riskUsdTotals = useMemo(() => {
     let exp = 0;
@@ -264,6 +490,7 @@ export function UnifiedSimulator({
       exp += fcyToUsdM(m.exposureLocalM, ccy);
       fwd += fcyToUsdM(m.forwardHedgeLocalM ?? 0, ccy);
       resid += fcyToUsdM(m.residualLocalM ?? m.exposureLocalM, ccy);
+      // Residual VaR after booked hedges (Decision % not applied here).
       varUsdM += m.varUsdM;
     }
     return { exp, fwd, resid, varUsdM };
@@ -278,6 +505,72 @@ export function UnifiedSimulator({
       setForecastProfileOpenLocal(open);
     }
   };
+  /** Collapsed Formula help disclosure in Forecast profile chrome. */
+  const [forecastFormulaHelpOpen, setForecastFormulaHelpOpen] = useState(false);
+  /** Click line name → assign 1m projection uncertainty for that cash line. */
+  const [lineUncertaintyEdit, setLineUncertaintyEdit] = useState<{
+    ccy: string;
+    field: ForecastFlowField;
+    label: string;
+    top: number;
+    left: number;
+  } | null>(null);
+  const [lineUncertaintyDraft, setLineUncertaintyDraft] = useState('');
+  const fpu = forecastProfileUi(simDark);
+
+  // Explicit 0 = no forecast — do not coerce to 1.
+  const forecastMonths =
+    typeof shared.forecastMonths === 'number' && shared.forecastMonths >= 0
+      ? shared.forecastMonths
+      : typeof varSetup?.forecastMonths === 'number' && varSetup.forecastMonths >= 0
+        ? varSetup.forecastMonths
+        : 1;
+
+  const setLineUncertainty = useCallback(
+    (ccy: string, field: ForecastFlowField, u1m: number) => {
+      if (!onForecastProfileChange) return;
+      onForecastProfileChange(
+        withLineUncertainty1m(
+          ensureProfileForRows(forecastProfile, rows, forecastMonths),
+          ccy,
+          field,
+          u1m,
+        ),
+      );
+    },
+    [
+      onForecastProfileChange,
+      forecastProfile,
+      rows,
+      forecastMonths,
+    ],
+  );
+
+  const openLineUncertainty = useCallback(
+    (
+      e: ReactMouseEvent<HTMLElement>,
+      ccy: string,
+      field: ForecastFlowField,
+      label: string,
+    ) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!onForecastProfileChange) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const u = lineUncertainty1m(forecastProfile, ccy, field);
+      setLineUncertaintyDraft(
+        u > 0 ? Number((u * 100).toFixed(2)).toString() : '',
+      );
+      setLineUncertaintyEdit({
+        ccy,
+        field,
+        label,
+        top: Math.min(rect.bottom + 4, window.innerHeight - 200),
+        left: Math.max(8, rect.left),
+      });
+    },
+    [onForecastProfileChange, forecastProfile],
+  );
 
   const offsetFor = useCallback(
     (ccy: string): BookedPositionOffset =>
@@ -381,25 +674,35 @@ export function UnifiedSimulator({
     }));
   }, [setRows, offsetFor]);
 
-  // Explicit 0 = no forecast — do not coerce to 1.
-  const forecastMonths =
-    typeof shared.forecastMonths === 'number' && shared.forecastMonths >= 0
-      ? shared.forecastMonths
-      : typeof varSetup?.forecastMonths === 'number' && varSetup.forecastMonths >= 0
-        ? varSetup.forecastMonths
-        : 1;
-
   /**
-   * Risk Metrics Exp = Net FX Forecast (F×T). VaR √T uses
-   * `varSetup.horizon` from Analytics — never synced from these chips.
+   * Risk Metrics Exp = Net FX Forecast (F×T). VaR uses Analytics
+   * `varSetup.horizon` — never synced from forecast chips.
    */
   const exposureRegimeLabel =
     forecastMonths === 0
-      ? 'Net FX Forecast · F×0 (stock only)'
-      : `Net FX Forecast · F×${forecastMonths}m`;
+      ? 'F×0 stock only'
+      : `F×${forecastMonths}m`;
   const varHorizonLabel = varSetup
     ? (VAR_HORIZON_OPTIONS.find(h => h.id === varSetup.horizon)?.label ?? varSetup.horizon)
     : '1m';
+  const analyticsSetupSummary = useMemo(() => {
+    const setup = varSetup ?? DEFAULT_VAR_SETUP;
+    const profile =
+      VAR_EXPOSURE_OPTIONS.find(o => o.id === setup.exposureBasis)?.label ??
+      setup.exposureBasis;
+    const vol =
+      VAR_VOL_SOURCE_OPTIONS.find(o => o.id === setup.volSource)?.label ??
+      setup.volSource;
+    const σPct = (monthlyVolForSetup(setup) * 100).toFixed(1);
+    return {
+      profile,
+      confidencePct: setup.confidencePct,
+      vol,
+      σPct,
+      forecastLabel: exposureRegimeLabel,
+      horizonLabel: varHorizonLabel,
+    };
+  }, [varSetup, exposureRegimeLabel, varHorizonLabel]);
 
   const setForecastMonths = useCallback(
     (months: number) => {
@@ -441,33 +744,103 @@ export function UnifiedSimulator({
         const g = Number.isFinite(forecastProfile.growthRateMoM)
           ? forecastProfile.growthRateMoM
           : 0;
-        // Prefill custom months from flat Rev/Exp with default MoM growth.
+        const extrasByCcy = { ...(forecastProfile.extrasByCcy ?? {}) };
         const byCcy: Record<string, ForecastMonthFlow[]> = {};
         for (const r of rows) {
           if (r.ccy === 'USD') continue;
-          byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths, g);
+          byCcy[r.ccy] = seedMonthsFromRowWithLineGrowth(
+            r,
+            forecastMonths,
+            forecastProfile,
+            extrasByCcy[r.ccy],
+          );
         }
         onForecastProfileChange({
           ...forecastProfile,
           mode: 'custom',
           byCcy,
+          extrasByCcy,
           formulas: {},
           growthRateMoM: g,
         });
         return;
       }
-      onForecastProfileChange({ ...forecastProfile, mode: 'flat' });
+      onForecastProfileChange({
+        ...forecastProfile,
+        mode: 'flat',
+        extrasByCcy: forecastProfile.extrasByCcy ?? {},
+      });
     },
     [onForecastProfileChange, forecastProfile, rows, forecastMonths],
   );
 
+  const commitFlatExtra = useCallback(
+    (ccy: string, field: keyof ForecastCashExtras, raw: string) => {
+      const draftKey = `fp.flat.${ccy}.${field}`;
+      setDrafts(prev => {
+        const next = { ...prev };
+        delete next[draftKey];
+        return next;
+      });
+      if (!onForecastProfileChange) return;
+      const line = FORECAST_FLOW_LINES.find(l => l.key === field);
+      if (!line) return;
+      const numeric = roundMoney(parseFloat(raw));
+      if (isNaN(numeric)) return;
+      const signed = flowFieldFromDisplay(numeric, line.side);
+      const prev = normalizeExtras(forecastProfile.extrasByCcy?.[ccy]);
+      onForecastProfileChange({
+        ...forecastProfile,
+        extrasByCcy: {
+          ...(forecastProfile.extrasByCcy ?? {}),
+          [ccy]: { ...prev, [field]: signed },
+        },
+      });
+    },
+    [onForecastProfileChange, forecastProfile],
+  );
+
+  const commitFlatGrowth = useCallback(
+    (ccy: string, field: ForecastFlowField, raw: string) => {
+      const draftKey = `fp.growth.${ccy}.${field}`;
+      setDrafts(prev => {
+        const next = { ...prev };
+        delete next[draftKey];
+        return next;
+      });
+      if (!onForecastProfileChange) return;
+      const prevLine = {
+        ...(forecastProfile.flatGrowthByCcy?.[ccy] ?? {}),
+      };
+      const trimmed = raw.trim();
+      // Blank → inherit Default g MoM; explicit 0 → hard zero override.
+      if (trimmed === '') {
+        delete prevLine[field];
+      } else {
+        const pct = parseFloat(trimmed);
+        if (!Number.isFinite(pct)) {
+          delete prevLine[field];
+        } else {
+          prevLine[field] = pct / 100;
+        }
+      }
+      const nextByCcy = {
+        ...(forecastProfile.flatGrowthByCcy ?? {}),
+        [ccy]: prevLine,
+      };
+      if (Object.keys(prevLine).length === 0) {
+        delete nextByCcy[ccy];
+      }
+      onForecastProfileChange({
+        ...forecastProfile,
+        flatGrowthByCcy: nextByCcy,
+      });
+    },
+    [onForecastProfileChange, forecastProfile],
+  );
+
   const commitPeriodCell = useCallback(
-    (
-      ccy: string,
-      monthIndex: number,
-      field: 'collections' | 'payout',
-      raw: string,
-    ) => {
+    (ccy: string, monthIndex: number, field: string, raw: string) => {
       const draftKey = `fp.${ccy}.${field}.${monthIndex}`;
       setDrafts(prev => {
         const next = { ...prev };
@@ -478,14 +851,85 @@ export function UnifiedSimulator({
       const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
       const row = rows.find(r => r.ccy === ccy);
       if (!row) return;
-      const months = [...(ensured.byCcy[ccy] ?? seedMonthsFromRow(row, forecastMonths))];
-      const cur = months[monthIndex] ?? { collections: 0, payout: 0 };
+      const months = [
+        ...(ensured.byCcy[ccy] ??
+          seedMonthsFromRow(
+            row,
+            forecastMonths,
+            0,
+            ensured.extrasByCcy[ccy],
+          )),
+      ].map(normalizeMonthFlow);
+      const calcRows = ensured.calcRowsByCcy?.[ccy] ?? [];
+      const calcValues = { ...(ensured.calcByCcy?.[ccy] ?? {}) };
+      const scopeOpts = { calcRows, calcValues };
       const trimmed = raw.trim();
-      let numeric: number;
       const formulas = { ...ensured.formulas };
       const fKey = forecastFormulaKey(ccy, field, monthIndex);
+
+      if (isCalcFieldKey(field)) {
+        const calcId = calcIdFromFieldKey(field);
+        if (!calcId || !calcRows.some(c => c.id === calcId)) return;
+        const series = resizeCalcSeries(calcValues[calcId], forecastMonths);
+        if (trimmed === '') {
+          delete formulas[fKey];
+          series[monthIndex] = 0;
+          calcValues[calcId] = series;
+          onForecastProfileChange({
+            ...ensured,
+            mode: 'custom',
+            formulas,
+            calcByCcy: { ...(ensured.calcByCcy ?? {}), [ccy]: calcValues },
+          });
+          return;
+        }
+        let numeric: number;
+        if (trimmed.startsWith('=')) {
+          const scope = periodFormulaScope(
+            row,
+            months,
+            field,
+            monthIndex,
+            scopeOpts,
+          );
+          const { value, error } = evalPeriodFormula(trimmed, scope);
+          if (error || !Number.isFinite(value)) return;
+          formulas[fKey] = trimmed;
+          numeric = value;
+        } else {
+          delete formulas[fKey];
+          numeric = roundMoney(parseFloat(trimmed));
+          if (isNaN(numeric)) return;
+        }
+        series[monthIndex] = numeric;
+        calcValues[calcId] = series;
+        onForecastProfileChange({
+          ...ensured,
+          mode: 'custom',
+          formulas,
+          calcByCcy: { ...(ensured.calcByCcy ?? {}), [ccy]: calcValues },
+        });
+        return;
+      }
+
+      const cashField = field as ForecastFlowField;
+      const line = FORECAST_FLOW_LINES.find(l => l.key === cashField);
+      if (!line) return;
+      const cur = months[monthIndex] ?? normalizeMonthFlow(undefined);
+      let numeric: number;
+      if (trimmed === '') {
+        delete formulas[fKey];
+        onForecastProfileChange({ ...ensured, formulas });
+        return;
+      }
       if (trimmed.startsWith('=')) {
-        const scope = periodFormulaScope(row, months, field, monthIndex);
+        const scope = periodFormulaScope(
+          row,
+          months,
+          cashField,
+          monthIndex,
+          scopeOpts,
+        );
         const { value, error } = evalPeriodFormula(trimmed, scope);
         if (error || !Number.isFinite(value)) return;
         formulas[fKey] = trimmed;
@@ -495,10 +939,11 @@ export function UnifiedSimulator({
         numeric = roundMoney(parseFloat(trimmed));
         if (isNaN(numeric)) return;
       }
-      months[monthIndex] =
-        field === 'collections'
-          ? { ...cur, collections: roundMoney(numeric) }
-          : { ...cur, payout: roundMoney(-Math.abs(numeric)) };
+      months[monthIndex] = withFlowField(
+        cur,
+        cashField,
+        flowFieldFromDisplay(numeric, line.side),
+      );
       if (monthIndex === 0) {
         setRows(prev =>
           prev.map(r =>
@@ -507,6 +952,7 @@ export function UnifiedSimulator({
                   ...r,
                   collections: months[0]!.collections,
                   payout: months[0]!.payout,
+                  fcastFX: months[0]!.invoiceFcast,
                 }
               : r,
           ),
@@ -522,20 +968,313 @@ export function UnifiedSimulator({
     [onForecastProfileChange, forecastProfile, rows, forecastMonths, setRows],
   );
 
+  const commitPeriodFormula = useCallback(
+    (
+      ccy: string,
+      monthIndex: number,
+      field: string,
+      formulaText: string,
+    ) => {
+      const trimmed = formulaText.trim();
+      if (trimmed === '') {
+        commitPeriodCell(ccy, monthIndex, field, '');
+        return;
+      }
+      const isPlainNumber =
+        /^-?\d*\.?\d+$/.test(trimmed) && !/[a-zA-Z_]/.test(trimmed);
+      commitPeriodCell(
+        ccy,
+        monthIndex,
+        field,
+        isPlainNumber ? trimmed : `=${trimmed}`,
+      );
+    },
+    [commitPeriodCell],
+  );
+
+  const addCalcRow = useCallback(
+    (ccy: string) => {
+      if (!onForecastProfileChange) return;
+      const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
+      const existing = ensured.calcRowsByCcy?.[ccy] ?? [];
+      const row = newCalcRow(existing);
+      const series = Array.from({ length: forecastMonths }, (_, i) =>
+        i === 0 ? 1 : 0,
+      );
+      onForecastProfileChange({
+        ...ensured,
+        mode: 'custom',
+        calcRowsByCcy: {
+          ...(ensured.calcRowsByCcy ?? {}),
+          [ccy]: [...existing, row],
+        },
+        calcByCcy: {
+          ...(ensured.calcByCcy ?? {}),
+          [ccy]: {
+            ...(ensured.calcByCcy?.[ccy] ?? {}),
+            [row.id]: series,
+          },
+        },
+      });
+    },
+    [onForecastProfileChange, forecastProfile, rows, forecastMonths],
+  );
+
+  const removeCalcRow = useCallback(
+    (ccy: string, calcId: string) => {
+      if (!onForecastProfileChange) return;
+      const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
+      const field = calcFieldKey(calcId);
+      const formulas = { ...ensured.formulas };
+      for (const key of Object.keys(formulas)) {
+        if (key.startsWith(`${ccy}::${field}::`)) delete formulas[key];
+      }
+      const nextRows = (ensured.calcRowsByCcy?.[ccy] ?? []).filter(
+        c => c.id !== calcId,
+      );
+      const nextVals = { ...(ensured.calcByCcy?.[ccy] ?? {}) };
+      delete nextVals[calcId];
+      const calcRowsByCcy = { ...(ensured.calcRowsByCcy ?? {}) };
+      const calcByCcy = { ...(ensured.calcByCcy ?? {}) };
+      if (nextRows.length === 0) delete calcRowsByCcy[ccy];
+      else calcRowsByCcy[ccy] = nextRows;
+      if (Object.keys(nextVals).length === 0) delete calcByCcy[ccy];
+      else calcByCcy[ccy] = nextVals;
+      onForecastProfileChange({
+        ...ensured,
+        formulas,
+        calcRowsByCcy,
+        calcByCcy,
+      });
+    },
+    [onForecastProfileChange, forecastProfile, rows, forecastMonths],
+  );
+
+  const renameCalcRow = useCallback(
+    (
+      ccy: string,
+      calcId: string,
+      patch: Partial<Pick<ForecastCalcRow, 'label' | 'ref'>>,
+      opts?: { trimLabel?: boolean },
+    ) => {
+      if (!onForecastProfileChange) return;
+      const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
+      const list = [...(ensured.calcRowsByCcy?.[ccy] ?? [])];
+      const idx = list.findIndex(c => c.id === calcId);
+      if (idx < 0) return;
+      const cur = list[idx]!;
+      let nextRef = cur.ref;
+      if (patch.ref !== undefined) {
+        const candidate = patch.ref.trim();
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(candidate)) return;
+        const taken = list.some(
+          (c, i) =>
+            i !== idx && c.ref.toLowerCase() === candidate.toLowerCase(),
+        );
+        if (taken) return;
+        nextRef = candidate;
+      }
+      let nextLabel = cur.label;
+      if (patch.label !== undefined) {
+        nextLabel =
+          opts?.trimLabel !== false
+            ? patch.label.trim() || cur.label
+            : patch.label;
+      }
+      list[idx] = { ...cur, label: nextLabel, ref: nextRef };
+      onForecastProfileChange({
+        ...ensured,
+        calcRowsByCcy: {
+          ...(ensured.calcRowsByCcy ?? {}),
+          [ccy]: list,
+        },
+      });
+    },
+    [onForecastProfileChange, forecastProfile, rows, forecastMonths],
+  );
+
+  /** Month indices as fill-axis keys — drag across M1…MT on the same line. */
+  const forecastMonthRowOrder = useMemo(
+    () => Array.from({ length: Math.max(0, forecastMonths) }, (_, i) => String(i)),
+    [forecastMonths],
+  );
+
+  /** Batch fill formulas across months with relative mN / revN shifts. */
+  const fillForecastFormulasAcrossMonths = useCallback(
+    (
+      lineKey: string,
+      monthKeys: string[],
+      formulaText: string,
+      sourceMonthIndex: number,
+    ) => {
+      if (!onForecastProfileChange) return;
+      const sep = lineKey.indexOf('::');
+      if (sep < 0) return;
+      const ccy = lineKey.slice(0, sep);
+      const field = lineKey.slice(sep + 2);
+      const row = rows.find(r => r.ccy === ccy);
+      if (!row) return;
+
+      const ensured = ensureProfileForRows(forecastProfile, rows, forecastMonths);
+      const months = [
+        ...(ensured.byCcy[ccy] ??
+          seedMonthsFromRow(row, forecastMonths, 0, ensured.extrasByCcy[ccy])),
+      ].map(normalizeMonthFlow);
+      const calcRows = ensured.calcRowsByCcy?.[ccy] ?? [];
+      const calcValues = { ...(ensured.calcByCcy?.[ccy] ?? {}) };
+      const formulas = { ...ensured.formulas };
+      const src = formulaText.trim().replace(/^=/, '').trim();
+      const scopeOpts = () => ({ calcRows, calcValues });
+
+      if (isCalcFieldKey(field)) {
+        const calcId = calcIdFromFieldKey(field);
+        if (!calcId || !calcRows.some(c => c.id === calcId)) return;
+        const series = resizeCalcSeries(calcValues[calcId], forecastMonths);
+
+        for (const mk of monthKeys) {
+          const mi = Number(mk);
+          if (!Number.isFinite(mi) || mi < 0 || mi >= series.length) continue;
+          const shifted = shiftForecastFormulaMonths(src, sourceMonthIndex, mi);
+          const expr = shifted.startsWith('=') ? shifted : `=${shifted}`;
+          calcValues[calcId] = series;
+          const scope = periodFormulaScope(
+            row,
+            months,
+            field,
+            mi,
+            scopeOpts(),
+          );
+          const { value, error } = evalPeriodFormula(expr, scope);
+          if (error || !Number.isFinite(value)) continue;
+          formulas[forecastFormulaKey(ccy, field, mi)] = expr;
+          series[mi] = value;
+        }
+
+        for (let mi = 0; mi < series.length; mi++) {
+          const fKey = forecastFormulaKey(ccy, field, mi);
+          const stored = formulas[fKey];
+          if (!stored) continue;
+          calcValues[calcId] = series;
+          const scope = periodFormulaScope(
+            row,
+            months,
+            field,
+            mi,
+            scopeOpts(),
+          );
+          const { value, error } = evalPeriodFormula(stored, scope);
+          if (error || !Number.isFinite(value)) continue;
+          series[mi] = value;
+        }
+        calcValues[calcId] = series;
+        onForecastProfileChange({
+          ...ensured,
+          mode: 'custom',
+          formulas,
+          calcByCcy: { ...(ensured.calcByCcy ?? {}), [ccy]: calcValues },
+        });
+        return;
+      }
+
+      const cashField = field as ForecastFlowField;
+      const line = FORECAST_FLOW_LINES.find(l => l.key === cashField);
+      if (!line) return;
+
+      for (const mk of monthKeys) {
+        const mi = Number(mk);
+        if (!Number.isFinite(mi) || mi < 0 || mi >= months.length) continue;
+        const shifted = shiftForecastFormulaMonths(src, sourceMonthIndex, mi);
+        const expr = shifted.startsWith('=') ? shifted : `=${shifted}`;
+        const scope = periodFormulaScope(
+          row,
+          months,
+          cashField,
+          mi,
+          scopeOpts(),
+        );
+        const { value, error } = evalPeriodFormula(expr, scope);
+        if (error || !Number.isFinite(value)) continue;
+        const fKey = forecastFormulaKey(ccy, cashField, mi);
+        formulas[fKey] = expr;
+        months[mi] = withFlowField(
+          months[mi] ?? normalizeMonthFlow(undefined),
+          cashField,
+          flowFieldFromDisplay(value, line.side),
+        );
+      }
+
+      // Re-eval in month order so later cells see updated prev / mN.
+      for (let mi = 0; mi < months.length; mi++) {
+        const fKey = forecastFormulaKey(ccy, cashField, mi);
+        const stored = formulas[fKey];
+        if (!stored) continue;
+        const scope = periodFormulaScope(
+          row,
+          months,
+          cashField,
+          mi,
+          scopeOpts(),
+        );
+        const { value, error } = evalPeriodFormula(stored, scope);
+        if (error || !Number.isFinite(value)) continue;
+        months[mi] = withFlowField(
+          months[mi]!,
+          cashField,
+          flowFieldFromDisplay(value, line.side),
+        );
+      }
+
+      if (months[0]) {
+        setRows(prev =>
+          prev.map(r =>
+            r.ccy === ccy
+              ? {
+                  ...r,
+                  collections: months[0]!.collections,
+                  payout: months[0]!.payout,
+                  fcastFX: months[0]!.invoiceFcast,
+                }
+              : r,
+          ),
+        );
+      }
+      onForecastProfileChange({
+        ...ensured,
+        mode: 'custom',
+        byCcy: { ...ensured.byCcy, [ccy]: months },
+        formulas,
+      });
+    },
+    [
+      onForecastProfileChange,
+      forecastProfile,
+      rows,
+      forecastMonths,
+      setRows,
+    ],
+  );
+
   const fillCustomFromFlat = useCallback(() => {
     if (!onForecastProfileChange) return;
     const g = Number.isFinite(forecastProfile.growthRateMoM)
       ? forecastProfile.growthRateMoM
       : 0;
+    const extrasByCcy = { ...(forecastProfile.extrasByCcy ?? {}) };
     const byCcy: Record<string, ForecastMonthFlow[]> = {};
     for (const r of rows) {
       if (r.ccy === 'USD') continue;
-      byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths, g);
+      byCcy[r.ccy] = seedMonthsFromRowWithLineGrowth(
+        r,
+        forecastMonths,
+        forecastProfile,
+        extrasByCcy[r.ccy],
+      );
     }
     onForecastProfileChange({
       ...forecastProfile,
       mode: 'custom',
       byCcy,
+      extrasByCcy,
       formulas: {},
       growthRateMoM: g,
     });
@@ -570,10 +1309,10 @@ export function UnifiedSimulator({
       const lastNeed = roundMoney(targetPeriod - headSum);
       const lastIdx = months.length - 1;
       if (lastIdx >= 0) {
-        months[lastIdx] = {
+        months[lastIdx] = normalizeMonthFlow({
           collections: roundMoney(Math.max(0, lastNeed)),
           payout: roundMoney(Math.min(0, lastNeed)),
-        };
+        });
       }
       onForecastProfileChange({
         ...ensured,
@@ -633,8 +1372,8 @@ export function UnifiedSimulator({
     } else {
       setRows(INITIAL_ROWS.map(r => ({ ...r })));
       setUsdParams({ ...INITIAL_USD_PARAMS });
-      setUsdCash(303.9);
-      setUsdNonNpCash(154.1);
+    setUsdCash(303.9);
+    setUsdNonNpCash(154.1);
     }
     setStrategy('SWAP_ONLY');
     setHedgeDeltas({});
@@ -856,8 +1595,8 @@ export function UnifiedSimulator({
               className="rounded border border-blue-300 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
               title={
                 forecastMonths === 0
-                  ? 'No forecast period — pick 1 month+ to edit Revenue / Expenses profile'
-                  : 'Edit flat or custom per-period Revenue / Expenses'
+                  ? 'No forecast period — pick 1 month+ to edit cash inflow / outflow profile'
+                  : 'Edit flat or custom per-period cash inflows / outflows'
               }
             >
               Forecast profile…
@@ -878,7 +1617,7 @@ export function UnifiedSimulator({
           typeof document !== 'undefined' &&
           createPortal(
             <div
-              className={`fixed inset-0 z-[200] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm${
+              className={`fixed inset-0 z-[200] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm${
                 simDark ? ' sim-dark' : ''
               }`}
               role="dialog"
@@ -888,373 +1627,1278 @@ export function UnifiedSimulator({
                 if (e.target === e.currentTarget) setForecastProfileOpen(false);
               }}
             >
-              <div className="w-full max-w-5xl rounded-xl border border-gray-200 bg-white p-5 shadow-2xl">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h4 id="forecast-profile-title" className="text-sm font-semibold text-gray-900">
-                      Forecast profile — Revenue / Expenses
+              <div className={fpu.panel}>
+                <div className="flex shrink-0 items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h4 id="forecast-profile-title" className={fpu.title}>
+                      Forecast profile — Balance-sheet cash
                     </h4>
-                    <p className="mt-1 text-[11px] text-gray-500">
-                      {forecastProfile.mode === 'flat'
-                        ? `Workspace formula: Net FX Forecast = book + monthly net path over ${forecastMonths}${forecastMonths === 1 ? ' month' : ' months'}${
-                            Math.abs(forecastProfile.growthRateMoM ?? 0) > 1e-15
-                              ? ` with ${(forecastProfile.growthRateMoM * 100).toFixed(1)}% MoM growth`
-                              : ''
-                          }.`
-                        : `Custom profile: months prefilled from flat Rev/Exp${
-                            Math.abs(forecastProfile.growthRateMoM ?? 0) > 1e-15
-                              ? ` at ${(forecastProfile.growthRateMoM * 100).toFixed(1)}% MoM growth`
-                              : ''
-                          }. Period net = Σ months. Cells accept numbers or =formulas (rev, exp, prev, m1…).`}
+                    <p className={fpu.desc}>
+                      {rows
+                        .filter(r => r.ccy !== 'USD')
+                        .map(r => r.ccy)
+                        .join(' · ') || '—'}{' '}
+                      book · as of{' '}
+                      {new Date().toLocaleDateString('en-GB', {
+                        day: '2-digit',
+                        month: 'short',
+                        year: 'numeric',
+                      })}{' '}
+                      · Tf {forecastMonths}m from FX Risk · amounts in M FCY
                     </p>
                   </div>
                   <button
                     type="button"
                     onClick={() => setForecastProfileOpen(false)}
-                    className="rounded border border-gray-300 px-2 py-1 text-xs text-gray-600 hover:bg-gray-50"
+                    className={fpu.close}
                   >
                     Close
                   </button>
                 </div>
 
-                <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <div className="flex rounded border border-gray-200 p-0.5">
-                    {(
-                      [
-                        {
-                          id: 'flat' as const,
-                          label: 'Flat formula',
-                          title:
-                            'Same monthly Rev/Exp × forecasting period (workspace)',
-                        },
-                        {
-                          id: 'custom' as const,
-                          label: 'Custom by period',
-                          title: 'Edit each month in the selected forecast term',
-                        },
-                      ] as const
-                    ).map(opt => {
-                      const on = forecastProfile.mode === opt.id;
-                      return (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          title={opt.title}
-                          onClick={() => setForecastMode(opt.id)}
-                          className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                            on
-                              ? 'bg-blue-600 text-white'
-                              : 'text-gray-600 hover:bg-gray-50'
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {onForecastProfileChange && (
-                    <label
-                      className="inline-flex items-center gap-1.5 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-700"
-                      title="Month-on-month growth from flat Rev/Exp. Flat mode uses it for the path; Custom mode prefills each month as M_k = M₀×(1+g)^k."
-                    >
-                      <span className="whitespace-nowrap text-gray-500">
-                        Default growth
-                      </span>
-                      <input
-                        type="number"
-                        step={0.1}
-                        className="w-16 rounded border border-gray-300 bg-white px-1.5 py-0.5 text-right font-mono text-[11px] text-gray-900"
-                        value={Number(
-                          (
-                            (Number.isFinite(forecastProfile.growthRateMoM)
-                              ? forecastProfile.growthRateMoM
-                              : 0) * 100
-                          ).toFixed(2),
-                        )}
-                        onChange={e => {
-                          const pct = Number(e.target.value);
-                          const g = Number.isFinite(pct) ? pct / 100 : 0;
-                          if (forecastProfile.mode === 'custom') {
-                            const byCcy: Record<string, ForecastMonthFlow[]> = {};
-                            for (const r of rows) {
-                              if (r.ccy === 'USD') continue;
-                              byCcy[r.ccy] = seedMonthsFromRow(r, forecastMonths, g);
+                <div className="shrink-0 space-y-0">
+                  <div className={fpu.chrome}>
+                    <div className={fpu.modeWrap} role="group" aria-label="Edit mode">
+                      {(
+                        [
+                          {
+                            id: 'flat' as const,
+                            label: 'Flat formula',
+                            title:
+                              'Monthly amount × Tf with per-line Growth % MoM',
+                          },
+                          {
+                            id: 'custom' as const,
+                            label: 'Custom by period',
+                            title:
+                              'Edit M1…MTf with Excel-like formulas and fill-handle',
+                          },
+                        ] as const
+                      ).map(opt => {
+                        const on = forecastProfile.mode === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            title={opt.title}
+                            onClick={() => setForecastMode(opt.id)}
+                            className={`transition-colors ${
+                              on ? fpu.modeOn : fpu.modeOff
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {onForecastProfileChange && (
+                      <label
+                        className={fpu.growthLabel}
+                        title="Used by lines without their own Growth cell · also seeds Fill from flat"
+                      >
+                        <span className={`whitespace-nowrap ${fpu.textMuted}`}>
+                          Default g MoM
+                        </span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          className={fpu.growthInput}
+                          value={Number(
+                            (
+                              (Number.isFinite(forecastProfile.growthRateMoM)
+                                ? forecastProfile.growthRateMoM
+                                : 0) * 100
+                            ).toFixed(2),
+                          )}
+                          onChange={e => {
+                            const pct = Number(e.target.value);
+                            const g = Number.isFinite(pct) ? pct / 100 : 0;
+                            if (forecastProfile.mode === 'custom') {
+                              const extrasByCcy = {
+                                ...(forecastProfile.extrasByCcy ?? {}),
+                              };
+                              const byCcy: Record<string, ForecastMonthFlow[]> =
+                                {};
+                              for (const r of rows) {
+                                if (r.ccy === 'USD') continue;
+                                byCcy[r.ccy] = seedMonthsFromRowWithLineGrowth(
+                                  r,
+                                  forecastMonths,
+                                  { ...forecastProfile, growthRateMoM: g },
+                                  extrasByCcy[r.ccy],
+                                );
+                              }
+                              onForecastProfileChange({
+                                ...forecastProfile,
+                                growthRateMoM: g,
+                                byCcy,
+                                extrasByCcy,
+                                formulas: {},
+                              });
+                              return;
                             }
                             onForecastProfileChange({
                               ...forecastProfile,
                               growthRateMoM: g,
-                              byCcy,
-                              formulas: {},
                             });
-                            return;
-                          }
-                          onForecastProfileChange({
-                            ...forecastProfile,
-                            growthRateMoM: g,
-                          });
-                        }}
-                      />
-                      <span className="text-gray-500">% MoM</span>
-                    </label>
-                  )}
-                  {forecastProfile.mode === 'custom' && (
-                    <>
-                      <button
-                        type="button"
-                        onClick={fillCustomFromFlat}
-                        className="rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
-                        title="Refill every month from flat Rev/Exp with the current default growth rate"
-                      >
-                        Fill from flat formula
-                      </button>
-                      <button
-                        type="button"
-                        onClick={copyM1Across}
-                        className="rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-700 hover:bg-gray-50"
-                        title="Copy M1 Revenue / Expenses across all months"
-                      >
-                        Copy M1 → all
-                      </button>
-                    </>
+                          }}
+                        />
+                        <span className={fpu.textMuted}>%</span>
+                      </label>
+                    )}
+                    {forecastProfile.mode === 'custom' && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={fillCustomFromFlat}
+                          className={fpu.actionBtn}
+                          title="Refill every month from flat cash sources using Default g MoM + per-line flat growth"
+                        >
+                          Fill from flat
+                        </button>
+                        <button
+                          type="button"
+                          onClick={copyM1Across}
+                          className={fpu.actionBtn}
+                          title="Copy M1 cash sources across all months"
+                        >
+                          Copy M1 → all
+                        </button>
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForecastFormulaHelpOpen(v => !v)
+                      }
+                      className={fpu.actionBtn}
+                      aria-expanded={forecastFormulaHelpOpen}
+                    >
+                      Formula help
+                    </button>
+                  </div>
+                  {forecastFormulaHelpOpen && (
+                    <div
+                      className={`rounded-md border px-2.5 py-2 ${
+                        simDark
+                          ? 'border-slate-700 bg-slate-950/60 text-slate-400'
+                          : 'border-gray-200 bg-gray-50 text-gray-600'
+                      } text-[10px] leading-relaxed`}
+                    >
+                      {forecastProfile.mode === 'flat' ? (
+                        <>
+                          Flat: Monthly × path with Growth % MoM · blank Growth
+                          inherits Default g · <span className="font-mono">0</span>{' '}
+                          = no growth for that line · Period Σ is the geometric
+                          path sum · click a line name for 1m projection σ
+                        </>
+                      ) : (
+                        <>
+                          Custom: + Calc row for indexes ·{' '}
+                          <span className="font-mono">=pow(1.01,k-1)</span> ·{' '}
+                          <span className="font-mono">=3.5*idx1</span> ·{' '}
+                          <span className="font-mono">F4</span> /{' '}
+                          <span className="font-mono">$m1</span> locks absolute
+                          (no shift on fill) · drag corner across months
+                        </>
+                      )}
+                    </div>
                   )}
                 </div>
 
-                <div className="mt-4 max-h-[60vh] overflow-auto">
+                <div className={fpu.tableWrap}>
                   {forecastProfile.mode === 'flat' ? (
-                    <table className="min-w-full text-left text-[11px]">
-                      <thead className="sticky top-0 bg-white">
-                        <tr className="text-gray-500">
-                          <th className="py-1.5 pr-3 font-medium">CCY</th>
+                    <table className="w-full table-fixed border-collapse font-mono text-[11px] tabular-nums">
+                      <colgroup>
+                        <col className="w-[52px]" />
+                        <col />
+                        <col className={fpu.colAmt} />
+                        <col className={fpu.colGrowth} />
+                        <col className={fpu.colSum} />
+                      </colgroup>
+                      <thead className="sticky top-0 z-20 bg-slate-950">
+                        <tr>
                           <th
-                            className="py-1.5 pr-3 font-medium text-right"
-                            title="Monthly collections / payins (M FCY)"
+                            colSpan={2}
+                            className={`${fpu.th} sticky left-0 z-30 border-l-0 bg-slate-950 text-left`}
+                          />
+                          <th
+                            colSpan={2}
+                            className={`${fpu.th} ${fpu.groupHead} text-center`}
                           >
-                            Revenue (in)
+                            Input
+                          </th>
+                          <th className={`${fpu.th} ${fpu.groupHead} text-center`}>
+                            Derived
+                          </th>
+                        </tr>
+                        <tr>
+                          <th
+                            className={`${fpu.th} sticky left-0 z-30 border-l-0 bg-slate-950 text-left`}
+                          >
+                            CCY
                           </th>
                           <th
-                            className="py-1.5 pr-3 font-medium text-right"
-                            title="Monthly payouts as positive outflow (stored negative)"
+                            className={`${fpu.th} sticky left-[52px] z-30 bg-slate-950 text-left`}
                           >
-                            Expenses (out)
+                            Line
                           </th>
                           <th
-                            className="py-1.5 font-medium text-right"
-                            title="Monthly net flow × forecast period"
+                            className={`${fpu.th} ${fpu.colAmt}`}
+                            title="Monthly amount (M FCY). Outflows entered positive."
                           >
-                            Period net ×{forecastMonths}
+                            Monthly
+                          </th>
+                          <th
+                            className={`${fpu.th} ${fpu.colGrowth}`}
+                            title="MoM growth for this line · blank inherits Default g MoM · 0 = no growth"
+                          >
+                            Growth %
+                          </th>
+                          <th
+                            className={`${fpu.th} ${fpu.colSum}`}
+                            title="Σ monthly path for this line over the forecast period"
+                          >
+                            Period Σ ×{forecastMonths}
                           </th>
                         </tr>
                       </thead>
                       <tbody>
                         {rows
                           .filter(r => r.ccy !== 'USD')
-                          .map(r => {
+                          .flatMap(r => {
                             const periodNet = periodFlowSumLocalM(
                               r,
                               forecastMonths,
                               forecastProfile,
                             );
-                            const expenseOut = Math.abs(Math.min(0, r.payout));
-                            return (
-                              <tr key={r.id} className="border-t border-gray-100">
-                                <td className="py-1.5 pr-3 font-semibold text-gray-900">
-                                  {r.ccy}
-                                </td>
-                                <td className="py-1.5 pr-3 text-right">
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={drafts[`${r.id}.collections`] ?? n(r.collections)}
-                                    onChange={e =>
-                                      editRow(r.id, 'collections', e.target.value)
-                                    }
-                                    onBlur={() => blurRow(r.id, 'collections')}
-                                    className={`${inBase} w-[72px] border border-gray-200 bg-white`}
-                                  />
-                                </td>
-                                <td className="py-1.5 pr-3 text-right">
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={
-                                      drafts[`${r.id}.expenseOut`] ??
-                                      n(expenseOut === 0 && r.payout >= 0 ? 0 : expenseOut)
-                                    }
-                                    onChange={e => {
-                                      const raw = e.target.value;
-                                      setDrafts(prev => ({
-                                        ...prev,
-                                        [`${r.id}.expenseOut`]: raw,
-                                      }));
-                                      const v = roundMoney(parseFloat(raw));
-                                      if (isNaN(v)) return;
-                                      setRows(prev =>
-                                        prev.map(row =>
-                                          row.id === r.id
-                                            ? { ...row, payout: -Math.abs(v) }
-                                            : row,
-                                        ),
-                                      );
-                                    }}
-                                    onBlur={() =>
-                                      setDrafts(prev => {
-                                        const next = { ...prev };
-                                        delete next[`${r.id}.expenseOut`];
-                                        return next;
-                                      })
-                                    }
-                                    className={`${inBase} w-[72px] border border-gray-200 bg-white`}
-                                  />
-                                </td>
+                            const extras = normalizeExtras(
+                              forecastProfile.extrasByCcy?.[r.ccy] ??
+                                EMPTY_FORECAST_EXTRAS,
+                            );
+                            const flatMonth = normalizeMonthFlow({
+                              collections: r.collections,
+                              payout: r.payout,
+                              invoiceFcast: r.fcastFX ?? 0,
+                              ...extras,
+                            });
+                            const defaultGrowthPct = Number(
+                              (
+                                (Number.isFinite(forecastProfile.growthRateMoM)
+                                  ? forecastProfile.growthRateMoM
+                                  : 0) * 100
+                              ).toFixed(2),
+                            );
+                            const grouped = forecastFlowLinesGrouped();
+                            const nodes: ReactNode[] = [];
+                            let dataIdx = 0;
+
+                            for (const group of FORECAST_FLOW_GROUPS) {
+                              nodes.push(
+                                <tr key={`${r.id}.sec.${group.id}`}>
+                                  <td
+                                    colSpan={5}
+                                    className={`${fpu.sectionRow} sticky left-0`}
+                                  >
+                                    {group.label}
+                                  </td>
+                                </tr>,
+                              );
+                              for (const key of group.keys) {
+                                const line = grouped.find(l => l.key === key);
+                                if (!line) continue;
+                                const li = dataIdx++;
+                                const isExtra =
+                                  line.key !== 'collections' &&
+                                  line.key !== 'payout' &&
+                                  line.key !== 'invoiceFcast';
+                                const displayNum = flowFieldDisplay(
+                                  flatMonth,
+                                  line.key,
+                                  line.side,
+                                );
+                                const draftKey = isExtra
+                                  ? `fp.flat.${r.ccy}.${line.key}`
+                                  : line.key === 'collections'
+                                    ? `${r.id}.collections`
+                                    : line.key === 'invoiceFcast'
+                                      ? `${r.id}.fcastFX`
+                                      : line.key === 'payout'
+                                        ? `${r.id}.expenseOut`
+                                        : '';
+                                const growthDraftKey = `fp.growth.${r.ccy}.${line.key}`;
+                                const growthOverride = hasFlatGrowthOverride(
+                                  forecastProfile,
+                                  r.ccy,
+                                  line.key,
+                                );
+                                const lineGrowthPct =
+                                  lineGrowthMoM(
+                                    forecastProfile,
+                                    r.ccy,
+                                    line.key,
+                                  ) * 100;
+                                const linePeriodSum = flatLinePeriodSum(
+                                  r,
+                                  extras,
+                                  forecastProfile,
+                                  line.key,
+                                  forecastMonths,
+                                );
+                                const sigma =
+                                  lineUncertainty1m(
+                                    forecastProfile,
+                                    r.ccy,
+                                    line.key,
+                                  );
+                                const signRail =
+                                  line.side === 'out' ? fpu.signOut : fpu.signIn;
+                                const sideTag =
+                                  line.side === 'out'
+                                    ? fpu.sideTagOut
+                                    : fpu.sideTagIn;
+                                nodes.push(
+                                  <tr key={`${r.id}.${line.key}`}>
+                                    <td
+                                      className={`${fpu.td} sticky left-0 z-[1] border-l-0 bg-slate-950 font-semibold ${fpu.textPrimary}`}
+                                    >
+                                      {li === 0 ? r.ccy : ''}
+                                    </td>
+                                    <td
+                                      className={`${fpu.td} sticky left-[52px] z-[1] bg-slate-950 text-left ${signRail}${
+                                        onForecastProfileChange
+                                          ? ` ${fpu.lineClickable}`
+                                          : ''
+                                      }`}
+                                      title={`${line.title} · click to set 1m projection uncertainty (σ)`}
+                                      onClick={
+                                        onForecastProfileChange
+                                          ? e =>
+                                              openLineUncertainty(
+                                                e,
+                                                r.ccy,
+                                                line.key,
+                                                line.label,
+                                              )
+                                          : undefined
+                                      }
+                                    >
+                                      <span className={fpu.textPrimary}>
+                                        {line.label}
+                                      </span>
+                                      <span className={sideTag}>
+                                        {line.side === 'out' ? 'OUT' : 'IN'}
+                                      </span>
+                                      {onForecastProfileChange && (
+                                        <span
+                                          className={
+                                            sigma > 0
+                                              ? fpu.sigmaSet
+                                              : fpu.sigmaUnset
+                                          }
+                                          title="Set 1m projection σ"
+                                        >
+                                          {sigma > 0
+                                            ? `σ ${(sigma * 100).toFixed(0)}%`
+                                            : 'σ'}
+                                        </span>
+                                      )}
+                                    </td>
+                                    <td
+                                      className={`${fpu.td} ${fpu.editableTd} ${fpu.colAmt}`}
+                                    >
+                                      <input
+                                        type="text"
+                                        inputMode="decimal"
+                                        title={line.title}
+                                        value={
+                                          drafts[draftKey] ?? n(displayNum)
+                                        }
+                                        onChange={e => {
+                                          const raw = e.target.value;
+                                          setDrafts(prev => ({
+                                            ...prev,
+                                            [draftKey]: raw,
+                                          }));
+                                          if (isExtra) return;
+                                          const v = roundMoney(parseFloat(raw));
+                                          if (isNaN(v)) return;
+                                          if (line.key === 'collections') {
+                                            editRow(
+                                              r.id,
+                                              'collections',
+                                              raw,
+                                            );
+                                          } else if (
+                                            line.key === 'invoiceFcast'
+                                          ) {
+                                            editRow(r.id, 'fcastFX', raw);
+                                          } else if (line.key === 'payout') {
+                                            setRows(prev =>
+                                              prev.map(row =>
+                                                row.id === r.id
+                                                  ? {
+                                                      ...row,
+                                                      payout: -Math.abs(v),
+                                                    }
+                                                  : row,
+                                              ),
+                                            );
+                                          }
+                                        }}
+                                        onBlur={e => {
+                                          if (isExtra) {
+                                            commitFlatExtra(
+                                              r.ccy,
+                                              line.key as keyof ForecastCashExtras,
+                                              e.target.value,
+                                            );
+                                            return;
+                                          }
+                                          if (line.key === 'collections') {
+                                            blurRow(r.id, 'collections');
+                                          } else if (
+                                            line.key === 'invoiceFcast'
+                                          ) {
+                                            blurRow(r.id, 'fcastFX');
+                                          } else {
+                                            setDrafts(prev => {
+                                              const next = { ...prev };
+                                              delete next[draftKey];
+                                              return next;
+                                            });
+                                          }
+                                        }}
+                                        className={fpu.input}
+                                      />
+                                    </td>
+                                    <td className={`${fpu.td} ${fpu.colGrowth}`}>
+                                      <input
+                                        type="text"
+                                        inputMode="decimal"
+                                        title="MoM growth · blank inherits Default g MoM · 0 = no growth"
+                                        placeholder={String(defaultGrowthPct)}
+                                        value={
+                                          drafts[growthDraftKey] !== undefined
+                                            ? drafts[growthDraftKey]!
+                                            : String(
+                                                Number(
+                                                  lineGrowthPct.toFixed(2),
+                                                ),
+                                              )
+                                        }
+                                        onChange={e => {
+                                          setDrafts(prev => ({
+                                            ...prev,
+                                            [growthDraftKey]: e.target.value,
+                                          }));
+                                        }}
+                                        onFocus={e => {
+                                          if (!growthOverride) e.target.select();
+                                        }}
+                                        onBlur={e => {
+                                          const raw = e.target.value.trim();
+                                          const shown = String(
+                                            Number(lineGrowthPct.toFixed(2)),
+                                          );
+                                          // Unchanged inherit display → stay inherit.
+                                          if (
+                                            !growthOverride &&
+                                            drafts[growthDraftKey] ===
+                                              undefined
+                                          ) {
+                                            return;
+                                          }
+                                          if (
+                                            !growthOverride &&
+                                            (raw === '' || raw === shown)
+                                          ) {
+                                            commitFlatGrowth(
+                                              r.ccy,
+                                              line.key,
+                                              '',
+                                            );
+                                            return;
+                                          }
+                                          commitFlatGrowth(
+                                            r.ccy,
+                                            line.key,
+                                            e.target.value,
+                                          );
+                                        }}
+                                        className={
+                                          growthOverride ||
+                                          drafts[growthDraftKey] !== undefined
+                                            ? fpu.input
+                                            : fpu.growthInherited
+                                        }
+                                      />
+                                    </td>
+                                    <td
+                                      className={`${fpu.td} ${fpu.colSum} ${fpu.textValue}`}
+                                    >
+                                      {f2(linePeriodSum)}
+                                    </td>
+                                  </tr>,
+                                );
+                              }
+                            }
+
+                            nodes.push(
+                              <tr key={`${r.id}.net`} className={fpu.netRow}>
                                 <td
-                                  className={`py-1.5 text-right font-medium tabular-nums ${
-                                    periodNet < 0 ? 'text-red-600' : 'text-gray-800'
-                                  }`}
+                                  className={`${fpu.td} sticky left-0 z-[1] border-l-0 bg-slate-950 font-semibold ${fpu.textPrimary}`}
+                                />
+                                <td
+                                  className={`${fpu.td} sticky left-[52px] z-[1] bg-slate-950 text-left ${fpu.textSecondary}`}
+                                  title="Monthly net of all sources"
                                 >
+                                  Period net
+                                </td>
+                                <td className={`${fpu.td} ${fpu.textNet}`}>
+                                  {f2(monthNet(flatMonth))}
+                                </td>
+                                <td className={fpu.td}>
+                                  <span className={`text-[10px] ${fpu.textMuted}`}>
+                                    —
+                                  </span>
+                                </td>
+                                <td className={`${fpu.td} ${fpu.textNet}`}>
                                   {f2(periodNet)}
                                 </td>
-                              </tr>
+                              </tr>,
                             );
+                            return nodes;
                           })}
                       </tbody>
                     </table>
                   ) : (
-                    <table className="min-w-full text-left text-[11px]">
-                      <thead className="sticky top-0 z-10 bg-white">
-                        <tr className="text-gray-500">
-                          <th className="sticky left-0 z-20 bg-white py-1.5 pr-3 font-medium">
+                    <FormulaGridProvider
+                      rowOrder={forecastMonthRowOrder}
+                      onFill={(
+                        columnKey,
+                        monthKeys,
+                        formulaText,
+                        sourceRowKey,
+                      ) => {
+                        const sourceMi = Number(sourceRowKey);
+                        fillForecastFormulasAcrossMonths(
+                          columnKey,
+                          monthKeys,
+                          formulaText,
+                          Number.isFinite(sourceMi) ? sourceMi : 0,
+                        );
+                      }}
+                    >
+                    <table className="min-w-full border-collapse font-mono text-[10px] tabular-nums">
+                      <thead className="sticky top-0 z-20 bg-slate-950">
+                        <tr>
+                          <th
+                            colSpan={2}
+                            className={`${fpu.th} sticky left-0 z-30 border-l-0 bg-slate-950 text-left`}
+                          />
+                          <th
+                            colSpan={Math.max(1, forecastMonths)}
+                            className={`${fpu.th} ${fpu.groupHead} text-center`}
+                          >
+                            Input · month cells
+                          </th>
+                          <th className={`${fpu.th} ${fpu.groupHead} text-center`}>
+                            Derived
+                          </th>
+                        </tr>
+                        <tr>
+                          <th
+                            className={`${fpu.th} sticky left-0 z-30 border-l-0 bg-slate-950 text-left`}
+                          >
                             CCY
                           </th>
-                          <th className="sticky left-10 z-20 bg-white py-1.5 pr-3 font-medium">
+                          <th
+                            className={`${fpu.th} sticky left-[52px] z-30 bg-slate-950 text-left`}
+                          >
                             Line
                           </th>
                           {Array.from({ length: forecastMonths }, (_, i) => (
                             <th
                               key={i}
-                              className="min-w-[68px] px-1 py-1.5 text-right font-medium"
+                              className={`${fpu.th} min-w-[64px] ${
+                                i % 3 === 0 ? 'border-l border-slate-700' : ''
+                              } ${
+                                Math.floor(i / 3) % 2 === 1
+                                  ? 'bg-slate-900/80'
+                                  : 'bg-slate-950'
+                              }`}
+                              title="Click to edit · =prev*exp(0.05) · =m1 · drag corner across months"
                             >
                               M{i + 1}
                             </th>
                           ))}
-                          <th className="py-1.5 pl-2 text-right font-medium">Period net</th>
+                          <th className={fpu.th}>Period Σ</th>
                         </tr>
                       </thead>
                       <tbody>
                         {rows
                           .filter(r => r.ccy !== 'USD')
-                          .map(r => {
+                          .flatMap(r => {
                             const ensured = ensureProfileForRows(
                               forecastProfile,
                               rows,
                               forecastMonths,
                             );
-                            const months =
-                              ensured.byCcy[r.ccy] ?? seedMonthsFromRow(r, forecastMonths);
+                            const months = (
+                              ensured.byCcy[r.ccy] ??
+                              seedMonthsFromRow(
+                                r,
+                                forecastMonths,
+                                0,
+                                ensured.extrasByCcy[r.ccy],
+                              )
+                            ).map(normalizeMonthFlow);
                             const periodNet = sumPeriodFlow(months);
-                            const lines: {
-                              key: 'collections' | 'payout' | 'net';
-                              label: string;
-                              readOnly?: boolean;
-                            }[] = [
-                              { key: 'collections', label: 'Revenue' },
-                              { key: 'payout', label: 'Expenses' },
-                              { key: 'net', label: 'Net', readOnly: true },
-                            ];
-                            return lines.map((line, li) => (
-                              <tr
-                                key={`${r.id}.${line.key}`}
-                                className={`border-t border-gray-100 ${li === 0 ? 'border-t-gray-200' : ''}`}
-                              >
-                                <td className="sticky left-0 bg-white py-1 pr-3 font-semibold text-gray-900">
-                                  {li === 0 ? r.ccy : ''}
-                                </td>
-                                <td className="sticky left-10 bg-white py-1 pr-3 text-gray-500">
-                                  {line.label}
-                                </td>
-                                {months.map((m, mi) => {
-                                  if (line.key === 'net') {
-                                    const net = monthNet(m);
-                                    return (
-                                      <td
-                                        key={mi}
-                                        className={`px-1 py-1 text-right tabular-nums ${
-                                          net < 0 ? 'text-red-600' : 'text-gray-700'
-                                        }`}
+                            const grouped = forecastFlowLinesGrouped();
+                            const calcRows =
+                              ensured.calcRowsByCcy?.[r.ccy] ?? [];
+                            const calcValues =
+                              ensured.calcByCcy?.[r.ccy] ?? {};
+                            const scopeOpts = {
+                              calcRows,
+                              calcValues,
+                            };
+                            const suggestions =
+                              forecastSuggestionsFor(calcRows);
+                            const nodes: ReactNode[] = [];
+                            let dataIdx = 0;
+                            const monthColSpan = 2 + forecastMonths + 1;
+
+                            nodes.push(
+                              <tr key={`${r.id}.sec.calc`}>
+                                <td
+                                  colSpan={monthColSpan}
+                                  className={`${fpu.sectionRow} sticky left-0`}
+                                >
+                                  <span className="inline-flex items-center gap-2">
+                                    Calculations
+                                    {onForecastProfileChange && (
+                                      <button
+                                        type="button"
+                                        className={`${fpu.actionBtn} normal-case tracking-normal`}
+                                        title="Temporary index / helper row (not in Net)"
+                                        onClick={() => addCalcRow(r.ccy)}
                                       >
-                                        {f2(net)}
-                                      </td>
-                                    );
-                                  }
-                                  const fKey = forecastFormulaKey(r.ccy, line.key, mi);
-                                  const formula = forecastProfile.formulas[fKey];
-                                  const draftKey = `fp.${r.ccy}.${line.key}.${mi}`;
-                                  const expenseOut = Math.abs(Math.min(0, m.payout));
-                                  const displayNum =
-                                    line.key === 'collections'
-                                      ? m.collections
-                                      : expenseOut === 0 && m.payout >= 0
-                                        ? 0
-                                        : expenseOut;
-                                  return (
-                                    <td key={mi} className="px-1 py-1 text-right">
+                                        + Calc row
+                                      </button>
+                                    )}
+                                  </span>
+                                </td>
+                              </tr>,
+                            );
+
+                            if (calcRows.length === 0) {
+                              nodes.push(
+                                <tr key={`${r.id}.calc.empty`}>
+                                  <td
+                                    colSpan={monthColSpan}
+                                    className={`${fpu.td} border-l-0 text-left ${fpu.textMuted}`}
+                                  >
+                                    Optional · e.g. idx1 ={' '}
+                                    <span className="font-mono">
+                                      pow(1.01, k-1)
+                                    </span>
+                                    , then Revenue ={' '}
+                                    <span className="font-mono">3.5*idx1</span>
+                                  </td>
+                                </tr>,
+                              );
+                            }
+
+                            for (const calc of calcRows) {
+                              const field = calcFieldKey(calc.id);
+                              const series = resizeCalcSeries(
+                                calcValues[calc.id],
+                                forecastMonths,
+                              );
+                              const lineSum = series.reduce((s, v) => s + v, 0);
+                              const li = dataIdx++;
+                              nodes.push(
+                                <tr key={`${r.id}.calc.${calc.id}`}>
+                                  <td
+                                    className={`${fpu.td} sticky left-0 z-[1] border-l-0 bg-slate-950 font-semibold ${fpu.textPrimary}`}
+                                  >
+                                    {li === 0 ? r.ccy : ''}
+                                  </td>
+                                  <td
+                                    className={`${fpu.td} sticky left-[52px] z-[1] bg-slate-950 text-left border-l-2 border-violet-500`}
+                                  >
+                                    <div className="flex min-w-0 items-center gap-1">
                                       <input
                                         type="text"
-                                        inputMode="decimal"
-                                        title={
-                                          formula
-                                            ? formula
-                                            : 'Number or =formula (rev, exp, prev, m1…)'
-                                        }
-                                        value={
-                                          drafts[draftKey] ??
-                                          (formula ? formula : n(displayNum))
-                                        }
-                                        onChange={e =>
-                                          setDrafts(prev => ({
-                                            ...prev,
-                                            [draftKey]: e.target.value,
-                                          }))
-                                        }
+                                        className={`min-w-0 flex-1 border-0 bg-transparent px-0 py-0 text-left font-mono text-[11px] ${fpu.textPrimary} outline-none focus:underline`}
+                                        title="Formula ref (idx1, growth, …) — commit on blur"
+                                        defaultValue={calc.ref}
+                                        key={`${calc.id}.ref.${calc.ref}`}
+                                        disabled={!onForecastProfileChange}
                                         onBlur={e =>
-                                          commitPeriodCell(
+                                          renameCalcRow(r.ccy, calc.id, {
+                                            ref: e.target.value,
+                                          })
+                                        }
+                                      />
+                                      {onForecastProfileChange && (
+                                        <button
+                                          type="button"
+                                          className={`shrink-0 px-1 text-[11px] ${fpu.textMuted} hover:text-rose-400`}
+                                          title="Delete calc row"
+                                          onClick={() =>
+                                            removeCalcRow(r.ccy, calc.id)
+                                          }
+                                        >
+                                          ×
+                                        </button>
+                                      )}
+                                    </div>
+                                    <input
+                                      type="text"
+                                      className={`mt-0.5 w-full border-0 bg-transparent px-0 py-0 text-left text-[9px] ${fpu.textMuted} outline-none`}
+                                      title="Label"
+                                      value={calc.label}
+                                      disabled={!onForecastProfileChange}
+                                      onChange={e =>
+                                        renameCalcRow(
+                                          r.ccy,
+                                          calc.id,
+                                          { label: e.target.value },
+                                          { trimLabel: false },
+                                        )
+                                      }
+                                      onBlur={e =>
+                                        renameCalcRow(r.ccy, calc.id, {
+                                          label: e.target.value,
+                                        })
+                                      }
+                                    />
+                                  </td>
+                                  {series.map((val, mi) => {
+                                    const fKey = forecastFormulaKey(
+                                      r.ccy,
+                                      field,
+                                      mi,
+                                    );
+                                    const storedFormula =
+                                      forecastProfile.formulas[fKey];
+                                    const scope = periodFormulaScope(
+                                      r,
+                                      months,
+                                      field,
+                                      mi,
+                                      scopeOpts,
+                                    );
+                                    const cellError = storedFormula
+                                      ? evalPeriodFormula(
+                                          storedFormula,
+                                          scope,
+                                        ).error
+                                      : undefined;
+                                    const cellColumnKey = `${r.ccy}::${field}`;
+                                    return (
+                                      <FormulaCell
+                                        key={mi}
+                                        tdClass={`${fpu.td} ${fpu.formulaCell} ${
+                                          storedFormula
+                                            ? fpu.formulaOverride
+                                            : ''
+                                        } ${
+                                          mi % 3 === 0
+                                            ? 'border-l border-slate-700'
+                                            : ''
+                                        } ${fpu.textValue}`}
+                                        display={f2(val)}
+                                        formula={storedFormula?.replace(
+                                          /^=/,
+                                          '',
+                                        )}
+                                        defaultFormula=""
+                                        onCommit={text =>
+                                          commitPeriodFormula(
                                             r.ccy,
                                             mi,
-                                            line.key as 'collections' | 'payout',
-                                            e.target.value,
+                                            field,
+                                            text,
                                           )
                                         }
-                                        className={`${inBase} w-[64px] border ${
-                                          formula
-                                            ? 'border-violet-300 bg-violet-50'
-                                            : 'border-gray-200 bg-white'
-                                        }`}
+                                        error={cellError}
+                                        cellAddress={`${calc.ref} · M${mi + 1}`}
+                                        evaluateLive={text => {
+                                          const t = text.trim();
+                                          if (!t) {
+                                            return {
+                                              valid: true,
+                                              resultLabel: f2(val),
+                                            };
+                                          }
+                                          const ev = evalPeriodFormula(
+                                            t.startsWith('=') ? t : `=${t}`,
+                                            scope,
+                                          );
+                                          if (
+                                            ev.error ||
+                                            ev.value == null
+                                          ) {
+                                            return {
+                                              valid: false,
+                                              resultLabel: '—',
+                                            };
+                                          }
+                                          return {
+                                            valid: true,
+                                            resultLabel: f2(ev.value),
+                                          };
+                                        }}
+                                        title={`${calc.ref} · =pow(1.01,k-1) · =prev*1.01 · drag across months`}
+                                        suggestions={suggestions}
+                                        columnKey={cellColumnKey}
+                                        rowKey={String(mi)}
+                                        pickTokenResolver={active =>
+                                          forecastFormulaPickToken(
+                                            active.columnKey,
+                                            active.rowKey,
+                                            cellColumnKey,
+                                            String(mi),
+                                            calcRows,
+                                          )
+                                        }
+                                        theme={simDark ? 'dark' : 'light'}
                                       />
+                                    );
+                                  })}
+                                  <td className={`${fpu.td} ${fpu.textValue}`}>
+                                    {f2(lineSum)}
+                                  </td>
+                                </tr>,
+                              );
+                            }
+
+                            for (const group of FORECAST_FLOW_GROUPS) {
+                              nodes.push(
+                                <tr key={`${r.id}.sec.${group.id}`}>
+                                  <td
+                                    colSpan={monthColSpan}
+                                    className={`${fpu.sectionRow} sticky left-0`}
+                                  >
+                                    {group.label}
+                                  </td>
+                                </tr>,
+                              );
+                              for (const key of group.keys) {
+                                const line = grouped.find(l => l.key === key);
+                                if (!line) continue;
+                                const li = dataIdx++;
+                                const sigma = lineUncertainty1m(
+                                  forecastProfile,
+                                  r.ccy,
+                                  line.key,
+                                );
+                                const growthOverride = hasFlatGrowthOverride(
+                                  forecastProfile,
+                                  r.ccy,
+                                  line.key,
+                                );
+                                const signRail =
+                                  line.side === 'out' ? fpu.signOut : fpu.signIn;
+                                const sideTag =
+                                  line.side === 'out'
+                                    ? fpu.sideTagOut
+                                    : fpu.sideTagIn;
+                                const linePeriodSum = months.reduce(
+                                  (s, m) =>
+                                    s +
+                                    flowFieldDisplay(m, line.key, line.side),
+                                  0,
+                                );
+                                nodes.push(
+                                  <tr key={`${r.id}.${line.key}`}>
+                                    <td
+                                      className={`${fpu.td} sticky left-0 z-[1] border-l-0 bg-slate-950 font-semibold ${fpu.textPrimary}`}
+                                    >
+                                      {li === 0 ? r.ccy : ''}
+                                    </td>
+                                    <td
+                                      className={`${fpu.td} sticky left-[52px] z-[1] bg-slate-950 text-left ${signRail}${
+                                        onForecastProfileChange
+                                          ? ` ${fpu.lineClickable}`
+                                          : ''
+                                      }`}
+                                      title={`${line.title} · click to set 1m projection uncertainty (σ)`}
+                                      onClick={
+                                        onForecastProfileChange
+                                          ? e =>
+                                              openLineUncertainty(
+                                                e,
+                                                r.ccy,
+                                                line.key,
+                                                line.label,
+                                              )
+                                          : undefined
+                                      }
+                                    >
+                                      <span className={fpu.textPrimary}>
+                                        {line.label}
+                                      </span>
+                                      <span className={sideTag}>
+                                        {line.side === 'out' ? 'OUT' : 'IN'}
+                                      </span>
+                                      {growthOverride && (
+                                        <span
+                                          className={fpu.gBadge}
+                                          title="Flat Growth % MoM override still set for this line"
+                                        >
+                                          g
+                                        </span>
+                                      )}
+                                      {onForecastProfileChange && (
+                                        <span
+                                          className={
+                                            sigma > 0
+                                              ? fpu.sigmaSet
+                                              : fpu.sigmaUnset
+                                          }
+                                          title="Set 1m projection σ"
+                                        >
+                                          {sigma > 0
+                                            ? `σ ${(sigma * 100).toFixed(0)}%`
+                                            : 'σ'}
+                                        </span>
+                                      )}
+                                    </td>
+                                    {months.map((m, mi) => {
+                                      const field = line.key;
+                                      const fKey = forecastFormulaKey(
+                                        r.ccy,
+                                        field,
+                                        mi,
+                                      );
+                                      const storedFormula =
+                                        forecastProfile.formulas[fKey];
+                                      const displayNum = flowFieldDisplay(
+                                        m,
+                                        field,
+                                        line.side,
+                                      );
+                                      const scope = periodFormulaScope(
+                                        r,
+                                        months,
+                                        field,
+                                        mi,
+                                        scopeOpts,
+                                      );
+                                      const cellError = storedFormula
+                                        ? evalPeriodFormula(
+                                            storedFormula,
+                                            scope,
+                                          ).error
+                                        : undefined;
+                                      const cellColumnKey = `${r.ccy}::${field}`;
+                                      return (
+                                        <FormulaCell
+                                          key={mi}
+                                          tdClass={`${fpu.td} ${fpu.formulaCell} ${
+                                            storedFormula
+                                              ? fpu.formulaOverride
+                                              : ''
+                                          } ${
+                                            mi % 3 === 0
+                                              ? 'border-l border-slate-700'
+                                              : ''
+                                          } ${fpu.textValue}`}
+                                          display={f2(displayNum)}
+                                          formula={storedFormula?.replace(
+                                            /^=/,
+                                            '',
+                                          )}
+                                          defaultFormula=""
+                                          onCommit={text =>
+                                            commitPeriodFormula(
+                                              r.ccy,
+                                              mi,
+                                              field,
+                                              text,
+                                            )
+                                          }
+                                          error={cellError}
+                                          cellAddress={`${line.label} · M${mi + 1}`}
+                                          evaluateLive={text => {
+                                            const t = text.trim();
+                                            if (!t) {
+                                              return {
+                                                valid: true,
+                                                resultLabel: f2(displayNum),
+                                              };
+                                            }
+                                            const ev = evalPeriodFormula(
+                                              t.startsWith('=') ? t : `=${t}`,
+                                              scope,
+                                            );
+                                            if (ev.error || ev.value == null) {
+                                              return {
+                                                valid: false,
+                                                resultLabel: '—',
+                                              };
+                                            }
+                                            const shown =
+                                              line.side === 'out'
+                                                ? Math.abs(ev.value)
+                                                : ev.value;
+                                            return {
+                                              valid: true,
+                                              resultLabel: f2(shown),
+                                            };
+                                          }}
+                                          title={`${line.title} · =3.5*idx1 · =prev*exp(0.05) · =m1 / $m1 · drag across months`}
+                                          suggestions={suggestions}
+                                          columnKey={cellColumnKey}
+                                          rowKey={String(mi)}
+                                          pickTokenResolver={active =>
+                                            forecastFormulaPickToken(
+                                              active.columnKey,
+                                              active.rowKey,
+                                              cellColumnKey,
+                                              String(mi),
+                                              calcRows,
+                                            )
+                                          }
+                                          theme={simDark ? 'dark' : 'light'}
+                                        />
+                                      );
+                                    })}
+                                    <td className={`${fpu.td} ${fpu.textValue}`}>
+                                      {f2(linePeriodSum)}
+                                    </td>
+                                  </tr>,
+                                );
+                              }
+                            }
+
+                            nodes.push(
+                              <tr key={`${r.id}.net`} className={fpu.netRow}>
+                                <td
+                                  className={`${fpu.td} sticky left-0 z-[1] border-l-0 bg-slate-950 font-semibold ${fpu.textPrimary}`}
+                                />
+                                <td
+                                  className={`${fpu.td} sticky left-[52px] z-[1] bg-slate-950 text-left ${fpu.textSecondary}`}
+                                  title="Month net of all sources"
+                                >
+                                  Period net
+                                </td>
+                                {months.map((m, mi) => {
+                                  const net = monthNet(m);
+                                  return (
+                                    <td
+                                      key={mi}
+                                      className={`${fpu.td} ${fpu.textNet} ${
+                                        mi % 3 === 0
+                                          ? 'border-l border-slate-700'
+                                          : ''
+                                      }`}
+                                    >
+                                      {f2(net)}
                                     </td>
                                   );
                                 })}
-                                <td
-                                  className={`py-1 pl-2 text-right font-medium tabular-nums ${
-                                    periodNet < 0 ? 'text-red-600' : 'text-gray-800'
-                                  }`}
-                                >
-                                  {li === 0 ? f2(periodNet) : ''}
+                                <td className={`${fpu.td} ${fpu.textNet}`}>
+                                  {f2(periodNet)}
                                 </td>
-                              </tr>
-                            ));
+                              </tr>,
+                            );
+                            return nodes;
                           })}
                       </tbody>
                     </table>
+                    </FormulaGridProvider>
                   )}
                 </div>
-                <div className="mt-4 flex justify-end">
+                <div className={fpu.footer}>
+                  <div className={`space-y-1 text-[10px] ${fpu.textMuted}`}>
+                    <div>
+                      {forecastProfile.mode === 'flat'
+                        ? 'Blank growth inherits Default · boxed Growth = override · 0 = flat path'
+                        : 'Calc rows above cash · k = month # · Growth in formulas · g badge = flat override'}
+                      {' · '}
+                      IN/OUT sign rail · σ on line name
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono">
+                      {rows
+                        .filter(r => r.ccy !== 'USD')
+                        .map(r => {
+                          const net = periodFlowSumLocalM(
+                            r,
+                            forecastMonths,
+                            forecastProfile,
+                          );
+                          return (
+                            <span key={r.ccy}>
+                              {r.ccy}{' '}
+                              <span className={fpu.textNet}>Σ {f2(net)}</span>
+                            </span>
+                          );
+                        })}
+                    </div>
+                  </div>
                   <button
                     type="button"
                     onClick={() => setForecastProfileOpen(false)}
-                    className="rounded border border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100"
+                    className={fpu.done}
                   >
                     Done
                   </button>
                 </div>
+
+                {lineUncertaintyEdit &&
+                  typeof document !== 'undefined' &&
+                  createPortal(
+                    <div
+                      className="fixed inset-0 z-[310]"
+                      role="dialog"
+                      aria-label="Line projection uncertainty"
+                      onMouseDown={e => {
+                        if (e.target === e.currentTarget) {
+                          setLineUncertaintyEdit(null);
+                        }
+                      }}
+                    >
+                      <div
+                        className={`absolute min-w-[260px] max-w-[320px] rounded-lg border p-3 shadow-2xl ${
+                          simDark
+                            ? 'sim-dark border-slate-600 bg-slate-900 text-slate-100 ring-1 ring-amber-500/25'
+                            : 'border-gray-200 bg-white text-gray-900'
+                        }`}
+                        style={{
+                          top: lineUncertaintyEdit.top,
+                          left: lineUncertaintyEdit.left,
+                        }}
+                        onMouseDown={e => e.stopPropagation()}
+                      >
+                        <div
+                          className={`text-[11px] font-semibold ${
+                            simDark ? 'text-amber-200' : 'text-amber-800'
+                          }`}
+                        >
+                          {lineUncertaintyEdit.ccy} ·{' '}
+                          {lineUncertaintyEdit.label} · projection σ
+                        </div>
+                        <p
+                          className={`mt-1 text-[10px] leading-relaxed ${
+                            simDark ? 'text-slate-400' : 'text-gray-500'
+                          }`}
+                        >
+                          1m relative σ on this line over Tf · compounds √g ·
+                          Revenue feeds Analytics u₁ₘ
+                        </p>
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {FORECAST_UNCERTAINTY_OPTIONS.map(opt => {
+                            const cur = lineUncertainty1m(
+                              forecastProfile,
+                              lineUncertaintyEdit.ccy,
+                              lineUncertaintyEdit.field,
+                            );
+                            const on = Math.abs(cur - opt.value) < 1e-12;
+                            return (
+                              <button
+                                key={opt.id}
+                                type="button"
+                                onClick={() => {
+                                  setLineUncertainty(
+                                    lineUncertaintyEdit.ccy,
+                                    lineUncertaintyEdit.field,
+                                    opt.value,
+                                  );
+                                  setLineUncertaintyDraft(
+                                    opt.value > 0
+                                      ? Number(
+                                          (opt.value * 100).toFixed(2),
+                                        ).toString()
+                                      : '',
+                                  );
+                                  if (opt.value === 0) {
+                                    setLineUncertaintyEdit(null);
+                                  }
+                                }}
+                                className={`rounded-md px-2 py-1 text-[11px] font-semibold transition-colors ${
+                                  on
+                                    ? simDark
+                                      ? 'bg-amber-500/25 text-amber-100'
+                                      : 'bg-amber-100 text-amber-900'
+                                    : simDark
+                                      ? 'text-slate-400 hover:bg-slate-800'
+                                      : 'text-gray-600 hover:bg-gray-100'
+                                }`}
+                              >
+                                {opt.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <label
+                          className={`mt-2 flex items-center gap-2 text-[10px] ${
+                            simDark ? 'text-slate-400' : 'text-gray-500'
+                          }`}
+                        >
+                          Custom %
+                          <input
+                            type="number"
+                            min={0}
+                            max={100}
+                            step={0.5}
+                            value={lineUncertaintyDraft}
+                            onChange={e =>
+                              setLineUncertaintyDraft(e.target.value)
+                            }
+                            onBlur={() => {
+                              const pct = Number(lineUncertaintyDraft);
+                              if (!Number.isFinite(pct) || pct <= 0) {
+                                setLineUncertainty(
+                                  lineUncertaintyEdit.ccy,
+                                  lineUncertaintyEdit.field,
+                                  0,
+                                );
+                                return;
+                              }
+                              setLineUncertainty(
+                                lineUncertaintyEdit.ccy,
+                                lineUncertaintyEdit.field,
+                                Math.min(1, pct / 100),
+                              );
+                            }}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') {
+                                (e.target as HTMLInputElement).blur();
+                                setLineUncertaintyEdit(null);
+                              } else if (e.key === 'Escape') {
+                                setLineUncertaintyEdit(null);
+                              }
+                            }}
+                            className={`w-16 rounded border px-1.5 py-0.5 font-mono text-[11px] ${
+                              simDark
+                                ? 'border-slate-600 bg-slate-950 text-slate-100'
+                                : 'border-gray-300 bg-white text-gray-900'
+                            }`}
+                          />
+                        </label>
+                        <div className="mt-2 flex justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => setLineUncertaintyEdit(null)}
+                            className={`rounded px-2 py-0.5 text-[10px] ${
+                              simDark
+                                ? 'text-slate-300 hover:bg-slate-800'
+                                : 'text-gray-600 hover:bg-gray-100'
+                            }`}
+                          >
+                            Close
+                          </button>
+                        </div>
+                      </div>
+                    </div>,
+                    document.body,
+                  )}
               </div>
             </div>,
             document.body,
@@ -1268,7 +2912,7 @@ export function UnifiedSimulator({
             { id: 'floorH' as LayerId, label: 'Min floor', hint: 'Hard minimum cash per currency' },
             { id: 'sigmaP' as LayerId, label: 'Payout σ buffer', hint: 'Safety margin on uncovered payout deficit (prefunded payout → σ = 0)' },
             { id: 'carryOptim' as LayerId, label: 'Carry target', hint: 'Rate-driven buffer shift (PAY sell / EARN buy)' },
-            { id: 'portfolioDiv' as LayerId, label: 'Portfolio VAR', hint: 'Cross-currency rebalance with VAR / USD budget limits' },
+            ...(hideFxHedge ? [] : [{ id: 'portfolioDiv' as LayerId, label: 'Portfolio VAR', hint: 'Cross-currency rebalance with VAR / USD budget limits' }]),
           ].map(l => {
             const on = activeLayers.has(l.id);
             return (
@@ -1289,27 +2933,31 @@ export function UnifiedSimulator({
             );
           })}
 
-          <span className="ml-4 text-xs font-medium text-gray-500">Hedging strategy:</span>
-          {HEDGE_STRATEGIES.map(s => (
-            <button
-              key={s.id}
-              type="button"
-              onClick={() => setStrategy(s.id)}
-              className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
-                strategy === s.id
-                  ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
-                  : 'bg-gray-50 text-gray-400 border-gray-200 hover:border-gray-300 hover:text-gray-600'
-              }`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${strategy === s.id ? 'bg-rose-600' : 'bg-gray-300'}`} />
-              {s.label}
-            </button>
-          ))}
+          {!hideFxHedge && (
+            <>
+              <span className="ml-4 text-xs font-medium text-gray-500">Hedging strategy:</span>
+              {HEDGE_STRATEGIES.map(s => (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => setStrategy(s.id)}
+                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
+                    strategy === s.id
+                      ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
+                      : 'bg-gray-50 text-gray-400 border-gray-200 hover:border-gray-300 hover:text-gray-600'
+                  }`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${strategy === s.id ? 'bg-rose-600' : 'bg-gray-300'}`} />
+                  {s.label}
+                </button>
+              ))}
+            </>
+          )}
         </div>
 
         )}
 
-        {showAdvancedBook && activeLayers.has('portfolioDiv') && portfolioSummary && (
+        {showAdvancedBook && !hideFxHedge && activeLayers.has('portfolioDiv') && portfolioSummary && (
           <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2">
             <span
               className="text-xs font-semibold text-violet-800"
@@ -1401,7 +3049,7 @@ export function UnifiedSimulator({
       <div className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-10rem)] rounded-lg border border-gray-200">
         <FormulaGridProvider
           rowOrder={computedWithHedge.map(r => r.ccy)}
-          onFill={(columnKey, rowKeys, formulaText) => {
+          onFill={(columnKey, rowKeys, formulaText, _sourceRowKey) => {
             const norm = formulaText.trim().replace(/^=/, '').trim();
             const def =
               SIM_FIELD_BY_KEY[columnKey as SimFieldKey]?.defaultFormula ?? '';
@@ -1428,21 +3076,21 @@ export function UnifiedSimulator({
               </th>
 
               {ratesOn && (
-                <th className="border-l border-gray-300 bg-gray-50 px-2 py-1 text-center text-xs font-semibold text-gray-600 tracking-wide" colSpan={3}>
-                  RATES
-                </th>
+              <th className="border-l border-gray-300 bg-gray-50 px-2 py-1 text-center text-xs font-semibold text-gray-600 tracking-wide" colSpan={3}>
+                RATES
+              </th>
               )}
 
               {showFxPosition && (
                 <th className="border-l border-gray-300 bg-white px-2 py-1 text-center text-xs font-semibold text-gray-600 tracking-wide" colSpan={fxPosColSpan}>
-                  FX POSITION
-                </th>
+                FX POSITION
+              </th>
               )}
 
               {showLiquidity && (
-                <th className="border-l border-gray-300 bg-sky-50 px-2 py-1 text-center text-xs font-semibold text-sky-700 tracking-wide" colSpan={9}>
-                  LIQUIDITY BOOK
-                </th>
+              <th className="border-l border-gray-300 bg-sky-50 px-2 py-1 text-center text-xs font-semibold text-sky-700 tracking-wide" colSpan={9}>
+                LIQUIDITY BOOK
+              </th>
               )}
 
               {showIrBook && (
@@ -1452,69 +3100,90 @@ export function UnifiedSimulator({
               )}
 
               {showCarry && (
-                <th className="border-l border-gray-300 bg-amber-50 px-2 py-1 text-center text-xs font-semibold text-amber-700 tracking-wide" colSpan={3}>
-                  CARRY / BUFFER
-                </th>
+              <th className="border-l border-gray-300 bg-amber-50 px-2 py-1 text-center text-xs font-semibold text-amber-700 tracking-wide" colSpan={3}>
+                CARRY / BUFFER
+              </th>
               )}
 
               {showSwap && (
-                <th className="border-l border-gray-300 bg-emerald-50 px-2 py-1 text-center text-xs font-semibold text-emerald-700 tracking-wide" colSpan={6}>
-                  SWAP
-                </th>
+              <th className="border-l border-gray-300 bg-emerald-50 px-2 py-1 text-center text-xs font-semibold text-emerald-700 tracking-wide" colSpan={6}>
+                SWAP
+              </th>
               )}
 
               {showFxHedge && (
-                <th className="border-l-2 border-rose-400 bg-rose-50 px-2 py-1 text-center text-xs font-semibold text-rose-700 tracking-wide" colSpan={5}>
-                  FX HEDGE
+              <th className="border-l-2 border-rose-400 bg-rose-50 px-2 py-1 text-center text-xs font-semibold text-rose-700 tracking-wide" colSpan={5}>
+                FX HEDGE
 
-                  {strategy === 'SWAP_ONLY' && (
-                    <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800 normal-case">
-                      Swap only — no fwd/option placed; select Swap + Fwd (± Option) above to hedge the forecast
-                    </span>
-                  )}
-                </th>
+                {strategy === 'SWAP_ONLY' && (
+                  <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-800 normal-case">
+                    Swap only — no fwd/option placed; select Swap + Fwd (± Option) above to hedge the forecast
+                  </span>
+                )}
+              </th>
               )}
 
               {showRiskMetrics && (
                 <th
                   className="border-l border-violet-400 bg-violet-50 px-2 py-1 text-center text-xs font-semibold text-violet-800 tracking-wide"
                   colSpan={riskMetricCols}
+                  title="Per-CCY Analytics: Exp, booked hedges, residual, and VaR after booked hedges (Decision-% staging excluded)."
                 >
-                  RISK METRICS
-                  <span className="ml-1 font-normal text-violet-400">{exposureRegimeLabel}</span>
-                  {varSetup && onVarSetupChange && (
-                    <span className="ml-2 inline-flex flex-wrap items-center justify-center gap-0.5 align-middle normal-case tracking-normal">
-                      <span className="text-[10px] font-normal text-violet-500">VaR tenure</span>
-                      {VAR_HORIZON_OPTIONS.map(opt => {
-                        const on = varSetup.horizon === opt.id;
-                        return (
-                          <button
-                            key={opt.id}
-                            type="button"
-                            title={`VaR calculation horizon (vol √T) · ${opt.label}. Independent of Exposure period.`}
-                            onClick={e => {
-                              e.stopPropagation();
-                              setAnalysisHorizon(opt.id);
-                            }}
-                            className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${
-                              on
-                                ? 'border-violet-600 bg-violet-600 text-white'
-                                : 'border-violet-300 bg-white text-violet-700 hover:bg-violet-100'
-                            }`}
-                          >
-                            {opt.label}
-                          </button>
-                        );
-                      })}
-                    </span>
-                  )}
+                  <div className="flex flex-col items-center gap-0.5 normal-case tracking-normal">
+                    <div>RISK METRICS</div>
+                    <div className="flex flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 text-[10px] font-normal text-violet-600">
+                      <span title="VaR exposure profile from Analytics setup">
+                        {analyticsSetupSummary.profile}
+                      </span>
+                      <span className="text-violet-300">·</span>
+                      <span title="Confidence level">
+                        {analyticsSetupSummary.confidencePct}%
+                      </span>
+                      <span className="text-violet-300">·</span>
+                      <span title={`σ₁ₘ source · ${analyticsSetupSummary.vol}`}>
+                        σ {analyticsSetupSummary.σPct}%
+                      </span>
+                      <span className="text-violet-300">·</span>
+                      <span title="Forecast / Exp buildup period">
+                        {analyticsSetupSummary.forecastLabel}
+                      </span>
+                    </div>
+                    {varSetup && onVarSetupChange && (
+                      <span className="inline-flex flex-wrap items-center justify-center gap-0.5">
+                        <span className="text-[10px] font-normal text-violet-500">
+                          VaR tenure
+                        </span>
+                        {VAR_HORIZON_OPTIONS.map(opt => {
+                          const on = varSetup.horizon === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              title={`VaR calculation horizon · ${opt.label}. Independent of forecast / Exp period.`}
+                              onClick={e => {
+                                e.stopPropagation();
+                                setAnalysisHorizon(opt.id);
+                              }}
+                              className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${
+                                on
+                                  ? 'border-violet-600 bg-violet-600 text-white'
+                                  : 'border-violet-300 bg-white text-violet-700 hover:bg-violet-100'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          );
+                        })}
+                      </span>
+                    )}
+                  </div>
                 </th>
               )}
 
               {showPnl && (
-                <th className="border-l border-gray-300 bg-purple-50 px-2 py-1 text-center text-xs font-semibold text-purple-700 tracking-wide" colSpan={5}>
-                  P&L
-                </th>
+              <th className="border-l border-gray-300 bg-purple-50 px-2 py-1 text-center text-xs font-semibold text-purple-700 tracking-wide" colSpan={pnlCarryOnly ? 2 : 5}>
+                P&L
+              </th>
               )}
             </tr>
 
@@ -1626,37 +3295,41 @@ export function UnifiedSimulator({
               {showRiskMetrics && (<>
               <th
                 className={`${thBase} bg-violet-50 border-l border-violet-300 min-w-[72px]`}
-                title="Net FX Forecast — hedge-target exposure (Net FX book + F×Exposure period), $USD M"
+                title={`Per-CCY Analytics position Exp $USD M = Net FX Forecast (${analyticsSetupSummary.forecastLabel}). Hedge-target exposure from open book + forecast — not Decision % staging.`}
               >
                 Exp
               </th>
               <th
                 className={`${thBase} bg-emerald-50 min-w-[72px]`}
-                title="Booked forward / option hedge position ($USD M) — opposite sign to exposure"
+                title="Booked spot/fwd/option hedge position only ($USD M). Potential / Decision-% hedges are excluded."
               >
-                Fwd hedge
+                Booked H
               </th>
               <th
                 className={`${thBase} bg-violet-50 min-w-[72px]`}
-                title="Residual = Exp + booked hedges (spot + fwd/option), $USD M"
+                title="Residual $USD M = Exp + booked hedges. Empty until trades are booked."
               >
                 Residual
               </th>
               <th
                 className={`${thBase} bg-violet-100 min-w-[80px]`}
-                title={`Path-integrated VaR on growing book e(t)=S+F·t over tenure ${varHorizonLabel}: spot×σ×z×√∫e²dt (not snapshot |E_end|×√T)`}
+                title={`VaR after booked hedges · ${analyticsSetupSummary.profile} · ${analyticsSetupSummary.confidencePct}% · σ₁ₘ ${analyticsSetupSummary.σPct}% · tenure ${varHorizonLabel}. Decision-% staging excluded.`}
               >
                 VaR
               </th>
               </>)}
 
               {showPnl && (<>
-              {/* P&L ×5 — all USD-denominated, $M/yr for carry columns */}
+              {/* P&L — all USD-denominated, $M/yr for carry columns */}
+              {!pnlCarryOnly && (
               <th className={`${thBase} bg-purple-50 border-l border-gray-300 min-w-[76px]`}>Net Delta $USD</th>
-              <th className={`${thBase} bg-purple-50 min-w-[76px]`}>Cash Carry $USD</th>
+              )}
+              <th className={`${thBase} bg-purple-50 min-w-[76px] ${pnlCarryOnly ? 'border-l border-gray-300' : ''}`}>Cash Carry $USD</th>
               <th className={`${thBase} bg-purple-50 min-w-[76px]`}>Swap Carry $USD</th>
+              {!pnlCarryOnly && (<>
               <th className={`${thBase} bg-purple-50 min-w-[76px]`}>Hedge Carry $USD</th>
               <th className={`${thBase} bg-purple-100 min-w-[80px]`}>Total Carry $USD</th>
+              </>)}
               </>)}
 
             </tr>
@@ -1871,7 +3544,7 @@ export function UnifiedSimulator({
                       className={`${inBase} w-[62px] font-medium ${r.netFxForecast < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${Math.abs(r.netFxForecast) < 0.005 ? 'text-gray-300' : clr(r.netFxForecast)}`}>
-                      {Math.abs(r.netFxForecast) < 0.005 ? '—' : f2(r.netFxForecast)}
+                  {Math.abs(r.netFxForecast) < 0.005 ? '—' : f2(r.netFxForecast)}
                     </span>
                   )}
                 </td>
@@ -1992,7 +3665,7 @@ export function UnifiedSimulator({
                 </td>
                 </>)}
 
-{showAdvancedBook && (<>
+{showCarry && (<>
                 {/* CARRY / BUFFER */}
                 <td className={`${tdBase} bg-amber-50 border-l border-gray-300 text-center`}>
                   <CarryBadge dir={r.carryDir} />
@@ -2009,7 +3682,9 @@ export function UnifiedSimulator({
                   formula={fFormula('targetNpCashUSD')} defaultFormula={SIM_FIELD_BY_KEY.targetNpCashUSD.defaultFormula}
                   onCommit={fCommit('targetNpCashUSD')} error={fErr('targetNpCashUSD')} title="Target NP Cash $USD"
                   columnKey="targetNpCashUSD" rowKey={r.ccy} />
+</>)}
 
+                {showSwap && (<>
                 {/* SWAP */}
                 <FormulaCell
                   tdClass={`${tdBase} bg-emerald-50 border-l border-gray-300 font-semibold ${clr(fv('swapNear'))}`}
@@ -2047,7 +3722,9 @@ export function UnifiedSimulator({
                   formula={fFormula('cycleEndUSD')} defaultFormula={SIM_FIELD_BY_KEY.cycleEndUSD.defaultFormula}
                   onCommit={fCommit('cycleEndUSD')} error={fErr('cycleEndUSD')} title="Cycle End $USD"
                   columnKey="cycleEndUSD" rowKey={r.ccy} />
+                </>)}
 
+                {showFxHedge && (<>
                 {/* FX HEDGE — strategy-driven fwd / option legs (editable) */}
                 <FormulaCell
                   tdClass={`${tdBase} bg-rose-50 border-l-2 border-rose-400 font-semibold ${
@@ -2063,9 +3740,9 @@ export function UnifiedSimulator({
                   display={Math.abs(fv('optionHedgeUSD')) < 0.005 ? '—' : (
                     <>
                       {r.optType && (
-                        <span className={`mr-1 rounded px-1 text-[10px] font-bold ${r.optType === 'SELL_CALL' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-700'}`}>
-                          {r.optType === 'SELL_CALL' ? 'sC' : 'sP'}
-                        </span>
+                      <span className={`mr-1 rounded px-1 text-[10px] font-bold ${r.optType === 'SELL_CALL' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-700'}`}>
+                        {r.optType === 'SELL_CALL' ? 'sC' : 'sP'}
+                      </span>
                       )}
                       {f2(fv('optionHedgeUSD'))}
                     </>
@@ -2078,20 +3755,20 @@ export function UnifiedSimulator({
                   title={strategy !== 'SWAP_FWD_OPT'
                     ? 'Option delta — select "Swap + Fwd + Option" strategy above to activate the written option'
                     : 'Option delta (ATM ≈ 0.5) — editable regardless of current forward size; takes effect once this row has a non-zero forecast to hedge'}>
-                  <input
-                    type="text" inputMode="decimal"
+                    <input
+                      type="text" inputMode="decimal"
                     disabled={strategy !== 'SWAP_FWD_OPT'}
                     value={drafts[`${r.id}.hedgeDelta`] ?? n((hedgeDeltas[r.id] ?? 0.5))}
-                    onChange={e => {
-                      setDrafts(prev => ({ ...prev, [`${r.id}.hedgeDelta`]: e.target.value }));
-                      const v = parseFloat(e.target.value);
-                      if (!isNaN(v) && v >= 0 && v <= 1) setHedgeDeltas(prev => ({ ...prev, [r.id]: v }));
-                    }}
-                    onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next[`${r.id}.hedgeDelta`]; return next; })}
+                      onChange={e => {
+                        setDrafts(prev => ({ ...prev, [`${r.id}.hedgeDelta`]: e.target.value }));
+                        const v = parseFloat(e.target.value);
+                        if (!isNaN(v) && v >= 0 && v <= 1) setHedgeDeltas(prev => ({ ...prev, [r.id]: v }));
+                      }}
+                      onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next[`${r.id}.hedgeDelta`]; return next; })}
                     className={`${inBase} w-[36px] font-medium ${
                       strategy !== 'SWAP_FWD_OPT' ? 'text-gray-300 cursor-not-allowed' : 'text-rose-700'
                     }`}
-                  />
+                    />
                 </td>
                 <td className={`${tdBase} bg-rose-100 font-medium ${
                   Math.abs(hedgeCarry) < 0.005 ? 'text-gray-300'
@@ -2113,7 +3790,7 @@ export function UnifiedSimulator({
                   const expUsd = fcyToUsdM(rm?.exposureLocalM ?? 0, r.ccy);
                   const fwdUsd = fcyToUsdM(rm?.forwardHedgeLocalM ?? 0, r.ccy);
                   const residUsd = fcyToUsdM(rm?.residualLocalM ?? rm?.exposureLocalM ?? 0, r.ccy);
-                  const v = rm?.varUsdM ?? 0;
+                  const varAfter = rm?.varUsdM ?? 0;
                   const fmtUsdM = (n: number) => `${n >= 0 ? '+' : '−'}$${f2(Math.abs(n))}`;
                   return (
                     <>
@@ -2121,7 +3798,7 @@ export function UnifiedSimulator({
                         className={`${tdBase} bg-violet-50 border-l border-violet-300 font-mono ${
                           expUsd >= 0 ? 'text-emerald-700' : 'text-rose-600'
                         }`}
-                        title={`Hedge-target Exp $USD M · ${exposureRegimeLabel}`}
+                        title={`Analytics position Exp $USD M · ${analyticsSetupSummary.forecastLabel} · ${analyticsSetupSummary.profile}`}
                       >
                         {fmtUsdM(expUsd)}
                       </td>
@@ -2133,7 +3810,7 @@ export function UnifiedSimulator({
                               ? 'text-emerald-700'
                               : 'text-rose-600'
                         }`}
-                        title="Booked forward / option hedge position $USD M (opposite sign to Exp)"
+                        title="Booked hedge only $USD M — Decision % staging excluded"
                       >
                         {Math.abs(fwdUsd) < 1e-9 ? '—' : fmtUsdM(fwdUsd)}
                       </td>
@@ -2145,27 +3822,29 @@ export function UnifiedSimulator({
                               ? 'text-emerald-700'
                               : 'text-rose-600'
                         }`}
-                        title="Residual $USD M = Exp + booked hedges (spot + fwd/option)"
+                        title="Residual $USD M = Exp + booked hedges"
                       >
                         {Math.abs(residUsd) < 1e-9 ? '✓ $0.00' : fmtUsdM(residUsd)}
                       </td>
                       <td
                         className={`${tdBase} bg-violet-100 font-semibold font-mono text-violet-900`}
-                        title={`Path-integrated VaR on residual path (S−hedge)+F·t · tenure ${varHorizonLabel}`}
+                        title={`VaR after booked hedges · ${analyticsSetupSummary.profile} · ${analyticsSetupSummary.confidencePct}% · σ ${analyticsSetupSummary.σPct}% · ${varHorizonLabel}`}
                       >
-                        ${(v * 1000).toFixed(0)}K
+                        ${(varAfter * 1000).toFixed(0)}K
                       </td>
                     </>
                   );
                 })()}
 
                 {showPnl && (<>
-                {/* P&L — all five columns below are USD-denominated ($M/yr) */}
+                {/* P&L — USD-denominated ($M/yr) */}
+                {!pnlCarryOnly && (
                 <td className={`${tdBase} bg-purple-50 border-l border-gray-300 font-semibold ${clr(swapNearUsd(r.ccy, r.netDelta))}`}
                   title={`Net FX delta ${f2(r.netDelta)} M ${r.ccy} × spot ${(CURRENCY_PARAMS[r.ccy]?.spot ?? 1).toFixed(4)} = $${f2(swapNearUsd(r.ccy, r.netDelta))} USD M`}>
                   ${f2(swapNearUsd(r.ccy, r.netDelta))}
                 </td>
-                <td className={`${tdBase} bg-purple-50 font-medium ${r.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`}
+                )}
+                <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l border-gray-300' : ''} ${r.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`}
                   title={`Post-swap economic cash carry (USD): NP+Swap ${f2(r.postSwapCash)}M ${r.ccy} × spot × (${r.postSwapCash >= 0 ? `credit ${r.r_FCY.toFixed(2)}%` : `debit ${r.r_OD.toFixed(2)}%`} − r_USD ${shared.r_USD.toFixed(2)}%) / 100 = $${f2(r.floatNim)}M/yr. Opening cash swapped away is not counted — CIP cancels that differential through the swap points.`}>
                   {usdCarry(r.floatNim, 0)}
                 </td>
@@ -2176,6 +3855,7 @@ export function UnifiedSimulator({
                   title="FX swap at mid vs term SOFR is CIP carry-neutral: earn/pay on the moved FCY notional is cancelled by the opposite swap points P&L. Economic carry sits entirely in Cash Carry on the post-swap balance.">
                   {usdCarry(r.swapCarryUsdYr)}
                 </td>
+                {!pnlCarryOnly && (<>
                 <td className={`${tdBase} bg-purple-50 font-medium ${
                   Math.abs(hedgeCarry) < 0.005 ? 'text-gray-300'
                     : hedgeCarry >= 0 ? 'text-green-700' : 'text-red-600'
@@ -2189,6 +3869,7 @@ export function UnifiedSimulator({
                   title="Total annual USD carry = post-swap Cash Carry (CIP-neutral swap → Swap Carry 0) + Hedge Carry">
                   {usdCarry(r.floatNim + r.swapCarryUsdYr + (R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr), 0)}
                 </td>
+                </>)}
                 </>)}
               </tr>
               );
@@ -2362,7 +4043,7 @@ export function UnifiedSimulator({
               </>)}
 
               {/* CARRY / BUFFER */}
-{showAdvancedBook && (<>
+{showCarry && (<>
               <td className={`${tdBase} bg-amber-50 border-l border-gray-300 text-center`}>
                 <CarryBadge dir={usdComputed.carryDir} />
               </td>
@@ -2380,7 +4061,9 @@ export function UnifiedSimulator({
                   <span className="ml-0.5 text-xs text-red-600" title="USD funding bind">⛓</span>
                 )}
               </td>
+              </>)}
 
+              {showSwap && (<>
               {/* SWAP */}
               <td className={`${tdBase} bg-emerald-50 border-l border-gray-300 font-semibold ${clr(usdComputed.swapNear)}`}
                 title="USD funding leg (already in $M)">
@@ -2406,7 +4089,9 @@ export function UnifiedSimulator({
                 title="Cycle Net Flow $USD + Swap $USD — before far leg">
                 {fmtSwapUsd(usdComputed.cycleEndCash)}
               </td>
+              </>)}
 
+              {showFxHedge && (<>
               {/* FX HEDGE — USD is the settlement leg of all FCY hedges */}
               <td className={`${tdBase} bg-rose-50 border-l-2 border-rose-400 font-semibold ${Math.abs(hedgeTotals.fwdUSD) < 0.005 ? 'text-gray-400' : clr(-hedgeTotals.fwdUSD)}`}
                 title="USD settlement leg of all FCY forwards = −Σ(fwd × spot)">
@@ -2437,11 +4122,15 @@ export function UnifiedSimulator({
 
               {showPnl && (<>
               {/* P&L */}
+              {!pnlCarryOnly && (
               <td className={`${tdBase} bg-purple-50 border-l border-gray-300 font-semibold ${clr(usdComputed.netDelta)}`}>${f2(usdComputed.netDelta)}</td>
-              <td className={`${tdBase} bg-purple-50 font-medium ${usdComputed.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`} title="USD is the base currency — Δr = 0, no carry vs itself">{usdCarry(usdComputed.floatNim, 0)}</td>
+              )}
+              <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l border-gray-300' : ''} ${usdComputed.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`} title="USD is the base currency — Δr = 0, no carry vs itself">{usdCarry(usdComputed.floatNim, 0)}</td>
               <td className={`${tdBase} bg-purple-50 text-gray-400 text-xs`} title="USD is the funding leg — its interest effect is inside each FCY swap carry">—</td>
+              {!pnlCarryOnly && (<>
               <td className={`${tdBase} bg-purple-50 text-gray-400 text-xs`}>—</td>
               <td className={`${tdBase} bg-purple-100 text-gray-400 text-xs`}>—</td>
+              </>)}
               </>)}
             </tr>
 
@@ -2451,7 +4140,7 @@ export function UnifiedSimulator({
 
               {/* RATES — blank */}
               {ratesOn && (
-                <td className="bg-gray-50 border-l border-gray-300" colSpan={3} />
+              <td className="bg-gray-50 border-l border-gray-300" colSpan={3} />
               )}
 
               {/* FX POSITION — FCY not additive; validate $USD columns */}
@@ -2515,12 +4204,14 @@ export function UnifiedSimulator({
                 <td className="bg-rose-50 border-l border-rose-200 text-gray-400 text-xs text-center" colSpan={irCols}>—</td>
               )}
 
-{showAdvancedBook && (<>
+{showCarry && (<>
               {/* CARRY / BUFFER */}
               <td className="bg-amber-50 border-l border-gray-300" />
               <td className={`${tdBase} bg-amber-50 text-gray-400 text-xs`} title="M FCY thresholds are not additive across currencies">—</td>
               <td className={`${tdBase} bg-amber-100 font-bold ${clr(thresholdUsdTotal)}`}>{fmtThresholdUsd(thresholdUsdTotal)}</td>
+              </>)}
 
+              {showSwap && (<>
               {/* SWAP — FCY units not additive; validate in $USD column */}
               <td className={`${tdBase} bg-emerald-50 border-l border-gray-300 text-gray-400 text-xs`} title="M FCY swap legs are not additive across currencies">—</td>
               <td className={`${tdBase} font-bold border border-emerald-300 ${
@@ -2541,7 +4232,9 @@ export function UnifiedSimulator({
                 title={`Σ Cycle End $USD (NP+Swap − payout + payins + Non-NP sweep) — before far leg`}>
                 {fmtSwapUsd(cycleEndUsdTotal)}
               </td>
+              </>)}
 
+              {showFxHedge && (<>
               {/* FX HEDGE totals — 5 cols: fwd, option, δ, hedge carry, residual */}
               <td className={`${tdBase} bg-rose-50 border-l-2 border-rose-400 font-bold ${Math.abs(hedgeTotals.fwdUSD) < 0.005 ? 'text-gray-400 text-xs font-normal' : clr(hedgeTotals.fwdUSD)}`}
                 title="Σ forward notionals in $USD across all FCY rows">
@@ -2599,7 +4292,7 @@ export function UnifiedSimulator({
                   </td>
                   <td
                     className={`${tdBase} bg-violet-100 font-bold text-violet-900`}
-                    title={`Σ undiversified VaR on residual · analysis tenure ${varHorizonLabel}`}
+                    title={`Σ undiversified VaR after booked hedges · ${analyticsSetupSummary.profile} · tenure ${varHorizonLabel}`}
                   >
                     ${(riskUsdTotals.varUsdM * 1000).toFixed(0)}K
                   </td>
@@ -2607,12 +4300,14 @@ export function UnifiedSimulator({
               )}
 
               {showPnl && (<>
-              {/* P&L — all five totals below are USD-denominated ($M/yr); Net Delta $USD is additive across currencies */}
+              {/* P&L totals — USD-denominated ($M/yr); Net Delta $USD is additive across currencies */}
+              {!pnlCarryOnly && (
               <td className={`${tdBase} bg-purple-50 border-l border-gray-300 font-bold ${clr(netDeltaUsdTotal)}`}
                 title="Σ net FX delta across all rows, converted to $USD at spot">
                 ${f2(netDeltaUsdTotal)}
               </td>
-              <td className={`${tdBase} bg-purple-50 font-bold ${floatNimUsdTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
+              )}
+              <td className={`${tdBase} bg-purple-50 font-bold ${pnlCarryOnly ? 'border-l border-gray-300' : ''} ${floatNimUsdTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
                 title="Σ post-swap economic cash carry across all rows, $M/yr USD — O/N earn/pay on the funded NP balance after CIP-neutral swaps">
                 {usdCarry(floatNimUsdTotal, 0)}
               </td>
@@ -2620,6 +4315,7 @@ export function UnifiedSimulator({
                 title="Σ swap P&L — identically 0 under CIP (cancelled into Cash Carry on the post-swap balance)">
                 {usdCarry(swapCarryTotal, 0)}
               </td>
+              {!pnlCarryOnly && (<>
               <td className={`${tdBase} bg-purple-50 font-bold ${
                 Math.abs(hedgeTotals.hedgeCarryUsdYr) < 0.005 ? 'text-gray-400 text-xs font-normal'
                   : hedgeTotals.hedgeCarryUsdYr >= 0 ? 'text-green-700' : 'text-red-600'
@@ -2632,6 +4328,7 @@ export function UnifiedSimulator({
                 {usdCarry(totalCarryUsd, 0)}
                 <span className="text-gray-400 ml-0.5 text-xs">M/yr</span>
               </td>
+              </>)}
               </>)}
             </tr>
           </tbody>

@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <meta name="design_doc_mode" content="canvas">
+  <style>
+    body { margin: 0; background: #020617; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    a { color: #7dd3fc; text-decoration: none; }
+    a:hover { color: #bae6fd; }
+  </style>
+</helmet>
+
+<section style="display:flex;flex-direction:column;gap:28px;padding:40px">
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <div style="font-size:13px;font-weight:600;color:#fff">Turn 1 · Analytics module tab menu</div>
+    <div style="font-size:11px;color:#64748b;max-width:880px;line-height:1.6">Today the row is four detached pills followed by two competing H-level headings and two description lines, so the tab looks like a filter chip and the module title repeats. Four treatments on the existing slate/sky kit: <a href="#1d">1d</a> shadcn TabsList · <a href="#1a">1a</a> underline rail · <a href="#1b">1b</a> segmented control · <a href="#1c">1c</a> rail with per-tab figures. Click a tab in any frame.</div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:32px">
+
+    <!-- ══════════ 1d ══════════ -->
+    <div id="1d" style="display:flex;flex-direction:column;gap:10px;width:1180px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1d</span>
+        <span style="font-size:11px;color:#64748b">shadcn TabsList · muted track, raised active trigger</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleD }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesD }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:620px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.97);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:#64748b">Callouts · 1d</span>
+                <button type="button" onClick="{{ toggleD }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:5px;font-size:11px;color:#94a3b8;line-height:1.55">
+                <li><b style="color:#cbd5e1">TabsList</b> — <code style="color:#cbd5e1">inline-flex h-9 items-center rounded-lg bg-muted p-1 text-muted-foreground</code>. Here <code style="color:#cbd5e1">bg-muted</code> maps to <code style="color:#cbd5e1">bg-slate-800/60</code> so the track sits above the panel without a border. shadcn's list has no outline; the fill alone separates it.</li>
+                <li><b style="color:#cbd5e1">TabsTrigger active</b> — <code style="color:#cbd5e1">rounded-md bg-background text-foreground shadow-sm</code>: the active tab is a <i>raised</i> surface, not a coloured one. <code style="color:#cbd5e1">bg-slate-950</code> against the muted track plus a 1px hairline reads as the panel showing through, which is why it needs no accent at all.</li>
+                <li><b style="color:#cbd5e1">Inactive triggers</b> — plain <code style="color:#cbd5e1">text-slate-400</code>, no fill, no border; hover only lifts the text. Disabled is <code style="color:#cbd5e1">opacity-50 pointer-events-none</code>, which is what the <code style="color:#cbd5e1">Soon</code> tabs use.</li>
+                <li><b style="color:#cbd5e1">Sizing is fixed, not padded ad hoc</b> — <code style="color:#cbd5e1">h-9</code> list, <code style="color:#cbd5e1">px-3 py-1 text-sm font-medium</code> triggers, <code style="color:#cbd5e1">gap-0</code>. That standard metric is most of why the pattern reads as a system component rather than four buttons.</li>
+                <li><b style="color:#cbd5e1">Focus ring is part of the spec</b> — <code style="color:#cbd5e1">focus-visible:ring-2 ring-sky-500 ring-offset-2 ring-offset-slate-900</code>. Keyboard nav is arrow keys within the list, one tab stop for the whole group.</li>
+                <li><b style="color:#cbd5e1">Where the accent goes</b> — nowhere on the tab. Sky stays on values and the Tf chip, so the tab row is the quietest thing in the header, which is the shadcn default and the right call here.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:#0b1120;padding:18px 24px">
+        <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:16px">
+          <div style="display:flex;flex-direction:column;gap:3px">
+            <div style="font-size:16px;font-weight:600;letter-spacing:-.01em;color:#f8fafc">Analytics</div>
+            <div style="font-size:12px;color:#64748b;max-width:820px;line-height:1.5">{{ activeDesc }}</div>
+          </div>
+          <div style="display:flex;flex:0 0 auto;align-items:center;gap:8px">
+            <span style="display:inline-flex;align-items:baseline;gap:5px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 8px;font-size:11px;color:#64748b">Tf<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:#bae6fd">12m</span></span>
+            <button type="button" aria-label="Settings" style="display:inline-flex;height:24px;width:24px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:12px;width:12px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V10a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div style="margin-top:14px;display:inline-flex;height:36px;align-items:center;border-radius:8px;background:rgba(30,41,59,.6);padding:4px">
+          <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="4">
+            <span onClick="{{ t.pick }}" style="display:inline-flex;align-items:center;gap:6px;border-radius:6px;background:{{ t.shadBg }};box-shadow:{{ t.shadShadow }};padding:5px 13px;cursor:{{ t.cursor }};font-size:13px;font-weight:500;color:{{ t.shadColor }};opacity:{{ t.shadOpacity }};white-space:nowrap" style-hover="color:#e2e8f0">
+              <span>{{ t.label }}</span>
+              <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:{{ t.soonColor }}">{{ t.soon }}</span>
+            </span>
+          </sc-for>
+        </div>
+
+        <div style="margin-top:14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#475569">{{ activeMeta }}</div>
+        <div style="margin-top:10px;height:64px;border-radius:8px;border:1px dashed #1e293b"></div>
+      </div>
+    </div>
+
+    <!-- ══════════ 1a ══════════ -->
+    <div id="1a" style="display:flex;flex-direction:column;gap:10px;width:1180px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1a</span>
+        <span style="font-size:11px;color:#64748b">Underline rail · tabs sit on the panel edge</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleA }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesA }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:600px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.97);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:#64748b">Callouts · 1a</span>
+                <button type="button" onClick="{{ toggleA }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:5px;font-size:11px;color:#94a3b8;line-height:1.55">
+                <li><b style="color:#cbd5e1">Tabs sit on a rail, not in boxes</b> — <code style="color:#cbd5e1">border-b border-slate-700</code> across the full panel width, active tab <code style="color:#cbd5e1">border-b-2 border-sky-500 text-slate-50</code>. A bordered pill is the same component the desk uses for filters and toggles elsewhere; a rail can only mean navigation.</li>
+                <li><b style="color:#cbd5e1">One heading, not two</b> — the module H2 and the per-tab H2 collapse into a single title that names the active tab (<code style="color:#cbd5e1">Analytics — Cash Carry</code>) with one description under it. Today both headings are the same size and weight, so neither wins.</li>
+                <li><b style="color:#cbd5e1">Description belongs to the tab</b> — it moves below the rail and swaps with the tab, which is what makes the second heading redundant in the first place.</li>
+                <li><b style="color:#cbd5e1">Disabled tabs stay in place</b> — <code style="color:#cbd5e1">text-slate-600 cursor-not-allowed</code> with a <code style="color:#cbd5e1">Soon</code> chip in <code style="color:#cbd5e1">text-[9px] uppercase tracking-[0.09em]</code>. No border, no hover, so they read as roadmap rather than as something that failed to load.</li>
+                <li><b style="color:#cbd5e1">Context row is right-aligned on the rail</b> — Tf and the gear move up onto the tab line. That removes the third stacked meta line entirely.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:#0b1120;overflow:hidden">
+        <div style="padding:18px 24px 0">
+          <div style="font-size:16px;font-weight:600;letter-spacing:-.01em;color:#f8fafc">Analytics — {{ activeTitle }}</div>
+          <div style="margin-top:3px;font-size:12px;color:#64748b;max-width:820px;line-height:1.5">{{ activeDesc }}</div>
+        </div>
+
+        <div style="margin-top:14px;padding:0 24px;border-bottom:1px solid #1e293b;display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px">
+          <div style="display:flex;align-items:flex-end;gap:2px">
+            <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="4">
+              <div onClick="{{ t.pick }}" style="display:flex;align-items:center;gap:7px;padding:9px 14px;margin-bottom:-1px;border-bottom:{{ t.rail }};cursor:{{ t.cursor }};font-size:13px;font-weight:{{ t.weight }};color:{{ t.color }}" style-hover="color:#cbd5e1">
+                <span>{{ t.label }}</span>
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:{{ t.soonColor }}">{{ t.soon }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;padding-bottom:6px">
+            <span style="display:inline-flex;align-items:baseline;gap:5px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 8px;font-size:11px;color:#64748b">Tf<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:#bae6fd">12m</span></span>
+            <button type="button" aria-label="Settings" style="display:inline-flex;height:24px;width:24px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:12px;width:12px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V10a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div style="padding:12px 24px 18px">
+          <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#475569">{{ activeMeta }}</div>
+          <div style="margin-top:10px;height:64px;border-radius:8px;border:1px dashed #1e293b"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ 1b ══════════ -->
+    <div id="1b" style="display:flex;flex-direction:column;gap:10px;width:1180px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1b</span>
+        <span style="font-size:11px;color:#64748b">Segmented control · one enclosure, sliding fill</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleB }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesB }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:600px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.97);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:#64748b">Callouts · 1b</span>
+                <button type="button" onClick="{{ toggleB }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:5px;font-size:11px;color:#94a3b8;line-height:1.55">
+                <li><b style="color:#cbd5e1">One enclosure, not four</b> — <code style="color:#cbd5e1">rounded-lg border border-slate-700 bg-slate-950/60 p-1</code> with the active segment as a filled <code style="color:#cbd5e1">rounded-md bg-slate-800 text-slate-50</code>. Four separate bordered pills read as four independent toggles that could each be on; a single track reads as one choice.</li>
+                <li><b style="color:#cbd5e1">Active fill is slate, not blue</b> — the current blue pill is the loudest element on a screen where blue also marks editable values and live figures. Selection is conveyed by the fill, and a 2px sky underline inside the segment carries the accent at a fraction of the weight.</li>
+                <li><b style="color:#cbd5e1">Sits beside the title</b> — the control is short enough to share the header line, which removes a whole row of vertical space and puts the module name and its section in one glance.</li>
+                <li><b style="color:#cbd5e1">Soon segments are inside the track</b> — <code style="color:#cbd5e1">text-slate-600</code>, no fill, <code style="color:#cbd5e1">Soon</code> in <code style="color:#cbd5e1">text-[9px]</code>. Keeping them inside the enclosure shows the full roadmap without implying four live options.</li>
+                <li><b style="color:#cbd5e1">Best when tabs stay ≤ 4</b> — a segmented control does not survive growth. If DV01 and Greeks ship and a fifth arrives, <a href="#1a">1a</a> is the treatment that scales.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:#0b1120;padding:18px 24px">
+        <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px">
+          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:16px">
+            <div style="font-size:16px;font-weight:600;letter-spacing:-.01em;color:#f8fafc">Analytics</div>
+            <span style="display:inline-flex;align-items:center;gap:2px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:3px">
+              <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="4">
+                <span onClick="{{ t.pick }}" style="display:inline-flex;align-items:center;gap:6px;border-radius:6px;background:{{ t.segBg }};box-shadow:{{ t.segRail }};padding:5px 12px;cursor:{{ t.cursor }};font-size:12px;font-weight:{{ t.weight }};color:{{ t.color }}">
+                  <span>{{ t.label }}</span>
+                  <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:{{ t.soonColor }}">{{ t.soon }}</span>
+                </span>
+              </sc-for>
+            </span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="display:inline-flex;align-items:baseline;gap:5px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 8px;font-size:11px;color:#64748b">Tf<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:#bae6fd">12m</span></span>
+            <button type="button" aria-label="Settings" style="display:inline-flex;height:24px;width:24px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:12px;width:12px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V10a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"></path></svg>
+            </button>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;font-size:12px;color:#64748b;max-width:860px;line-height:1.5">{{ activeDesc }}</div>
+        <div style="margin-top:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#475569">{{ activeMeta }}</div>
+        <div style="margin-top:10px;height:64px;border-radius:8px;border:1px dashed #1e293b"></div>
+      </div>
+    </div>
+
+    <!-- ══════════ 1c ══════════ -->
+    <div id="1c" style="display:flex;flex-direction:column;gap:10px;width:1180px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1c</span>
+        <span style="font-size:11px;color:#64748b">Rail with per-tab status · densest</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleC }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesC }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:600px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.97);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:#64748b">Callouts · 1c</span>
+                <button type="button" onClick="{{ toggleC }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:5px;font-size:11px;color:#94a3b8;line-height:1.55">
+                <li><b style="color:#cbd5e1">Each tab carries its headline figure</b> — a mono value under the label, so the desk sees where the exposure is before it clicks. On a treasury screen a tab that shows nothing until selected wastes the row.</li>
+                <li><b style="color:#cbd5e1">Rail on top, not bottom</b> — <code style="color:#cbd5e1">border-t-2 border-sky-500</code> on the active tab, with the whole tab block sitting flush in the panel head. It reads as a card selector, which suits tabs that carry data.</li>
+                <li><b style="color:#cbd5e1">Values are muted on inactive tabs</b> — <code style="color:#cbd5e1">text-slate-500</code> against <code style="color:#cbd5e1">text-slate-100</code> on the active one. The figures are context, not four competing readouts.</li>
+                <li><b style="color:#cbd5e1">Cost</b> — it needs a real number per tab. DV01 and Greeks show an em dash until they ship, which is honest but leaves two thirds of the row empty at launch.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:#0b1120;overflow:hidden">
+        <div style="padding:18px 24px 12px">
+          <div style="font-size:16px;font-weight:600;letter-spacing:-.01em;color:#f8fafc">Analytics — {{ activeTitle }}</div>
+          <div style="margin-top:3px;font-size:12px;color:#64748b;max-width:820px;line-height:1.5">{{ activeDesc }}</div>
+        </div>
+
+        <div style="display:flex;flex-wrap:wrap;border-top:1px solid #1e293b;border-bottom:1px solid #1e293b">
+          <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="4">
+            <div onClick="{{ t.pick }}" style="display:flex;flex:1;min-width:150px;flex-direction:column;gap:3px;border-top:{{ t.topRail }};border-left:1px solid #1e293b;background:{{ t.cardBg }};padding:10px 16px;cursor:{{ t.cursor }}" style-hover="background:rgba(148,163,184,.05)">
+              <div style="display:flex;align-items:center;gap:6px">
+                <span style="font-size:12px;font-weight:{{ t.weight }};color:{{ t.color }}">{{ t.label }}</span>
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:{{ t.soonColor }}">{{ t.soon }}</span>
+              </div>
+              <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;font-weight:600;color:{{ t.statColor }}">{{ t.stat }}</div>
+              <div style="font-size:9px;text-transform:uppercase;letter-spacing:.09em;color:#475569">{{ t.statLabel }}</div>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 24px 18px">
+          <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:#475569">{{ activeMeta }}</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="display:inline-flex;align-items:baseline;gap:5px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 8px;font-size:11px;color:#64748b">Tf<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:#bae6fd">12m</span></span>
+            <button type="button" aria-label="Settings" style="display:inline-flex;height:24px;width:24px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:12px;width:12px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V10a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"></path></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1260,&quot;height&quot;:980}}">
+class Component extends DCLogic {
+  toggle(k) { this.setState(s => ({ notes: s.notes === k ? null : k })); }
+
+  renderVals() {
+    const DEFS = [
+      {
+        id: 'fx', label: 'FX Risk', soon: false,
+        title: 'Group FX VaR setup',
+        desc: 'Exposure inputs set the hedge target and VaR profile. Pick the active tenure on the evolution chart — it drives Hedging Decision, Live Ladder and Risk Metrics.',
+        meta: 'Group VaR · all currencies · Tf 12m',
+        stat: '$1.24M', statLabel: 'Resid VaR',
+      },
+      {
+        id: 'carry', label: 'Cash Carry', soon: false,
+        title: 'Planned Consolidated Hedged Cash forecast',
+        desc: 'Cash in/out plus hedge CF with all carry layers — residual FCY interest, FWD points at each strip or bullet settle, and USD interest on post-settle balances.',
+        meta: 'Cash carry · all currencies · Tf 12m — click a currency row to set the carry chart',
+        stat: '+1.73K', statLabel: 'Total carry',
+      },
+      { id: 'dv01', label: 'DV01', soon: true, title: 'DV01', desc: '', meta: '', stat: '—', statLabel: 'Not enabled' },
+      { id: 'greeks', label: 'Greeks', soon: true, title: 'Greeks', desc: '', meta: '', stat: '—', statLabel: 'Not enabled' },
+    ];
+    const activeId = this.state.tab || 'carry';
+    const active = DEFS.find(d => d.id === activeId) || DEFS[1];
+
+    const tabs = DEFS.map(d => {
+      const on = d.id === activeId;
+      return {
+        label: d.label,
+        soon: d.soon ? 'Soon' : '',
+        soonColor: d.soon ? '#475569' : 'transparent',
+        cursor: d.soon ? 'not-allowed' : 'pointer',
+        weight: on ? '600' : '400',
+        color: on ? '#f8fafc' : d.soon ? '#475569' : '#94a3b8',
+        rail: on ? '2px solid #0ea5e9' : '2px solid transparent',
+        topRail: on ? '2px solid #0ea5e9' : '2px solid transparent',
+        segBg: on ? '#1e293b' : 'transparent',
+        segRail: on ? 'inset 0 -2px 0 0 #0ea5e9' : 'none',
+        cardBg: on ? 'rgba(15,23,42,.85)' : 'transparent',
+        shadBg: on ? '#020617' : 'transparent',
+        shadShadow: on ? '0 1px 2px rgba(0,0,0,.5), inset 0 0 0 1px #1e293b' : 'none',
+        shadColor: on ? '#f8fafc' : '#94a3b8',
+        shadOpacity: d.soon ? '.5' : '1',
+        stat: d.stat,
+        statLabel: d.statLabel,
+        statColor: on ? '#f1f5f9' : d.soon ? '#334155' : '#64748b',
+        pick: () => { if (!d.soon) this.setState({ tab: d.id }); },
+      };
+    });
+
+    return {
+      tabs,
+      activeTitle: active.title,
+      activeDesc: active.desc,
+      activeMeta: active.meta,
+      notesA: this.state.notes === 'a',
+      notesB: this.state.notes === 'b',
+      notesC: this.state.notes === 'c',
+      notesD: this.state.notes === 'd',
+      toggleD: () => this.toggle('d'),
+      toggleA: () => this.toggle('a'),
+      toggleB: () => this.toggle('b'),
+      toggleC: () => this.toggle('c'),
+    };
+  }
+}
+</script>
+</body>
+</html>

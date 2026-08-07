@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -10,7 +11,11 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { ExposureHedgePathChart } from '@/components/test-mode/ExposureHedgePathChart';
+import {
+  ExposureHedgePathChart,
+  type HedgePathPrepareAction,
+  type HedgePathSummaryMetrics,
+} from '@/components/test-mode/ExposureHedgePathChart';
 import {
   DEFAULT_FORECAST_PROFILE,
   monthlyFlowSeriesLocalM,
@@ -28,23 +33,31 @@ import {
 } from '@/lib/test-mode/exposure-hedge-path';
 import {
   buildHedgeVarSummary,
+  clearPreparedHedgeForCcy,
   equalVarLinearHedgeNotionalLocalM,
   isLiveHedgeTicket,
   newHedgeTicketId,
   overlayRiskFromFxBook,
   proposeBookHedge,
+  setPreparedHedgeForCcy,
+  varSetupWithLineUncertainty,
   type HedgeInstrument,
   type HedgeTicket,
+  type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
+import { assignImpliedCarryFromSwapPoints } from '@/lib/test-mode/cash-carry-analytics';
+import { getActiveMarketRates } from '@/lib/fx-market-rates';
 import {
   buildRollingHedgeEdges,
   bulletMaturityForForecast,
+  clearRollingStripForCcy,
   hasRollingStripForCcy,
   mergeRollingStripIntoBook,
   needsRollingHedges,
   proposeRollingHedgeTickets,
   removeHedgeTicketOrStrip,
   resyncBookedRollingStrips,
+  sizingForHedgePathBasis,
   stripForwardLegsFromEdges,
   varSetupForHedgeStructure,
   varSetupForPathHedgeRegime,
@@ -55,6 +68,7 @@ import {
   RiskPerspectiveSelector,
   riskPerspectiveMeta,
   type RiskPerspective,
+  type RiskPerspectiveTabStat,
 } from '@/components/test-mode/RiskPerspectiveSelector';
 import {
   DEFAULT_VAR_SETUP,
@@ -178,6 +192,14 @@ interface HedgingDecisionLayerProps {
   /** Booked hedge tickets — shared with Live Ladder for VaR recalculation. */
   bookedHedges?: HedgeTicket[];
   onBookedHedgesChange?: (tickets: HedgeTicket[]) => void;
+  /** Analytics-prepared packages (not live until Send). */
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  onPreparedByCcyChange?: (next: Record<string, PreparedHedgeProfile>) => void;
+  /** Entity/group scope for Market data swap-points carry on Prepare. */
+  ratesScopeId?: string;
+  /** Shared with Analytics — bullet vs rolling strip. */
+  hedgeStructure?: ForecastHedgeStructure;
+  onHedgeStructureChange?: (s: ForecastHedgeStructure) => void;
   varSetup?: VarSetup;
   onBookHedge?: (ticket: HedgeTicket) => void;
   bookRows?: RowState[];
@@ -191,11 +213,16 @@ interface HedgingDecisionLayerProps {
 export function HedgingDecisionLayer({
   risk: seedRisk,
   embedded = true,
-  title = 'Decision layer — Hedging (Δ → VaR)',
+  title: _moduleTitle = 'Decision layer — Hedging (Δ → VaR)',
   hedgeRatios: controlledRatios,
   onHedgeRatiosChange,
   bookedHedges: controlledBooked,
   onBookedHedgesChange,
+  preparedByCcy: controlledPrepared,
+  onPreparedByCcyChange,
+  ratesScopeId,
+  hedgeStructure: controlledStructure,
+  onHedgeStructureChange,
   varSetup = DEFAULT_VAR_SETUP,
   onBookHedge,
   bookRows,
@@ -213,15 +240,28 @@ export function HedgingDecisionLayer({
   );
   const [localRatios, setLocalRatios] = useState<Record<string, number>>({});
   const [localBooked, setLocalBooked] = useState<HedgeTicket[]>([]);
+  const [localPrepared, setLocalPrepared] = useState<
+    Record<string, PreparedHedgeProfile>
+  >({});
   const [draft, setDraft] = useState<HedgeTicket | null>(null);
   const [chartCcy, setChartCcy] = useState<string | null>(null);
-  const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('totalExpected');
+  const [pathSummaryMetrics, setPathSummaryMetrics] =
+    useState<HedgePathSummaryMetrics | null>(null);
+  const [pathPrepareAction, setPathPrepareAction] =
+    useState<HedgePathPrepareAction | null>(null);
+  const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('varNeutral');
   /** bullet = one Tf forward; strip = rolling Th windows (when Tf > Th). */
-  const [hedgeStructure, setHedgeStructure] =
+  const [localStructure, setLocalStructure] =
     useState<ForecastHedgeStructure>('bullet');
+  const hedgeStructure = controlledStructure ?? localStructure;
+  const setHedgeStructure = (s: ForecastHedgeStructure) => {
+    if (onHedgeStructureChange) onHedgeStructureChange(s);
+    else setLocalStructure(s);
+  };
   const [perspective, setPerspective] = useState<RiskPerspective>('fxRisk');
   const ratios = controlledRatios ?? localRatios;
   const booked = controlledBooked ?? localBooked;
+  const preparedByCcy = controlledPrepared ?? localPrepared;
   const setRatios = (next: Record<string, number>) => {
     if (onHedgeRatiosChange) onHedgeRatiosChange(next);
     else setLocalRatios(next);
@@ -229,6 +269,10 @@ export function HedgingDecisionLayer({
   const setBooked = (next: HedgeTicket[]) => {
     if (onBookedHedgesChange) onBookedHedgesChange(next);
     else setLocalBooked(next);
+  };
+  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+    if (onPreparedByCcyChange) onPreparedByCcyChange(next);
+    else setLocalPrepared(next);
   };
 
   const ThM = horizonMonths(varSetup.horizon);
@@ -281,8 +325,9 @@ export function HedgingDecisionLayer({
         hedgeSizingSetup,
         booked,
         monthlyFlowsByCcy,
+        forecastProfile,
       ),
-    [risk, ratios, hedgeSizingSetup, booked, monthlyFlowsByCcy],
+    [risk, ratios, hedgeSizingSetup, booked, monthlyFlowsByCcy, forecastProfile],
   );
 
   /** Re-snap Cash·VN·Target % and rebuild strips when Analytics setup changes. */
@@ -293,6 +338,7 @@ export function HedgingDecisionLayer({
     varSetup.horizon,
     varSetup.confidencePct,
     varSetup.forecastUncertainty1m,
+    JSON.stringify(forecastProfile.uncertainty1mByCcy ?? {}),
     varSetup.volSource,
     hedgeSizingSetup.horizon,
     hedgeSizingSetup.exposureBasis,
@@ -365,7 +411,7 @@ export function HedgingDecisionLayer({
   const openPathChart = (ccy: string) => {
     const r = summary.rows.find(row => row.ccy === ccy);
     if (!r) return;
-    // Bullet defaults to VaR-neutral — never Target just because strip is available.
+    // Reopen on the regime that matches Live / Decision Hedge N.
     const inferred =
       Math.abs(r.hedgeNotionalLocalM) > 1e-9
         ? inferHedgePathBasis(
@@ -406,13 +452,15 @@ export function HedgingDecisionLayer({
       flowsForCcy,
     );
     // Prefer structure from the chart (avoids stale parent 'bullet' on Strip click).
-    const structureNow = structure ?? hedgeStructure;
     if (structure && structure !== hedgeStructure) {
       setHedgeStructure(structure);
     }
-    // Strip: preview only (Cash/VN/Target chips). Book via "Book … forwards".
-    if (structureNow === 'strip' && needsRollingHedges(varSetup)) {
-      return;
+    // Never auto-book strips from path chips — only Decision %. Prepare/Send is explicit.
+    if (hasRollingStripForCcy(booked, chartRow.ccy)) {
+      setBooked(clearRollingStripForCcy(booked, chartRow.ccy));
+    }
+    if (preparedByCcy[chartRow.ccy]) {
+      setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, chartRow.ccy));
     }
     const bulletEq = equalVarLinearHedgeNotionalLocalM(
       chartBar.stockNetM,
@@ -436,33 +484,214 @@ export function HedgingDecisionLayer({
     setRatios({ ...ratios, [chartRow.ccy]: ratio });
   };
 
-  const bookRollingStripFromChart = (edges: RollingHedgeEdge[]) => {
-    if (!chartRow) return;
-    if (hasRollingStripForCcy(booked, chartRow.ccy)) {
-      closePathChart();
+  const ticketBasisForPath = (
+    basis: HedgePathBasisId,
+  ): VarExposureBasis =>
+    basis === 'cash'
+      ? 'stock'
+      : basis === 'totalExpected'
+        ? 'totalBuildup'
+        : varSetup.exposureBasis === 'stock'
+          ? 'simpleAvg'
+          : varSetup.exposureBasis;
+
+  /** Path-chart Book → stage package under CCY (Send in Decision books it). */
+  const bookHedgeProfileFromChart = (args: {
+    structure: ForecastHedgeStructure;
+    basis: HedgePathBasisId;
+    edges: RollingHedgeEdge[];
+    cashSettleByEdgeIndex?: Record<number, number>;
+    bulletSettleMonths?: number;
+    cashDeliveryAt?: 'periodEnd' | 'periodStart' | 'matchExposure';
+    coverPct?: number;
+  }) => {
+    if (!chartRow || !chartBar) return;
+    const {
+      structure,
+      basis,
+      edges,
+      cashSettleByEdgeIndex,
+      bulletSettleMonths: chartBulletSettle,
+      cashDeliveryAt,
+      coverPct: coverPctArg,
+    } = args;
+    const coverPct = Math.min(1, Math.max(0, coverPctArg ?? 1));
+    setPathBasis(basis);
+    setHedgeStructure(structure);
+    const ticketBasis = ticketBasisForPath(basis);
+    const defaultTf =
+      varSetup.forecastMonths || horizonMonths(varSetup.horizon);
+
+    if (structure === 'strip' && edges.length > 1) {
+      const coverLocalM = edges[edges.length - 1]?.hedgeLocalM ?? 0;
+      const profile = assignImpliedCarryFromSwapPoints(
+        {
+          structure: 'strip',
+          basis,
+          ticketBasis,
+          legs: edges.map(e => ({
+            index: e.index,
+            startMonth: e.startMonth,
+            endMonth: e.endMonth,
+            settleMonths: cashSettleByEdgeIndex?.[e.index] ?? e.endMonth,
+            hedgeLocalM: e.hedgeLocalM,
+            label: e.label,
+            stockStartM: e.stockStartM,
+            endExposureM: e.endExposureM,
+          })),
+          coverLocalM,
+          hedgeRatio: coverPct,
+          cashDeliveryAt,
+        },
+        {
+          marketRates: getActiveMarketRates(ratesScopeId),
+          bulletSettleMonths: defaultTf,
+        },
+      );
+      setPreparedByCcy(
+        setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+          ...profile,
+          preparedFor: 'var',
+        }),
+      );
+      // Stay open — same as Cash Carry's Prebook: stage, don't dismiss.
+      // The header shows a live "Prebooked" badge as confirmation.
       return;
     }
-    const ticketBasis =
-      pathBasis === 'cash'
-        ? 'stock'
-        : pathBasis === 'totalExpected'
-          ? 'totalBuildup'
-          : varSetup.exposureBasis === 'stock'
-            ? 'simpleAvg'
-            : varSetup.exposureBasis;
-    const tickets = proposeRollingHedgeTickets(
-      chartRow.ccy,
-      edges,
+
+    // Bullet: stage one forward package; Decision % preview still via Apply chips.
+    const flowM =
+      varSetup.forecastMonths > 0 && Math.abs(chartBar.flowM) > 1e-15
+        ? chartBar.flowM
+        : 0;
+    const flowsForCcy = monthlyFlowsByCcy[chartRow.ccy];
+    const { startM, endM, flows } = resolveChartMonthlyFlows(
+      chartBar.stockNetM,
+      flowM,
       varSetup,
-      ticketBasis,
-      monthlyFlowsByCcy[chartRow.ccy] ?? [],
+      flowsForCcy,
     );
-    setBooked(mergeRollingStripIntoBook(booked, tickets, chartRow.ccy));
-    setRatios({ ...ratios, [chartRow.ccy]: 0 });
-    for (const t of tickets) {
-      if (isLiveHedgeTicket(t)) onBookHedge?.(t);
+    const bulletEq = equalVarLinearHedgeNotionalLocalM(
+      chartBar.stockNetM,
+      flowM,
+      chartRow.ccy,
+      varSetupForPathHedgeRegime(varSetup, 'bullet'),
+      undefined,
+      flowsForCcy ?? flows,
+    ).amountLocalM;
+    const target =
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
+    const target100 = Math.abs(chartRow.targetHedgeLocalM);
+    const ratio =
+      target100 < 1e-12
+        ? 0
+        : Math.min(1, hedgeRatioForNumber(target, chartRow.targetHedgeLocalM));
+    const bulletSettleMonths = chartBulletSettle ?? defaultTf;
+    const profile = assignImpliedCarryFromSwapPoints(
+      {
+        structure: 'bullet',
+        basis,
+        ticketBasis,
+        legs: [],
+        coverLocalM: target,
+        hedgeRatio: coverPctArg != null ? coverPct : ratio,
+        cashDeliveryAt,
+        settleMonths: bulletSettleMonths,
+      },
+      {
+        marketRates: getActiveMarketRates(ratesScopeId),
+        bulletSettleMonths,
+      },
+    );
+    setPreparedByCcy(
+      setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+        ...profile,
+        preparedFor: 'var',
+      }),
+    );
+    // Stay open — same as Cash Carry's Prebook: stage, don't dismiss.
+    // The header shows a live "Prebooked" badge as confirmation.
+  };
+
+  const discardPrepared = (ccy: string) => {
+    setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+  };
+
+  /** Commit Analytics-prepared package onto the live Decision book. */
+  const sendPreparedToDecision = (ccy: string) => {
+    const prep = preparedByCcy[ccy];
+    const row = summary.rows.find(r => r.ccy === ccy);
+    const riskRow = riskByCcy.get(ccy);
+    if (!prep || !row || !riskRow) return;
+
+    if (prep.structure === 'strip' && prep.legs.length > 1) {
+      const edges: RollingHedgeEdge[] = prep.legs.map(l => ({
+        index: l.index,
+        startMonth: l.startMonth,
+        endMonth: l.endMonth,
+        hedgeLocalM: l.hedgeLocalM,
+        label: l.label,
+        stockStartM: l.stockStartM ?? 0,
+        endExposureM: l.endExposureM ?? 0,
+      }));
+      const settleMonthsByEdgeIndex: Record<number, number> = {};
+      for (const l of prep.legs) {
+        settleMonthsByEdgeIndex[l.index] = l.settleMonths ?? l.endMonth;
+      }
+      const tickets = proposeRollingHedgeTickets(
+        ccy,
+        edges,
+        varSetup,
+        prep.ticketBasis,
+        monthlyFlowsByCcy[ccy] ?? [],
+        settleMonthsByEdgeIndex,
+      );
+      setBooked(mergeRollingStripIntoBook(booked, tickets, ccy));
+      setRatios({ ...ratios, [ccy]: 0 });
+      for (const t of tickets) {
+        if (isLiveHedgeTicket(t)) onBookHedge?.(t);
+      }
+      setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+      return;
     }
-    closePathChart();
+
+    // Bullet → one forward ticket at cash-delivery settle (default Tf).
+    if (Math.abs(prep.coverLocalM) < 1e-9) return;
+    const template = proposeBookHedge(riskRow, prep.ticketBasis, varSetup);
+    const settleM =
+      prep.settleMonths != null
+        ? prep.settleMonths
+        : varSetup.forecastMonths > 0
+          ? varSetup.forecastMonths
+          : horizonMonths(varSetup.horizon);
+    const maturity = bulletMaturityForForecast(settleM, varSetup.horizon);
+    const maturityLabel =
+      VAR_HORIZON_OPTIONS.find(h => h.id === maturity)?.label ?? maturity;
+    const settleTag =
+      prep.cashDeliveryAt === 'periodStart'
+        ? 'period start'
+        : prep.cashDeliveryAt === 'matchExposure'
+          ? 'e ∩ H'
+          : 'Tf';
+    const ticket: HedgeTicket = {
+      ...template,
+      id: newHedgeTicketId(),
+      instrument: 'forward',
+      amountLocalM: prep.coverLocalM,
+      maturity,
+      maturityLabel: `${maturityLabel} · bullet ${settleTag}`,
+      varUsdM: computeParametricVarUsdM(prep.coverLocalM, ccy, {
+        ...varSetup,
+        horizon: maturity,
+      }),
+    };
+    const withoutStrip = hasRollingStripForCcy(booked, ccy)
+      ? clearRollingStripForCcy(booked, ccy)
+      : booked;
+    setBooked([ticket, ...withoutStrip]);
+    setRatios({ ...ratios, [ccy]: 0 });
+    onBookHedge?.(ticket);
+    setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
   };
 
   const openBookModal = (ccy: string) => {
@@ -541,22 +770,35 @@ export function HedgingDecisionLayer({
       varSetup,
       custom,
     );
-    const sizing =
-      varSetup.exposureBasis === 'stock'
-        ? 'stockStart'
-        : varSetup.exposureBasis === 'totalBuildup'
-          ? 'windowEnd'
-          : 'varNeutral';
-    const edges = buildRollingHedgeEdges(startM, flows, varSetup, sizing);
+    // Same Cash / VN / Target sizing as the path-chart regime (not Analytics
+    // profile → Target). Growth-path Analytics used to force windowEnd (=9.1).
+    const sizing = sizingForHedgePathBasis(pathBasis);
+    const edges = buildRollingHedgeEdges(startM, flows, varSetup, sizing, {
+      ccy: eur.bar.ccy,
+      varSetup,
+    });
     if (edges.length < 2) return null;
     return { ccy: eur.bar.ccy, edges, endM, sizing };
-  }, [risk, varSetup, bookRows, forecastProfile, stripAvailable, effectiveStructure]);
+  }, [
+    risk,
+    varSetup,
+    bookRows,
+    forecastProfile,
+    stripAvailable,
+    effectiveStructure,
+    pathBasis,
+  ]);
 
   const stripAlreadyBooked =
     rollingStrip != null && hasRollingStripForCcy(booked, rollingStrip.ccy);
+  const stripAlreadyPrepared =
+    rollingStrip != null &&
+    preparedByCcy[rollingStrip.ccy]?.structure === 'strip';
 
-  const bookRollingStrip = () => {
+  /** Stage EUR/default strip for Decision Send (does not book live). */
+  const prepareRollingStrip = () => {
     if (!rollingStrip || stripAlreadyBooked) return;
+    setHedgeStructure('strip');
     const ticketBasis =
       rollingStrip.sizing === 'stockStart'
         ? 'stock'
@@ -565,19 +807,37 @@ export function HedgingDecisionLayer({
           : varSetup.exposureBasis === 'stock'
             ? 'simpleAvg'
             : varSetup.exposureBasis;
-    const tickets = proposeRollingHedgeTickets(
-      rollingStrip.ccy,
-      rollingStrip.edges,
-      varSetup,
-      ticketBasis,
-      monthlyFlowsByCcy[rollingStrip.ccy] ?? [],
+    const coverLocalM =
+      rollingStrip.edges[rollingStrip.edges.length - 1]?.hedgeLocalM ?? 0;
+    const profile = assignImpliedCarryFromSwapPoints(
+      {
+        structure: 'strip',
+        basis: pathBasis,
+        ticketBasis,
+        legs: rollingStrip.edges.map(e => ({
+          index: e.index,
+          startMonth: e.startMonth,
+          endMonth: e.endMonth,
+          hedgeLocalM: e.hedgeLocalM,
+          label: e.label,
+          stockStartM: e.stockStartM,
+          endExposureM: e.endExposureM,
+        })),
+        coverLocalM,
+        hedgeRatio: 0,
+      },
+      {
+        marketRates: getActiveMarketRates(ratesScopeId),
+        bulletSettleMonths:
+          varSetup.forecastMonths || horizonMonths(varSetup.horizon),
+      },
     );
-    setBooked(mergeRollingStripIntoBook(booked, tickets, rollingStrip.ccy));
-    setRatios({ ...ratios, [rollingStrip.ccy]: 0 });
-    // All strip legs are live from M0 (staggered tenures).
-    for (const t of tickets) {
-      if (isLiveHedgeTicket(t)) onBookHedge?.(t);
-    }
+    setPreparedByCcy(
+      setPreparedHedgeForCcy(preparedByCcy, rollingStrip.ccy, {
+        ...profile,
+        preparedFor: 'var',
+      }),
+    );
   };
 
   const shell = embedded
@@ -588,52 +848,120 @@ export function HedgingDecisionLayer({
   const rowHover = embedded ? 'hover:bg-slate-800/50' : 'hover:bg-gray-50';
   const border = embedded ? 'border-slate-800' : 'border-gray-200';
 
+  /** FX Exposure overview — read-only per-currency snapshot (Cash Carry-style summary table). */
+  const exposureOverviewRows = useMemo(() => {
+    return summary.rows.map(r => {
+      const riskRow = riskByCcy.get(r.ccy);
+      const stockRaw = riskRow?.bar.stockNetM ?? r.stockHedgeLocalM;
+      const flowRaw = riskRow?.bar.flowM ?? 0;
+      const totalM = r.targetHedgeLocalM;
+      const flowForVar =
+        varSetup.forecastMonths > 0 && Math.abs(flowRaw) > 1e-15
+          ? flowRaw
+          : 0;
+      const varStock = computeAnalyticsVarUsdM(stockRaw, 0, r.ccy, {
+        ...varSetup,
+        exposureBasis: 'stock',
+      });
+      const varTotal = computeAnalyticsVarUsdM(stockRaw, flowForVar, r.ccy, {
+        ...varSetup,
+        exposureBasis: 'totalBuildup',
+      });
+      const direction: 'long' | 'short' | 'flat' =
+        Math.abs(totalM) < 1e-9 ? 'flat' : totalM > 0 ? 'long' : 'short';
+      return {
+        ccy: r.ccy,
+        stockM: stockRaw,
+        flowM: flowRaw,
+        totalM,
+        varStock,
+        varTotal,
+        direction,
+      };
+    });
+  }, [summary.rows, riskByCcy, varSetup]);
+
+  const exposureOverviewTotals = useMemo(
+    () =>
+      exposureOverviewRows.reduce(
+        (a, r) => ({
+          varStock: a.varStock + r.varStock,
+          varTotal: a.varTotal + r.varTotal,
+        }),
+        { varStock: 0, varTotal: 0 },
+      ),
+    [exposureOverviewRows],
+  );
+
+  const perspectiveTabStats = useMemo((): Partial<
+    Record<RiskPerspective, RiskPerspectiveTabStat>
+  > => {
+    const resid = summary.totalVarAfterUsdM;
+    const residLabel =
+      !Number.isFinite(resid) || Math.abs(resid) < 1e-12
+        ? '—'
+        : Math.abs(resid) >= 0.1
+          ? `$${resid.toFixed(2)}M`
+          : `$${(resid * 1000).toFixed(1)}K`;
+    return {
+      fxRisk: { value: residLabel, label: 'Resid VaR' },
+    };
+  }, [summary.totalVarAfterUsdM]);
+
   return (
     <div className={`space-y-4 ${shell}`}>
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-semibold">{title}</h3>
-          <p className={`mt-0.5 text-xs ${muted}`}>
-            Hedge-add % of Target (Total expected): Cash = min · VaR-neutral = mid ·
-            Total = 100%. Setup: {hedgeSizingSetup.confidencePct}% ·{' '}
-            {hedgeSizingSetup.horizon}
-            {effectiveStructure === 'bullet' &&
-            hedgeSizingSetup.horizon !== varSetup.horizon
-              ? ` (bullet=forecast)`
-              : ''}{' '}
-            · {hedgeSizingSetup.exposureBasis}
-            {TfM > 0 ? ` · forecast ${TfM}m` : ''}.
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {rollingStrip && (
+      <RiskPerspectiveSelector
+        value={perspective}
+        onChange={setPerspective}
+        moduleLabel="Hedging Decision"
+        tabStats={perspectiveTabStats}
+        tfMonths={varSetup.forecastMonths}
+        metaLine={[
+          'Hedge-add % of Target · Cash = min · VN = Equal-VaR · Total = 100%',
+          `${hedgeSizingSetup.confidencePct}%`,
+          hedgeSizingSetup.horizon,
+          effectiveStructure === 'bullet' &&
+          hedgeSizingSetup.horizon !== varSetup.horizon
+            ? '(bullet=forecast)'
+            : null,
+          hedgeSizingSetup.exposureBasis,
+          TfM > 0 ? `forecast ${TfM}m` : null,
+        ]
+          .filter(Boolean)
+          .join(' · ')}
+        trailing={
+          <>
+            {rollingStrip && (
+              <button
+                type="button"
+                onClick={prepareRollingStrip}
+                disabled={stripAlreadyBooked}
+                title={
+                  stripAlreadyBooked
+                    ? 'Strip already on the book — cancel it to rebook'
+                    : stripAlreadyPrepared
+                      ? `Replace prepared ${rollingStrip.edges.length}-leg strip — then Send under ${rollingStrip.ccy}`
+                      : `Prepare ${rollingStrip.edges.length} forwards from M0 — Send under ${rollingStrip.ccy} to book`
+                }
+                className="rounded-md border border-violet-500/50 bg-violet-500/20 px-2.5 py-1 text-[11px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {stripAlreadyBooked
+                  ? 'Strip booked'
+                  : stripAlreadyPrepared
+                    ? `Prepared ${rollingStrip.edges.length}-leg strip`
+                    : `Prepare ${rollingStrip.edges.length}-leg strip`}
+              </button>
+            )}
             <button
               type="button"
-              onClick={bookRollingStrip}
-              disabled={stripAlreadyBooked}
-              title={
-                stripAlreadyBooked
-                  ? 'Strip already on the book — cancel it to rebook'
-                  : `Book ${rollingStrip.edges.length} forwards from M0 (own size + tenure each)`
-              }
-              className="rounded-md border border-violet-500/50 bg-violet-500/20 px-2.5 py-1 text-[11px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={() => hedgeAll(0)}
+              className="rounded-md border border-slate-600 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
             >
-              {stripAlreadyBooked
-                ? 'Strip booked'
-                : `Book ${rollingStrip.edges.length}-leg strip from M0`}
+              Unhedged
             </button>
-          )}
-          <button
-            type="button"
-            onClick={() => hedgeAll(0)}
-            className="rounded-md border border-slate-600 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
-          >
-            Unhedged
-          </button>
-        </div>
-      </div>
-
-      <RiskPerspectiveSelector value={perspective} onChange={setPerspective} />
+          </>
+        }
+      />
 
       {perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
@@ -710,9 +1038,9 @@ export function HedgingDecisionLayer({
           )}
           {effectiveStructure === 'bullet' && (
             <p className={`mt-2 text-[10px] ${muted}`}>
-              Bullet sizes Equal-VaR at forecast tenor {TfM}m (
-              {hedgeSizingSetup.horizon}). VaR-neutral = mid (Ē / RMS); Target =
-              end buildup — they are not the same. One forward at t=0.
+              Bullet sizes at forecast tenor {TfM}m (
+              {hedgeSizingSetup.horizon}). VaR-neutral = path CoG (growth) or
+              Ē (simple/TW); Target = end buildup. One forward at t=0.
             </p>
           )}
         </div>
@@ -752,11 +1080,130 @@ export function HedgingDecisionLayer({
         />
       </div>
 
+      <div>
+        <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+          FX Exposure overview
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[560px] text-left text-xs">
+            <thead>
+              <tr className={`border-b ${border} ${head}`}>
+                <th className="py-2 pr-3 font-medium">CCY</th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Cash / Net FX book at t=0"
+                >
+                  Stock
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Forecast flow over the horizon"
+                >
+                  Flow
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Net FX Forecast = Stock + Flow — the hedge target"
+                >
+                  Net exposure
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium text-amber-300/90"
+                  title="Undiversified VaR on Stock only"
+                >
+                  VaR (Stock)
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium text-emerald-300/80"
+                  title="Undiversified VaR on Net exposure"
+                >
+                  VaR (Net)
+                </th>
+                <th className="py-2 font-medium">Direction</th>
+              </tr>
+            </thead>
+            <tbody>
+              {exposureOverviewRows.map(r => (
+                <tr
+                  key={r.ccy}
+                  className={`border-b ${border}/60${
+                    r.direction === 'flat' ? ' opacity-50' : ''
+                  }`}
+                >
+                  <td className="py-2 pr-3 font-semibold text-white">
+                    {r.ccy}
+                  </td>
+                  <td className="py-2 pr-3 font-mono text-slate-300">
+                    {fmtLocal(r.stockM, r.ccy)}
+                  </td>
+                  <td
+                    className={`py-2 pr-3 font-mono ${
+                      Math.abs(r.flowM) < 1e-9
+                        ? 'text-slate-600'
+                        : 'text-slate-300'
+                    }`}
+                  >
+                    {Math.abs(r.flowM) < 1e-9
+                      ? '—'
+                      : fmtLocal(r.flowM, r.ccy)}
+                  </td>
+                  <td className="py-2 pr-3 font-mono font-semibold text-violet-200">
+                    {fmtLocal(r.totalM, r.ccy)}
+                  </td>
+                  <td className="py-2 pr-3 font-mono text-amber-300">
+                    {fmtVarK(r.varStock)}
+                  </td>
+                  <td className="py-2 pr-3 font-mono font-semibold text-emerald-300">
+                    {fmtVarK(r.varTotal)}
+                  </td>
+                  <td className="py-2">
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${
+                        r.direction === 'long'
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : r.direction === 'short'
+                            ? 'bg-rose-500/15 text-rose-300'
+                            : 'bg-slate-700/50 text-slate-500'
+                      }`}
+                    >
+                      {r.direction}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            {exposureOverviewRows.length > 1 && (
+              <tfoot>
+                <tr className="bg-slate-900/40">
+                  <td className="py-2 pr-3 font-semibold text-violet-200">
+                    All CCY
+                  </td>
+                  <td
+                    className={`py-2 pr-3 font-mono text-slate-500`}
+                    colSpan={3}
+                    title="FCY amounts don't sum across currencies — see VaR (USD) totals"
+                  >
+                    —
+                  </td>
+                  <td className="py-2 pr-3 font-mono font-semibold text-amber-300">
+                    {fmtVarK(exposureOverviewTotals.varStock)}
+                  </td>
+                  <td className="py-2 pr-3 font-mono font-semibold text-emerald-300">
+                    {fmtVarK(exposureOverviewTotals.varTotal)}
+                  </td>
+                  <td className="py-2" />
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      </div>
+
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[820px] text-left text-xs">
+        <table className="w-full min-w-[900px] text-left text-xs">
           <thead>
             <tr className={`border-b ${border} ${head}`}>
-              <th className="py-2 pr-2 font-medium">CCY</th>
+              <th className="py-2 pr-2 font-medium">CCY / Trade</th>
               <th
                 className="max-w-[5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
                 title="Click → Cash / stock hedge (min on Target scale). Blue highlight = selected."
@@ -775,14 +1222,17 @@ export function HedgingDecisionLayer({
               >
                 Target (Total)
               </th>
+              <th
+                className="py-2 pr-2 font-medium"
+                title="Trade Δ notional (strip leg) or Hedge % on CCY row"
+              >
+                Size / %
+              </th>
+              <th className="py-2 pr-2 font-medium" title="Forward settle from M0">
+                Settle
+              </th>
               <th className="max-w-[3.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal">
                 VaR @ Δ1
-              </th>
-              <th
-                className="max-w-[3.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="% of Target (Total expected)"
-              >
-                Hedge % of Target
               </th>
               <th className="py-2 pr-2 font-medium">Delta</th>
               <th className="py-2 pr-2 font-medium">Residual</th>
@@ -799,10 +1249,10 @@ export function HedgingDecisionLayer({
               const flowRaw = riskRow?.bar.flowM ?? 0;
               const stockM = r.stockHedgeLocalM;
               const totalM = r.targetHedgeLocalM;
-              // Higher-VaR pick must use the Analytics engine (path ≠ snapshot |E|×σ×√T).
               const flowForVar =
-                varSetup.forecastMonths > 0 && Math.abs(flowRaw) > 1e-15 ? flowRaw : 0;
-              // Stock Analytics ⇒ Equal-VaR ≡ Cash; ladder VN uses path totalBuildup.
+                varSetup.forecastMonths > 0 && Math.abs(flowRaw) > 1e-15
+                  ? flowRaw
+                  : 0;
               const varNeutralM =
                 varSetup.exposureBasis === 'stock'
                   ? (() => {
@@ -827,17 +1277,21 @@ export function HedgingDecisionLayer({
                 r.ccy,
                 pathRegimeSetup,
               );
-              const varTotal = computeAnalyticsVarUsdM(stockRaw, flowForVar, r.ccy, {
-                ...varSetup,
-                exposureBasis: 'totalBuildup',
-              });
+              const varTotal = computeAnalyticsVarUsdM(
+                stockRaw,
+                flowForVar,
+                r.ccy,
+                {
+                  ...varSetup,
+                  exposureBasis: 'totalBuildup',
+                },
+              );
               const higherBasis: VarExposureBasis =
                 varTotal >= varNeutralUsd && varTotal > varStock + 1e-12
                   ? 'totalBuildup'
                   : varNeutralUsd > varStock + 1e-12
                     ? 'simpleAvg'
                     : 'stock';
-              // Flat when Target (Total expected) is ~0.
               const flat = Math.abs(totalM) < 1e-9;
               const canBook = !flat;
               const selectedRegime: HedgePathBasisId | null =
@@ -849,166 +1303,430 @@ export function HedgingDecisionLayer({
                       totalM,
                       varNeutralM,
                     );
+              const prepared = preparedByCcy[r.ccy];
+              const regimeLabel =
+                prepared?.basis === 'cash'
+                  ? 'Expected stock'
+                  : prepared?.basis === 'totalExpected'
+                    ? 'Target'
+                    : prepared?.basis === 'varNeutral'
+                      ? 'VaR-neutral'
+                      : null;
+              const bookedForCcy = booked
+                .filter(t => t.ccy === r.ccy)
+                .sort(
+                  (a, b) => (a.stripEdgeIndex ?? 0) - (b.stripEdgeIndex ?? 0),
+                );
+              const preparedLegs =
+                prepared?.structure === 'strip' && prepared.legs.length > 0
+                  ? prepared.legs
+                  : prepared
+                    ? [
+                        {
+                          index: 0,
+                          startMonth: 0,
+                          endMonth: TfM,
+                          settleMonths:
+                            prepared.settleMonths != null
+                              ? prepared.settleMonths
+                              : TfM,
+                          hedgeLocalM: prepared.coverLocalM,
+                          label: `M0–M${Math.round(
+                            prepared.settleMonths != null
+                              ? prepared.settleMonths
+                              : TfM,
+                          )}`,
+                          tradeNotionalLocalM: prepared.coverLocalM,
+                          impliedCarryUsdM: prepared.impliedCarryUsdM,
+                          swapPoints: prepared.swapPoints,
+                          swapPointsSide: prepared.swapPointsSide,
+                        },
+                      ]
+                    : [];
+              const tradeCount =
+                preparedLegs.length + bookedForCcy.length;
               return (
-                <tr
-                  key={r.ccy}
-                  className={`border-b ${border}/80 ${rowHover}${flat ? ' opacity-50' : ''}`}
-                >
-                  <td className="py-2.5 pr-2 font-semibold align-middle">{r.ccy}</td>
-                  <td className="max-w-[4.5rem] py-2.5 pr-2 align-middle">
-                    <ExposureApplyButton
-                      valueLocalM={stockM}
-                      ccy={r.ccy}
-                      label="Cash (stock)"
-                      varUsdM={varStock}
-                      emphasize={higherBasis === 'stock'}
-                      selected={selectedRegime === 'cash'}
-                      disabled={flat}
-                      onApply={() =>
-                        applyTargetNotional(r.ccy, stockM, 'cash')
-                      }
-                    />
-                  </td>
-                  <td className="max-w-[5.5rem] py-2.5 pr-2 align-middle">
-                    <ExposureApplyButton
-                      valueLocalM={varNeutralM}
-                      ccy={r.ccy}
-                      label="VaR-neutral"
-                      varUsdM={varNeutralUsd}
-                      emphasize={higherBasis === 'simpleAvg'}
-                      selected={selectedRegime === 'varNeutral'}
-                      disabled={flat || Math.abs(varNeutralM) < 1e-9}
-                      onApply={() =>
-                        applyTargetNotional(r.ccy, varNeutralM, 'varNeutral')
-                      }
-                    />
-                  </td>
-                  <td className="max-w-[5.5rem] py-2.5 pr-2 align-middle">
-                    <ExposureApplyButton
-                      valueLocalM={totalM}
-                      ccy={r.ccy}
-                      label="Target (Total)"
-                      varUsdM={varTotal}
-                      emphasize={higherBasis === 'totalBuildup'}
-                      selected={selectedRegime === 'totalExpected'}
-                      disabled={flat}
-                      onApply={() =>
-                        applyTargetNotional(r.ccy, totalM, 'totalExpected')
-                      }
-                    />
-                  </td>
-                  <td className="py-2.5 pr-3 font-mono font-semibold align-middle">
-                    {fmtVarK(r.varBeforeUsdM)}
-                  </td>
-                  <td className="py-2.5 pr-3 align-middle">
-                    <HedgeRatioControl
-                      pct={Math.round(r.hedgeRatio * 100)}
-                      notional={fmtLocal(r.hedgeNotionalLocalM, r.ccy)}
-                      mutedClass={muted}
-                      disabled={flat}
-                      onChange={pct => setRatio(r.ccy, pct)}
-                    />
-                  </td>
-                  <td className="py-2.5 pr-3 font-mono text-amber-300 align-middle">
-                    {r.delta.toFixed(2)}
-                  </td>
-                  <td className="py-2.5 pr-3 font-mono text-slate-400 align-middle">
-                    {fmtLocal(r.residualLocalM, r.ccy)}
-                  </td>
-                  <td className="py-2.5 pr-3 font-mono font-semibold text-emerald-300 align-middle">
-                    {fmtVarK(r.varAfterUsdM)}
-                  </td>
-                  <td className="py-2.5 align-middle">
-                    <div className="flex flex-col gap-1">
-                      <button
-                        type="button"
+                <Fragment key={r.ccy}>
+                  <tr
+                    className={`border-b ${border} ${rowHover}${flat ? ' opacity-50' : ''}${
+                      prepared ? ' bg-violet-500/[0.04]' : ''
+                    }`}
+                  >
+                    <td className="py-2.5 pr-2 align-middle">
+                      <div className="font-semibold text-white">{r.ccy}</div>
+                      {tradeCount > 0 && (
+                        <div className={`mt-0.5 text-[10px] ${muted}`}>
+                          {preparedLegs.length > 0 && (
+                            <span className="text-violet-300">
+                              {preparedLegs.length} prepared
+                              {prepared?.structure === 'strip'
+                                ? ' strip'
+                                : ' bullet'}
+                            </span>
+                          )}
+                          {preparedLegs.length > 0 &&
+                            bookedForCcy.length > 0 && (
+                              <span className="text-slate-600"> · </span>
+                            )}
+                          {bookedForCcy.length > 0 && (
+                            <span className="text-emerald-300/90">
+                              {bookedForCcy.length} booked
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                    <td className="max-w-[4.5rem] py-2.5 pr-2 align-middle">
+                      <ExposureApplyButton
+                        valueLocalM={stockM}
+                        ccy={r.ccy}
+                        label="Cash (stock)"
+                        varUsdM={varStock}
+                        emphasize={higherBasis === 'stock'}
+                        selected={selectedRegime === 'cash'}
                         disabled={flat}
-                        title="Open exposure path + residual VaR charts"
-                        onClick={() => openPathChart(r.ccy)}
-                        className="whitespace-nowrap rounded-md border border-violet-500/50 bg-violet-500/15 px-2.5 py-1.5 text-[11px] font-medium text-violet-200 hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-30"
-                      >
-                        Path charts
-                      </button>
-                      <button
-                        type="button"
-                        disabled={!canBook}
-                        title={
-                          flat
-                            ? 'No net exposure on this Analytics basis'
-                            : 'Open book-hedge proposal (auto size & timeline)'
+                        onApply={() =>
+                          applyTargetNotional(r.ccy, stockM, 'cash')
                         }
-                        onClick={() => openBookModal(r.ccy)}
-                        className="whitespace-nowrap rounded-md border border-sky-600/50 bg-sky-500/10 px-2.5 py-1.5 text-[11px] font-medium text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-30"
+                      />
+                    </td>
+                    <td className="max-w-[5.5rem] py-2.5 pr-2 align-middle">
+                      <ExposureApplyButton
+                        valueLocalM={varNeutralM}
+                        ccy={r.ccy}
+                        label="VaR-neutral"
+                        varUsdM={varNeutralUsd}
+                        emphasize={higherBasis === 'simpleAvg'}
+                        selected={selectedRegime === 'varNeutral'}
+                        disabled={flat || Math.abs(varNeutralM) < 1e-9}
+                        onApply={() =>
+                          applyTargetNotional(r.ccy, varNeutralM, 'varNeutral')
+                        }
+                      />
+                    </td>
+                    <td className="max-w-[5.5rem] py-2.5 pr-2 align-middle">
+                      <ExposureApplyButton
+                        valueLocalM={totalM}
+                        ccy={r.ccy}
+                        label="Target (Total)"
+                        varUsdM={varTotal}
+                        emphasize={higherBasis === 'totalBuildup'}
+                        selected={selectedRegime === 'totalExpected'}
+                        disabled={flat}
+                        onApply={() =>
+                          applyTargetNotional(r.ccy, totalM, 'totalExpected')
+                        }
+                      />
+                    </td>
+                    <td className="py-2.5 pr-3 align-middle">
+                      <HedgeRatioControl
+                        pct={Math.round(r.hedgeRatio * 100)}
+                        notional={fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}
+                        mutedClass={muted}
+                        disabled={flat}
+                        onChange={pct => setRatio(r.ccy, pct)}
+                      />
+                    </td>
+                    <td className={`py-2.5 pr-3 align-middle text-[10px] ${muted}`}>
+                      —
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono font-semibold align-middle">
+                      {fmtVarK(r.varBeforeUsdM)}
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono text-amber-300 align-middle">
+                      {r.delta.toFixed(2)}
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono text-slate-400 align-middle">
+                      {fmtLocal(r.residualLocalM, r.ccy)}
+                    </td>
+                    <td className="py-2.5 pr-3 font-mono font-semibold text-emerald-300 align-middle">
+                      {fmtVarK(r.varAfterUsdM)}
+                    </td>
+                    <td className="py-2.5 align-middle">
+                      <div className="flex flex-col gap-1">
+                        <button
+                          type="button"
+                          disabled={flat}
+                          title="Open exposure path + residual VaR charts"
+                          onClick={() => openPathChart(r.ccy)}
+                          className="whitespace-nowrap rounded-md border border-violet-500/50 bg-violet-500/15 px-2.5 py-1.5 text-[11px] font-medium text-violet-200 hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          Path charts
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!canBook}
+                          title={
+                            flat
+                              ? 'No net exposure on this Analytics basis'
+                              : 'Open book-hedge proposal (auto size & timeline)'
+                          }
+                          onClick={() => openBookModal(r.ccy)}
+                          className="whitespace-nowrap rounded-md border border-sky-600/50 bg-sky-500/10 px-2.5 py-1.5 text-[11px] font-medium text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          Book hedge
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+
+                  {/* Analytics-prepared strip / bullet — nested under CCY */}
+                  {prepared && preparedLegs.length > 0 && (
+                    <tr className="bg-violet-500/10">
+                      <td
+                        colSpan={11}
+                        className={`border-b ${border}/60 px-2 py-1.5`}
                       >
-                        Book hedge
-                      </button>
-                    </div>
-                  </td>
-                </tr>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                            <span className="rounded border border-violet-500/40 bg-violet-500/20 px-1.5 py-0.5 font-semibold text-violet-100">
+                              From Analytics
+                            </span>
+                            {prepared.preparedFor && (
+                              <span
+                                className={`rounded border px-1.5 py-0.5 font-semibold ${
+                                  prepared.preparedFor === 'carry'
+                                    ? 'border-amber-500/40 bg-amber-500/15 text-amber-200'
+                                    : 'border-sky-500/40 bg-sky-500/15 text-sky-200'
+                                }`}
+                                title={
+                                  prepared.preparedFor === 'carry'
+                                    ? 'Shaped in Cash Carry — sized for carry / Enhancement, not equal-VaR'
+                                    : 'Shaped in FX Risk — sized for equal-VaR hedge ratio'
+                                }
+                              >
+                                {prepared.preparedFor === 'carry'
+                                  ? 'Carry-shaped'
+                                  : 'VaR-shaped'}
+                              </span>
+                            )}
+                            <span className="font-medium text-violet-100">
+                              {r.ccy} ·{' '}
+                              {prepared.structure === 'strip'
+                                ? `${preparedLegs.length}-leg strip`
+                                : 'Bullet forward'}
+                            </span>
+                            {regimeLabel && (
+                              <span className={muted}>· {regimeLabel}</span>
+                            )}
+                            <span className={`font-mono ${muted}`}>
+                              Σ {fmtLocal(prepared.coverLocalM, r.ccy)}
+                            </span>
+                            {typeof prepared.impliedCarryUsdM === 'number' && (
+                              <span
+                                className={`font-mono ${
+                                  prepared.impliedCarryUsdM >= 0
+                                    ? 'text-emerald-300/90'
+                                    : 'text-rose-300/90'
+                                }`}
+                                title="Package Σ implied swap-points carry"
+                              >
+                                Carry {fmtVarK(prepared.impliedCarryUsdM)}
+                              </span>
+                            )}
+                            {Math.abs(
+                              Math.abs(prepared.coverLocalM) -
+                                Math.abs(r.hedgeNotionalLocalM),
+                            ) >
+                              Math.max(
+                                0.01,
+                                0.02 * Math.abs(prepared.coverLocalM),
+                              ) && (
+                              <span
+                                className="rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-0.5 font-semibold text-rose-200"
+                                title={`VaR after (${fmtVarK(r.varAfterUsdM)}) above reflects the ratio slider (${fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}), not this prepared Σ (${fmtLocal(prepared.coverLocalM, r.ccy)}) — Send books the prepared package, not the slider.`}
+                              >
+                                Σ ≠ ratio slider
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex gap-1.5">
+                            <button
+                              type="button"
+                              title="Book these Analytics trades onto the Decision book"
+                              onClick={() => sendPreparedToDecision(r.ccy)}
+                              disabled={hasRollingStripForCcy(booked, r.ccy)}
+                              className="rounded-md border border-emerald-500/50 bg-emerald-500/15 px-2.5 py-1 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              Send to Decision book
+                            </button>
+                            <button
+                              type="button"
+                              title="Discard prepared package"
+                              onClick={() => discardPrepared(r.ccy)}
+                              className="rounded-md border border-slate-600 px-2 py-1 text-[10px] text-slate-400 hover:bg-slate-800"
+                            >
+                              Discard
+                            </button>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                  {preparedLegs.map((leg, i) => {
+                    const prev =
+                      i > 0 ? preparedLegs[i - 1]!.hedgeLocalM : 0;
+                    const delta = leg.hedgeLocalM - prev;
+                    const settle = leg.settleMonths ?? leg.endMonth;
+                    const settleLabel =
+                      Math.abs(settle - Math.round(settle)) < 1e-6
+                        ? `M${Math.round(settle)}`
+                        : `t=${settle.toFixed(1)}`;
+                    const isLast = i === preparedLegs.length - 1;
+                    return (
+                      <tr
+                        key={`${r.ccy}-prep-${leg.index}`}
+                        className={`bg-violet-500/[0.06] ${
+                          isLast && bookedForCcy.length === 0
+                            ? `border-b ${border}`
+                            : `border-b ${border}/40`
+                        }`}
+                      >
+                        <td className="py-2 pr-2 align-middle pl-3">
+                          <div className="flex items-center gap-1.5 font-mono text-[11px]">
+                            <span className="text-slate-600">└</span>
+                            <span className="rounded bg-violet-500/20 px-1 py-0.5 text-[9px] font-semibold text-violet-200">
+                              FWD
+                            </span>
+                            <span className="text-emerald-300">
+                              {leg.label}
+                            </span>
+                          </div>
+                          <div className={`pl-5 text-[9px] ${muted}`}>
+                            prepared · {r.ccy}
+                          </div>
+                        </td>
+                        <td
+                          colSpan={3}
+                          className={`py-2 pr-2 align-middle text-[10px] ${muted}`}
+                        >
+                          {prepared?.structure === 'strip'
+                            ? 'Strip leg'
+                            : 'Bullet'}{' '}
+                          · Analytics
+                          {regimeLabel ? ` · ${regimeLabel}` : ''}
+                        </td>
+                        <td className="py-2 pr-3 font-mono font-semibold text-emerald-300 align-middle">
+                          {fmtLocal(delta, r.ccy)}
+                          <div className={`text-[9px] font-normal ${muted}`}>
+                            H {fmtLocal(leg.hedgeLocalM, r.ccy)}
+                          </div>
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-amber-200/90 align-middle">
+                          {settleLabel}
+                        </td>
+                        <td
+                          colSpan={4}
+                          className={`py-2 pr-3 align-middle text-[10px] font-mono ${
+                            leg.impliedCarryUsdM != null
+                              ? 'text-emerald-300/90'
+                              : muted
+                          }`}
+                          title={
+                            leg.swapPoints != null
+                              ? `Swap pts ${leg.swapPoints.toFixed(2)} ${leg.swapPointsSide ?? ''} → implied carry`
+                              : prepared?.impliedCarryUsdM != null &&
+                                  prepared.structure === 'bullet'
+                                ? `Swap pts ${prepared.swapPoints?.toFixed(2) ?? '—'} → implied carry`
+                                : 'Implied carry from EURUSD swap points (Market data)'
+                          }
+                        >
+                          {(() => {
+                            const carry =
+                              leg.impliedCarryUsdM ??
+                              (prepared?.structure === 'bullet'
+                                ? prepared.impliedCarryUsdM
+                                : undefined);
+                            if (carry == null) return '—';
+                            const k = carry * 1000;
+                            const sign = k >= 0 ? '+' : '−';
+                            return `${sign}${Math.abs(k).toFixed(1)}K implied`;
+                          })()}
+                        </td>
+                        <td className={`py-2 align-middle text-[10px] ${muted}`}>
+                          pending Send
+                        </td>
+                      </tr>
+                    );
+                  })}
+
+                  {/* Booked trades under same CCY */}
+                  {bookedForCcy.map((t, i) => {
+                    const scheduled = !isLiveHedgeTicket(t);
+                    const isLast = i === bookedForCcy.length - 1;
+                    return (
+                      <tr
+                        key={t.id}
+                        className={`bg-emerald-500/[0.04] ${
+                          isLast
+                            ? `border-b ${border}`
+                            : `border-b ${border}/40`
+                        }`}
+                      >
+                        <td className="py-2 pr-2 align-middle pl-3">
+                          <div className="flex items-center gap-1.5 font-mono text-[11px]">
+                            <span className="text-slate-600">└</span>
+                            <span className="rounded bg-emerald-500/20 px-1 py-0.5 text-[9px] font-semibold text-emerald-300">
+                              {t.instrument.toUpperCase()}
+                            </span>
+                            <span className="text-slate-200">
+                              {t.maturityLabel ?? t.maturity ?? 'spot'}
+                            </span>
+                          </div>
+                          <div className={`pl-5 text-[9px] ${muted}`}>
+                            booked · {r.ccy}
+                            {t.stripId ? ' · strip' : ''}
+                          </div>
+                        </td>
+                        <td
+                          colSpan={3}
+                          className={`py-2 pr-2 align-middle text-[10px] ${muted}`}
+                        >
+                          {ticketLabel(t)}
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-emerald-300 align-middle">
+                          {fmtLocal(t.amountLocalM, r.ccy)}
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-amber-200/90 align-middle">
+                          {t.maturityLabel ?? t.maturity ?? '—'}
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-slate-400 align-middle">
+                          {fmtVarK(t.varUsdM)}
+                        </td>
+                        <td
+                          colSpan={2}
+                          className={`py-2 pr-3 align-middle text-[10px] ${
+                            scheduled ? 'text-amber-200' : 'text-emerald-300/80'
+                          }`}
+                        >
+                          {scheduled ? 'PENDING' : 'live'}
+                        </td>
+                        <td className={`py-2 pr-3 align-middle text-[10px] ${muted}`}>
+                          —
+                        </td>
+                        <td className="py-2 align-middle">
+                          <button
+                            type="button"
+                            title={
+                              t.stripId
+                                ? 'Cancel entire rolling strip'
+                                : 'Cancel this hedge transaction'
+                            }
+                            onClick={() => requestCancellation(t)}
+                            className="rounded-md border border-rose-600/40 bg-rose-500/10 px-2 py-1 text-[10px] font-medium text-rose-300 hover:bg-rose-500/20"
+                          >
+                            {t.stripId ? 'Cancel strip' : 'Cancel'}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </Fragment>
               );
             })}
           </tbody>
         </table>
       </div>
-
-      {booked.length > 0 && (
-        <div className={`rounded-lg border ${border} px-3 py-2.5`}>
-          <div className={`text-[11px] font-medium ${head}`}>
-            Booked hedges ·{' '}
-            {booked.filter(isLiveHedgeTicket).length} live
-            {booked.some(t => !isLiveHedgeTicket(t))
-              ? ` · ${booked.filter(t => !isLiveHedgeTicket(t)).length} scheduled`
-              : ''}
-          </div>
-          <ul className="mt-1.5 space-y-1.5">
-            {[...booked]
-              .sort((a, b) => {
-                const ai = isLiveHedgeTicket(a) ? 0 : 1;
-                const bi = isLiveHedgeTicket(b) ? 0 : 1;
-                if (ai !== bi) return ai - bi;
-                return (a.stripEdgeIndex ?? 0) - (b.stripEdgeIndex ?? 0);
-              })
-              .map(t => {
-                const scheduled = !isLiveHedgeTicket(t);
-                return (
-                  <li
-                    key={t.id}
-                    className="flex flex-wrap items-center gap-2 font-mono text-[11px]"
-                  >
-                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-300">
-                      {t.instrument.toUpperCase()}
-                    </span>
-                    {scheduled && (
-                      <span className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200">
-                        PENDING
-                      </span>
-                    )}
-                    <span className={scheduled ? 'text-slate-400' : undefined}>
-                      {ticketLabel(t)}
-                    </span>
-                    <span className={muted}>
-                      {scheduled
-                        ? 'scheduled roll · not traded yet'
-                        : `VaR ${fmtVarK(t.varUsdM)}${t.addressesHigherVar ? ' · higher VaR' : ''}`}
-                    </span>
-                    <button
-                      type="button"
-                      title={
-                        t.stripId
-                          ? 'Cancel entire rolling strip'
-                          : 'Cancel this hedge transaction'
-                      }
-                      onClick={() => requestCancellation(t)}
-                      className="ml-auto rounded-md border border-rose-600/40 bg-rose-500/10 px-2 py-1 text-[10px] font-medium text-rose-300 hover:bg-rose-500/20"
-                    >
-                      {t.stripId ? 'Cancel strip' : 'Request cancellation'}
-                    </button>
-                  </li>
-                );
-              })}
-          </ul>
-        </div>
-      )}
 
       {draft && (
         <BookHedgeModal
@@ -1033,34 +1751,112 @@ export function HedgingDecisionLayer({
               if (e.target === e.currentTarget) closePathChart();
             }}
           >
-            <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
-              <div className="mb-3 flex items-start justify-between gap-3">
-                <div>
-                  <h4
-                    id="decision-path-title"
-                    className="text-sm font-semibold text-white"
-                  >
-                    {chartCcy} — exposure path vs hedge
-                  </h4>
-                  <p className="mt-0.5 text-[11px] text-slate-400">
-                    Selected regime:{' '}
-                    <span className="font-semibold text-violet-200">
-                      {pathBasis === 'cash'
-                        ? 'Cash (stock)'
-                        : pathBasis === 'varNeutral'
-                          ? 'VaR-neutral'
-                          : 'Target (Total)'}
-                    </span>
-                  </p>
+            <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
+              <div className="sticky top-0 z-30 shrink-0 border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <h4
+                      id="decision-path-title"
+                      className="text-sm font-semibold text-white"
+                    >
+                      {chartCcy} — exposure path vs hedge
+                    </h4>
+                    <p className="mt-0.5 text-[11px] text-slate-400">
+                      Selected regime:{' '}
+                      <span className="font-semibold text-violet-200">
+                        {pathBasis === 'cash'
+                          ? 'Cash (stock)'
+                          : pathBasis === 'varNeutral'
+                            ? 'VaR-neutral'
+                            : 'Target (Total)'}
+                      </span>
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+                    {chartCcy && preparedByCcy[chartCcy] && (
+                      <span
+                        className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[10px] font-semibold text-emerald-200"
+                        title="Staged in Hedging Decision — Send under this CCY to book"
+                      >
+                        ✓ Prebooked
+                      </span>
+                    )}
+                    {pathPrepareAction && (
+                      <button
+                        type="button"
+                        disabled={pathPrepareAction.disabled}
+                        onClick={() => pathPrepareAction.run()}
+                        title={pathPrepareAction.title}
+                        className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {pathPrepareAction.label}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={closePathChart}
+                      className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={closePathChart}
-                  className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
-                >
-                  Close
-                </button>
+                {pathSummaryMetrics && (
+                  <div className="mt-2 flex flex-wrap items-center gap-1">
+                    {(
+                      [
+                        [
+                          'Cover',
+                          pathSummaryMetrics.coverValue,
+                          pathSummaryMetrics.coverPct,
+                          pathSummaryMetrics.coverSub,
+                          'text-emerald-200',
+                        ],
+                        [
+                          'Legs',
+                          pathSummaryMetrics.legsValue,
+                          null,
+                          pathSummaryMetrics.legsSub,
+                          'text-sky-200',
+                        ],
+                        [
+                          'Resid',
+                          pathSummaryMetrics.residVarValue,
+                          pathSummaryMetrics.residVarPct,
+                          pathSummaryMetrics.residVarSub,
+                          'text-rose-300',
+                        ],
+                        [
+                          'BE',
+                          pathSummaryMetrics.breakevenValue,
+                          null,
+                          pathSummaryMetrics.breakevenSub,
+                          'text-amber-200/90',
+                        ],
+                      ] as const
+                    ).map(([label, value, pct, title, tone]) => (
+                      <span
+                        key={label}
+                        title={title ?? undefined}
+                        className="inline-flex items-center gap-1 rounded border border-slate-700/80 bg-slate-950/90 px-1.5 py-0.5 text-[10px] text-slate-500"
+                      >
+                        {label}{' '}
+                        <span
+                          className={`font-mono font-semibold tabular-nums ${tone}`}
+                        >
+                          {value}
+                        </span>
+                        {pct != null && (
+                          <span className="font-mono font-semibold tabular-nums text-slate-400">
+                            {pct}
+                          </span>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
               <ExposureHedgePathChart
                 key={`${chartRow.ccy}-${pathBasis}-${effectiveStructure}-${hedgeSizingSetup.horizon}-${varSetup.forecastMonths}-${varSetup.exposureBasis}-${hasRollingStripForCcy(booked, chartRow.ccy) ? 'strip' : 'open'}`}
                 ccy={chartRow.ccy}
@@ -1072,7 +1868,11 @@ export function HedgingDecisionLayer({
                     : 0
                 }
                 monthlyFlows={monthlyFlowsByCcy[chartRow.ccy]}
-                setup={varSetup}
+                setup={varSetupWithLineUncertainty(
+                  varSetup,
+                  chartRow.ccy,
+                  forecastProfile,
+                )}
                 appliedHedgeLocalM={chartRow.hedgeNotionalLocalM}
                 hedgeRatio={chartRow.hedgeRatio}
                 equalVarHedgeLocalM={chartRow.equalVarHedgeLocalM}
@@ -1080,11 +1880,11 @@ export function HedgingDecisionLayer({
                 selectedBasis={pathBasis}
                 onSelectedBasisChange={setPathBasis}
                 onApplyBasis={applyPathBasis}
-                onBookRollingStrip={
-                  hedgeStructure === 'strip'
-                    ? bookRollingStripFromChart
-                    : undefined
-                }
+                onBookHedgeProfile={bookHedgeProfileFromChart}
+                summaryMetricsPlacement="none"
+                onSummaryMetricsChange={setPathSummaryMetrics}
+                prepareCtaPlacement="external"
+                onPrepareActionChange={setPathPrepareAction}
                 stripAlreadyBooked={hasRollingStripForCcy(
                   booked,
                   chartRow.ccy,
@@ -1092,6 +1892,7 @@ export function HedgingDecisionLayer({
                 hedgeStructure={hedgeStructure}
                 onHedgeStructureChange={setHedgeStructure}
               />
+              </div>
             </div>
           </div>,
           document.body,

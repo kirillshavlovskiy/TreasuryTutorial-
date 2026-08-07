@@ -1,7 +1,9 @@
 import {
   loadSandbox,
+  mergeHedgeBooksPreservingPrepared,
   newerSandboxState,
   normalizeSandboxState,
+  preferWorkspaceSetup,
   resetSandbox,
   saveSandbox,
   seedSandbox,
@@ -59,16 +61,37 @@ export async function loadSandboxPersistent(
     ...remote.state,
     updatedAt: remote.updatedAt ?? remote.state.updatedAt,
   });
-  const merged = newerSandboxState(local, remoteState);
+  const newer = newerSandboxState(local, remoteState);
+  const older = newer === local ? remoteState : local;
+  // Keep prepared packages from either side — UI/workspace "newer" must not
+  // erase FX Risk Analytics Prepare staging still present on the other copy.
+  const hedgesMerged = mergeHedgeBooksPreservingPrepared(
+    newer.hedgesByEntityId,
+    older.hedgesByEntityId,
+  );
+  // Same for dashboards/FX profiles: a freshly reseeded local shell with a
+  // newer updatedAt must not erase a completed remote workspace.
+  const setup = preferWorkspaceSetup(newer, older);
+  const merged: TestSandboxState = {
+    ...newer,
+    workspace: setup.workspace,
+    group: setup.group,
+    hedgesByEntityId: hedgesMerged,
+  };
   saveSandbox(userKey, merged);
 
-  // If local was newer, sync it to the server.
-  if (merged === local || merged.updatedAt === local.updatedAt) {
-    const localAt = Date.parse(local.updatedAt ?? '') || 0;
-    const remoteAt = Date.parse(remoteState.updatedAt ?? '') || 0;
-    if (localAt > remoteAt) {
-      void persistSandboxRemote(local, taskId);
-    }
+  const preparedCount = (h?: TestSandboxState['hedgesByEntityId']) =>
+    Object.values(h ?? {}).reduce(
+      (n, book) => n + Object.keys(book.preparedByCcy ?? {}).length,
+      0,
+    );
+  const localAt = Date.parse(local.updatedAt ?? '') || 0;
+  const remoteAt = Date.parse(remoteState.updatedAt ?? '') || 0;
+  if (
+    localAt > remoteAt ||
+    preparedCount(hedgesMerged) > preparedCount(newer.hedgesByEntityId)
+  ) {
+    void persistSandboxRemote(merged, taskId);
   }
 
   return { state: merged, persistent: true };
@@ -93,11 +116,29 @@ export async function persistSandboxRemote(
   state: TestSandboxState,
   taskId = '01',
 ): Promise<boolean> {
-  const res = await fetchJson<ApiSandboxResponse>('/api/test/sandbox', {
-    method: 'PUT',
-    body: JSON.stringify({ taskId, state }),
-  });
-  return Boolean(res?.persistent);
+  try {
+    const res = await fetch('/api/test/sandbox', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId, state }),
+    });
+    if (!res.ok) {
+      console.warn(
+        `[sandbox] Neon PUT failed status=${res.status} taskId=${taskId} — localStorage still saved`,
+      );
+      return false;
+    }
+    const body = (await res.json()) as ApiSandboxResponse;
+    if (!body.persistent) {
+      console.warn(
+        `[sandbox] Neon PUT ok but persistent=false taskId=${taskId} — check DATABASE_URL / session`,
+      );
+    }
+    return Boolean(body.persistent);
+  } catch (err) {
+    console.warn('[sandbox] Neon PUT network error — localStorage still saved', err);
+    return false;
+  }
 }
 
 export async function resetSandboxPersistent(

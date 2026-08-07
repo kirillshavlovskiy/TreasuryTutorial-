@@ -1,8 +1,18 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
-import { ExposureHedgePathChart } from '@/components/test-mode/ExposureHedgePathChart';
+import {
+  ExposureHedgePathChart,
+  type HedgePathPrepareAction,
+  type HedgePathSummaryMetrics,
+} from '@/components/test-mode/ExposureHedgePathChart';
 import {
   DEFAULT_FORECAST_PROFILE,
   monthlyFlowSeriesLocalM,
@@ -23,15 +33,19 @@ import {
   buildStripHedgedVarProfile,
   equalVarLinearHedgeNotionalLocalM,
   overlayRiskFromFxBook,
+  residualVarFromMismatchUsdM,
+  setPreparedHedgeForCcy,
   stripTicketsForCcy,
+  varSetupWithLineUncertainty,
   type HedgeTicket,
+  type HedgeVarRow,
+  type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
 import {
   buildRollingHedgeEdges,
+  clearRollingStripForCcy,
   hasRollingStripForCcy,
-  mergeRollingStripIntoBook,
   needsRollingHedges,
-  proposeRollingHedgeTickets,
   resyncBookedRollingStrips,
   sizingForHedgePathBasis,
   stripForwardLegsFromEdges,
@@ -42,10 +56,17 @@ import {
   type StripForwardLeg,
 } from '@/lib/test-mode/rolling-hedge';
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
+import { CashCarryAnalyticsView } from '@/components/test-mode/CashCarryAnalyticsView';
+import {
+  assignImpliedCarryFromSwapPoints,
+  buildCashForecastCarryComparison,
+} from '@/lib/test-mode/cash-carry-analytics';
+import { getActiveMarketRates } from '@/lib/fx-market-rates';
 import {
   RiskPerspectiveSelector,
   riskPerspectiveMeta,
   type RiskPerspective,
+  type RiskPerspectiveTabStat,
 } from '@/components/test-mode/RiskPerspectiveSelector';
 import {
   FORECAST_PERIOD_OPTIONS,
@@ -62,6 +83,7 @@ import {
   VAR_PROFILE_OPTIONS,
   VAR_VOL_SOURCE_OPTIONS,
   volForHorizon,
+  type VarHorizonId,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
 
@@ -91,6 +113,12 @@ interface VarAnalyticsPanelProps {
   onHedgeRatiosChange?: (ratios: Record<string, number>) => void;
   bookedHedges?: HedgeTicket[];
   onBookedHedgesChange?: (tickets: HedgeTicket[]) => void;
+  /** Staged packages for Hedging Decision (Send books them). */
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  onPreparedByCcyChange?: (next: Record<string, PreparedHedgeProfile>) => void;
+  /** Shared with Hedging Decision — bullet vs rolling strip. */
+  hedgeStructure?: ForecastHedgeStructure;
+  onHedgeStructureChange?: (s: ForecastHedgeStructure) => void;
   title?: string;
   /** Live FX book rows — used with forecastProfile for custom month schedules. */
   bookRows?: RowState[];
@@ -98,10 +126,27 @@ interface VarAnalyticsPanelProps {
   forecastProfile?: ForecastProfileState;
   /** Opens the same Forecast profile modal as FX Risk. */
   onOpenForecastProfile?: () => void;
+  /** Entity/group scope for overnight cash + swap-points curves (Market data). */
+  ratesScopeId?: string;
 }
 
 function fmtVarK(usdM: number): string {
   return `$${(usdM * 1000).toFixed(0)}K`;
+}
+
+/** Tab-rail Resid VaR — $M when ≥ $0.1M, else $K. */
+function fmtTabResidVar(usdM: number): string {
+  if (!Number.isFinite(usdM) || Math.abs(usdM) < 1e-12) return '—';
+  if (Math.abs(usdM) >= 0.1) return `$${usdM.toFixed(2)}M`;
+  return `$${(usdM * 1000).toFixed(1)}K`;
+}
+
+/** Tab-rail Total carry — signed $K. */
+function fmtTabCarryK(usdM: number): string {
+  if (!Number.isFinite(usdM) || Math.abs(usdM) < 1e-12) return '—';
+  const k = usdM * 1000;
+  const sign = k >= 0 ? '+' : '−';
+  return `${sign}${Math.abs(k).toFixed(1)}K`;
 }
 
 function fmtSignedM(v: number): string {
@@ -115,6 +160,91 @@ function shortHorizonLabel(label: string): string {
     .replace(' month', 'm')
     .replace(' week', 'w')
     .replace(' year', 'y');
+}
+
+/** Live VaR regime chip: Stock · VaR · Total. */
+function hedgeRegimeShortLabel(id: HedgePathBasisId): string {
+  if (id === 'cash') return 'Stock';
+  if (id === 'totalExpected') return 'Total';
+  return 'VaR';
+}
+
+/** Live VaR structure chip: Bullet · Strip · N-leg. */
+function hedgeStructureShortLabel(
+  s: ForecastHedgeStructure,
+  legCount?: number,
+): string {
+  if (s !== 'strip') return 'Bullet';
+  return typeof legCount === 'number' && legCount > 0
+    ? `Strip · ${legCount}`
+    : 'Strip';
+}
+
+/** Longest VaR horizon chip at or before the forecast (for setup clamp). */
+function longestHorizonWithinForecast(forecastMonths: number): VarHorizonId {
+  const Tf = forecastMonths > 0 ? forecastMonths : 0;
+  let best = VAR_HORIZON_OPTIONS[0]!;
+  for (const h of VAR_HORIZON_OPTIONS) {
+    if (h.months <= Tf + 1e-9) best = h;
+  }
+  return best.id;
+}
+
+/** Compact ⓘ control — chart reading notes live here, not in footer prose. */
+function ChartInfoButton({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div className="relative inline-flex" ref={rootRef}>
+      <button
+        type="button"
+        aria-label={label}
+        aria-expanded={open}
+        title={label}
+        onClick={() => setOpen(v => !v)}
+        className={`inline-flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-bold leading-none transition-colors ${
+          open
+            ? 'border-sky-400 bg-sky-500/20 text-sky-100'
+            : 'border-slate-600 text-slate-400 hover:border-slate-400 hover:text-slate-200'
+        }`}
+      >
+        i
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          aria-label={label}
+          className="absolute right-0 top-full z-30 mt-1.5 w-64 rounded-lg border border-slate-600 bg-slate-900 p-3 text-left text-[10px] leading-relaxed text-slate-300 shadow-xl"
+        >
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+            {label}
+          </div>
+          {children}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function stubRowFromBar(ccy: string, flowM: number): RowState {
@@ -155,10 +285,15 @@ export function VarAnalyticsPanel({
   onHedgeRatiosChange,
   bookedHedges = [],
   onBookedHedgesChange,
-  title = 'Analytics — VaR setup',
+  preparedByCcy = {},
+  onPreparedByCcyChange,
+  hedgeStructure: controlledStructure,
+  onHedgeStructureChange,
+  title: _moduleTitle = 'Analytics — VaR setup',
   bookRows,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
   onOpenForecastProfile,
+  ratesScopeId,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -204,9 +339,47 @@ export function VarAnalyticsPanel({
 
   /** Chart opens only when user picks a currency in the Live VaR table. */
   const [chartCcy, setChartCcy] = useState<string | null>(null);
-  const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('totalExpected');
-  const [hedgeStructure, setHedgeStructure] =
+  const [pathSummaryMetrics, setPathSummaryMetrics] =
+    useState<HedgePathSummaryMetrics | null>(null);
+  const [pathPrepareAction, setPathPrepareAction] =
+    useState<HedgePathPrepareAction | null>(null);
+  const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('varNeutral');
+  /** Last applied Cash / VN / Total per CCY — Live VaR label (not only inferred). */
+  const [regimeByCcy, setRegimeByCcy] = useState<
+    Record<string, HedgePathBasisId>
+  >({});
+  /** Last chosen Bullet / Strip per CCY — Live VaR tag (not the word “path”). */
+  const [structureByCcy, setStructureByCcy] = useState<
+    Record<string, ForecastHedgeStructure>
+  >({});
+  /** Manual strip leg count per CCY (null/missing = default ceil(Tf/Th)). */
+  const [stripLegCountByCcy, setStripLegCountByCcy] = useState<
+    Record<string, number | null>
+  >({});
+  /** Brief notice when user clicks a post-Tf evolution column. */
+  const [postTfNotice, setPostTfNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!postTfNotice) return;
+    const t = window.setTimeout(() => setPostTfNotice(null), 4500);
+    return () => window.clearTimeout(t);
+  }, [postTfNotice]);
+  /** Active VaR horizon for hedging setup must be ≤ forecast Tf. */
+  useEffect(() => {
+    const Tf = setup.forecastMonths;
+    if (!(Tf > 0)) return;
+    if (horizonMonths(setup.horizon) <= Tf + 1e-9) return;
+    onSetupChange({
+      ...setup,
+      horizon: longestHorizonWithinForecast(Tf),
+    });
+  }, [setup, onSetupChange]);
+  const [localStructure, setLocalStructure] =
     useState<ForecastHedgeStructure>('bullet');
+  const hedgeStructure = controlledStructure ?? localStructure;
+  const setHedgeStructure = (s: ForecastHedgeStructure) => {
+    if (onHedgeStructureChange) onHedgeStructureChange(s);
+    else setLocalStructure(s);
+  };
   const stripAvailable = needsRollingHedges(setup);
   /** Booked strip ⇒ Live VaR uses strip Th sizing (legs still from M0). */
   const stripBooked = bookedHedges.some(t => Boolean(t.stripId));
@@ -214,6 +387,21 @@ export function VarAnalyticsPanel({
     stripAvailable && (hedgeStructure === 'strip' || stripBooked)
       ? 'strip'
       : 'bullet';
+
+  const structureTagFor = (
+    ccy: string,
+    hedgeNotionalLocalM: number,
+  ): ForecastHedgeStructure | null => {
+    if (hasRollingStripForCcy(bookedHedges, ccy)) return 'strip';
+    if (structureByCcy[ccy]) return structureByCcy[ccy]!;
+    // Prepared-but-not-yet-booked strip (staged from Cash Carry / Decision) —
+    // tag it Strip so Live VaR sizes off the strip regime, not the bullet ratio.
+    if (preparedByCcy[ccy]?.structure === 'strip') return 'strip';
+    if (Math.abs(hedgeNotionalLocalM) > 1e-9) {
+      return stripAvailable && hedgeStructure === 'strip' ? 'strip' : 'bullet';
+    }
+    return null;
+  };
   /** Path-chart / apply: bullet sizes Equal-VaR at Th = Tf. */
   const chartSizingSetup = useMemo(
     () => varSetupForHedgeStructure(setup, effectiveStructure),
@@ -251,14 +439,204 @@ export function VarAnalyticsPanel({
         chartSizingSetup,
         bookedHedges,
         monthlyFlowsByCcy,
+        forecastProfile,
       ),
-    [risk, hedgeRatios, chartSizingSetup, bookedHedges, monthlyFlowsByCcy],
+    [
+      risk,
+      hedgeRatios,
+      chartSizingSetup,
+      bookedHedges,
+      monthlyFlowsByCcy,
+      forecastProfile,
+    ],
   );
+
+  /**
+   * Strip ladder covers matching the path modal (per-window Equal-VaR for VN).
+   * Live VaR VaR-neutral N / leg tags use this — not bullet EQ@Tf.
+   */
+  const stripMetaByCcy = useMemo(() => {
+    const out: Record<
+      string,
+      {
+        legs: number;
+        vnCoverM: number;
+        cashCoverM: number;
+        targetCoverM: number;
+      }
+    > = {};
+    if (!stripAvailable) return out;
+    const Tf = setup.forecastMonths;
+    const Th = horizonMonths(setup.horizon);
+    if (!(Tf > 0) || !(Th > 0)) return out;
+    const defaultLegs = Math.max(2, Math.ceil(Tf / Th - 1e-12));
+    for (const { bar } of risk) {
+      if (bar.ccy === 'USD') continue;
+      const booked = stripTicketsForCcy(bookedHedges, bar.ccy);
+      const preparedStrip = preparedByCcy[bar.ccy];
+      const preparedLegCount =
+        preparedStrip?.structure === 'strip'
+          ? preparedStrip.legs.length
+          : 0;
+      const legCount =
+        booked.length > 0
+          ? booked.length
+          : Math.max(
+              2,
+              preparedLegCount || stripLegCountByCcy[bar.ccy] || defaultLegs,
+            );
+      const flowM =
+        Tf > 0 && Math.abs(bar.flowM) > 1e-15 ? bar.flowM : 0;
+      const flows =
+        monthlyFlowsByCcy[bar.ccy] ??
+        Array.from({ length: Math.ceil(Tf) }, () => flowM);
+      const opts = {
+        legCount,
+        ccy: bar.ccy,
+        varSetup: setup,
+      };
+      const vn = buildRollingHedgeEdges(
+        bar.stockNetM,
+        flows,
+        setup,
+        'varNeutral',
+        opts,
+      );
+      const cash = buildRollingHedgeEdges(
+        bar.stockNetM,
+        flows,
+        setup,
+        'stockStart',
+        opts,
+      );
+      const target = buildRollingHedgeEdges(
+        bar.stockNetM,
+        flows,
+        setup,
+        'windowEnd',
+        opts,
+      );
+      out[bar.ccy] = {
+        legs: Math.max(vn.length, booked.length, legCount),
+        vnCoverM: vn[vn.length - 1]?.hedgeLocalM ?? 0,
+        cashCoverM: cash[cash.length - 1]?.hedgeLocalM ?? 0,
+        targetCoverM: target[target.length - 1]?.hedgeLocalM ?? 0,
+      };
+    }
+    return out;
+  }, [
+    stripAvailable,
+    setup,
+    risk,
+    bookedHedges,
+    monthlyFlowsByCcy,
+    stripLegCountByCcy,
+    preparedByCcy,
+  ]);
+
+  /**
+   * Live VaR rows: honor staged Analytics packages (Cash Carry Prebook / path
+   * Book) before Decision % — otherwise carry-shaped cover never appears in
+   * Hedge N / Resid VaR until Send. Booked strips still win over prepared.
+   */
+  const liveRows = useMemo((): HedgeVarRow[] => {
+    return summary.rows.map(r => {
+      const meta = stripMetaByCcy[r.ccy];
+      const prep = preparedByCcy[r.ccy];
+      const hasStrip = hasRollingStripForCcy(bookedHedges, r.ccy);
+      const struct = structureTagFor(r.ccy, r.hedgeNotionalLocalM);
+
+      const applyCover = (
+        cover: number,
+        equalVarHedgeLocalM: number,
+      ): HedgeVarRow => {
+        const pathExposureM = r.residualLocalM + r.hedgeNotionalLocalM;
+        const ErefM =
+          Math.abs(r.targetHedgeLocalM) > 1e-12
+            ? r.targetHedgeLocalM
+            : pathExposureM;
+        const varAfterUsdM = residualVarFromMismatchUsdM(
+          r.varBeforeUsdM,
+          pathExposureM,
+          cover,
+          ErefM,
+        );
+        const delta =
+          r.varBeforeUsdM < 1e-12
+            ? 0
+            : Math.min(1, Math.max(0, varAfterUsdM / r.varBeforeUsdM));
+        const targetAbs = Math.abs(r.targetHedgeLocalM);
+        return {
+          ...r,
+          equalVarHedgeLocalM,
+          hedgeNotionalLocalM: cover,
+          hedgeRatio:
+            targetAbs < 1e-12 ? 0 : Math.min(1, Math.abs(cover) / targetAbs),
+          residualLocalM: pathExposureM - cover,
+          varAfterUsdM,
+          delta,
+        };
+      };
+
+      // 1) Booked strip — summary already has strip notionals; only refresh VN.
+      if (hasStrip) {
+        return meta
+          ? { ...r, equalVarHedgeLocalM: meta.vnCoverM }
+          : r;
+      }
+
+      // 2) Staged prepared package (Carry Prebook or FX Risk Book) — use Σ cover.
+      if (prep && Math.abs(prep.coverLocalM) >= 1e-12) {
+        const equalVarHedgeLocalM =
+          struct === 'strip' && meta ? meta.vnCoverM : r.equalVarHedgeLocalM;
+        return applyCover(prep.coverLocalM, equalVarHedgeLocalM);
+      }
+
+      // 3) Strip regime preview (no prepared) — Cash / VN / Target from ladder.
+      if (struct === 'strip' && meta) {
+        const equalVarHedgeLocalM = meta.vnCoverM;
+        const regime =
+          regimeByCcy[r.ccy] ??
+          (Math.abs(r.hedgeNotionalLocalM) > 1e-9
+            ? inferHedgePathBasis(
+                r.hedgeNotionalLocalM,
+                r.stockHedgeLocalM,
+                r.targetHedgeLocalM,
+                equalVarHedgeLocalM,
+              )
+            : null);
+        if (regime == null) {
+          return { ...r, equalVarHedgeLocalM };
+        }
+        const cover =
+          regime === 'cash'
+            ? meta.cashCoverM
+            : regime === 'totalExpected'
+              ? meta.targetCoverM
+              : meta.vnCoverM;
+        return applyCover(cover, equalVarHedgeLocalM);
+      }
+
+      return r;
+    });
+  }, [
+    summary.rows,
+    stripMetaByCcy,
+    bookedHedges,
+    regimeByCcy,
+    structureByCcy,
+    hedgeStructure,
+    stripAvailable,
+    preparedByCcy,
+  ]);
 
   /**
    * Profile / sizing change: re-snap Cash·VN·Target % and rebuild booked
    * strips (all M0 legs) so Live VaR does not need the path modal.
    */
+  const lineUncertaintySig = JSON.stringify(
+    forecastProfile.uncertainty1mByCcy ?? {},
+  );
   const hedgeSetupSig = [
     setup.exposureBasis,
     setup.averagingConvention,
@@ -266,6 +644,7 @@ export function VarAnalyticsPanel({
     setup.horizon,
     setup.confidencePct,
     setup.forecastUncertainty1m,
+    lineUncertaintySig,
     setup.volSource,
     chartSizingSetup.horizon,
     chartSizingSetup.exposureBasis,
@@ -309,7 +688,8 @@ export function VarAnalyticsPanel({
   ]);
 
   const chartRow = chartCcy
-    ? summary.rows.find(r => r.ccy === chartCcy)
+    ? liveRows.find(r => r.ccy === chartCcy) ??
+      summary.rows.find(r => r.ccy === chartCcy)
     : undefined;
   const chartBar = chartCcy
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
@@ -341,6 +721,7 @@ export function VarAnalyticsPanel({
   ) => {
     if (!chartRow || !chartBar) return;
     setPathBasis(basis);
+    setRegimeByCcy(prev => ({ ...prev, [chartRow.ccy]: basis }));
     const flowM =
       setup.forecastMonths > 0 && Math.abs(chartBar.flowM) > 1e-15
         ? chartBar.flowM
@@ -353,13 +734,19 @@ export function VarAnalyticsPanel({
       flowsForCcy,
     );
     // Prefer structure from the chart (avoids stale parent 'bullet' on Strip click).
-    const structureNow = structure ?? hedgeStructure;
+    const nextStructure = structure ?? hedgeStructure;
     if (structure && structure !== hedgeStructure) {
       setHedgeStructure(structure);
     }
-    // Strip: preview only (Cash/VN/Target chips). Book via "Book … forwards".
-    if (structureNow === 'strip' && needsRollingHedges(setup)) {
-      return;
+    setStructureByCcy(prev => ({ ...prev, [chartRow.ccy]: nextStructure }));
+    // Never auto-book strips from Analytics chips — only Decision % / regime.
+    // Keep Cash Carry / FX Risk prepared packages: regime only updates the
+    // Decision % slider. Prebook/Book is replaced only by an explicit Book.
+    if (
+      onBookedHedgesChange &&
+      hasRollingStripForCcy(bookedHedges, chartRow.ccy)
+    ) {
+      onBookedHedgesChange(clearRollingStripForCcy(bookedHedges, chartRow.ccy));
     }
     if (!onHedgeRatiosChange) return;
     const bulletEq = equalVarLinearHedgeNotionalLocalM(
@@ -370,12 +757,27 @@ export function VarAnalyticsPanel({
       undefined,
       flowsForCcy ?? flows,
     ).amountLocalM;
-    const target = hedgeBasisNotionalLocalM(
-      basis,
-      startM,
-      endM,
-      bulletEq,
-    );
+    let target: number;
+    if (nextStructure === 'strip' && needsRollingHedges(setup)) {
+      const Th = horizonMonths(setup.horizon);
+      const Tf = setup.forecastMonths;
+      const defaultLegs =
+        Tf > 0 && Th > 0 ? Math.max(2, Math.ceil(Tf / Th - 1e-12)) : 2;
+      const legCount = Math.max(
+        2,
+        stripLegCountByCcy[chartRow.ccy] ?? defaultLegs,
+      );
+      const edges = buildRollingHedgeEdges(
+        startM,
+        flows,
+        setup,
+        sizingForHedgePathBasis(basis),
+        { legCount, ccy: chartRow.ccy, varSetup: setup },
+      );
+      target = edges[edges.length - 1]?.hedgeLocalM ?? 0;
+    } else {
+      target = hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq);
+    }
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -386,31 +788,135 @@ export function VarAnalyticsPanel({
 
   const closePathChart = () => setChartCcy(null);
 
-  const bookRollingStrip = (edges: RollingHedgeEdge[]) => {
-    if (!onBookedHedgesChange || !chartRow) return;
-    if (hasRollingStripForCcy(bookedHedges, chartRow.ccy)) {
-      closePathChart();
-      return;
-    }
+  /**
+   * Path-chart Book → stage package for Hedging Decision.
+   * Live book only updates when user clicks Send under that CCY.
+   */
+  const bookHedgeProfile = (args: {
+    structure: ForecastHedgeStructure;
+    basis: HedgePathBasisId;
+    edges: RollingHedgeEdge[];
+    cashSettleByEdgeIndex?: Record<number, number>;
+    bulletSettleMonths?: number;
+    cashDeliveryAt?: 'periodEnd' | 'periodStart' | 'matchExposure';
+    coverPct?: number;
+  }) => {
+    if (!chartRow || !chartBar || !onPreparedByCcyChange) return;
+    const {
+      structure,
+      basis,
+      edges,
+      cashSettleByEdgeIndex,
+      bulletSettleMonths: chartBulletSettle,
+      cashDeliveryAt,
+      coverPct: coverPctArg,
+    } = args;
+    const coverPct = Math.min(1, Math.max(0, coverPctArg ?? 1));
+    setPathBasis(basis);
+    setHedgeStructure(structure);
+    setStructureByCcy(prev => ({ ...prev, [chartRow.ccy]: structure }));
+    setRegimeByCcy(prev => ({ ...prev, [chartRow.ccy]: basis }));
+
     const ticketBasis =
-      pathBasis === 'cash'
+      basis === 'cash'
         ? 'stock'
-        : pathBasis === 'totalExpected'
+        : basis === 'totalExpected'
           ? 'totalBuildup'
           : setup.exposureBasis === 'stock'
             ? 'simpleAvg'
             : setup.exposureBasis;
-    const tickets = proposeRollingHedgeTickets(
-      chartRow.ccy,
-      edges,
+    const defaultTf = setup.forecastMonths || horizonMonths(setup.horizon);
+
+    if (structure === 'strip' && edges.length > 1) {
+      setStripLegCountByCcy(prev => ({
+        ...prev,
+        [chartRow.ccy]: edges.length,
+      }));
+      const coverLocalM = edges[edges.length - 1]?.hedgeLocalM ?? 0;
+      const profile = assignImpliedCarryFromSwapPoints(
+        {
+          structure: 'strip',
+          basis,
+          ticketBasis,
+          legs: edges.map(e => ({
+            index: e.index,
+            startMonth: e.startMonth,
+            endMonth: e.endMonth,
+            settleMonths: cashSettleByEdgeIndex?.[e.index] ?? e.endMonth,
+            hedgeLocalM: e.hedgeLocalM,
+            label: e.label,
+            stockStartM: e.stockStartM,
+            endExposureM: e.endExposureM,
+          })),
+          coverLocalM,
+          hedgeRatio: coverPct,
+          cashDeliveryAt,
+        },
+        {
+          marketRates: getActiveMarketRates(ratesScopeId),
+          bulletSettleMonths: defaultTf,
+        },
+      );
+      onPreparedByCcyChange(
+        setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+          ...profile,
+          preparedFor: 'var',
+        }),
+      );
+      closePathChart();
+      return;
+    }
+
+    // Bullet: stage one forward; do not book live.
+    const flowM =
+      setup.forecastMonths > 0 && Math.abs(chartBar.flowM) > 1e-15
+        ? chartBar.flowM
+        : 0;
+    const flowsForCcy = monthlyFlowsByCcy[chartRow.ccy];
+    const { startM, endM, flows } = resolveChartMonthlyFlows(
+      chartBar.stockNetM,
+      flowM,
       setup,
-      ticketBasis,
-      monthlyFlowsByCcy[chartRow.ccy] ?? [],
+      flowsForCcy,
     );
-    onBookedHedgesChange(
-      mergeRollingStripIntoBook(bookedHedges, tickets, chartRow.ccy),
+    const bulletEq = equalVarLinearHedgeNotionalLocalM(
+      chartBar.stockNetM,
+      flowM,
+      chartRow.ccy,
+      varSetupForPathHedgeRegime(setup, 'bullet'),
+      undefined,
+      flowsForCcy ?? flows,
+    ).amountLocalM;
+    const target =
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
+    const target100 = Math.abs(chartRow.targetHedgeLocalM);
+    const ratio =
+      target100 < 1e-12
+        ? 0
+        : Math.min(1, hedgeRatioForNumber(target, chartRow.targetHedgeLocalM));
+    const bulletSettle = chartBulletSettle ?? defaultTf;
+    const profile = assignImpliedCarryFromSwapPoints(
+      {
+        structure: 'bullet',
+        basis,
+        ticketBasis,
+        legs: [],
+        coverLocalM: target,
+        hedgeRatio: coverPctArg != null ? coverPct : ratio,
+        cashDeliveryAt,
+        settleMonths: bulletSettle,
+      },
+      {
+        marketRates: getActiveMarketRates(ratesScopeId),
+        bulletSettleMonths: bulletSettle,
+      },
     );
-    onHedgeRatiosChange?.({ ...hedgeRatios, [chartRow.ccy]: 0 });
+    onPreparedByCcyChange(
+      setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+        ...profile,
+        preparedFor: 'var',
+      }),
+    );
     closePathChart();
   };
 
@@ -455,6 +961,7 @@ export function VarAnalyticsPanel({
           flows,
           setup,
           sizingForHedgePathBasis(pathBasis),
+          { ccy: evoBar.ccy, varSetup: setup },
         ),
       );
     }
@@ -499,11 +1006,16 @@ export function VarAnalyticsPanel({
       Tf,
       ...VAR_HORIZON_OPTIONS.map(h => h.months),
     );
+    const evoSetup = varSetupWithLineUncertainty(
+      setup,
+      evoBar.ccy,
+      forecastProfile,
+    );
     return buildStripHedgedVarProfile(
       evoBar.stockNetM,
       flowM,
       evoBar.ccy,
-      setup,
+      evoSetup,
       evoHedgeLegs.map(l => ({
         amountLocalM: l.amountLocalM,
         tenureMonths: l.tenureMonths,
@@ -514,7 +1026,7 @@ export function VarAnalyticsPanel({
       Eref > 1e-12 ? Eref : undefined,
       throughMonths,
     );
-  }, [evoBar, evoHedgeLegs, setup, monthlyFlowsByCcy]);
+  }, [evoBar, evoHedgeLegs, setup, monthlyFlowsByCcy, forecastProfile]);
 
   /** Horizon pickers: open VaR + resid VaR (samples past Tf when forecast is short). */
   const evoTerm = useMemo(() => {
@@ -524,11 +1036,16 @@ export function VarAnalyticsPanel({
         ? evoBar.flowM
         : 0;
     const flows = monthlyFlowsByCcy[evoBar.ccy];
+    const evoSetup = varSetupWithLineUncertainty(
+      setup,
+      evoBar.ccy,
+      forecastProfile,
+    );
     const open = growingVarByHorizonUsdM(
       evoBar.stockNetM,
       flowM,
       evoBar.ccy,
-      setup,
+      evoSetup,
       flows,
     );
     const atProfile = (months: number) => {
@@ -548,7 +1065,7 @@ export function VarAnalyticsPanel({
         absResidualM: p?.residualCoverLocalM ?? null,
       };
     });
-  }, [evoBar, setup, monthlyFlowsByCcy, evoProfile]);
+  }, [evoBar, setup, monthlyFlowsByCcy, evoProfile, forecastProfile]);
 
   const maxTermVar = Math.max(
     1e-9,
@@ -558,19 +1075,122 @@ export function VarAnalyticsPanel({
 
   const patch = (partial: Partial<VarSetup>) => onSetupChange({ ...setup, ...partial });
 
+  const marketRates = useMemo(
+    () => getActiveMarketRates(ratesScopeId),
+    [ratesScopeId],
+  );
+
+  /** Portfolio Total carry @ Tf — Cash Carry tab figure (design 1c). */
+  const cashCarryTotalUsdM = useMemo(() => {
+    const ccys = new Set<string>();
+    for (const r of risk) ccys.add(r.bar.ccy);
+    for (const row of bookRows ?? []) {
+      if (row.ccy) ccys.add(row.ccy);
+    }
+    let sum = 0;
+    for (const ccy of ccys) {
+      const cmp = buildCashForecastCarryComparison({
+        ccy,
+        bookRows,
+        forecastProfile,
+        forecastMonths: setup.forecastMonths,
+        marketRates,
+        bookedHedges,
+        preparedByCcy,
+        setup,
+      });
+      if (cmp) sum += cmp.categories.hedgedIncomeUsdM;
+    }
+    return sum;
+  }, [
+    risk,
+    bookRows,
+    forecastProfile,
+    setup,
+    marketRates,
+    bookedHedges,
+    preparedByCcy,
+  ]);
+
+  const perspectiveTabStats = useMemo((): Partial<
+    Record<RiskPerspective, RiskPerspectiveTabStat>
+  > => {
+    return {
+      fxRisk: {
+        value: fmtTabResidVar(summary.totalVarAfterUsdM),
+        label: 'Resid VaR',
+      },
+      cashCarry: {
+        value: fmtTabCarryK(cashCarryTotalUsdM),
+        label: 'Total carry',
+      },
+    };
+  }, [summary.totalVarAfterUsdM, cashCarryTotalUsdM]);
+
+  const growthMoM = forecastProfile.growthRateMoM ?? 0;
+  const analyticsMetaLine = useMemo(() => {
+    if (perspective === 'cashCarry') {
+      return [
+        'Cash carry · all currencies',
+        customSchedule ? 'custom schedule' : null,
+        Math.abs(growthMoM) > 1e-12
+          ? `MoM ${(growthMoM * 100).toFixed(1)}%`
+          : null,
+        'click a currency row to set the carry chart',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+    }
+    if (perspective === 'fxRisk') {
+      return [
+        'Group VaR · all currencies',
+        customSchedule ? 'custom schedule' : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+    }
+    return undefined;
+  }, [perspective, customSchedule, growthMoM]);
+
   return (
     <div className="space-y-5 rounded-xl border border-slate-800 bg-slate-900/60 p-5 text-slate-200">
-      <div>
-        <h3 className="text-sm font-semibold text-white">{title}</h3>
-        <p className="mt-0.5 text-xs text-slate-500">
-          Exposure inputs set the hedge target and VaR profile. Pick the active tenure on the
-          evolution chart — it drives Hedging Decision, Live Ladder, and Risk Metrics.
-        </p>
-      </div>
+      <RiskPerspectiveSelector
+        value={perspective}
+        onChange={setPerspective}
+        moduleLabel="Analytics"
+        tabStats={perspectiveTabStats}
+        tfMonths={setup.forecastMonths}
+        metaLine={analyticsMetaLine}
+        onOpenSettings={
+          onOpenForecastProfile
+            ? () => onOpenForecastProfile()
+            : undefined
+        }
+        settingsDisabled={
+          !onOpenForecastProfile || setup.forecastMonths === 0
+        }
+        settingsTitle={
+          setup.forecastMonths === 0
+            ? 'No forecast period — pick 1 month+ to edit cash inflow / outflow profile'
+            : 'Forecast profile — flat / MoM / custom cash inflows & outflows'
+        }
+      />
 
-      <RiskPerspectiveSelector value={perspective} onChange={setPerspective} />
-
-      {perspective !== 'fxRisk' ? (
+      {perspective === 'cashCarry' ? (
+        <CashCarryAnalyticsView
+          risk={risk}
+          setup={setup}
+          bookedHedges={bookedHedges}
+          preparedByCcy={preparedByCcy}
+          onPreparedByCcyChange={onPreparedByCcyChange}
+          bookRows={bookRows}
+          forecastProfile={forecastProfile}
+          ratesScopeId={ratesScopeId}
+          onHorizonChange={horizon =>
+            onSetupChange({ ...setup, horizon })
+          }
+        />
+      ) : perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
           {riskPerspectiveMeta(perspective).label} view is coming soon on Analytics.
         </div>
@@ -580,7 +1200,7 @@ export function VarAnalyticsPanel({
       <section className="space-y-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+            <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
               Input exposure metrics
             </div>
             <p className="mt-0.5 text-[10px] text-slate-500">
@@ -589,20 +1209,6 @@ export function VarAnalyticsPanel({
               {customSchedule ? ' Profile: custom.' : ''}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => onOpenForecastProfile?.()}
-            disabled={!onOpenForecastProfile || setup.forecastMonths === 0}
-            title={
-              setup.forecastMonths === 0
-                ? 'No forecast period — pick 1 month+ to edit Revenue / Expenses profile'
-                : 'Forecast profile — flat or custom per-period Revenue / Expenses'
-            }
-            aria-label="Open forecast profile setup"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <GearIcon className="h-3.5 w-3.5" />
-          </button>
         </div>
 
         <div>
@@ -722,7 +1328,7 @@ export function VarAnalyticsPanel({
           <p className="mt-1.5 text-[10px] text-slate-500">
             {setup.forecastMonths === 0
               ? 'Pick a forecast period &gt; 0 to enable quantity uncertainty.'
-              : `σ_E = |F|×${(u1m * 100).toFixed(2).replace(/\.?0+$/, '')}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — higher u steepens VaR vs tenure.`}
+              : `σ_E = |F|×${(u1m * 100).toFixed(2).replace(/\.?0+$/, '')}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — global default. Per-CCY line σ in Forecast profile (click Revenue / line name) overrides when set.`}
           </p>
         </div>
       </section>
@@ -731,7 +1337,7 @@ export function VarAnalyticsPanel({
       <section className="space-y-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
+            <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
               VaR setup
             </div>
             <p className="mt-0.5 text-[10px] text-slate-500">
@@ -873,8 +1479,41 @@ export function VarAnalyticsPanel({
       <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="mb-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-300">
-              VaR evolution · select horizon
+            <div className="flex items-center gap-2">
+              <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
+                VaR evolution · select horizon
+              </div>
+              <ChartInfoButton label="How to read VaR evolution">
+                <ul className="list-disc space-y-1.5 pl-3.5">
+                  <li>
+                    Click a column ≤ Tf to set the active VaR horizon for hedging
+                    / Analytics setup.
+                  </li>
+                  <li>
+                    Numbers above each bar: open VaR (slate) and residual VaR after
+                    hedge (amber).
+                  </li>
+                  <li>
+                    Stacked bar: green = VaR reduction from the hedge; yellow =
+                    remaining residual VaR.
+                  </li>
+                  <li>
+                    Resid VaR = V(t)·|e−H|/|E(Tf)| — same formula as the path
+                    modal.
+                  </li>
+                  <li>
+                    Post-Tf columns (beyond forecast) are display-only — they do
+                    not change the hedging profile horizon. Only periods ≤ Tf
+                    apply.
+                  </li>
+                  {!showEvoHedge && (
+                    <li>
+                      No hedge on the book yet — bars show open VaR only. Apply a
+                      regime in Decision or the path modal to see reduction.
+                    </li>
+                  )}
+                </ul>
+              </ChartInfoButton>
             </div>
             {evolutionCcys.length > 0 && (
               <div
@@ -904,13 +1543,11 @@ export function VarAnalyticsPanel({
             )}
           </div>
           <p className="mt-1.5 text-[10px] text-slate-500">
-            {evoCcy} · Profile: {profile?.label ?? setup.exposureBasis}
+            {evoCcy} · {profile?.label ?? setup.exposureBasis}
             {' · '}
-            Tf = {setup.forecastMonths === 0 ? '0 (stock)' : `${setup.forecastMonths}m`}
+            Tf ={' '}
+            {setup.forecastMonths === 0 ? '0 (stock)' : `${setup.forecastMonths}m`}
             {customSchedule ? ' · custom schedule' : ''}
-            {showEvoHedge
-              ? ' · stacked bar: green reduction / yellow remaining · columns after Tf = beyond forecast (e flat, resid still grows)'
-              : ' — click a column to set the active VaR horizon.'}
           </p>
         </div>
 
@@ -955,11 +1592,22 @@ export function VarAnalyticsPanel({
                         key={t.id}
                         type="button"
                         title={
-                          t.residualVarUsdM != null
-                            ? `${evoCcy} ${t.label}: open ${fmtVarK(t.varUsdM)} · resid ${fmtVarK(t.residualVarUsdM)} · |e−H| ${t.absResidualM != null ? fmtSignedM(t.absResidualM) : '—'}${beyondForecast ? ' · beyond forecast (e flat)' : ''}`
-                            : `${evoCcy} ${t.label}: ${fmtVarK(t.varUsdM)}`
+                          beyondForecast
+                            ? `${t.label}: beyond forecast — display only. Hedging setup uses horizons ≤ Tf (${setup.forecastMonths}m).`
+                            : t.residualVarUsdM != null
+                              ? `${evoCcy} ${t.label}: open ${fmtVarK(t.varUsdM)} · resid ${fmtVarK(t.residualVarUsdM)} · |e−H| ${t.absResidualM != null ? fmtSignedM(t.absResidualM) : '—'}`
+                              : `${evoCcy} ${t.label}: ${fmtVarK(t.varUsdM)}`
                         }
-                        onClick={() => patch({ horizon: t.id })}
+                        onClick={() => {
+                          if (beyondForecast) {
+                            setPostTfNotice(
+                              `${t.label} is beyond forecast (Tf = ${setup.forecastMonths}m) — not applied to hedging setup. Use a horizon ≤ Tf.`,
+                            );
+                            return;
+                          }
+                          setPostTfNotice(null);
+                          patch({ horizon: t.id });
+                        }}
                         className={`flex flex-col items-center rounded-md px-0.5 py-1 transition-colors ${
                           on
                             ? 'bg-emerald-500/10'
@@ -1033,23 +1681,46 @@ export function VarAnalyticsPanel({
                         </span>
                         {beyondForecast && (
                           <span className="mt-0.5 text-[8px] font-medium uppercase tracking-wide text-slate-500">
-                            post-Tf
+                            view only
                           </span>
                         )}
                       </button>
                     );
                   })}
                 </div>
-                <p className="mt-2 text-center text-[10px] text-slate-500">
-                  {evoCcy} · Active:{' '}
-                  <span className="font-medium text-emerald-300">
-                    {evoTerm.find(t => t.id === setup.horizon)?.label ??
-                      setup.horizon}
+                {postTfNotice && (
+                  <p
+                    role="status"
+                    className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-center text-[10px] text-amber-100"
+                  >
+                    {postTfNotice}
+                  </p>
+                )}
+                <div className="mt-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] text-slate-500">
+                  <span>
+                    Active setup:{' '}
+                    <span className="font-medium text-emerald-300">
+                      {evoTerm.find(t => t.id === setup.horizon)?.label ??
+                        setup.horizon}
+                    </span>
+                    <span className="text-slate-600"> (≤ Tf)</span>
                   </span>
-                  {' · '}
-                  <span className="text-emerald-300/90">green = reduction</span>
-                  {' · '}
-                  <span className="text-amber-300/90">yellow = remaining</span>
+                  {showEvoHedge && (
+                    <span className="inline-flex items-center gap-2">
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rounded-sm bg-emerald-400/80" />
+                        reduction
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rounded-sm bg-amber-300/90" />
+                        remaining
+                      </span>
+                      <span className="inline-flex items-center gap-1">
+                        <span className="inline-block h-2 w-2 rounded-sm bg-slate-600/80" />
+                        post-Tf (view only)
+                      </span>
+                    </span>
+                  )}
                   {showEvoHedge && evoProfile.length > 0 && (() => {
                     const Tf = setup.forecastMonths;
                     const atTf =
@@ -1060,30 +1731,25 @@ export function VarAnalyticsPanel({
                     const atEnd = evoProfile[evoProfile.length - 1]!;
                     const pastTf = atEnd.t > Tf + 1e-9;
                     return (
-                      <>
-                        {' · resid @ Tf '}
-                        <span className="font-mono text-amber-300">
-                          {fmtVarK(atTf.hedgedVarUsdM)}
+                      <span className="inline-flex items-center gap-1.5 font-mono text-amber-300/90">
+                        <span title="Residual VaR at forecast end">
+                          resid@Tf {fmtVarK(atTf.hedgedVarUsdM)}
                         </span>
                         {pastTf && (
-                          <>
-                            {' · resid @ '}
+                          <span
+                            title="Residual VaR at chart end — e flat after Tf; VN gap can keep resid growing"
+                          >
+                            · resid@
                             {Number.isInteger(atEnd.t)
                               ? `${atEnd.t}m`
                               : `${atEnd.t.toFixed(1)}m`}{' '}
-                            <span className="font-mono text-amber-300">
-                              {fmtVarK(atEnd.hedgedVarUsdM)}
-                            </span>
-                            <span className="text-slate-600">
-                              {' '}
-                              (e flat · VN gap stays)
-                            </span>
-                          </>
+                            {fmtVarK(atEnd.hedgedVarUsdM)}
+                          </span>
                         )}
-                      </>
+                      </span>
                     );
                   })()}
-                </p>
+                </div>
               </>
             )}
           </div>
@@ -1148,7 +1814,7 @@ export function VarAnalyticsPanel({
       </div>
 
       <div className="space-y-3">
-        <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
           Live VaR · {setupLabel(setup)}
           {hedged ? ' · after Hedging Decision' : ' · Δ = 1 (unhedged)'}
           {stripBooked
@@ -1157,8 +1823,8 @@ export function VarAnalyticsPanel({
               ? ' · strip sizing (Th windows)'
               : ''}
           {customSchedule ? ' · custom schedule' : ''}
-          <span className="ml-2 font-normal normal-case text-slate-600">
-            — click a currency row to open the path chart
+          <span className="ml-2 font-normal normal-case tracking-normal text-slate-600">
+            — click a currency row to select · open bullet/strip profile
           </span>
         </div>
 
@@ -1175,7 +1841,7 @@ export function VarAnalyticsPanel({
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Equal-VaR bullet on the open book (Decision mid). Does not shrink when you hedge."
+                  title="VaR-neutral at Tf: growth = path CoG e(∫t e²/∫e²); simple/TW = Ē. Strip: per-window same rule."
                 >
                   VaR-neutral N
                 </th>
@@ -1193,7 +1859,7 @@ export function VarAnalyticsPanel({
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Hedge cover (same sign as Target). 100% Target / Target strip → Hedge N = Target N."
+                  title="Trade-signed hedge (offsets exposure): opposite of Stock / Target / path cover. Long book → negative Hedge N."
                 >
                   Hedge N
                 </th>
@@ -1205,7 +1871,7 @@ export function VarAnalyticsPanel({
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Path e(Th) − H — same |e−H| as VaR evolution / path modal"
+                  title="Path e(Tf) − H — residual at forecast end (100% Target → 0). Same |e−H| as path modal at Tf."
                 >
                   Residual
                 </th>
@@ -1219,31 +1885,101 @@ export function VarAnalyticsPanel({
               </tr>
             </thead>
             <tbody>
-              {summary.rows.map(r => (
+              {liveRows.map(r => {
+                const selected = chartCcy === r.ccy;
+                const prep = preparedByCcy[r.ccy];
+                const struct = structureTagFor(r.ccy, r.hedgeNotionalLocalM);
+                const legs = stripMetaByCcy[r.ccy]?.legs;
+                const isHedged =
+                  Math.abs(r.hedgeNotionalLocalM) > 1e-9 ||
+                  (prep != null && Math.abs(prep.coverLocalM) >= 1e-12) ||
+                  hasRollingStripForCcy(bookedHedges, r.ccy);
+                return (
                 <tr
                   key={r.ccy}
-                  className="cursor-pointer border-b border-slate-800/80 hover:bg-violet-500/10"
+                  role="button"
+                  tabIndex={0}
+                  className={`cursor-pointer border-b border-slate-800/80 hover:bg-violet-500/10 ${
+                    selected ? 'bg-violet-500/10' : ''
+                  }`}
                   onClick={() => {
-                    // Bullet P&L / path default = VaR-neutral (not Target).
-                    // Strip may infer from an applied hedge; else start at VN too.
+                    // Prefer last applied chip; else infer from Live VaR Hedge N.
                     const inferred =
-                      Math.abs(r.hedgeNotionalLocalM) > 1e-9
+                      regimeByCcy[r.ccy] ??
+                      (Math.abs(r.hedgeNotionalLocalM) > 1e-9
                         ? inferHedgePathBasis(
                             r.hedgeNotionalLocalM,
                             r.stockHedgeLocalM,
                             r.targetHedgeLocalM,
                             r.equalVarHedgeLocalM,
                           )
-                        : 'varNeutral';
+                        : prep?.basis === 'cash'
+                          ? 'cash'
+                          : prep?.basis === 'totalExpected'
+                            ? 'totalExpected'
+                            : 'varNeutral');
+                    const nextStruct =
+                      struct ??
+                      (prep?.structure === 'strip' ? 'strip' : 'bullet');
                     setPathBasis(inferred);
+                    setHedgeStructure(nextStruct);
                     setChartCcy(r.ccy);
                   }}
-                  title={`Open ${r.ccy} exposure path vs hedge`}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLTableRowElement).click();
+                    }
+                  }}
+                  title={`Select ${r.ccy} · open hedge profile (bullet / strip · regime)`}
                 >
                   <td className="py-2 pr-3 font-semibold text-violet-200">
-                    {r.ccy}
-                    <span className="ml-1 text-[9px] font-normal text-violet-400/80">
-                      path
+                    <span className="inline-flex flex-col gap-0.5">
+                      <span className="inline-flex items-baseline gap-1.5">
+                        {r.ccy}
+                        {struct ? (
+                          <span
+                            className="text-[9px] font-semibold uppercase tracking-wide text-violet-300/90"
+                            title="Hedge structure from Cash Carry Prebook / FX Risk Book / Decision"
+                          >
+                            {hedgeStructureShortLabel(struct, legs)}
+                          </span>
+                        ) : null}
+                        {prep?.preparedFor === 'carry' ? (
+                          <span
+                            className="text-[9px] font-semibold uppercase tracking-wide text-amber-300/90"
+                            title="Staged from Cash Carry — sized for carry / Enhancement"
+                          >
+                            Carry
+                          </span>
+                        ) : null}
+                      </span>
+                      {isHedged ? (
+                        <span
+                          className="text-[9px] font-semibold uppercase tracking-wide text-emerald-400/90"
+                          title={
+                            prep
+                              ? `Prepared ${prep.preparedFor === 'carry' ? 'Carry' : 'VaR'} package · Σ ${fmtSignedM(prep.coverLocalM)}`
+                              : 'Hedging regime: Stock (Cash) · VaR-neutral · Total (Target)'
+                          }
+                        >
+                          {prep && !hasRollingStripForCcy(bookedHedges, r.ccy)
+                            ? 'Hedged'
+                            : hedgeRegimeShortLabel(
+                                regimeByCcy[r.ccy] ??
+                                  inferHedgePathBasis(
+                                    r.hedgeNotionalLocalM,
+                                    r.stockHedgeLocalM,
+                                    r.targetHedgeLocalM,
+                                    r.equalVarHedgeLocalM,
+                                  ),
+                              )}
+                        </span>
+                      ) : (
+                        <span className="text-[9px] font-normal text-slate-600">
+                          —
+                        </span>
+                      )}
                     </span>
                   </td>
                   <td className="py-2 pr-3 font-mono text-slate-300">
@@ -1252,13 +1988,15 @@ export function VarAnalyticsPanel({
                   <td
                     className="py-2 pr-3 font-mono text-sky-300/90"
                     title={
-                      r.hedgeCapped
-                        ? 'Equal-VaR on open book — capped by accrued position at Th'
-                        : 'Equal-VaR bullet matching open-book VaR @ Δ1 (Decision mid)'
+                      struct === 'strip'
+                        ? 'Strip VaR-neutral = last-window Equal-VaR cover (same as path modal VN chip)'
+                        : r.hedgeCapped
+                          ? 'Equal-VaR on open book — capped by accrued position at Th'
+                          : 'Equal-VaR bullet matching open-book VaR @ Δ1 (Decision mid)'
                     }
                   >
                     {fmtSignedM(r.equalVarHedgeLocalM)}
-                    {r.hedgeCapped ? (
+                    {r.hedgeCapped && struct !== 'strip' ? (
                       <span className="ml-1 text-[9px] text-amber-400/90">cap</span>
                     ) : null}
                   </td>
@@ -1269,7 +2007,7 @@ export function VarAnalyticsPanel({
                     {Math.round(r.hedgeRatio * 100)}%
                   </td>
                   <td className="py-2 pr-3 font-mono text-emerald-200">
-                    {fmtSignedM(r.hedgeNotionalLocalM)}
+                    {fmtSignedM(-r.hedgeNotionalLocalM)}
                   </td>
                   <td className="py-2 pr-3 font-mono text-amber-300">
                     {r.delta.toFixed(2)}
@@ -1284,7 +2022,8 @@ export function VarAnalyticsPanel({
                     {fmtVarK(r.varAfterUsdM)}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -1304,34 +2043,109 @@ export function VarAnalyticsPanel({
               if (e.target === e.currentTarget) closePathChart();
             }}
           >
-            <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
-              <div className="mb-3 flex items-start justify-between gap-3">
-                <div>
-                  <h4
-                    id="exposure-path-title"
-                    className="text-sm font-semibold text-white"
-                  >
-                    {chartCcy} — exposure path vs hedge
-                  </h4>
-                  <p className="mt-0.5 text-[11px] text-slate-400">
-                    Selected regime:{' '}
-                    <span className="font-semibold text-violet-200">
-                      {pathBasis === 'cash'
-                        ? 'Cash (stock)'
-                        : pathBasis === 'varNeutral'
-                          ? 'VaR-neutral'
-                          : 'Target (Total)'}
-                    </span>
-                  </p>
+            <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
+              <div className="sticky top-0 z-30 shrink-0 border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <h4
+                      id="exposure-path-title"
+                      className="text-sm font-semibold text-white"
+                    >
+                      {chartCcy} — hedge profile
+                    </h4>
+                    <p className="mt-0.5 text-[11px] text-slate-400">
+                      Structure:{' '}
+                      <span className="font-semibold text-violet-200">
+                        {effectiveStructure === 'strip' ? 'Strip' : 'Bullet'}
+                      </span>
+                      {' · '}
+                      Regime:{' '}
+                      <span className="font-semibold text-violet-200">
+                        {pathBasis === 'cash'
+                          ? 'Cash (stock)'
+                          : pathBasis === 'varNeutral'
+                            ? 'VaR-neutral'
+                            : 'Target (Total)'}
+                      </span>
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+                    {pathPrepareAction && (
+                      <button
+                        type="button"
+                        disabled={pathPrepareAction.disabled}
+                        onClick={() => pathPrepareAction.run()}
+                        title={pathPrepareAction.title}
+                        className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {pathPrepareAction.label}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={closePathChart}
+                      className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={closePathChart}
-                  className="rounded border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
-                >
-                  Close
-                </button>
+                {pathSummaryMetrics && (
+                  <div className="mt-2 flex flex-wrap items-center gap-1">
+                    {(
+                      [
+                        [
+                          'Cover',
+                          pathSummaryMetrics.coverValue,
+                          pathSummaryMetrics.coverPct,
+                          pathSummaryMetrics.coverSub,
+                          'text-emerald-200',
+                        ],
+                        [
+                          'Legs',
+                          pathSummaryMetrics.legsValue,
+                          null,
+                          pathSummaryMetrics.legsSub,
+                          'text-sky-200',
+                        ],
+                        [
+                          'Resid',
+                          pathSummaryMetrics.residVarValue,
+                          pathSummaryMetrics.residVarPct,
+                          pathSummaryMetrics.residVarSub,
+                          'text-rose-300',
+                        ],
+                        [
+                          'BE',
+                          pathSummaryMetrics.breakevenValue,
+                          null,
+                          pathSummaryMetrics.breakevenSub,
+                          'text-amber-200/90',
+                        ],
+                      ] as const
+                    ).map(([label, value, pct, title, tone]) => (
+                      <span
+                        key={label}
+                        title={title ?? undefined}
+                        className="inline-flex items-center gap-1 rounded border border-slate-700/80 bg-slate-950/90 px-1.5 py-0.5 text-[10px] text-slate-500"
+                      >
+                        {label}{' '}
+                        <span
+                          className={`font-mono font-semibold tabular-nums ${tone}`}
+                        >
+                          {value}
+                        </span>
+                        {pct != null && (
+                          <span className="font-mono font-semibold tabular-nums text-slate-400">
+                            {pct}
+                          </span>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
               <ExposureHedgePathChart
                 key={`${chartRow.ccy}-${pathBasis}-${effectiveStructure}-${setup.horizon}-${chartSizingSetup.horizon}-${setup.forecastMonths}-${setup.exposureBasis}-${hasRollingStripForCcy(bookedHedges, chartRow.ccy) ? 'strip' : 'open'}`}
                 ccy={chartRow.ccy}
@@ -1342,7 +2156,11 @@ export function VarAnalyticsPanel({
                     : 0
                 }
                 monthlyFlows={monthlyFlowsByCcy[chartRow.ccy]}
-                setup={setup}
+                setup={varSetupWithLineUncertainty(
+                  setup,
+                  chartRow.ccy,
+                  forecastProfile,
+                )}
                 appliedHedgeLocalM={chartRow.hedgeNotionalLocalM}
                 hedgeRatio={chartRow.hedgeRatio}
                 equalVarHedgeLocalM={chartRow.equalVarHedgeLocalM}
@@ -1350,19 +2168,42 @@ export function VarAnalyticsPanel({
                 selectedBasis={pathBasis}
                 onSelectedBasisChange={setPathBasis}
                 onApplyBasis={applyPathBasis}
-                onBookRollingStrip={
-                  onBookedHedgesChange && hedgeStructure === 'strip'
-                    ? bookRollingStrip
-                    : undefined
+                onBookHedgeProfile={
+                  onPreparedByCcyChange ? bookHedgeProfile : undefined
                 }
+                summaryMetricsPlacement="none"
+                onSummaryMetricsChange={setPathSummaryMetrics}
+                prepareCtaPlacement="external"
+                onPrepareActionChange={setPathPrepareAction}
                 stripAlreadyBooked={
                   chartRow
                     ? hasRollingStripForCcy(bookedHedges, chartRow.ccy)
                     : false
                 }
                 hedgeStructure={hedgeStructure}
-                onHedgeStructureChange={setHedgeStructure}
+                onHedgeStructureChange={s => {
+                  setHedgeStructure(s);
+                  if (chartRow) {
+                    setStructureByCcy(prev => ({
+                      ...prev,
+                      [chartRow.ccy]: s,
+                    }));
+                  }
+                }}
+                stripLegCount={
+                  chartRow
+                    ? (stripLegCountByCcy[chartRow.ccy] ?? null)
+                    : null
+                }
+                onStripLegCountChange={n => {
+                  if (!chartRow) return;
+                  setStripLegCountByCcy(prev => ({
+                    ...prev,
+                    [chartRow.ccy]: n,
+                  }));
+                }}
               />
+              </div>
             </div>
           </div>,
           document.body,

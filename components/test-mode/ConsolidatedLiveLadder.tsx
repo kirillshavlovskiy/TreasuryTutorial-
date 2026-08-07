@@ -24,6 +24,7 @@ import {
   RiskPerspectiveSelector,
   riskPerspectiveMeta,
   type RiskPerspective,
+  type RiskPerspectiveTabStat,
 } from '@/components/test-mode/RiskPerspectiveSelector';
 
 /** @deprecated Use RiskPerspective — kept for existing imports. */
@@ -110,7 +111,7 @@ export function ConsolidatedLiveLadder({
   bookedHedges = [],
   varSetup = DEFAULT_VAR_SETUP,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
-  title = 'Consolidated Live Ladder',
+  title: _moduleTitle = 'Consolidated Live Ladder',
 }: ConsolidatedLiveLadderProps) {
   const risk = useMemo(
     () =>
@@ -139,14 +140,30 @@ export function ConsolidatedLiveLadder({
 
   /** Decision-layer residual VaR (booked netted for incremental %). */
   const hedgeSummary = useMemo(
-    () => buildHedgeVarSummary(risk, ratios, varSetup, bookedHedges, monthlyFlowsByCcy),
-    [risk, ratios, varSetup, bookedHedges, monthlyFlowsByCcy],
+    () =>
+      buildHedgeVarSummary(
+        risk,
+        ratios,
+        varSetup,
+        bookedHedges,
+        monthlyFlowsByCcy,
+        forecastProfile,
+      ),
+    [risk, ratios, varSetup, bookedHedges, monthlyFlowsByCcy, forecastProfile],
   );
 
   /** Unhedged originals — VaR @ Δ=1 and source baseline for the ladder. */
   const unhedgedSummary = useMemo(
-    () => buildHedgeVarSummary(risk, {}, varSetup, [], monthlyFlowsByCcy),
-    [risk, varSetup, monthlyFlowsByCcy],
+    () =>
+      buildHedgeVarSummary(
+        risk,
+        {},
+        varSetup,
+        [],
+        monthlyFlowsByCcy,
+        forecastProfile,
+      ),
+    [risk, varSetup, monthlyFlowsByCcy, forecastProfile],
   );
 
   const hedgeByCcy = useMemo(() => {
@@ -324,38 +341,59 @@ export function ConsolidatedLiveLadder({
   const reductionPct = varBeforeUsdM > 1e-12 ? (varReductionUsdM / varBeforeUsdM) * 100 : 0;
   const totalHedgeAddLocalM = bars.reduce((s, b) => s + Math.abs(b.hedge), 0);
 
+  const perspectiveTabStats = useMemo((): Partial<
+    Record<RiskPerspective, RiskPerspectiveTabStat>
+  > => {
+    const resid = varAfterUsdM;
+    const residLabel =
+      !Number.isFinite(resid) || Math.abs(resid) < 1e-12
+        ? '—'
+        : Math.abs(resid) >= 0.1
+          ? `$${resid.toFixed(2)}M`
+          : `$${(resid * 1000).toFixed(1)}K`;
+    return {
+      fxRisk: { value: residLabel, label: 'Resid VaR' },
+    };
+  }, [varAfterUsdM]);
+
   return (
     <div className="space-y-4 rounded-xl border border-slate-800 bg-slate-900/60 p-5 text-slate-200">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-semibold text-white">{title}</h3>
-          <p className="mt-0.5 text-xs text-slate-500">
-            Wired to Hedging Decision
-            {bookedHedges.length > 0
-              ? ` · ${bookedHedges.length} booked (shown as hedge structure)`
-              : ''}{' '}
-            · VaR {varSetup.confidencePct}% · {varSetup.horizon} · {varSetup.exposureBasis}
-          </p>
-        </div>
-        <div className="flex rounded-md border border-slate-700 p-0.5 text-[11px]">
-          <button
-            type="button"
-            onClick={() => setUnit('local')}
-            className={`rounded px-2 py-1 ${unit === 'local' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
-          >
-            Local M
-          </button>
-          <button
-            type="button"
-            onClick={() => setUnit('usd')}
-            className={`rounded px-2 py-1 ${unit === 'usd' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
-          >
-            $USD M
-          </button>
-        </div>
-      </div>
-
-      <RiskPerspectiveSelector value={perspective} onChange={setPerspective} />
+      <RiskPerspectiveSelector
+        value={perspective}
+        onChange={setPerspective}
+        moduleLabel="Live Ladder"
+        tabStats={perspectiveTabStats}
+        tfMonths={varSetup.forecastMonths}
+        metaLine={[
+          'Wired to Hedging Decision',
+          bookedHedges.length > 0
+            ? `${bookedHedges.length} booked`
+            : null,
+          `VaR ${varSetup.confidencePct}%`,
+          varSetup.horizon,
+          varSetup.exposureBasis,
+        ]
+          .filter(Boolean)
+          .join(' · ')}
+        trailing={
+          <div className="flex rounded-md border border-slate-700 p-0.5 text-[11px]">
+            <button
+              type="button"
+              onClick={() => setUnit('local')}
+              className={`rounded px-2 py-1 ${unit === 'local' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
+            >
+              Local M
+            </button>
+            <button
+              type="button"
+              onClick={() => setUnit('usd')}
+              className={`rounded px-2 py-1 ${unit === 'usd' ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
+            >
+              $USD M
+            </button>
+          </div>
+        }
+      />
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Stat

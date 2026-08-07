@@ -1,0 +1,848 @@
+{
+  "pair": "EURUSD",
+  "baseCcy": "EUR",
+  "quoteCcy": "USD",
+  "sourceFile": "FXOCalculator EURUSD.xlsx",
+  "asOf": {
+    "tradeDate": "2026-08-02",
+    "spotDate": "2026-08-04"
+  },
+  "spot": {
+    "bid": 1.1527,
+    "ask": 1.1529,
+    "mid": 1.1528
+  },
+  "deposits": [
+    {
+      "tenor": "SW",
+      "months": 0.23333333333333334,
+      "eur": {
+        "creditPct": 2.09,
+        "debitPct": 2.39
+      },
+      "usd": {
+        "creditPct": 3.505,
+        "debitPct": 3.809
+      },
+      "swapPoints": {
+        "bid": 3.17,
+        "ask": 3.18
+      },
+      "outright": {
+        "bid": 1.15302,
+        "ask": 1.15322
+      }
+    },
+    {
+      "tenor": "2W",
+      "months": 0.4666666666666667,
+      "eur": {
+        "creditPct": 2.11,
+        "debitPct": 2.41
+      },
+      "usd": {
+        "creditPct": 3.53,
+        "debitPct": 3.835
+      },
+      "swapPoints": {
+        "bid": 6.36,
+        "ask": 6.38
+      },
+      "outright": {
+        "bid": 1.15334,
+        "ask": 1.15354
+      }
+    },
+    {
+      "tenor": "3W",
+      "months": 0.7,
+      "eur": {
+        "creditPct": 2.16,
+        "debitPct": 2.31
+      },
+      "usd": {
+        "creditPct": 3.58,
+        "debitPct": 3.737
+      },
+      "swapPoints": {
+        "bid": 9.54,
+        "ask": 9.58
+      },
+      "outright": {
+        "bid": 1.15365,
+        "ask": 1.15386
+      }
+    },
+    {
+      "tenor": "1M",
+      "months": 1,
+      "eur": {
+        "creditPct": 2.26,
+        "debitPct": 2.56
+      },
+      "usd": {
+        "creditPct": 3.687,
+        "debitPct": 3.993
+      },
+      "swapPoints": {
+        "bid": 14.14,
+        "ask": 14.19
+      },
+      "outright": {
+        "bid": 1.15411,
+        "ask": 1.15432
+      }
+    },
+    {
+      "tenor": "2M",
+      "months": 2,
+      "eur": {
+        "creditPct": 2.2,
+        "debitPct": 2.5
+      },
+      "usd": {
+        "creditPct": 3.631,
+        "debitPct": 3.937
+      },
+      "swapPoints": {
+        "bid": 28.31,
+        "ask": 28.41
+      },
+      "outright": {
+        "bid": 1.15553,
+        "ask": 1.15574
+      }
+    },
+    {
+      "tenor": "3M",
+      "months": 3,
+      "eur": {
+        "creditPct": 2.48,
+        "debitPct": 2.78
+      },
+      "usd": {
+        "creditPct": 3.915,
+        "debitPct": 4.221
+      },
+      "swapPoints": {
+        "bid": 42.01,
+        "ask": 42.15
+      },
+      "outright": {
+        "bid": 1.1569,
+        "ask": 1.15712
+      }
+    },
+    {
+      "tenor": "4M",
+      "months": 4,
+      "eur": {
+        "creditPct": 2.31,
+        "debitPct": 2.64
+      },
+      "usd": {
+        "creditPct": 3.744,
+        "debitPct": 4.082
+      },
+      "swapPoints": {
+        "bid": 55.59,
+        "ask": 55.83
+      },
+      "outright": {
+        "bid": 1.15826,
+        "ask": 1.15848
+      }
+    },
+    {
+      "tenor": "5M",
+      "months": 5,
+      "eur": {
+        "creditPct": 2.6,
+        "debitPct": 2.9
+      },
+      "usd": {
+        "creditPct": 4.079,
+        "debitPct": 4.387
+      },
+      "swapPoints": {
+        "bid": 71.67,
+        "ask": 71.95
+      },
+      "outright": {
+        "bid": 1.15987,
+        "ask": 1.1601
+      }
+    },
+    {
+      "tenor": "6M",
+      "months": 6,
+      "eur": {
+        "creditPct": 2.68,
+        "debitPct": 2.98
+      },
+      "usd": {
+        "creditPct": 4.157,
+        "debitPct": 4.466
+      },
+      "swapPoints": {
+        "bid": 85.85,
+        "ask": 86.26
+      },
+      "outright": {
+        "bid": 1.16129,
+        "ask": 1.16153
+      }
+    },
+    {
+      "tenor": "7M",
+      "months": 7,
+      "eur": {
+        "creditPct": 2.71,
+        "debitPct": 2.78
+      },
+      "usd": {
+        "creditPct": 4.191,
+        "debitPct": 4.269
+      },
+      "swapPoints": {
+        "bid": 98.94,
+        "ask": 99.45
+      },
+      "outright": {
+        "bid": 1.16259,
+        "ask": 1.16285
+      }
+    },
+    {
+      "tenor": "8M",
+      "months": 8,
+      "eur": {
+        "creditPct": 2.76,
+        "debitPct": 2.87
+      },
+      "usd": {
+        "creditPct": 4.241,
+        "debitPct": 4.36
+      },
+      "swapPoints": {
+        "bid": 113.64,
+        "ask": 114.22
+      },
+      "outright": {
+        "bid": 1.16406,
+        "ask": 1.16432
+      }
+    },
+    {
+      "tenor": "9M",
+      "months": 9,
+      "eur": {
+        "creditPct": 2.71,
+        "debitPct": 3.01
+      },
+      "usd": {
+        "creditPct": 4.196,
+        "debitPct": 4.507
+      },
+      "swapPoints": {
+        "bid": 127.27,
+        "ask": 127.92
+      },
+      "outright": {
+        "bid": 1.16543,
+        "ask": 1.16569
+      }
+    },
+    {
+      "tenor": "10M",
+      "months": 10,
+      "eur": {
+        "creditPct": 2.79,
+        "debitPct": 2.92
+      },
+      "usd": {
+        "creditPct": 4.28,
+        "debitPct": 4.419
+      },
+      "swapPoints": {
+        "bid": 141.73,
+        "ask": 142.44
+      },
+      "outright": {
+        "bid": 1.16687,
+        "ask": 1.16714
+      }
+    },
+    {
+      "tenor": "11M",
+      "months": 11,
+      "eur": {
+        "creditPct": 2.95,
+        "debitPct": 3.03
+      },
+      "usd": {
+        "creditPct": 4.447,
+        "debitPct": 4.543
+      },
+      "swapPoints": {
+        "bid": 156.76,
+        "ask": 157.57
+      },
+      "outright": {
+        "bid": 1.16838,
+        "ask": 1.16866
+      }
+    },
+    {
+      "tenor": "1Y",
+      "months": 12,
+      "eur": {
+        "creditPct": 2.95,
+        "debitPct": 3.25
+      },
+      "usd": {
+        "creditPct": 4.449,
+        "debitPct": 4.761
+      },
+      "swapPoints": {
+        "bid": 170.1,
+        "ask": 170.98
+      },
+      "outright": {
+        "bid": 1.16971,
+        "ask": 1.17
+      }
+    },
+    {
+      "tenor": "15M",
+      "months": 15,
+      "eur": {
+        "creditPct": 3.01,
+        "debitPct": 3.335
+      },
+      "usd": {
+        "creditPct": 4.515,
+        "debitPct": 4.855
+      },
+      "swapPoints": {
+        "bid": 212.1,
+        "ask": 213.33
+      },
+      "outright": {
+        "bid": 1.17391,
+        "ask": 1.17423
+      }
+    },
+    {
+      "tenor": "18M",
+      "months": 18,
+      "eur": {
+        "creditPct": 3.071,
+        "debitPct": 3.421
+      },
+      "usd": {
+        "creditPct": 4.579,
+        "debitPct": 4.946
+      },
+      "swapPoints": {
+        "bid": 253.26,
+        "ask": 254.73
+      },
+      "outright": {
+        "bid": 1.17803,
+        "ask": 1.17837
+      }
+    },
+    {
+      "tenor": "21M",
+      "months": 21,
+      "eur": {
+        "creditPct": 3.13,
+        "debitPct": 3.505
+      },
+      "usd": {
+        "creditPct": 4.637,
+        "debitPct": 5.03
+      },
+      "swapPoints": {
+        "bid": 292.13,
+        "ask": 293.83
+      },
+      "outright": {
+        "bid": 1.18191,
+        "ask": 1.18228
+      }
+    },
+    {
+      "tenor": "2Y",
+      "months": 24,
+      "eur": {
+        "creditPct": 3.19,
+        "debitPct": 3.59
+      },
+      "usd": {
+        "creditPct": 4.707,
+        "debitPct": 5.128
+      },
+      "swapPoints": {
+        "bid": 333.57,
+        "ask": 335.51
+      },
+      "outright": {
+        "bid": 1.18606,
+        "ask": 1.18645
+      }
+    },
+    {
+      "tenor": "30M",
+      "months": 30,
+      "eur": {
+        "creditPct": 3.2,
+        "debitPct": 3.6
+      },
+      "usd": {
+        "creditPct": 4.696,
+        "debitPct": 5.176
+      },
+      "swapPoints": {
+        "bid": 405.75,
+        "ask": 423.48
+      },
+      "outright": {
+        "bid": 1.19328,
+        "ask": 1.19525
+      }
+    },
+    {
+      "tenor": "3Y",
+      "months": 36,
+      "eur": {
+        "creditPct": 3.21,
+        "debitPct": 3.61
+      },
+      "usd": {
+        "creditPct": 4.72,
+        "debitPct": 5.172
+      },
+      "swapPoints": {
+        "bid": 483.59,
+        "ask": 494.59
+      },
+      "outright": {
+        "bid": 1.20106,
+        "ask": 1.20236
+      }
+    },
+    {
+      "tenor": "4Y",
+      "months": 48,
+      "eur": {
+        "creditPct": 3.42,
+        "debitPct": 3.82
+      },
+      "usd": {
+        "creditPct": 4.971,
+        "debitPct": 5.43
+      },
+      "swapPoints": {
+        "bid": 637.74,
+        "ask": 652.57
+      },
+      "outright": {
+        "bid": 1.21647,
+        "ask": 1.21816
+      }
+    },
+    {
+      "tenor": "5Y",
+      "months": 60,
+      "eur": {
+        "creditPct": 3.3,
+        "debitPct": 3.7
+      },
+      "usd": {
+        "creditPct": 4.887,
+        "debitPct": 5.353
+      },
+      "swapPoints": {
+        "bid": 794.77,
+        "ask": 813.54
+      },
+      "outright": {
+        "bid": 1.23218,
+        "ask": 1.23425
+      }
+    },
+    {
+      "tenor": "6Y",
+      "months": 72,
+      "eur": {
+        "creditPct": 3.35,
+        "debitPct": 3.75
+      },
+      "usd": {
+        "creditPct": 4.995,
+        "debitPct": 5.468
+      },
+      "swapPoints": {
+        "bid": 958.99,
+        "ask": 981.83
+      },
+      "outright": {
+        "bid": 1.2486,
+        "ask": 1.25108
+      }
+    },
+    {
+      "tenor": "7Y",
+      "months": 84,
+      "eur": {
+        "creditPct": 3.4,
+        "debitPct": 3.8
+      },
+      "usd": {
+        "creditPct": 5.09,
+        "debitPct": 5.64
+      },
+      "swapPoints": {
+        "bid": 1115.0,
+        "ask": 1186.0
+      },
+      "outright": {
+        "bid": 1.2642,
+        "ask": 1.2715
+      }
+    },
+    {
+      "tenor": "8Y",
+      "months": 96,
+      "eur": {
+        "creditPct": 3.557,
+        "debitPct": 3.957
+      },
+      "usd": {
+        "creditPct": 5.307,
+        "debitPct": 5.866
+      },
+      "swapPoints": {
+        "bid": 1271.0,
+        "ask": 1352.0
+      },
+      "outright": {
+        "bid": 1.2798,
+        "ask": 1.2881
+      }
+    },
+    {
+      "tenor": "9Y",
+      "months": 108,
+      "eur": {
+        "creditPct": 3.714,
+        "debitPct": 4.114
+      },
+      "usd": {
+        "creditPct": 5.531,
+        "debitPct": 6.102
+      },
+      "swapPoints": {
+        "bid": 1429.0,
+        "ask": 1522.0
+      },
+      "outright": {
+        "bid": 1.2956,
+        "ask": 1.3051
+      }
+    },
+    {
+      "tenor": "10Y",
+      "months": 120,
+      "eur": {
+        "creditPct": 3.87,
+        "debitPct": 4.27
+      },
+      "usd": {
+        "creditPct": 5.779,
+        "debitPct": 6.284
+      },
+      "swapPoints": {
+        "bid": 1603.61,
+        "ask": 1643.65
+      },
+      "outright": {
+        "bid": 1.31306,
+        "ask": 1.31727
+      }
+    }
+  ],
+  "volatility": [
+    {
+      "tenor": "ON",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 4.085,
+      "atmAsk": 5.335,
+      "rr25Bid": -1.125,
+      "rr25Ask": 0.125,
+      "rr10Bid": -1.453,
+      "rr10Ask": -0.203,
+      "bf25Bid": -0.333,
+      "bf25Ask": 0.518,
+      "bf10Bid": -0.202,
+      "bf10Ask": 0.799
+    },
+    {
+      "tenor": "SW",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.855,
+      "atmAsk": 6.305,
+      "rr25Bid": -0.751,
+      "rr25Ask": -0.301,
+      "rr10Bid": -1.21,
+      "rr10Ask": -0.66,
+      "bf25Bid": -0.036,
+      "bf25Ask": 0.214,
+      "bf10Bid": 0.142,
+      "bf10Ask": 0.492
+    },
+    {
+      "tenor": "2W",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.435,
+      "atmAsk": 5.985,
+      "rr25Bid": -0.682,
+      "rr25Ask": -0.132,
+      "rr10Bid": -1.148,
+      "rr10Ask": -0.598,
+      "bf25Bid": -0.032,
+      "bf25Ask": 0.218,
+      "bf10Bid": 0.162,
+      "bf10Ask": 0.512
+    },
+    {
+      "tenor": "1M",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.05,
+      "atmAsk": 5.25,
+      "rr25Bid": -0.521,
+      "rr25Ask": -0.321,
+      "rr10Bid": -0.936,
+      "rr10Ask": -0.686,
+      "bf25Bid": 0.05700000000000001,
+      "bf25Ask": 0.157,
+      "bf10Bid": 0.31,
+      "bf10Ask": 0.45999999999999996
+    },
+    {
+      "tenor": "2M",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.2,
+      "atmAsk": 5.4,
+      "rr25Bid": -0.53,
+      "rr25Ask": -0.33,
+      "rr10Bid": -0.9080000000000001,
+      "rr10Ask": -0.708,
+      "bf25Bid": 0.07,
+      "bf25Ask": 0.17,
+      "bf10Bid": 0.394,
+      "bf10Ask": 0.494
+    },
+    {
+      "tenor": "3M",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.25,
+      "atmAsk": 5.4,
+      "rr25Bid": -0.503,
+      "rr25Ask": -0.353,
+      "rr10Bid": -0.885,
+      "rr10Ask": -0.685,
+      "bf25Bid": 0.088,
+      "bf25Ask": 0.188,
+      "bf10Bid": 0.453,
+      "bf10Ask": 0.553
+    },
+    {
+      "tenor": "6M",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.4,
+      "atmAsk": 5.6,
+      "rr25Bid": -0.527,
+      "rr25Ask": -0.327,
+      "rr10Bid": -0.893,
+      "rr10Ask": -0.643,
+      "bf25Bid": 0.11800000000000001,
+      "bf25Ask": 0.218,
+      "bf10Bid": 0.566,
+      "bf10Ask": 0.716
+    },
+    {
+      "tenor": "9M",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.683,
+      "atmAsk": 5.883,
+      "rr25Bid": -0.538,
+      "rr25Ask": -0.338,
+      "rr10Bid": -0.9199999999999999,
+      "rr10Ask": -0.72,
+      "bf25Bid": 0.152,
+      "bf25Ask": 0.252,
+      "bf10Bid": 0.733,
+      "bf10Ask": 0.8330000000000001
+    },
+    {
+      "tenor": "1Y",
+      "atmConv": "DNS",
+      "deltaConv": "Spot",
+      "bflyConv": "Broker",
+      "atmBid": 5.95,
+      "atmAsk": 6.05,
+      "rr25Bid": -0.475,
+      "rr25Ask": -0.375,
+      "rr10Bid": -0.8659999999999999,
+      "rr10Ask": -0.766,
+      "bf25Bid": 0.209,
+      "bf25Ask": 0.259,
+      "bf10Bid": 0.856,
+      "bf10Ask": 0.956
+    },
+    {
+      "tenor": "2Y",
+      "atmConv": "DNS",
+      "deltaConv": "Forward",
+      "bflyConv": "Broker",
+      "atmBid": 6.365,
+      "atmAsk": 6.565,
+      "rr25Bid": -0.481,
+      "rr25Ask": -0.281,
+      "rr10Bid": -0.89,
+      "rr10Ask": -0.64,
+      "bf25Bid": 0.23600000000000002,
+      "bf25Ask": 0.336,
+      "bf10Bid": 1.004,
+      "bf10Ask": 1.154
+    },
+    {
+      "tenor": "3Y",
+      "atmConv": "DNS",
+      "deltaConv": "Forward",
+      "bflyConv": "Broker",
+      "atmBid": 6.32,
+      "atmAsk": 7.22,
+      "rr25Bid": -0.852,
+      "rr25Ask": 0.048,
+      "rr10Bid": -1.232,
+      "rr10Ask": -0.332,
+      "bf25Bid": 0.009,
+      "bf25Ask": 0.559,
+      "bf10Bid": 0.695,
+      "bf10Ask": 1.445
+    },
+    {
+      "tenor": "5Y",
+      "atmConv": "DNS",
+      "deltaConv": "Forward",
+      "bflyConv": "Broker",
+      "atmBid": 6.65,
+      "atmAsk": 7.6499999999999995,
+      "rr25Bid": -0.873,
+      "rr25Ask": 0.128,
+      "rr10Bid": -1.228,
+      "rr10Ask": -0.22800000000000004,
+      "bf25Bid": -0.085,
+      "bf25Ask": 0.665,
+      "bf10Bid": 0.655,
+      "bf10Ask": 1.505
+    },
+    {
+      "tenor": "10Y",
+      "atmConv": "DNS",
+      "deltaConv": "Forward",
+      "bflyConv": "Broker",
+      "atmBid": 6.79,
+      "atmAsk": 7.89,
+      "rr25Bid": -1.02,
+      "rr25Ask": 0.08,
+      "rr10Bid": -1.39,
+      "rr10Ask": -0.29,
+      "bf25Bid": -0.05,
+      "bf25Ask": 0.65,
+      "bf10Bid": 0.65,
+      "bf10Ask": 1.5500000000000003
+    }
+  ],
+  "parameters": {
+    "Market Rates": null,
+    "Calculated Data": "USD Deposits",
+    "EUR/USD Spot Source": "Composite",
+    "EUR Depo Source": "Composite",
+    "USD Depo Source": "Composite",
+    "EUR/USD Volatility Source": "Composite",
+    "FX Swap Source": "Composite",
+    "Vol Strategy Source": "Composite",
+    "Display Settings": "BidAsk",
+    "Show Conventions": "true",
+    "Payout Profile": null,
+    "Greeks Currency": "USD",
+    "Volatility scenarios": "Fixed implied volatilities by strike",
+    "Bid/Ask assumptions for profit @ calc date": "Same side",
+    "Min": 0,
+    "Max": 0,
+    "Calculation Parameters": null,
+    "Deposit Interpolation": "Linear",
+    "FX Forwards Interpolation": "Linear",
+    "Vol Smile Interpolation": "SVI",
+    "Deposit Flat Extrapolation": "true",
+    "Allow Extrapolation": "true",
+    "Show cash tenor up to vol tenor": "false",
+    "Recalculate expiry date when delivery date is updated": "false"
+  },
+  "legsSnapshot": {
+    "atmVolPct": {
+      "bid": 5.05,
+      "ask": 5.25
+    },
+    "eurDepoPct": {
+      "bid": 2.26,
+      "ask": 2.56
+    },
+    "usdDepoPct": {
+      "bid": 3.687,
+      "ask": 3.993
+    },
+    "fwdPoints": {
+      "bid": 14.14,
+      "ask": 14.19
+    }
+  },
+  "rateConvention": {
+    "depositBid": "term credit \u2014 forward CIP / points",
+    "depositAsk": "term debit \u2014 forward CIP / points",
+    "overnightBid": "overnight cash credit \u2014 cash interest layer",
+    "overnightAsk": "overnight cash debit \u2014 cash interest layer",
+    "units": "percent p.a. in deposits[] and overnightCash; workbook raw deposits were decimal"
+  },
+  "overnightCash": {
+    "base": {
+      "creditPct": 1.78,
+      "debitPct": 2.21
+    },
+    "usd": {
+      "creditPct": 3.5,
+      "debitPct": 3.89
+    }
+  }
+}

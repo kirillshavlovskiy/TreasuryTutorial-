@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<style>
+  body { margin:0; background:#0b1220; color:#e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  a { color:#6ee7b7; text-decoration:none; }
+  a:hover { color:#a7f3d0; }
+</style>
+</helmet>
+
+<section style="display:flex;flex-direction:column;gap:28px;padding:40px">
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <div style="font-size:13px;font-weight:600;color:#fff">Turn 1 · Cash carry · all currencies — hierarchy refinement</div>
+    <div style="font-size:11px;color:#64748b;max-width:760px;line-height:1.6">Same panel, same Tailwind class set. Changes are column order, weight, spacing and header wrap only. Options <a href="#1a">1a</a> collapsed portfolio · <a href="#1b">1b</a> EUR expanded · <a href="#1c">1c</a> narrow 720.</div>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:32px">
+
+    <!-- ─────────── 1a · collapsed portfolio, 1280 ─────────── -->
+    <div id="1a" style="display:flex;flex:0 0 auto;flex-direction:column;gap:10px;width:1240px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1a</span>
+        <span style="font-size:11px;color:#64748b">Collapsed portfolio · 1280 content</span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:rgba(15,23,42,.6);padding:20px;color:#e2e8f0;display:flex;flex-direction:column;gap:20px">
+        <div>
+          <h3 style="margin:0;font-size:14px;font-weight:600;color:#fff">Cash carry</h3>
+          <p style="margin:2px 0 0;font-size:12px;color:#64748b">Hedged vs do-nothing carry across the FX book at forecast horizon Tf.</p>
+        </div>
+
+        <section style="display:flex;flex-direction:column;gap:12px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+          <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px">
+            <div>
+              <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(253,230,138,.9)">Cash carry · all currencies</div>
+              <p style="margin:2px 0 0;font-size:10px;color:#64748b">Aggregated hedged carry @ Tf. Click a CCY row to expand the month schedule for that book.</p>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+              <div style="display:inline-flex;max-width:100%;flex-wrap:wrap;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px">
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">0 month</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">1 month</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">3 months</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">6 months</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">9 months</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:rgba(16,185,129,.2);color:#d1fae5;box-shadow:0 1px 2px rgba(0,0,0,.3)">1 year</button>
+              </div>
+              <button type="button" aria-label="Open cash forecast profile" style="display:inline-flex;height:32px;width:32px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:14px;width:14px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z"></path></svg>
+              </button>
+            </div>
+          </div>
+
+          <div style="overflow-x:auto">
+            <table style="width:100%;min-width:780px;text-align:left;font-size:10px;border-collapse:collapse">
+              <thead>
+                <tr>
+                  <th style="padding:0 8px 2px 0;width:24px"></th>
+                  <th style="padding:0 8px 2px 0"></th>
+                  <th colspan="3" style="padding:0 8px 2px 0;text-align:right;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">Outcome @ Tf ($K)</th>
+                  <th colspan="5" style="padding:0 0 2px 12px;text-align:right;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569;border-left:1px solid #1e293b">Cash &amp; carry split</th>
+                </tr>
+                <tr style="color:#64748b">
+                  <th style="padding:6px 8px;font-weight:500;width:24px"></th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500">CCY</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Total carry</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(253,230,138,.8)">Do nothing</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Δ vs do nothing</th>
+                  <th style="padding:6px 8px 6px 12px;font-weight:500;text-align:right;border-left:1px solid #1e293b">Opening</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right">Hedge CF</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(196,181,253,.8)">Residual int</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(110,231,183,.8)">FWD pts</th>
+                  <th style="padding:6px 0 6px 0;font-weight:500;text-align:right;color:rgba(125,211,252,.8)">USD int</th>
+                </tr>
+              </thead>
+              <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1;cursor:pointer" style-hover="background:rgba(30,41,59,.5)">
+                  <td style="padding:8px;color:#64748b">▸</td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">EUR<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.7)">hedged</span></td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+1380.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+950.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right">
+                    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                      <span style="font-size:11px;font-weight:600;color:#d1fae5">+430.0K</span>
+                      <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"><span style="display:block;height:2px;width:100%;border-radius:1px;background:rgba(52,211,153,.85)"></span></span>
+                    </div>
+                  </td>
+                  <td style="padding:8px 8px 8px 12px;text-align:right;color:rgba(125,211,252,.9);border-left:1px solid #1e293b">+42.00M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,164,175,.8)">−18.50M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#ddd6fe">+120.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#6ee7b7">+850.0K</td>
+                  <td style="padding:8px 0;text-align:right;color:#7dd3fc">+410.0K</td>
+                </tr>
+                <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1;cursor:pointer" style-hover="background:rgba(30,41,59,.5)">
+                  <td style="padding:8px;color:#64748b">▸</td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">GBP</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+40.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+40.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right">
+                    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                      <span style="font-size:11px;font-weight:600;color:#64748b">+0.0K</span>
+                      <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"></span>
+                    </div>
+                  </td>
+                  <td style="padding:8px 8px 8px 12px;text-align:right;color:rgba(125,211,252,.9);border-left:1px solid #1e293b">+8.20M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#475569">—</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#ddd6fe">+40.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#475569">—</td>
+                  <td style="padding:8px 0;text-align:right;color:#475569">—</td>
+                </tr>
+                <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1;cursor:pointer" style-hover="background:rgba(30,41,59,.5)">
+                  <td style="padding:8px;color:#64748b">▸</td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">PLN<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.7)">hedged</span></td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+310.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+180.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right">
+                    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                      <span style="font-size:11px;font-weight:600;color:#d1fae5">+130.0K</span>
+                      <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"><span style="display:block;height:2px;width:30%;border-radius:1px;background:rgba(52,211,153,.85)"></span></span>
+                    </div>
+                  </td>
+                  <td style="padding:8px 8px 8px 12px;text-align:right;color:rgba(125,211,252,.9);border-left:1px solid #1e293b">+15.00M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,164,175,.8)">−6.00M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#fda4af">−20.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#6ee7b7">+220.0K</td>
+                  <td style="padding:8px 0;text-align:right;color:#7dd3fc">+110.0K</td>
+                </tr>
+              </tbody>
+              <tfoot style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                <tr style="border-top:2px solid #475569;background:rgba(15,23,42,.8);color:#e2e8f0">
+                  <td style="padding:8px"></td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">All CCY</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+1730.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+1170.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+560.0K</td>
+                  <td colspan="2" style="padding:8px 8px 8px 12px;text-align:right;color:#64748b;border-left:1px solid #1e293b">—</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#ddd6fe">+140.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#6ee7b7">+1070.0K</td>
+                  <td style="padding:8px 0;text-align:right;color:#7dd3fc">+520.0K</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <sc-if value="{{ showLegend }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;font-size:10px;color:#64748b">
+              <span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;height:8px;width:8px;border-radius:2px;background:#8b5cf6"></span>Residual FCY int</span>
+              <span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;height:8px;width:8px;border-radius:2px;background:#10b981"></span>FWD pts</span>
+              <span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;height:8px;width:8px;border-radius:2px;background:#0ea5e9"></span>USD int / opening</span>
+              <span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;height:8px;width:8px;border-radius:2px;background:#f59e0b"></span>Do nothing</span>
+              <span style="display:inline-flex;align-items:center;gap:6px"><span style="display:inline-block;height:8px;width:8px;border-radius:2px;background:#f43f5e"></span>Cash out</span>
+            </div>
+          </sc-if>
+        </section>
+      </div>
+
+      <ul style="margin:4px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;line-height:1.5">
+        <li>Total carry · Do nothing · Δ moved directly after CCY, so the “which CCY wins” read happens in the first three columns.</li>
+        <li>Split columns pushed right behind a <code style="color:#cbd5e1">border-l border-slate-800</code> divider with a 9px group label — no new component, same head style.</li>
+        <li>Numbers right-aligned; hero columns bumped to <code style="color:#cbd5e1">text-[11px] font-semibold</code>, split columns stay <code style="color:#cbd5e1">text-[10px]</code>.</li>
+        <li>Δ micro-bar sits under the value inside the same cell (emerald-400/85 on slate-700 track).</li>
+        <li>Legend uses only existing semantic tokens.</li>
+      </ul>
+    </div>
+
+    <!-- ─────────── 1b · EUR expanded ─────────── -->
+    <div id="1b" style="display:flex;flex:0 0 auto;flex-direction:column;gap:10px;width:1240px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1b</span>
+        <span style="font-size:11px;color:#64748b">EUR expanded · settles M3/M6/M9/M12</span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:rgba(15,23,42,.6);padding:20px;color:#e2e8f0;display:flex;flex-direction:column;gap:20px">
+        <section style="display:flex;flex-direction:column;gap:12px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+          <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:12px">
+            <div>
+              <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(253,230,138,.9)">Cash carry · all currencies</div>
+              <p style="margin:2px 0 0;font-size:10px;color:#64748b">Aggregated hedged carry @ Tf. Click a CCY row to expand the month schedule for that book.</p>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+              <div style="display:inline-flex;max-width:100%;flex-wrap:wrap;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px">
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">0 month</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">1 month</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">3 months</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">6 months</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">9 months</button>
+                <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:rgba(16,185,129,.2);color:#d1fae5;box-shadow:0 1px 2px rgba(0,0,0,.3)">1 year</button>
+              </div>
+              <button type="button" aria-label="Open cash forecast profile" style="display:inline-flex;height:32px;width:32px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:14px;width:14px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z"></path></svg>
+              </button>
+            </div>
+          </div>
+
+          <div style="overflow-x:auto">
+            <table style="width:100%;min-width:780px;text-align:left;font-size:10px;border-collapse:collapse">
+              <thead>
+                <tr>
+                  <th style="padding:0 8px 2px 0;width:24px"></th>
+                  <th style="padding:0 8px 2px 0"></th>
+                  <th colspan="3" style="padding:0 8px 2px 0;text-align:right;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">Outcome @ Tf ($K)</th>
+                  <th colspan="5" style="padding:0 0 2px 12px;text-align:right;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569;border-left:1px solid #1e293b">Cash &amp; carry split</th>
+                </tr>
+                <tr style="color:#64748b">
+                  <th style="padding:6px 8px;font-weight:500;width:24px"></th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500">CCY</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Total carry</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(253,230,138,.8)">Do nothing</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Δ vs do nothing</th>
+                  <th style="padding:6px 8px 6px 12px;font-weight:500;text-align:right;border-left:1px solid #1e293b">Opening</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right">Hedge CF</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(196,181,253,.8)">Residual int</th>
+                  <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(110,231,183,.8)">FWD pts</th>
+                  <th style="padding:6px 0 6px 0;font-weight:500;text-align:right;color:rgba(125,211,252,.8)">USD int</th>
+                </tr>
+              </thead>
+              <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                <tr style="border-top:1px solid rgba(30,41,59,.8);background:rgba(16,185,129,.12);color:#f1f5f9;cursor:pointer">
+                  <td style="padding:8px;color:#6ee7b7">▾</td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">EUR<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.7)">hedged</span></td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+1380.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+950.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right">
+                    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                      <span style="font-size:11px;font-weight:600;color:#d1fae5">+430.0K</span>
+                      <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"><span style="display:block;height:2px;width:100%;border-radius:1px;background:rgba(52,211,153,.85)"></span></span>
+                    </div>
+                  </td>
+                  <td style="padding:8px 8px 8px 12px;text-align:right;color:rgba(125,211,252,.9);border-left:1px solid #1e293b">+42.00M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,164,175,.8)">−18.50M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#ddd6fe">+120.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#6ee7b7">+850.0K</td>
+                  <td style="padding:8px 0;text-align:right;color:#7dd3fc">+410.0K</td>
+                </tr>
+                <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1;cursor:pointer" style-hover="background:rgba(30,41,59,.5)">
+                  <td style="padding:8px;color:#64748b">▸</td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">GBP</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+40.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+40.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right">
+                    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                      <span style="font-size:11px;font-weight:600;color:#64748b">+0.0K</span>
+                      <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"></span>
+                    </div>
+                  </td>
+                  <td style="padding:8px 8px 8px 12px;text-align:right;color:rgba(125,211,252,.9);border-left:1px solid #1e293b">+8.20M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#475569">—</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#ddd6fe">+40.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#475569">—</td>
+                  <td style="padding:8px 0;text-align:right;color:#475569">—</td>
+                </tr>
+                <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1;cursor:pointer" style-hover="background:rgba(30,41,59,.5)">
+                  <td style="padding:8px;color:#64748b">▸</td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">PLN<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.7)">hedged</span></td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+310.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+180.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right">
+                    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                      <span style="font-size:11px;font-weight:600;color:#d1fae5">+130.0K</span>
+                      <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"><span style="display:block;height:2px;width:30%;border-radius:1px;background:rgba(52,211,153,.85)"></span></span>
+                    </div>
+                  </td>
+                  <td style="padding:8px 8px 8px 12px;text-align:right;color:rgba(125,211,252,.9);border-left:1px solid #1e293b">+15.00M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,164,175,.8)">−6.00M</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#fda4af">−20.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#6ee7b7">+220.0K</td>
+                  <td style="padding:8px 0;text-align:right;color:#7dd3fc">+110.0K</td>
+                </tr>
+              </tbody>
+              <tfoot style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                <tr style="border-top:2px solid #475569;background:rgba(15,23,42,.8);color:#e2e8f0">
+                  <td style="padding:8px"></td>
+                  <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">All CCY</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+1730.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+1170.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+560.0K</td>
+                  <td colspan="2" style="padding:8px 8px 8px 12px;text-align:right;color:#64748b;border-left:1px solid #1e293b">—</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#ddd6fe">+140.0K</td>
+                  <td style="padding:8px 8px 8px 0;text-align:right;color:#6ee7b7">+1070.0K</td>
+                  <td style="padding:8px 0;text-align:right;color:#7dd3fc">+520.0K</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <!-- Expanded detail -->
+          <div style="display:flex;flex-direction:column;gap:12px;border-radius:6px;border:1px solid rgba(16,185,129,.3);background:rgba(2,6,23,.7);padding:12px">
+            <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px">
+              <div style="display:flex;align-items:baseline;gap:8px">
+                <div style="font-size:11px;font-weight:600;color:#d1fae5">EUR · month schedule @ Tf</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:#64748b">12m · 4 settles · strip</div>
+              </div>
+              <button type="button" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Collapse</button>
+            </div>
+
+            <div style="display:grid;gap:8px;grid-template-columns:repeat(5,minmax(0,1fr))">
+              <div style="border-radius:4px;border:1px solid rgba(16,185,129,.4);background:rgba(16,185,129,.1);padding:6px 8px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(167,243,208,.8)">Δ vs do nothing</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#d1fae5">+430.0K</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 8px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Total carry</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">+1380.0K</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 8px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Residual EUR int</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">+120.0K</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 8px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">FWD pts accrued</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">+850.0K</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 8px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">USD int</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">+410.0K</div>
+              </div>
+            </div>
+
+            <div style="display:flex;flex-wrap:wrap;gap:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px">
+              <div><span style="color:#64748b">Opening </span><span style="color:#cbd5e1">+42.00M</span></div>
+              <div><span style="color:#64748b">Income Σ </span><span style="color:#cbd5e1">+38.40M</span></div>
+              <div><span style="color:#64748b">Expenses Σ </span><span style="color:rgba(253,164,175,.8)">−13.20M</span></div>
+              <div><span style="color:#64748b">Hedge CF </span><span style="color:rgba(253,164,175,.8)">−18.50M</span></div>
+              <div><span style="color:#64748b">End EUR </span><span style="color:#f1f5f9">+48.70M</span></div>
+              <div><span style="color:#64748b">End USD </span><span style="color:#f1f5f9">+20.17M</span></div>
+            </div>
+
+            <div style="overflow-x:auto">
+              <table style="width:100%;min-width:960px;text-align:left;font-size:10px;border-collapse:collapse">
+                <thead>
+                  <tr style="color:#64748b">
+                    <th style="padding:4px 8px 4px 0;font-weight:500">Month</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">Start EUR</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">Income</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">Expenses</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">Hedge CF</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">End EUR</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">End USD</th>
+                    <th style="padding:4px 8px 4px 12px;font-weight:500;text-align:right;color:rgba(196,181,253,.8);border-left:1px solid #1e293b">Residual int</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right;color:rgba(110,231,183,.8)">FWD accrued</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right;color:rgba(125,211,252,.8)">USD int</th>
+                    <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right;color:#a7f3d0">Income Σ</th>
+                    <th style="padding:4px 0;font-weight:500;text-align:right;color:#a7f3d0">Enhancement</th>
+                  </tr>
+                </thead>
+                <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">
+                  <sc-for list="{{ monthRows }}" as="m" hint-placeholder-count="12">
+                    <tr style="border-top:1px solid rgba(30,41,59,.8);background:{{ m.rowBg }}">
+                      <td style="padding:4px 8px 4px 0;font-weight:600;color:#fff">{{ m.label }}<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.8)">{{ m.settleBadge }}</span></td>
+                      <td style="padding:4px 8px 4px 0;text-align:right">{{ m.start }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right">{{ m.income }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;color:#f1f5f9">{{ m.expenses }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;color:#f1f5f9">{{ m.hedge }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;color:#f1f5f9">{{ m.endFcy }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;color:#f1f5f9">{{ m.endUsd }}</td>
+                      <td style="padding:4px 8px 4px 12px;text-align:right;color:#ddd6fe;border-left:1px solid #1e293b">{{ m.residual }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;color:#6ee7b7">{{ m.fwd }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;color:#7dd3fc">{{ m.usd }}</td>
+                      <td style="padding:4px 8px 4px 0;text-align:right;font-weight:600;color:#d1fae5">{{ m.incomeSum }}</td>
+                      <td style="padding:4px 0;text-align:right;font-weight:600;color:{{ m.enhColor }}">{{ m.enh }}</td>
+                    </tr>
+                  </sc-for>
+                </tbody>
+                <tfoot style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                  <tr style="border-top:2px solid #475569;background:rgba(15,23,42,.8);color:#e2e8f0">
+                    <td colspan="7" style="padding:8px 8px 8px 0;font-weight:600;color:#fff">Total @ Tf</td>
+                    <td style="padding:8px 8px 8px 12px;text-align:right;font-weight:600;color:#e2e8f0;border-left:1px solid #1e293b">+120.0K</td>
+                    <td style="padding:8px 8px 8px 0;text-align:right;font-weight:600;color:#e2e8f0">+850.0K</td>
+                    <td style="padding:8px 8px 8px 0;text-align:right;font-weight:600;color:#e2e8f0">+410.0K</td>
+                    <td style="padding:8px 8px 8px 0;text-align:right;font-weight:600;color:#d1fae5">+1380.0K</td>
+                    <td style="padding:8px 0;text-align:right;font-weight:600;color:#d1fae5">+430.0K</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <ul style="margin:4px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;line-height:1.5">
+        <li>Metric cards reordered to Δ → Total → split; only Δ keeps its emerald accent, the rest go neutral (<code style="color:#cbd5e1">border-slate-700 bg-slate-900/60</code>) so one card reads as primary.</li>
+        <li>Colour in the expanded panel is now carried by the column heads and by sign (rose for outflows) instead of tinting every number.</li>
+        <li>Selected row: existing <code style="color:#cbd5e1">bg-emerald-500/[0.12]</code> plus the chevron tinted <code style="color:#cbd5e1">text-emerald-300</code> — no new state chrome.</li>
+        <li>Nested title gets a mono sub-line (12m · 4 settles · strip) in <code style="color:#cbd5e1">text-[10px] text-slate-500</code>.</li>
+        <li>Month table carries the same divider before the carry-split group; Income Σ right-aligned as the closing hero column.</li>
+      </ul>
+    </div>
+
+    <!-- ─────────── 1c · narrow 720 ─────────── -->
+    <div id="1c" style="display:flex;flex:0 0 auto;flex-direction:column;gap:10px;width:720px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1c</span>
+        <span style="font-size:11px;color:#64748b">Narrow ~720 · period control on its own row, split columns dropped</span>
+      </div>
+
+      <div style="border-radius:12px;border:1px solid #1e293b;background:rgba(15,23,42,.6);padding:20px;color:#e2e8f0">
+        <section style="display:flex;flex-direction:column;gap:12px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+          <div>
+            <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(253,230,138,.9)">Cash carry · all currencies</div>
+            <p style="margin:2px 0 0;font-size:10px;color:#64748b">Aggregated hedged carry @ Tf. Click a CCY row to expand the month schedule.</p>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+            <div style="display:inline-flex;flex-wrap:wrap;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px">
+              <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">0m</button>
+              <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">1m</button>
+              <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">3m</button>
+              <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">6m</button>
+              <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:none;color:#64748b">9m</button>
+              <button type="button" style="border:0;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;background:rgba(16,185,129,.2);color:#d1fae5;box-shadow:0 1px 2px rgba(0,0,0,.3)">1y</button>
+            </div>
+            <button type="button" aria-label="Open cash forecast profile" style="display:inline-flex;height:32px;width:32px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:none;color:#94a3b8;cursor:pointer">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:14px;width:14px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z"></path></svg>
+            </button>
+          </div>
+
+          <table style="width:100%;text-align:left;font-size:10px;border-collapse:collapse">
+            <thead>
+              <tr style="color:#64748b">
+                <th style="padding:6px 8px 6px 0;font-weight:500;width:24px"></th>
+                <th style="padding:6px 8px 6px 0;font-weight:500">CCY</th>
+                <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Total carry</th>
+                <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(253,230,138,.8)">Do nothing</th>
+                <th style="padding:6px 0;font-weight:500;text-align:right;color:#a7f3d0">Δ vs do nothing</th>
+              </tr>
+            </thead>
+            <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+              <tr style="border-top:1px solid rgba(30,41,59,.8);background:rgba(16,185,129,.12);color:#f1f5f9">
+                <td style="padding:8px 8px 8px 0;color:#6ee7b7">▾</td>
+                <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">EUR<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.7)">hedged</span><div style="margin-top:2px;font-size:9px;font-weight:400;color:#64748b">+42.00M · CF −18.50M</div></td>
+                <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+1380.0K</td>
+                <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+950.0K</td>
+                <td style="padding:8px 0;text-align:right">
+                  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                    <span style="font-size:11px;font-weight:600;color:#d1fae5">+430.0K</span>
+                    <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"><span style="display:block;height:2px;width:100%;border-radius:1px;background:rgba(52,211,153,.85)"></span></span>
+                  </div>
+                </td>
+              </tr>
+              <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1" style-hover="background:rgba(30,41,59,.5)">
+                <td style="padding:8px 8px 8px 0;color:#64748b">▸</td>
+                <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">GBP<div style="margin-top:2px;font-size:9px;font-weight:400;color:#64748b">+8.20M · CF —</div></td>
+                <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+40.0K</td>
+                <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+40.0K</td>
+                <td style="padding:8px 0;text-align:right">
+                  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                    <span style="font-size:11px;font-weight:600;color:#64748b">+0.0K</span>
+                    <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"></span>
+                  </div>
+                </td>
+              </tr>
+              <tr style="border-top:1px solid rgba(30,41,59,.8);color:#cbd5e1" style-hover="background:rgba(30,41,59,.5)">
+                <td style="padding:8px 8px 8px 0;color:#64748b">▸</td>
+                <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">PLN<span style="margin-left:4px;font-size:9px;font-weight:400;color:rgba(110,231,183,.7)">hedged</span><div style="margin-top:2px;font-size:9px;font-weight:400;color:#64748b">+15.00M · CF −6.00M</div></td>
+                <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+310.0K</td>
+                <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+180.0K</td>
+                <td style="padding:8px 0;text-align:right">
+                  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px">
+                    <span style="font-size:11px;font-weight:600;color:#d1fae5">+130.0K</span>
+                    <span style="display:block;height:2px;width:64px;border-radius:1px;background:rgba(51,65,85,.7)"><span style="display:block;height:2px;width:30%;border-radius:1px;background:rgba(52,211,153,.85)"></span></span>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+            <tfoot style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+              <tr style="border-top:2px solid #475569;background:rgba(15,23,42,.8);color:#e2e8f0">
+                <td style="padding:8px 8px 8px 0"></td>
+                <td style="padding:8px 8px 8px 0;font-weight:600;color:#fff">All CCY</td>
+                <td style="padding:8px 8px 8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+1730.0K</td>
+                <td style="padding:8px 8px 8px 0;text-align:right;color:rgba(253,230,138,.9)">+1170.0K</td>
+                <td style="padding:8px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">+560.0K</td>
+              </tr>
+            </tfoot>
+          </table>
+          <p style="margin:0;font-size:10px;color:#64748b">Residual int · FWD pts · USD int collapse into the expanded panel below ~840px.</p>
+        </section>
+      </div>
+
+      <ul style="margin:4px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;line-height:1.5">
+        <li>Header stacks: title block, then the same segmented track full-width with short labels — no second component.</li>
+        <li>Column priority: keep CCY / Total / Do nothing / Δ; Opening + Hedge CF drop to a 9px sub-line under CCY.</li>
+        <li>No horizontal scroll at 720 for the aggregate table.</li>
+      </ul>
+    </div>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;showLegend&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Aggregate table&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const fmtM = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(2) + 'M';
+    const fmtK = v => (v >= 0 ? '+' : '−') + Math.abs(v * 1000).toFixed(1) + 'K';
+    const settles = new Set([3, 6, 9, 12]);
+    let cash = 42.0;
+    let usd = 0;
+    let sum = 0;
+    const monthRows = [];
+    for (let i = 1; i <= 12; i++) {
+      const income = 3.2;
+      const expenses = -1.1;
+      const isSettle = settles.has(i);
+      const hedge = isSettle ? -4.625 : 0;
+      const start = cash;
+      const end = start + income + expenses + hedge;
+      if (isSettle) usd += 5.04;
+      const residual = 0.01;
+      const fwd = 0.0708;
+      const usdInt = usd > 0 ? 0.0038 * usd : 0;
+      const rowIncome = residual + fwd + usdInt;
+      const doNothing = 0.95 / 12;
+      const enh = rowIncome - doNothing;
+      sum += rowIncome;
+      monthRows.push({
+        label: 'M' + i,
+        settleBadge: isSettle ? 'settle' : '',
+        start: fmtM(start),
+        income: fmtM(income),
+        expenses: fmtM(expenses),
+        hedge: isSettle ? fmtM(hedge) : '—',
+        endFcy: fmtM(end),
+        endUsd: usd > 0 ? fmtM(usd) : '—',
+        residual: fmtK(residual),
+        fwd: fmtK(fwd),
+        usd: usdInt > 0 ? fmtK(usdInt) : '—',
+        incomeSum: fmtK(sum),
+        enh: fmtK(enh),
+        enhColor: enh >= 0 ? '#d1fae5' : '#fda4af',
+        rowBg: isSettle ? 'rgba(16,185,129,.06)' : 'transparent',
+      });
+      cash = end;
+    }
+    return {
+      monthRows,
+      showLegend: this.props.showLegend ?? true,
+    };
+  }
+}
+
+</script>
+</body>
+</html>

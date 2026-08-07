@@ -133,12 +133,25 @@ function normalizeHedges(
   const out: Record<string, EntityHedgeBook> = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     if (!value || typeof value !== 'object') continue;
-    const book = value as { bookedHedges?: unknown; hedgeRatios?: unknown };
+    const book = value as {
+      bookedHedges?: unknown;
+      hedgeRatios?: unknown;
+      preparedByCcy?: unknown;
+      carrySessionsByCcy?: unknown;
+    };
     out[key] = {
       bookedHedges: Array.isArray(book.bookedHedges) ? book.bookedHedges : [],
       hedgeRatios:
         book.hedgeRatios && typeof book.hedgeRatios === 'object'
           ? (book.hedgeRatios as Record<string, number>)
+          : {},
+      preparedByCcy:
+        book.preparedByCcy && typeof book.preparedByCcy === 'object'
+          ? (book.preparedByCcy as EntityHedgeBook['preparedByCcy'])
+          : {},
+      carrySessionsByCcy:
+        book.carrySessionsByCcy && typeof book.carrySessionsByCcy === 'object'
+          ? (book.carrySessionsByCcy as EntityHedgeBook['carrySessionsByCcy'])
           : {},
     };
   }
@@ -259,4 +272,70 @@ export function newerSandboxState(
   const aAt = Date.parse(a.updatedAt ?? a.seededAt ?? '') || 0;
   const bAt = Date.parse(b.updatedAt ?? b.seededAt ?? '') || 0;
   return bAt >= aAt ? b : a;
+}
+
+/** Count FX risk profiles — used so a newer empty shell cannot wipe a set-up workspace. */
+export function workspaceFxProfileCount(state: TestSandboxState): number {
+  return state.workspace.entities.reduce(
+    (n, e) =>
+      n
+      + e.dashboards.reduce(
+        (m, d) => m + d.riskProfiles.filter(p => p.type === 'fx').length,
+        0,
+      ),
+    0,
+  );
+}
+
+/**
+ * Prefer the side with real FX setup when timestamps alone would keep an empty
+ * reseed over a completed Task 01 workspace (common after guest/localStorage drift).
+ */
+export function preferWorkspaceSetup(
+  primary: TestSandboxState,
+  secondary: TestSandboxState,
+): Pick<TestSandboxState, 'workspace' | 'group'> {
+  const primaryScore = workspaceFxProfileCount(primary);
+  const secondaryScore = workspaceFxProfileCount(secondary);
+  if (secondaryScore > primaryScore) {
+    return { workspace: secondary.workspace, group: secondary.group };
+  }
+  return { workspace: primary.workspace, group: primary.group };
+}
+
+/**
+ * Union prepared packages across two hedge maps so a newer workspace/UI
+ * snapshot cannot drop Analytics "Prepare" packages still present on the
+ * other copy (local ↔ server merge).
+ */
+export function mergeHedgeBooksPreservingPrepared(
+  primary: Record<string, EntityHedgeBook> | undefined,
+  secondary: Record<string, EntityHedgeBook> | undefined,
+): Record<string, EntityHedgeBook> {
+  const keys = new Set([
+    ...Object.keys(primary ?? {}),
+    ...Object.keys(secondary ?? {}),
+  ]);
+  const out: Record<string, EntityHedgeBook> = {};
+  for (const key of keys) {
+    const a = primary?.[key];
+    const b = secondary?.[key];
+    // Union by ticket id — a primary-only pick silently dropped every
+    // booked hedge on the other side whenever primary had at least one.
+    const byId = new Map((b?.bookedHedges ?? []).map(t => [t.id, t] as const));
+    for (const t of a?.bookedHedges ?? []) byId.set(t.id, t);
+    out[key] = {
+      bookedHedges: [...byId.values()],
+      hedgeRatios: { ...(b?.hedgeRatios ?? {}), ...(a?.hedgeRatios ?? {}) },
+      preparedByCcy: {
+        ...(b?.preparedByCcy ?? {}),
+        ...(a?.preparedByCcy ?? {}),
+      },
+      carrySessionsByCcy: {
+        ...(b?.carrySessionsByCcy ?? {}),
+        ...(a?.carrySessionsByCcy ?? {}),
+      },
+    };
+  }
+  return out;
 }

@@ -1,11 +1,19 @@
 'use client';
 
-import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from 'react';
 import Link from 'next/link';
 import { Simulator, type SimulatorTab } from '@/app/dashboard/Simulator';
 import { TaskScore } from '@/components/test-mode/TaskScore';
 import { HedgingDecisionLayer } from '@/components/test-mode/HedgingDecisionLayer';
 import { ConsolidatedLiveLadder } from '@/components/test-mode/ConsolidatedLiveLadder';
+import { DataUploadPanel } from '@/components/test-mode/DataUploadPanel';
 import { VarAnalyticsPanel } from '@/components/test-mode/VarAnalyticsPanel';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -42,11 +50,15 @@ import {
   scoreTask01,
   simSeedForEntity,
   setupLabel,
+  VAR_PROFILE_OPTIONS,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
   TASK01_REQUIRED_FX_INPUTS,
+  type CarryProfileSessionV1,
   type EntityHedgeBook,
+  type ForecastHedgeStructure,
   type HedgeTicket,
+  type PreparedHedgeProfile,
   type SandboxUiState,
   type TaskAnswers,
   type TaskStepId,
@@ -100,6 +112,8 @@ const TASK01_TAB_LABELS: Partial<Record<SimulatorTab, string>> = {
   hedging: 'Hedging Decision',
   liveLadder: 'Consolidated Live Ladder',
   analytics: 'Analytics',
+  liquidity: 'Liquidity',
+  dataUpload: 'Market data',
   sensitivity: 'Sensitivity',
   monteCarlo: 'Monte Carlo',
 };
@@ -121,6 +135,8 @@ function hiddenTabsForLayers(
   }
   if (!analytical.includes('riskMetrics')) {
     hide.add('analytics');
+    hide.add('liquidity'); // cash / carry sits with Analytics layer
+    hide.add('dataUpload'); // market data sits with Analytics layer
   }
   // Sensitivity is never offered in Task Mode (see TASK01_BASE_HIDDEN).
   if (!analytical.includes('monteCarlo')) hide.add('monteCarlo');
@@ -232,17 +248,28 @@ export function Task01App({
   const [resumeReady, setResumeReady] = useState(false);
   const [serverPersistent, setServerPersistent] = useState(false);
 
-  const currentUi = (): SandboxUiState => ({
+  /** Always-current hedges/UI for persist — avoids stale closures wiping prepared. */
+  const hedgesRef = useRef(hedgesByEntityId);
+  hedgesRef.current = hedgesByEntityId;
+  const uiRef = useRef<SandboxUiState>({
     view,
     entityId,
     dashboardId,
     activeProfileId,
   });
+  uiRef.current = {
+    view,
+    entityId,
+    dashboardId,
+    activeProfileId,
+  };
+
+  const currentUi = (): SandboxUiState => uiRef.current;
 
   const persist = (
     next: TestSandboxState,
-    hedges: Record<string, EntityHedgeBook> = hedgesByEntityId,
-    ui: SandboxUiState = currentUi(),
+    hedges: Record<string, EntityHedgeBook> = hedgesRef.current,
+    ui: SandboxUiState = uiRef.current,
   ) => {
     const saved = saveSandboxPersistent(
       storageKey,
@@ -254,6 +281,8 @@ export function Task01App({
       taskId,
     );
     setState(saved);
+    hedgesRef.current = saved.hedgesByEntityId ?? {};
+    setHedgesByEntityId(hedgesRef.current);
     return saved;
   };
 
@@ -267,8 +296,10 @@ export function Task01App({
       );
       if (cancelled) return;
       setServerPersistent(persistent);
+      const loadedHedges = loaded.hedgesByEntityId ?? {};
+      hedgesRef.current = loadedHedges;
       setState(loaded);
-      setHedgesByEntityId(loaded.hedgesByEntityId ?? {});
+      setHedgesByEntityId(loadedHedges);
       const ui = loaded.ui ?? defaultSandboxUi();
       setView(ui.view);
       setEntityId(ui.entityId);
@@ -294,7 +325,7 @@ export function Task01App({
     ) {
       return;
     }
-    persist(state, hedgesByEntityId, ui);
+    persist(state, hedgesRef.current, ui);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional navigation snapshot
   }, [view, entityId, dashboardId, activeProfileId, resumeReady]);
 
@@ -315,15 +346,22 @@ export function Task01App({
       setState(current => {
         if (!current) return current;
         const resolved = next(current);
-        return saveSandboxPersistent(
+        const saved = saveSandboxPersistent(
           storageKey,
           {
             ...resolved,
-            hedgesByEntityId,
-            ui: currentUi(),
+            // Prefer live hedges ref — never a render-closure snapshot.
+            hedgesByEntityId: hedgesRef.current,
+            ui: uiRef.current,
           },
           taskId,
         );
+        const hedges = saved.hedgesByEntityId ?? hedgesRef.current;
+        hedgesRef.current = hedges;
+        // Keep React hedge state in lockstep — otherwise a later persist can
+        // rewrite Neon/localStorage from a stale empty prepared book.
+        setHedgesByEntityId(hedges);
+        return saved;
       });
       return;
     }
@@ -337,6 +375,7 @@ export function Task01App({
   ) => {
     setHedgesByEntityId(prev => {
       const resolved = typeof next === 'function' ? next(prev) : next;
+      hedgesRef.current = resolved;
       setState(current => {
         if (!current) return current;
         return saveSandboxPersistent(
@@ -344,12 +383,7 @@ export function Task01App({
           {
             ...current,
             hedgesByEntityId: resolved,
-            ui: {
-              view,
-              entityId,
-              dashboardId,
-              activeProfileId,
-            },
+            ui: uiRef.current,
           },
           taskId,
         );
@@ -900,7 +934,8 @@ function AnswersPanel({
       <label className="mt-2 block text-[11px] text-slate-400">
         Largest mismatch (local M)
         <span className="mt-0.5 block text-[10px] text-slate-600">
-          Stock now, avg P&L pipeline, or total forecast — same basis as Analytics
+          Exposure @ Δ1 under your VaR profile (Simple / Time-weighted / Growth
+          path)
         </span>
         <input
           value={answers.largestMismatchAmount}
@@ -942,17 +977,46 @@ function AnswersPanel({
           className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
         />
       </label>
+      <div className="mt-2 block text-[11px] text-slate-400">
+        VaR profile (how VaR evolves over time)
+        <span className="mt-0.5 block text-[10px] text-slate-600">
+          Not a hedge regime — Cash / Target are Decision hedging only. Pick the
+          Analytics VaR calculation method.
+        </span>
+        <div
+          className="mt-1.5 flex flex-wrap gap-1"
+          role="group"
+          aria-label="VaR profile"
+        >
+          {VAR_PROFILE_OPTIONS.map(opt => {
+            const parsed = parseVarExposureBasis(answers.varExposureBasis);
+            const on = parsed === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                aria-pressed={on}
+                title={opt.description}
+                onClick={() =>
+                  onChange({ ...answers, varExposureBasis: opt.id })
+                }
+                className={`rounded-md border px-2 py-1 text-[10px] font-semibold ${
+                  on
+                    ? 'border-emerald-500/50 bg-emerald-500/20 text-emerald-100'
+                    : 'border-slate-700 bg-slate-950 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
       <label className="mt-2 block text-[11px] text-slate-400">
-        Exposure (stock / avgBuildup / totalBuildup)
-        <input
-          value={answers.varExposureBasis}
-          onChange={e => onChange({ ...answers, varExposureBasis: e.target.value })}
-          placeholder="basis"
-          className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
-        />
-      </label>
-      <label className="mt-2 block text-[11px] text-slate-400">
-        EUR VaR @ Δ=1 for setup ($K)
+        EUR VaR @ Δ=1 for that profile ($K)
+        <span className="mt-0.5 block text-[10px] text-slate-600">
+          From Analytics / Risk Metrics under the VaR profile above
+        </span>
         <input
           value={answers.eurVarUsdK}
           onChange={e => onChange({ ...answers, eurVarUsdK: e.target.value })}
@@ -962,7 +1026,7 @@ function AnswersPanel({
       </label>
       {setup && (
         <p className="mt-2 text-[10px] text-slate-500">
-          Declared setup: {setupLabel(setup)} — score VaR against that regime.
+          Declared setup: {setupLabel(setup)} — score VaR against that profile.
         </p>
       )}
     </div>
@@ -1039,6 +1103,9 @@ function GroupConsolidatedView({
     rows: RowState[];
     forecastProfile: ForecastProfileState;
   }>({ rows: [], forecastProfile: DEFAULT_FORECAST_PROFILE });
+  /** Shared Analytics ↔ Decision: bullet vs rolling strip. */
+  const [hedgeStructure, setHedgeStructure] =
+    useState<ForecastHedgeStructure>('bullet');
   const includedNames = entities.map(e => e.name).join(' · ') || 'none';
 
   const entityIds = useMemo(
@@ -1051,6 +1118,8 @@ function GroupConsolidatedView({
   );
   const groupBook = hedgesByEntityId[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
   const hedgeRatios = groupBook.hedgeRatios;
+  const preparedByCcy = groupBook.preparedByCcy ?? {};
+  const carrySessionsByCcy = groupBook.carrySessionsByCcy ?? {};
 
   const setHedgeRatios = (ratios: Record<string, number>) => {
     onHedgesByEntityIdChange(prev => {
@@ -1058,8 +1127,11 @@ function GroupConsolidatedView({
       return {
         ...prev,
         [GROUP_HEDGE_SCOPE]: {
+          ...g,
           bookedHedges: g.bookedHedges,
           hedgeRatios: ratios,
+          preparedByCcy: g.preparedByCcy ?? {},
+          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
         },
       };
     });
@@ -1077,6 +1149,36 @@ function GroupConsolidatedView({
     );
   };
 
+  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+    onHedgesByEntityIdChange(prev => {
+      const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+      return {
+        ...prev,
+        [GROUP_HEDGE_SCOPE]: {
+          ...g,
+          preparedByCcy: next,
+          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
+        },
+      };
+    });
+  };
+
+  const setCarrySessionsByCcy = (
+    next: Record<string, CarryProfileSessionV1>,
+  ) => {
+    onHedgesByEntityIdChange(prev => {
+      const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+      return {
+        ...prev,
+        [GROUP_HEDGE_SCOPE]: {
+          ...g,
+          preparedByCcy: g.preparedByCcy ?? {},
+          carrySessionsByCcy: next,
+        },
+      };
+    });
+  };
+
   /** Reset incremental hedge % after a book (ticket list updated via onBookedHedgesChange). */
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgesByEntityIdChange(prev => {
@@ -1084,8 +1186,11 @@ function GroupConsolidatedView({
       return {
         ...prev,
         [GROUP_HEDGE_SCOPE]: {
+          ...g,
           bookedHedges: g.bookedHedges,
           hedgeRatios: { ...g.hedgeRatios, [ticket.ccy]: 0 },
+          preparedByCcy: g.preparedByCcy ?? {},
+          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
         },
       };
     });
@@ -1149,6 +1254,11 @@ function GroupConsolidatedView({
               onHedgeRatiosChange={setHedgeRatios}
               bookedHedges={bookedHedges}
               onBookedHedgesChange={setBookedHedges}
+              preparedByCcy={preparedByCcy}
+              onPreparedByCcyChange={setPreparedByCcy}
+              ratesScopeId={GROUP_HEDGE_SCOPE}
+              hedgeStructure={hedgeStructure}
+              onHedgeStructureChange={setHedgeStructure}
               onBookHedge={handleBookHedge}
               varSetup={varSetup}
               bookRows={analyticsBook.rows}
@@ -1176,9 +1286,22 @@ function GroupConsolidatedView({
               onHedgeRatiosChange={setHedgeRatios}
               bookedHedges={bookedHedges}
               onBookedHedgesChange={setBookedHedges}
+              preparedByCcy={preparedByCcy}
+              onPreparedByCcyChange={setPreparedByCcy}
+              hedgeStructure={hedgeStructure}
+              onHedgeStructureChange={setHedgeStructure}
               title="Analytics — Group FX VaR setup"
               bookRows={analyticsBook.rows}
               forecastProfile={analyticsBook.forecastProfile}
+              ratesScopeId={GROUP_HEDGE_SCOPE}
+            />
+          }
+          dataUploadPanel={
+            <DataUploadPanel
+              scopeId={GROUP_HEDGE_SCOPE}
+              scopeLabel={groupDashboardName}
+              currencies={risk.map(r => r.bar.ccy)}
+              title={`Market data — ${groupDashboardName}`}
             />
           }
         />
@@ -1768,11 +1891,21 @@ function DashboardView({
     rows: RowState[];
     forecastProfile: ForecastProfileState;
   }>({ rows: [], forecastProfile: DEFAULT_FORECAST_PROFILE });
+  /** Shared Analytics ↔ Decision: bullet vs rolling strip. */
+  const [hedgeStructure, setHedgeStructure] =
+    useState<ForecastHedgeStructure>('bullet');
   const hedgeRatios = hedgeBook.hedgeRatios;
   const bookedHedges = hedgeBook.bookedHedges;
+  const preparedByCcy = hedgeBook.preparedByCcy ?? {};
+  const carrySessionsByCcy = hedgeBook.carrySessionsByCcy ?? {};
 
   const setHedgeRatios = (ratios: Record<string, number>) => {
-    onHedgeBookChange(prev => ({ ...prev, hedgeRatios: ratios }));
+    onHedgeBookChange(prev => ({
+      ...prev,
+      hedgeRatios: ratios,
+      preparedByCcy: prev.preparedByCcy ?? {},
+      carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
+    }));
   };
   const setBookedHedges = (tickets: HedgeTicket[]) => {
     onHedgeBookChange(prev => ({
@@ -1782,12 +1915,32 @@ function DashboardView({
         entityId: entity.id,
         entityName: entity.name,
       })),
+      preparedByCcy: prev.preparedByCcy ?? {},
+      carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
+    }));
+  };
+  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+    onHedgeBookChange(prev => ({
+      ...prev,
+      preparedByCcy: next,
+      carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
+    }));
+  };
+  const setCarrySessionsByCcy = (
+    next: Record<string, CarryProfileSessionV1>,
+  ) => {
+    onHedgeBookChange(prev => ({
+      ...prev,
+      preparedByCcy: prev.preparedByCcy ?? {},
+      carrySessionsByCcy: next,
     }));
   };
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgeBookChange(prev => ({
       ...prev,
       hedgeRatios: { ...prev.hedgeRatios, [ticket.ccy]: 0 },
+      preparedByCcy: prev.preparedByCcy ?? {},
+      carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
   const fractions = resolveTimingFractions(dashboard.timing ?? {
@@ -1979,6 +2132,11 @@ function DashboardView({
                         onHedgeRatiosChange={setHedgeRatios}
                         bookedHedges={bookedHedges}
                         onBookedHedgesChange={setBookedHedges}
+                        preparedByCcy={preparedByCcy}
+                        onPreparedByCcyChange={setPreparedByCcy}
+                        ratesScopeId={entity.id}
+                        hedgeStructure={hedgeStructure}
+                        onHedgeStructureChange={setHedgeStructure}
                         onBookHedge={handleBookHedge}
                         varSetup={varSetup}
                         bookRows={analyticsBook.rows}
@@ -2010,9 +2168,22 @@ function DashboardView({
                         onHedgeRatiosChange={setHedgeRatios}
                         bookedHedges={bookedHedges}
                         onBookedHedgesChange={setBookedHedges}
+                        preparedByCcy={preparedByCcy}
+                        onPreparedByCcyChange={setPreparedByCcy}
+                        hedgeStructure={hedgeStructure}
+                        onHedgeStructureChange={setHedgeStructure}
                         title={`Analytics — ${entity.name} VaR setup`}
                         bookRows={analyticsBook.rows}
                         forecastProfile={analyticsBook.forecastProfile}
+                        ratesScopeId={entity.id}
+                      />
+                    }
+                    dataUploadPanel={
+                      <DataUploadPanel
+                        scopeId={entity.id}
+                        scopeLabel={entity.name}
+                        currencies={entityRisk.map(r => r.bar.ccy)}
+                        title={`Market data — ${entity.name}`}
                       />
                     }
                   />

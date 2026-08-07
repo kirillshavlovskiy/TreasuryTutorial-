@@ -18,6 +18,7 @@ import {
   isLiveHedgeTicket,
   mergeRollingStripIntoBook,
   needsRollingHedges,
+  packSelectedStripEdges,
   proposeRollingHedgeTickets,
   resyncBookedRollingStrips,
   buildStripHedgedVarProfile,
@@ -27,7 +28,6 @@ import {
   varSetupForHedgeStructure,
   varSetupForPathHedgeRegime,
   removeHedgeTicketOrStrip,
-  rollingHedgeAtMonth,
   buildExposurePathPoints,
   buildResidualPath,
   budgetRiskUsdM,
@@ -39,6 +39,7 @@ import {
   computeParametricVarUsdM,
   cumulativeForecastErrorStdM,
   equalVarLinearHedgeNotionalLocalM,
+  equalVarNotionalAtTenureLocalM,
   eurRefExposureM,
   expectedEurVarUsdM,
   growingExposurePathFactor,
@@ -571,7 +572,13 @@ describe('Book hedge tickets', () => {
   });
 
   it('booked ticket nets into exposure; VaR @ Δ1 stays on open; avg basis reopens residual', () => {
-    const stockSetup = setupOf({ confidencePct: 99, exposureBasis: 'stock', horizon: '6m' });
+    // forecastMonths=0 so stock ticket can zero path residual (no F×T buildup).
+    const stockSetup = setupOf({
+      confidencePct: 99,
+      exposureBasis: 'stock',
+      horizon: '6m',
+      forecastMonths: 0,
+    });
     const risk = computeConsolidatedRisk(seedNordtechWorkspace().entities, stockSetup);
     const eur = risk.find(r => r.bar.ccy === 'EUR')!;
     const ticket = proposeBookHedge(eur, 'stock', stockSetup);
@@ -590,7 +597,11 @@ describe('Book hedge tickets', () => {
     expect(stockRow.delta).toBe(0);
     expect(stockRow.varAfterUsdM).toBeLessThan(1e-9);
 
-    const avgSetup: VarSetup = { ...stockSetup, exposureBasis: 'avgBuildup' };
+    const avgSetup: VarSetup = {
+      ...stockSetup,
+      exposureBasis: 'avgBuildup',
+      forecastMonths: 1,
+    };
     const afterSwitch = buildHedgeVarSummary(risk, {}, avgSetup, [ticket]);
     const avgRow = afterSwitch.rows.find(r => r.ccy === 'EUR')!;
     // Exposure @ Δ1 = accrued end (not Ē); stock ticket leaves forecast residual.
@@ -639,7 +650,12 @@ describe('Book hedge tickets', () => {
       setup,
     );
     const eur = summary.rows.find(r => r.ccy === 'EUR')!;
-    expect(Math.abs(eur.equalVarHedgeLocalM)).toBeCloseTo(Math.abs(amountLocalM), 5);
+    // VaR-neutral N = Equal-VaR at Tf (matches bullet/strip final), not Th-only.
+    const eqAtTf = equalVarNotionalAtTenureLocalM(S, F, 'EUR', setup, 12);
+    expect(Math.abs(eur.equalVarHedgeLocalM)).toBeCloseTo(Math.abs(eqAtTf), 5);
+    expect(Math.abs(eur.equalVarHedgeLocalM)).toBeGreaterThan(
+      Math.abs(amountLocalM),
+    );
     // 100% Decision hedge → Hedge N = Target N (same sign / cover).
     expect(eur.hedgeNotionalLocalM).toBeCloseTo(eur.targetHedgeLocalM, 5);
     expect(Math.abs(eur.targetHedgeLocalM)).toBeGreaterThan(
@@ -718,9 +734,16 @@ describe('Book hedge tickets', () => {
     });
     expect(synced).not.toBeNull();
     expect(synced!.EUR).toBeCloseTo(freshVn, 5);
-    // After resync, Δ should match equal-VaR cover (~0).
+    // After resync, Hedge N = Equal-VaR; residual formula still leaves end gap.
     const after = buildHedgeVarSummary(risk, synced!, avg);
-    expect(after.rows.find(r => r.ccy === 'EUR')!.delta).toBe(0);
+    const eurAfter = after.rows.find(r => r.ccy === 'EUR')!;
+    expect(eurAfter.hedgeNotionalLocalM).toBeCloseTo(eurA.equalVarHedgeLocalM, 4);
+    expect(eurAfter.delta).toBeGreaterThan(0);
+    expect(eurAfter.delta).toBeCloseTo(
+      Math.abs(eurAfter.residualLocalM) /
+        Math.abs(eurAfter.targetHedgeLocalM),
+      5,
+    );
     // Idempotent when already on the chip under the current book.
     expect(resyncHedgeRatiosToNearestRegime(after.rows, synced!)).toBeNull();
   });
@@ -864,13 +887,18 @@ describe('Book hedge tickets', () => {
     const flows = Array.from({ length: 6 }, () => F);
     const path = buildExposurePathPoints(S, flows, 6);
     const stock = buildRollingHedgeEdges(S, flows, setup, 'stockStart');
-    const mid = buildRollingHedgeEdges(S, flows, setup, 'varNeutral');
+    const mid = buildRollingHedgeEdges(S, flows, setup, 'varNeutral', {
+      ccy: 'EUR',
+      varSetup: setup,
+    });
     const end = buildRollingHedgeEdges(S, flows, setup, 'windowEnd');
     expect(stock).toHaveLength(2);
     // Cash/stock roll: H = S at each window start
     expect(stock[0]!.hedgeLocalM).toBeCloseTo(1.9, 5);
     expect(stock[1]!.hedgeLocalM).toBeCloseTo(5.5, 5);
-    expect(mid[0]!.hedgeLocalM).toBeCloseTo(3.7, 5);
+    // VN strip = per-window path-VaR CoG H=e(∫t e²/∫e²)
+    expect(mid[0]!.hedgeLocalM).toBeCloseTo(4.241, 2);
+    expect(mid[1]!.hedgeLocalM).toBeCloseTo(7.590, 2);
     expect(end[0]!.hedgeLocalM).toBeCloseTo(5.5, 5);
     const beStock = hedgeBreakevensForStrip(path, stock, 'stockStart');
     expect(beStock).toHaveLength(2);
@@ -883,6 +911,51 @@ describe('Book hedge tickets', () => {
     const beEnd = hedgeBreakevensForStrip(path, end, 'windowEnd');
     expect(beEnd[0]!.t).toBeCloseTo(3, 5);
     expect(beEnd[1]!.t).toBeCloseTo(6, 5);
+  });
+
+  it('custom endMonths keep applied settles — do not append phantom Tf', () => {
+    const S = 1.9;
+    const F = 1.2;
+    const setup = setupOf({
+      confidencePct: 95,
+      exposureBasis: 'stock',
+      horizon: '3m',
+      forecastMonths: 12,
+    });
+    const flows = Array.from({ length: 12 }, () => F);
+    // Optimizer-style strip ending before Tf (e.g. M6.4 / M8.4 / M8.8).
+    const applied = [6.4, 8.4, 8.8];
+    const edges = buildRollingHedgeEdges(S, flows, setup, 'stockStart', {
+      endMonths: applied,
+      ccy: 'EUR',
+      varSetup: setup,
+    });
+    expect(edges).toHaveLength(3);
+    expect(edges.map(e => e.endMonth)).toEqual([6.4, 8.4, 8.8]);
+    expect(edges[edges.length - 1]!.endMonth).toBeLessThan(12 - 1e-9);
+  });
+
+  it('windowEnd custom settles cover full E(Tf) — no underhedge vs Target', () => {
+    const S = 1.9;
+    const F = 1.2;
+    const setup = setupOf({
+      confidencePct: 95,
+      exposureBasis: 'totalBuildup',
+      horizon: '3m',
+      forecastMonths: 12,
+    });
+    const flows = Array.from({ length: 12 }, () => F);
+    const applied = [6.4, 8.4, 8.8];
+    const edges = buildRollingHedgeEdges(S, flows, setup, 'windowEnd', {
+      endMonths: applied,
+    });
+    const eTf = accruedPositionFromScheduleM(S, flows, 12);
+    expect(edges).toHaveLength(3);
+    expect(edges.map(e => e.endMonth)).toEqual([6.4, 8.4, 8.8]);
+    expect(edges[edges.length - 1]!.hedgeLocalM).toBeCloseTo(eTf, 6);
+    const legs = stripForwardLegsFromEdges(edges);
+    const sum = legs.reduce((s, l) => s + l.amountLocalM, 0);
+    expect(sum).toBeCloseTo(eTf, 6);
   });
 
   it('rolling strip: all legs live from M0; incremental size; own tenure', () => {
@@ -1073,6 +1146,43 @@ describe('Book hedge tickets', () => {
       0,
       5,
     );
+
+    // Untick M0–M6 → its Δ folds into M0–M12 (same Σ, later maturity).
+    const packed = packSelectedStripEdges(
+      edges,
+      legs,
+      { 0: false, 1: true },
+      12,
+    );
+    expect(packed).toHaveLength(1);
+    expect(packed[0]!.startMonth).toBeCloseTo(0, 5);
+    expect(packed[0]!.endMonth).toBeCloseTo(12, 5);
+    expect(packed[0]!.hedgeLocalM).toBeCloseTo(16.3, 5);
+
+    // Target strip: H=Σ=16.3 from M0 → |e−H|@M6 = 7.2 (≠ 0); 0 only at Tf.
+    const targetProfile = buildStripHedgedVarProfile(
+      S,
+      F,
+      'EUR',
+      setup,
+      [
+        { amountLocalM: 9.1, tenureMonths: 6, recognizeFromMonths: 0 },
+        { amountLocalM: 7.2, tenureMonths: 12, recognizeFromMonths: 0 },
+      ],
+      flows,
+      1,
+      16.3,
+      12,
+    );
+    const at6 = targetProfile.find(p => Math.abs(p.t - 6) < 1e-6)!;
+    const at12 = targetProfile.find(p => Math.abs(p.t - 12) < 1e-6)!;
+    expect(at6.cumulCoverLocalM).toBeCloseTo(16.3, 5);
+    expect(at6.exposureLocalM).toBeCloseTo(9.1, 5);
+    expect(at6.residualCoverLocalM).toBeCloseTo(7.2, 5);
+    expect(at6.hedgedVarUsdM).toBeGreaterThan(1e-6);
+    expect(at12.residualCoverLocalM).toBeCloseTo(0, 5);
+    expect(at12.hedgedVarUsdM).toBeCloseTo(0, 5);
+
     const resid6 = stripResidualVarAtMonthsUsdM(
       S,
       F,
@@ -1212,6 +1322,7 @@ describe('Book hedge tickets', () => {
       flows,
       setup,
       'varNeutral',
+      { ccy: 'EUR', varSetup: setup },
     );
     const stripVn = proposeRollingHedgeTickets(
       'EUR',
@@ -1220,11 +1331,12 @@ describe('Book hedge tickets', () => {
       'simpleAvg',
       flows,
     );
-    // VN strip: partial cover → Σ leg VaR < VaR(Tf), residual VaR remains.
+    // VN strip: per-window CoG — final ≈ last-window H (~7.59).
     const afterVn = buildHedgeVarSummary(risk, {}, stripSetup, stripVn);
     const eurVn = afterVn.rows.find(r => r.ccy === 'EUR')!;
     expect(eurVn.varAfterUsdM).toBeGreaterThan(1e-6);
-    expect(bookedNotionalLocalM(stripVn, 'EUR')).toBeCloseTo(7.3, 5);
+    expect(bookedNotionalLocalM(stripVn, 'EUR')).toBeCloseTo(7.590, 2);
+    expect(Math.abs(eurVn.hedgeNotionalLocalM)).toBeCloseTo(7.590, 2);
     expect(Math.abs(eurVn.hedgeNotionalLocalM)).toBeLessThan(
       Math.abs(eurVn.targetHedgeLocalM) - 1e-6,
     );
@@ -1283,7 +1395,7 @@ describe('Book hedge tickets', () => {
     );
   });
 
-  it('custom uneven schedule: Exposure=end 5.8, Equal-VaR N=time-avg Ē', () => {
+  it('custom uneven schedule: Exposure=Ē; VN = time-weighted Ē (not path CoG)', () => {
     const S = 1.9;
     const flows = [1.2, 1.3, 1.4]; // Σ = 3.9, end = 5.8
     const setup = setupOf({
@@ -1315,7 +1427,6 @@ describe('Book hedge tickets', () => {
     const risk = computeConsolidatedRisk(seedNordtechWorkspace().entities, setup);
     const summary = buildHedgeVarSummary(risk, {}, setup, [], { EUR: flows });
     const eur = summary.rows.find(r => r.ccy === 'EUR')!;
-    // Exposure @ Δ1 = time-weighted Ē; Equal-VaR N ≈ that Ē (not mid / end).
     expect(eur.openExposureLocalM).toBeCloseTo(tw, 5);
     expect(Math.abs(eur.equalVarHedgeLocalM)).toBeCloseTo(tw, 2);
     expect(Math.abs(amountLocalM)).toBeCloseTo(tw, 2);
@@ -1324,7 +1435,27 @@ describe('Book hedge tickets', () => {
     );
   });
 
-  it('growth-path Equal-VaR N is RMS-equivalent, not end exposure', () => {
+  it('VN differs by regime: simple/TW → Ē; growth → path CoG', () => {
+    const S = 1.9;
+    const F = 1.2;
+    const base = {
+      confidencePct: 99 as const,
+      horizon: '1y' as const,
+      forecastMonths: 12,
+    };
+    const growth = setupOf({ ...base, exposureBasis: 'totalBuildup' });
+    const simple = setupOf({ ...base, exposureBasis: 'simpleAvg' });
+    const tw = setupOf({ ...base, exposureBasis: 'avgBuildup' });
+    const Hg = equalVarNotionalAtTenureLocalM(S, F, 'EUR', growth, 12);
+    const Hs = equalVarNotionalAtTenureLocalM(S, F, 'EUR', simple, 12);
+    const Ht = equalVarNotionalAtTenureLocalM(S, F, 'EUR', tw, 12);
+    expect(Hs).toBeCloseTo(9.1, 5);
+    expect(Ht).toBeCloseTo(9.1, 5);
+    expect(Hg).toBeCloseTo(12.242, 2);
+    expect(Hg).toBeGreaterThan(Hs + 1);
+  });
+
+  it('growth-path VaR-neutral N is path-VaR CoG, above Ē and RMS', () => {
     const setup = setupOf({
       confidencePct: 99,
       exposureBasis: 'totalBuildup',
@@ -1334,6 +1465,7 @@ describe('Book hedge tickets', () => {
     const S = 1.9;
     const F = 1.2;
     const pathVar = computeAnalyticsVarUsdM(S, F, 'EUR', setup);
+    // Legacy path-VaR invert (explicit) still yields RMS — not the VN chip.
     const { amountLocalM, capped } = equalVarLinearHedgeNotionalLocalM(
       S,
       F,
@@ -1342,14 +1474,19 @@ describe('Book hedge tickets', () => {
       pathVar,
     );
     const endExp = S + F * 3; // 5.5
+    const eBar = (S + endExp) / 2; // 3.7
+    const rms = 3.843;
     expect(capped).toBe(false);
-    expect(Math.abs(amountLocalM)).toBeCloseTo(3.843, 2);
+    expect(Math.abs(amountLocalM)).toBeCloseTo(rms, 2);
     expect(Math.abs(amountLocalM)).toBeLessThan(endExp - 0.5);
     const risk = computeConsolidatedRisk(seedNordtechWorkspace().entities, setup);
     const atTarget = buildHedgeVarSummary(risk, { EUR: 1 }, setup);
     const eurT = atTarget.rows.find(r => r.ccy === 'EUR')!;
-    // Exposure @ Δ1 = accrued end-of-window; Equal-VaR RMS bullet < |E_end|.
+    // Live VaR VN = CoG of e² mass (~4.24) > RMS > Ē.
     expect(eurT.openExposureLocalM).toBeCloseTo(endExp, 5);
+    expect(Math.abs(eurT.equalVarHedgeLocalM)).toBeCloseTo(4.241, 2);
+    expect(Math.abs(eurT.equalVarHedgeLocalM)).toBeGreaterThan(rms);
+    expect(Math.abs(eurT.equalVarHedgeLocalM)).toBeGreaterThan(eBar);
     expect(Math.abs(eurT.equalVarHedgeLocalM)).toBeLessThan(
       Math.abs(eurT.openExposureLocalM) - 0.5,
     );

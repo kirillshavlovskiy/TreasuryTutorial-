@@ -140,3 +140,59 @@
 .sim-dark [class*="border-orange-"]  { border-color: rgba(249,115,22,0.40); }
 .sim-dark [class*="border-red-"]     { border-color: rgba(239,68,68,0.40); }
 .sim-dark [class*="border-rose-"]    { border-color: rgba(244,63,94,0.40); }
+
+/* ── Light spreadsheet panels inside dark sim (portaled modals) ─────────── */
+.sim-light-panel,
+.sim-dark .sim-light-panel {
+  color: #111827;
+}
+.sim-light-panel .bg-white,
+.sim-dark .sim-light-panel .bg-white { background-color: #ffffff !important; }
+.sim-light-panel .bg-gray-50,
+.sim-dark .sim-light-panel .bg-gray-50 { background-color: #f9fafb !important; }
+.sim-light-panel .bg-gray-100,
+.sim-dark .sim-light-panel .bg-gray-100 { background-color: #f3f4f6 !important; }
+.sim-light-panel .bg-\\[\\#ecfdf5\\],
+.sim-dark .sim-light-panel .bg-\\[\\#ecfdf5\\] { background-color: #ecfdf5 !important; }
+.sim-light-panel .bg-\\[\\#fff1f2\\],
+.sim-dark .sim-light-panel .bg-\\[\\#fff1f2\\] { background-color: #fff1f2 !important; }
+.sim-light-panel .bg-violet-50,
+.sim-dark .sim-light-panel .bg-violet-50 { background-color: #f5f3ff !important; }
+.sim-light-panel .text-red-600,
+.sim-dark .sim-light-panel .text-red-600 { color: #dc2626 !important; }
+.sim-light-panel .text-gray-900,
+.sim-dark .sim-light-panel .text-gray-900 { color: #111827 !important; }
+.sim-light-panel .text-gray-800,
+.sim-dark .sim-light-panel .text-gray-800 { color: #1f2937 !important; }
+.sim-light-panel .text-gray-700,
+.sim-dark .sim-light-panel .text-gray-700 { color: #374151 !important; }
+.sim-light-panel .text-gray-600,
+.sim-dark .sim-light-panel .text-gray-600 { color: #4b5563 !important; }
+.sim-light-panel .text-gray-500,
+.sim-dark .sim-light-panel .text-gray-500 { color: #6b7280 !important; }
+.sim-light-panel .text-gray-400,
+.sim-dark .sim-light-panel .text-gray-400 { color: #9ca3af !important; }
+.sim-light-panel .border-gray-100,
+.sim-dark .sim-light-panel .border-gray-100 { border-color: #f3f4f6 !important; }
+.sim-light-panel .border-gray-200,
+.sim-dark .sim-light-panel .border-gray-200 { border-color: #e5e7eb !important; }
+.sim-light-panel .border-gray-300,
+.sim-dark .sim-light-panel .border-gray-300 { border-color: #d1d5db !important; }
+.sim-light-panel input,
+.sim-light-panel select,
+.sim-light-panel textarea,
+.sim-dark .sim-light-panel input,
+.sim-dark .sim-light-panel select,
+.sim-dark .sim-light-panel textarea {
+  background-color: #ffffff !important;
+  color: #111827 !important;
+  border-color: #d1d5db !important;
+}
+.sim-light-panel table,
+.sim-light-panel th,
+.sim-light-panel td,
+.sim-dark .sim-light-panel table,
+.sim-dark .sim-light-panel th,
+.sim-dark .sim-light-panel td {
+  border-color: #e5e7eb;
+}

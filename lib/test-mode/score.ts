@@ -43,7 +43,7 @@ const HINTS = {
   mismatchAmt:
     'EUR exposure for your Analytics basis: Simple avg ≈ (S+E)/2; Time-weighted ≈ (1/T)∫e; Growth path accrued ≈ stock + F×min(Th,Tf). Match Analytics Exposure @ Δ1 (±5%).',
   varSetup:
-    'In Analytics choose confidence (90/95/99), VaR analysis horizon (vol √T), and exposure basis. Set forecast period on FX Risk. Copy those into Your answers.',
+    'In Analytics choose confidence (90/95/99), VaR analysis horizon (vol √T), and VaR profile (Simple / Time-weighted / Growth path). Set forecast period on FX Risk. Copy those into Your answers.',
   varAmt:
     'Enter EUR VaR at Δ = 1 ($K) that matches your Analytics setup (±5%). Read it from Risk Metrics / Analytics at Δ = 1 — not from a guessed template.',
 } as const;
@@ -328,7 +328,7 @@ export function scoreTask01(
     id: 'answerConfidence',
     label: 'Answer: Analytics VaR setup',
     pass: setupOk,
-    expected: 'confidence · horizon · exposure basis',
+    expected: 'confidence · horizon · VaR profile',
     actual: setup
       ? setupLabel(setup)
       : [

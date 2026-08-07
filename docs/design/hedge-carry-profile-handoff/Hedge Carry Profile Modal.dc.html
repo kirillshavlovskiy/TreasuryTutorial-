@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<style>
+  body { margin:0; background:#0b1220; color:#e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  a { color:#6ee7b7; text-decoration:none; }
+  a:hover { color:#a7f3d0; }
+</style>
+</helmet>
+
+<section style="display:flex;flex-direction:column;gap:28px;padding:40px">
+  <div style="display:flex;flex-direction:column;gap:6px">
+    <div style="font-size:13px;font-weight:600;color:#fff">Turn 1 · EUR — hedge carry profile · modal hierarchy</div>
+    <div style="font-size:11px;color:#64748b;max-width:820px;line-height:1.6">Same dialog chrome, same class family. Changes: chaptering, header chips, one primary summary accent, an Enhancement @ book WAM hero, and a rescanned ladder. <a href="#1a">1a</a> wide ~1024 · <a href="#1b">1b</a> ladder focus · <a href="#1c">1c</a> narrow ~720. Press the small <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">i</span> beside each frame for callouts.</div>
+  </div>
+
+  <div style="display:flex;flex-wrap:wrap;align-items:flex-start;gap:32px">
+
+    <!-- ══════════ 1a · wide ══════════ -->
+    <div id="1a" style="display:flex;flex:0 0 auto;flex-direction:column;gap:10px;width:1056px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1a</span>
+        <span style="font-size:11px;color:#64748b">Wide ~1024 content · full stack, panel scrolls under a sticky header</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleA }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesA }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:540px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.96);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Callouts · 1a</span>
+                <button type="button" onClick="{{ toggleA }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;line-height:1.5">
+                <li>Header meta becomes four chips on the existing tokens (<code style="color:#cbd5e1">violet-200</code> structure, <code style="color:#cbd5e1">amber-200/90</code> skew &amp; schedule, <code style="color:#cbd5e1">emerald-200</code> book WAM) instead of one run-on line. Title + Close go <code style="color:#cbd5e1">sticky top-0 bg-slate-900</code>.</li>
+                <li>Chapters are just a <code style="color:#cbd5e1">text-[9px] uppercase text-slate-600</code> label above each existing section card — no new chrome.</li>
+                <li>Enhancement @ book WAM is the only tinted summary card and spans two columns; Cover / Legs / Resid VaR / Breakeven go neutral <code style="color:#cbd5e1">border-slate-700 bg-slate-900/60</code>, keeping rose only for genuine negatives.</li>
+                <li>The hero card carries vs-book context (best month, spread) so the answer is above the fold and no longer sits at the far end of a 12-column table.</li>
+                <li>Performance / tick-trades host is unchanged except for being wrapped in the same section card as its neighbours, so it stops floating free.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <!-- backdrop -->
+      <div style="border-radius:12px;background:rgba(0,0,0,.6);padding:16px">
+        <!-- panel -->
+        <div style="max-height:660px;overflow-y:auto;border-radius:12px;border:1px solid #334155;background:#0f172a;padding:16px;box-shadow:0 25px 50px -12px rgba(0,0,0,.6)">
+
+          <!-- sticky header -->
+          <div style="position:sticky;top:-16px;z-index:10;margin:-16px -16px 0;background:#0f172a;padding:16px 16px 10px;border-bottom:1px solid rgba(30,41,59,.8);display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+              <div style="font-size:14px;font-weight:600;color:#fff">EUR — hedge carry profile</div>
+              <button type="button" style="border-radius:4px;border:1px solid #475569;background:none;padding:4px 8px;font-size:12px;color:#cbd5e1;cursor:pointer">Close</button>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px">
+              <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Structure<span style="font-weight:600;color:#ddd6fe">Strip · 2</span></span>
+              <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Skew<span style="font-weight:600;color:rgba(253,230,138,.9)">Neutral</span></span>
+              <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Book WAM<span style="font-weight:600;color:#a7f3d0">M9</span></span>
+              <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Schedule<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:rgba(253,230,138,.9)">M6/M12</span></span>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:14px;padding-top:14px">
+
+            <!-- chapter 1 · summary -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">1 · Summary</div>
+              <div style="display:grid;gap:8px;grid-template-columns:2fr 1fr 1fr 1fr 1fr">
+                <div style="border-radius:4px;border:1px solid rgba(4,120,87,.4);background:rgba(2,44,34,.3);padding:6px 10px">
+                  <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(52,211,153,.8)">Enhancement @ book WAM · M9</div>
+                  <div style="display:flex;align-items:baseline;gap:8px">
+                    <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;font-weight:600;color:#d1fae5">+294.6K</span>
+                    <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#bae6fd">vs book —</span>
+                  </div>
+                  <div style="margin-top:2px;font-size:9px;color:rgba(167,243,208,.7)">Best M5 <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">+302.4K</span> · <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#bae6fd">+7.8K</span> vs book · band <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">15.6K</span></div>
+                </div>
+                <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                  <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Strip cover · target</div>
+                  <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">+16.30M</div>
+                  <div style="margin-top:2px;font-size:9px;color:#64748b">100% of E_end · 0.0% unhedged</div>
+                </div>
+                <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                  <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Strip legs</div>
+                  <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">2</div>
+                  <div style="margin-top:2px;font-size:9px;color:#64748b">from M0</div>
+                </div>
+                <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                  <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Resid VaR</div>
+                  <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">$0K</div>
+                  <div style="margin-top:2px;font-size:9px;color:#64748b">0.0% @ M12</div>
+                </div>
+                <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                  <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Breakeven</div>
+                  <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">M4.2</div>
+                  <div style="margin-top:2px;font-size:9px;color:#64748b">carry covers spread</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- chapter 2 · performance -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">2 · Performance &amp; setup</div>
+              <section style="display:flex;flex-direction:column;gap:10px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+                <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px">
+                  <div>
+                    <div style="font-size:11px;font-weight:600;color:#a7f3d0">Performance · tick trades</div>
+                    <div style="font-size:10px;color:#64748b">Tick a trade to show or hide its green hedge on the path charts below.</div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;font-size:11px;color:#94a3b8">
+                    <button type="button" style="border-radius:6px;border:1px solid #475569;background:none;padding:3px 8px;font-size:11px;color:#cbd5e1;cursor:pointer">Reset</button>
+                    <span style="color:#475569">|</span>
+                    <span>Custom dates</span>
+                    <span style="display:inline-flex;align-items:center;gap:6px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 6px">
+                      <button type="button" style="border:0;background:none;color:#94a3b8;cursor:pointer;font-size:11px">−</button>
+                      <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:#f1f5f9">2</span>
+                      <button type="button" style="border:0;background:none;color:#94a3b8;cursor:pointer;font-size:11px">+</button>
+                    </span>
+                    <button type="button" aria-label="Structure and schedule" style="display:inline-flex;height:24px;width:24px;align-items:center;justify-content:center;border-radius:6px;border:1px solid rgba(245,158,11,.4);background:rgba(245,158,11,.12);color:rgba(253,230,138,.9);cursor:pointer">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="height:13px;width:13px"><circle cx="12" cy="12" r="3.5"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z"></path></svg>
+                    </button>
+                  </div>
+                </div>
+
+                <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;border-radius:6px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                  <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:#94a3b8">Carry rates · FXOCalculator EURUSD.xlsx · ON EUR <span style="color:#a7f3d0">1.78%/2.21%</span> · fwd 1M <span style="color:#a7f3d0">2.26%/2.56%</span></div>
+                  <button type="button" style="border:0;background:none;cursor:pointer;font-size:10px;color:#7dd3fc">Refresh from Market data</button>
+                </div>
+
+                <div style="overflow-x:auto">
+                  <table style="width:100%;min-width:900px;text-align:left;font-size:10px;border-collapse:collapse">
+                    <thead>
+                      <tr style="color:#64748b">
+                        <th style="padding:4px 8px 4px 0;font-weight:500">On</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500">Forward / t</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right;color:#a7f3d0">Carry</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right;color:#a7f3d0">Δ</th>
+                        <th style="padding:4px 8px 4px 12px;font-weight:500;text-align:right;border-left:1px solid #1e293b">Hedge Δ</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">H @ t</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">e @ t</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right;color:rgba(253,230,138,.8)">|e−H|</th>
+                        <th style="padding:4px 8px 4px 0;font-weight:500;text-align:right">Open VaR</th>
+                        <th style="padding:4px 0;font-weight:500;text-align:right">Resid VaR</th>
+                      </tr>
+                    </thead>
+                    <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#cbd5e1">
+                      <sc-for list="{{ tickRows }}" as="t" hint-placeholder-count="3">
+                        <tr style="border-top:1px solid rgba(30,41,59,.8)">
+                          <td style="padding:6px 8px 6px 0"><span style="display:inline-flex;height:12px;width:12px;align-items:center;justify-content:center;border-radius:3px;background:#0ea5e9;color:#fff;font-size:9px">✓</span></td>
+                          <td style="padding:6px 8px 6px 0;color:#f1f5f9">{{ t.leg }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">{{ t.carry }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;font-weight:600;color:#6ee7b7">{{ t.delta }}</td>
+                          <td style="padding:6px 8px 6px 12px;text-align:right;color:#f1f5f9;border-left:1px solid #1e293b">{{ t.hedge }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#f1f5f9">{{ t.hAt }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#f1f5f9">{{ t.eAt }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:rgba(253,230,138,.9)">{{ t.gap }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#cbd5e1">{{ t.openVar }}</td>
+                          <td style="padding:6px 0;text-align:right;font-weight:600;color:#cbd5e1">{{ t.residVar }}</td>
+                        </tr>
+                      </sc-for>
+                    </tbody>
+                  </table>
+                </div>
+                <div style="font-size:9px;color:#475569;font-family:ui-monospace,SFMono-Regular,Menlo,monospace">Carry split · fwd +$23K · cash +$198K (M0–M3) · fwd +$47K · cash +$115K (M0–M7) · fwd +$102K · cash +$52K (M0–M12)</div>
+              </section>
+            </div>
+
+            <!-- chapter 3 · settle WAM -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">3 · Settle WAM</div>
+              <section style="display:flex;flex-direction:column;gap:10px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+                <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px">
+                  <div>
+                    <div style="font-size:11px;font-weight:600;color:#a7f3d0">Settle WAM · Enhancement</div>
+                    <div style="font-size:10px;color:#64748b;max-width:620px">Absolute Enhancement (New − Old + FWD) at each settle M-index. Click a month to apply that settle WAM.</div>
+                  </div>
+                  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;font-size:10px;color:#64748b">
+                    <span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;height:8px;width:8px;border-radius:9999px;background:#a7f3d0"></span>Selected settle WAM</span>
+                    <span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;height:8px;width:8px;border-radius:9999px;border:2px solid #f59e0b;background:#10b981"></span>Proposed strip month</span>
+                    <span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;height:8px;width:8px;border-radius:9999px;background:#059669"></span>Click to apply</span>
+                  </div>
+                </div>
+
+                <div style="border-radius:6px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:10px">
+                  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px">
+                    <div style="font-size:10px;font-weight:600;color:#a7f3d0">Enhancement ($K)</div>
+                    <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:#64748b">selected ≈ M9 · proposed M6/M12</div>
+                  </div>
+                  <svg viewBox="0 0 960 190" preserveAspectRatio="none" style="width:100%;height:190px;display:block">
+                    <line x1="40" y1="24" x2="950" y2="24" stroke="#1e293b" stroke-dasharray="3 5"></line>
+                    <line x1="40" y1="94" x2="950" y2="94" stroke="#1e293b" stroke-dasharray="3 5"></line>
+                    <line x1="40" y1="164" x2="950" y2="164" stroke="#1e293b" stroke-dasharray="3 5"></line>
+                    <text x="4" y="20" fill="#64748b" font-size="9" font-family="ui-monospace, monospace">{{ yTop }}</text>
+                    <text x="4" y="98" fill="#64748b" font-size="9" font-family="ui-monospace, monospace">{{ yMid }}</text>
+                    <text x="4" y="168" fill="#64748b" font-size="9" font-family="ui-monospace, monospace">{{ yBot }}</text>
+                    <polyline points="{{ linePoints }}" fill="none" stroke="#34d399" stroke-width="2" stroke-dasharray="7 5"></polyline>
+                    <sc-for list="{{ chartPts }}" as="p" hint-placeholder-count="13">
+                      <circle cx="{{ p.x }}" cy="{{ p.y }}" r="{{ p.r }}" fill="{{ p.fill }}" stroke="{{ p.stroke }}" stroke-width="{{ p.sw }}"></circle>
+                    </sc-for>
+                  </svg>
+                  <div style="position:relative;height:14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9px">
+                    <sc-for list="{{ chartPts }}" as="p" hint-placeholder-count="13">
+                      <div style="position:absolute;left:{{ p.leftPct }};transform:translateX(-50%);font-weight:{{ p.labelWeight }};color:{{ p.labelColor }}">{{ p.label }}</div>
+                    </sc-for>
+                  </div>
+                  <div style="text-align:center;font-size:9px;color:#475569">Settle WAM (M-index)</div>
+                </div>
+              </section>
+            </div>
+
+            <!-- chapter 4 · path -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">4 · Hedge path</div>
+              <section style="display:flex;flex-direction:column;gap:10px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+                <div>
+                  <div style="font-size:11px;font-weight:600;color:#a7f3d0">Resid VaR &amp; exposure profile</div>
+                  <div style="font-size:10px;color:#64748b">Unchanged charts. Kept last so the WAM decision is made before the path is inspected.</div>
+                </div>
+                <div style="display:grid;gap:10px;grid-template-columns:1fr 1fr">
+                  <div style="height:120px;border-radius:6px;border:1px solid #334155;background:rgba(15,23,42,.6);display:flex;align-items:center;justify-content:center;font-size:10px;color:#475569">Resid VaR profile</div>
+                  <div style="height:120px;border-radius:6px;border:1px solid #334155;background:rgba(15,23,42,.6);display:flex;align-items:center;justify-content:center;font-size:10px;color:#475569">Exposure profile</div>
+                </div>
+              </section>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ 1b · ladder focus ══════════ -->
+    <div id="1b" style="display:flex;flex:0 0 auto;flex-direction:column;gap:10px;width:1056px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1b</span>
+        <span style="font-size:11px;color:#64748b">Same modal, scrolled to the ladder · reordered and weighted columns</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleB }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesB }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:540px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.96);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Callouts · 1b</span>
+                <button type="button" onClick="{{ toggleB }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;line-height:1.5">
+                <li>Column order becomes Settle WAM · <strong style="color:#d1fae5">Enhancement</strong> · <strong style="color:#bae6fd">vs book</strong> · │ · Struct · Hedge Δ · Schedule · Default (Old) · FCY int · USD int · New · FWD pts · Total. Every column and its colour survives; only position and weight change.</li>
+                <li>The two hero columns are <code style="color:#cbd5e1">text-[11px] font-semibold</code>; the split group stays <code style="color:#cbd5e1">text-[10px]</code> behind a <code style="color:#cbd5e1">border-l border-slate-800</code> divider with a 9px group label.</li>
+                <li>Settle WAM column is <code style="color:#cbd5e1">sticky left-0</code> with the section background, so the label survives horizontal scroll.</li>
+                <li>Book row keeps <code style="color:#cbd5e1">bg-emerald-500/[0.08]</code>; the <code style="color:#cbd5e1">book</code> and <code style="color:#cbd5e1">prop</code> chips reuse the existing emerald / amber chip recipe.</li>
+                <li>Ladder sits behind a Show / Hide control so the chart alone can hold the fold; state is local and does not touch prepared package.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <div style="border-radius:12px;background:rgba(0,0,0,.6);padding:16px">
+        <div style="border-radius:12px;border:1px solid #334155;background:#0f172a;padding:16px;box-shadow:0 25px 50px -12px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:14px">
+
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;border-bottom:1px solid rgba(30,41,59,.8);padding-bottom:10px">
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="font-size:14px;font-weight:600;color:#fff">EUR — hedge carry profile</div>
+              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px">
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Structure<span style="font-weight:600;color:#ddd6fe">Strip · 2</span></span>
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Skew<span style="font-weight:600;color:rgba(253,230,138,.9)">Neutral</span></span>
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Book WAM<span style="font-weight:600;color:#a7f3d0">M9</span></span>
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Schedule<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:rgba(253,230,138,.9)">M6/M12</span></span>
+              </div>
+            </div>
+            <button type="button" style="border-radius:4px;border:1px solid #475569;background:none;padding:4px 8px;font-size:12px;color:#cbd5e1;cursor:pointer">Close</button>
+          </div>
+
+          <div style="display:grid;gap:8px;grid-template-columns:2fr 1fr 1fr">
+            <div style="border-radius:4px;border:1px solid rgba(4,120,87,.4);background:rgba(2,44,34,.3);padding:6px 10px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(52,211,153,.8)">Enhancement @ book WAM · M9</div>
+              <div style="display:flex;align-items:baseline;gap:8px">
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;font-weight:600;color:#d1fae5">+294.6K</span>
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#bae6fd">vs book —</span>
+              </div>
+            </div>
+            <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Best in ladder · M5</div>
+              <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">+302.4K</div>
+              <div style="margin-top:2px;font-size:9px;color:#64748b"><span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#bae6fd">+7.8K</span> vs book</div>
+            </div>
+            <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Strip cover · legs</div>
+              <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">+16.30M · 2</div>
+              <div style="margin-top:2px;font-size:9px;color:#64748b">100% of E_end</div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">3 · Settle WAM</div>
+            <section style="display:flex;flex-direction:column;gap:10px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+              <div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:10px">
+                <div>
+                  <div style="font-size:11px;font-weight:600;color:#a7f3d0">Settle WAM · Enhancement</div>
+                  <div style="font-size:10px;color:#64748b">Click a row to apply that settle WAM to the prepared package and schedule.</div>
+                </div>
+                <button type="button" onClick="{{ toggleLadder }}" style="border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:3px 9px;font-size:10px;font-weight:600;color:#cbd5e1;cursor:pointer">{{ ladderBtn }}</button>
+              </div>
+
+              <sc-if value="{{ ladderOpen }}" hint-placeholder-val="{{ true }}">
+                <div style="overflow-x:auto">
+                  <table style="width:100%;min-width:980px;text-align:left;font-size:10px;border-collapse:collapse">
+                    <thead>
+                      <tr>
+                        <th style="padding:0 8px 2px 0"></th>
+                        <th colspan="2" style="padding:0 8px 2px 0;text-align:right;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">Outcome</th>
+                        <th colspan="9" style="padding:0 0 2px 12px;text-align:right;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569;border-left:1px solid #1e293b">Setup &amp; carry split</th>
+                      </tr>
+                      <tr style="color:#64748b">
+                        <th style="padding:6px 8px 6px 0;font-weight:500;position:sticky;left:0;background:rgb(10,16,34)">Settle WAM</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Enhancement</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#bae6fd">vs book</th>
+                        <th style="padding:6px 8px 6px 12px;font-weight:500;border-left:1px solid #1e293b;color:rgba(196,181,253,.8)">Struct</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right">Hedge Δ</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500">Schedule</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(253,230,138,.8)">Default (Old)</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(196,181,253,.8)">FCY int</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(125,211,252,.8)">USD int</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right">New</th>
+                        <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:rgba(110,231,183,.8)">FWD pts</th>
+                        <th style="padding:6px 0;font-weight:500;text-align:right">Total</th>
+                      </tr>
+                    </thead>
+                    <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                      <sc-for list="{{ ladder }}" as="r" hint-placeholder-count="13">
+                        <tr style="border-top:1px solid rgba(30,41,59,.8);background:{{ r.bg }};color:#cbd5e1;cursor:pointer">
+                          <td style="padding:6px 8px 6px 0;font-weight:600;color:#fff;position:sticky;left:0;background:{{ r.stickyBg }}">{{ r.label }}<span style="margin-left:5px;font-size:9px;font-weight:400;color:{{ r.chipColor }}">{{ r.chip }}</span></td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">{{ r.enh }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;font-size:11px;font-weight:600;color:{{ r.vsColor }}">{{ r.vs }}</td>
+                          <td style="padding:6px 8px 6px 12px;border-left:1px solid #1e293b;color:#c4b5fd">{{ r.struct }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#cbd5e1">{{ r.hedge }}</td>
+                          <td style="padding:6px 8px 6px 0;color:#94a3b8">{{ r.schedule }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:rgba(253,230,138,.9)">{{ r.old }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#c4b5fd">{{ r.fcy }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#7dd3fc">{{ r.usd }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#f1f5f9">{{ r.newv }}</td>
+                          <td style="padding:6px 8px 6px 0;text-align:right;color:#6ee7b7">{{ r.fwd }}</td>
+                          <td style="padding:6px 0;text-align:right;color:#cbd5e1">{{ r.total }}</td>
+                        </tr>
+                      </sc-for>
+                    </tbody>
+                  </table>
+                </div>
+              </sc-if>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ 1c · narrow ══════════ -->
+    <div id="1c" style="display:flex;flex:0 0 auto;flex-direction:column;gap:10px;width:752px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="border-radius:4px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;color:#cbd5e1">1c</span>
+        <span style="font-size:11px;color:#64748b">Narrow ~720 content · chips wrap, summary stacks 2-up</span>
+        <span style="position:relative;display:inline-flex">
+          <button type="button" aria-label="Callouts" onClick="{{ toggleC }}" style="display:inline-flex;height:18px;width:18px;align-items:center;justify-content:center;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);color:#94a3b8;font-size:10px;font-weight:600;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;cursor:pointer">i</button>
+          <sc-if value="{{ notesC }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:24px;left:0;z-index:30;width:500px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.96);padding:12px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Callouts · 1c</span>
+                <button type="button" onClick="{{ toggleC }}" style="border:0;background:none;cursor:pointer;font-size:10px;color:#64748b">Close</button>
+              </div>
+              <ul style="margin:0;padding-left:16px;display:flex;flex-direction:column;gap:4px;font-size:11px;color:#94a3b8;line-height:1.5">
+                <li>Hero card goes full width; the four neutral cards fall to <code style="color:#cbd5e1">grid-cols-2</code>. No new component, same card recipe.</li>
+                <li>Chips wrap onto a second line under the title rather than truncating.</li>
+                <li>Ladder collapses to Settle WAM · Enhancement · vs book, with Struct and Schedule as a 9px sub-line under the month — the split columns stay reachable in the expanded ladder.</li>
+                <li>No invented mobile nav: it is the same dialog at a smaller content width.</li>
+              </ul>
+            </div>
+          </sc-if>
+        </span>
+      </div>
+
+      <div style="border-radius:12px;background:rgba(0,0,0,.6);padding:16px">
+        <div style="border-radius:12px;border:1px solid #334155;background:#0f172a;padding:16px;box-shadow:0 25px 50px -12px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:14px">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;border-bottom:1px solid rgba(30,41,59,.8);padding-bottom:10px">
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="font-size:14px;font-weight:600;color:#fff">EUR — hedge carry profile</div>
+              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px">
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Structure<span style="font-weight:600;color:#ddd6fe">Strip · 2</span></span>
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Skew<span style="font-weight:600;color:rgba(253,230,138,.9)">Neutral</span></span>
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Book WAM<span style="font-weight:600;color:#a7f3d0">M9</span></span>
+                <span style="display:inline-flex;align-items:center;gap:4px;border-radius:6px;border:1px solid #334155;background:rgba(2,6,23,.6);padding:2px 7px;color:#64748b">Schedule<span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;color:rgba(253,230,138,.9)">M6/M12</span></span>
+              </div>
+            </div>
+            <button type="button" style="border-radius:4px;border:1px solid #475569;background:none;padding:4px 8px;font-size:12px;color:#cbd5e1;cursor:pointer">Close</button>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div style="border-radius:4px;border:1px solid rgba(4,120,87,.4);background:rgba(2,44,34,.3);padding:8px 10px">
+              <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:rgba(52,211,153,.8)">Enhancement @ book WAM · M9</div>
+              <div style="display:flex;align-items:baseline;gap:8px">
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:18px;font-weight:600;color:#d1fae5">+294.6K</span>
+                <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#bae6fd">vs book —</span>
+              </div>
+              <div style="margin-top:2px;font-size:9px;color:rgba(167,243,208,.7)">Best M5 <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">+302.4K</span> · <span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#bae6fd">+7.8K</span> vs book</div>
+            </div>
+            <div style="display:grid;gap:8px;grid-template-columns:1fr 1fr">
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Strip cover · target</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">+16.30M</div>
+                <div style="margin-top:2px;font-size:9px;color:#64748b">100% of E_end</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Strip legs</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#f1f5f9">2</div>
+                <div style="margin-top:2px;font-size:9px;color:#64748b">from M0</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Resid VaR</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">$0K</div>
+                <div style="margin-top:2px;font-size:9px;color:#64748b">0.0% @ M12</div>
+              </div>
+              <div style="border-radius:4px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:6px 10px">
+                <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#64748b">Breakeven</div>
+                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;font-weight:600;color:#cbd5e1">M4.2</div>
+                <div style="margin-top:2px;font-size:9px;color:#64748b">carry covers spread</div>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <div style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:#475569">3 · Settle WAM</div>
+            <section style="display:flex;flex-direction:column;gap:10px;border-radius:8px;border:1px solid #334155;background:rgba(2,6,23,.4);padding:12px">
+              <div>
+                <div style="font-size:11px;font-weight:600;color:#a7f3d0">Settle WAM · Enhancement</div>
+                <div style="font-size:10px;color:#64748b">Click a month to apply that settle WAM.</div>
+              </div>
+              <div style="border-radius:6px;border:1px solid #334155;background:rgba(15,23,42,.6);padding:10px">
+                <svg viewBox="0 0 960 190" preserveAspectRatio="none" style="width:100%;height:150px;display:block">
+                  <line x1="40" y1="24" x2="950" y2="24" stroke="#1e293b" stroke-dasharray="3 5"></line>
+                  <line x1="40" y1="94" x2="950" y2="94" stroke="#1e293b" stroke-dasharray="3 5"></line>
+                  <line x1="40" y1="164" x2="950" y2="164" stroke="#1e293b" stroke-dasharray="3 5"></line>
+                  <polyline points="{{ linePoints }}" fill="none" stroke="#34d399" stroke-width="2" stroke-dasharray="7 5"></polyline>
+                  <sc-for list="{{ chartPts }}" as="p" hint-placeholder-count="13">
+                    <circle cx="{{ p.x }}" cy="{{ p.y }}" r="{{ p.r }}" fill="{{ p.fill }}" stroke="{{ p.stroke }}" stroke-width="{{ p.sw }}"></circle>
+                  </sc-for>
+                </svg>
+                <div style="position:relative;height:14px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9px">
+                  <sc-for list="{{ chartPts }}" as="p" hint-placeholder-count="13">
+                    <div style="position:absolute;left:{{ p.leftPct }};transform:translateX(-50%);font-weight:{{ p.labelWeight }};color:{{ p.labelColor }}">{{ p.label }}</div>
+                  </sc-for>
+                </div>
+              </div>
+
+              <table style="width:100%;text-align:left;font-size:10px;border-collapse:collapse">
+                <thead>
+                  <tr style="color:#64748b">
+                    <th style="padding:6px 8px 6px 0;font-weight:500">Settle WAM</th>
+                    <th style="padding:6px 8px 6px 0;font-weight:500;text-align:right;color:#a7f3d0">Enhancement</th>
+                    <th style="padding:6px 0;font-weight:500;text-align:right;color:#bae6fd">vs book</th>
+                  </tr>
+                </thead>
+                <tbody style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">
+                  <sc-for list="{{ ladderNarrow }}" as="r" hint-placeholder-count="6">
+                    <tr style="border-top:1px solid rgba(30,41,59,.8);background:{{ r.bg }};color:#cbd5e1;cursor:pointer">
+                      <td style="padding:6px 8px 6px 0;font-weight:600;color:#fff">{{ r.label }}<span style="margin-left:5px;font-size:9px;font-weight:400;color:{{ r.chipColor }}">{{ r.chip }}</span><div style="margin-top:2px;font-size:9px;font-weight:400;color:#64748b">{{ r.sub }}</div></td>
+                      <td style="padding:6px 8px 6px 0;text-align:right;font-size:11px;font-weight:600;color:#d1fae5">{{ r.enh }}</td>
+                      <td style="padding:6px 0;text-align:right;font-size:11px;font-weight:600;color:{{ r.vsColor }}">{{ r.vs }}</td>
+                    </tr>
+                  </sc-for>
+                </tbody>
+              </table>
+              <p style="margin:0;font-size:10px;color:#64748b">Default (Old) · FCY int · USD int · New · FWD pts · Total stay in the expanded ladder above ~840px.</p>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1140,&quot;height&quot;:900}}">
+class Component extends DCLogic {
+  state = { notes: null, ladderOpen: true };
+  toggle(id) { this.setState(s => ({ notes: s.notes === id ? null : id })); }
+
+  renderVals() {
+    const fmtK = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(1) + 'K';
+    const fmtM = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(2) + 'M';
+    const enhK = [291.4, 286.8, 293.1, 299.6, 299.2, 302.4, 297.7, 295.9, 301.5, 294.6, 296.2, 300.1, 288.4];
+    const bookM = 9;
+    const proposed = [6, 12];
+    const bookEnh = enhK[bookM];
+    const oldK = 118.4;
+
+    const min = Math.min(...enhK), max = Math.max(...enhK);
+    const pad = (max - min) * 0.18;
+    const lo = min - pad, hi = max + pad;
+    const x = i => 40 + (i * (950 - 40)) / 12;
+    const y = v => 164 - ((v - lo) / (hi - lo)) * 140;
+
+    const chartPts = enhK.map((v, i) => {
+      const isBook = i === bookM, isProp = proposed.includes(i);
+      return {
+        x: x(i), y: y(v),
+        leftPct: ((x(i) / 960) * 100).toFixed(3) + '%',
+        r: isBook ? 6 : isProp ? 6 : 4,
+        fill: isBook ? '#a7f3d0' : '#10b981',
+        stroke: isProp ? '#f59e0b' : 'none',
+        sw: isProp ? 2.5 : 0,
+        label: 'M' + i,
+        labelWeight: isBook || isProp ? '600' : '400',
+        labelColor: isBook ? '#a7f3d0' : isProp ? 'rgba(253,230,138,.9)' : '#64748b',
+      };
+    });
+
+    const ladder = enhK.map((v, i) => {
+      const isBook = i === bookM, isProp = proposed.includes(i);
+      const fwd = 70 + i * 2.5;
+      const usd = 41 + i * 1.5;
+      const fcy = v + oldK - fwd - usd;
+      const vs = v - bookEnh;
+      return {
+        label: 'M' + i,
+        chip: isBook ? 'book' : isProp ? 'prop' : '',
+        chipColor: isBook ? '#a7f3d0' : 'rgba(253,230,138,.9)',
+        bg: isBook ? 'rgba(16,185,129,.08)' : 'transparent',
+        // composited: section bg-slate-950/40 over the slate-900 panel, plus emerald-500/8% on the book row
+        stickyBg: isBook ? 'rgb(11,30,42)' : 'rgb(10,16,34)',
+        enh: fmtK(v),
+        vs: isBook ? '—' : fmtK(vs),
+        vsColor: isBook ? '#64748b' : vs >= 0 ? '#bae6fd' : '#fda4af',
+        struct: 'Strip · 2',
+        hedge: fmtM(16.3),
+        schedule: i <= 1 ? 'M0/M' + (i + 1) : 'M' + Math.max(1, Math.round(i / 2)) + '/M' + i,
+        old: fmtK(oldK),
+        fcy: fmtK(fcy),
+        usd: fmtK(usd),
+        newv: fmtK(fcy + usd),
+        fwd: fmtK(fwd),
+        total: fmtK(fcy + usd + fwd),
+        sub: 'Strip · 2 · ' + (i <= 1 ? 'M0/M' + (i + 1) : 'M' + Math.max(1, Math.round(i / 2)) + '/M' + i),
+      };
+    });
+
+    return {
+      chartPts,
+      linePoints: enhK.map((v, i) => x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' '),
+      yTop: fmtK(hi),
+      yMid: fmtK((hi + lo) / 2),
+      yBot: fmtK(lo),
+      ladder,
+      ladderNarrow: [ladder[5], ladder[6], ladder[8], ladder[9], ladder[11], ladder[12]],
+      tickRows: [
+        { leg: 'M0–M3', carry: '+$221K', delta: '0.61', hedge: '+5.50M', hAt: '+16.30M', eAt: '+5.50M', gap: '+10.80M', openVar: '$274K', residVar: '$181K' },
+        { leg: 'M0–M7', carry: '+$163K', delta: '0.34', hedge: '+4.80M', hAt: '+16.30M', eAt: '+10.30M', gap: '+6.00M', openVar: '$714K', residVar: '$263K' },
+        { leg: 'M0–M12', carry: '+$154K', delta: '0.02', hedge: '+6.00M', hAt: '+16.30M', eAt: '+16.30M', gap: '+0.00M', openVar: '$1425K', residVar: '$0K' },
+      ],
+      notesA: this.state.notes === 'a',
+      notesB: this.state.notes === 'b',
+      notesC: this.state.notes === 'c',
+      toggleA: () => this.toggle('a'),
+      toggleB: () => this.toggle('b'),
+      toggleC: () => this.toggle('c'),
+      ladderOpen: this.state.ladderOpen,
+      ladderBtn: this.state.ladderOpen ? 'Hide ladder' : 'Show ladder',
+      toggleLadder: () => this.setState(s => ({ ladderOpen: !s.ladderOpen })),
+    };
+  }
+}
+
+</script>
+</body>
+</html>

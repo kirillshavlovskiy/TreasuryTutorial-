@@ -28,21 +28,23 @@ export const HEDGE_PATH_BASIS_OPTIONS: {
 }[] = [
   {
     id: 'cash',
-    label: 'Cash exposure',
-    short: 'Cash',
-    description: 'Stock Net FX only (S) — no forecast buildup',
+    label: 'Expected stock',
+    short: 'Stock',
+    description: 'Expected stock (S) — no forecast buildup',
   },
   {
     id: 'varNeutral',
     label: 'VaR-neutral',
     short: 'VaR-neutral',
-    description: 'Equal-VaR bullet from Analytics method (Ē or RMS)',
+    description:
+      'VaR-neutral: growth → path CoG; simple/TW → Ē — strip per window',
   },
   {
     id: 'totalExpected',
     label: 'Total expected',
     short: 'E_end',
-    description: 'End buildup S+ΣF over the chart window',
+    description:
+      'Target: E_end — bullet = 1×Tf; strip = n×Δe tenors; H=Σ from M0',
   },
 ];
 
@@ -171,8 +173,9 @@ export function hedgeRatioForNumber(
 }
 
 /**
- * First time t∈(0,T] where |e| strictly crosses |H|.
+ * First time t∈(0,T] where |e| crosses or lands on |H|.
  * Ignores a start that sits exactly on the hedge (not a real crossing).
+ * Landing on H at Tf (Target) counts — previously missed when b≡H.
  */
 export function hedgeBreakevenMonths(
   path: readonly ExposurePathPoint[],
@@ -183,7 +186,12 @@ export function hedgeBreakevenMonths(
   for (let i = 1; i < path.length; i++) {
     const a = Math.abs(path[i - 1]!.exposureM);
     const b = Math.abs(path[i]!.exposureM);
-    // Strict sign change only — touching at t=0 when H=S must not count.
+    // Landed on H from below/above (e.g. Target H = E(Tf) at path end).
+    if (a + 1e-9 < H && Math.abs(b - H) <= 1e-9) {
+      const tStar = path[i]!.t;
+      if (tStar > 1e-6) return tStar;
+    }
+    // Strict sign change.
     if ((a - H) * (b - H) >= 0) continue;
     if (Math.abs(b - a) < 1e-15) return path[i]!.t;
     const w = (H - a) / (b - a);
@@ -192,6 +200,59 @@ export function hedgeBreakevenMonths(
     return tStar;
   }
   return null;
+}
+
+/**
+ * Where strip cash / forward settlement lands for carry and booking.
+ * Contract window (start/end) stays for schedule; this is the economic settle.
+ */
+export type StripCashDeliveryAt = 'periodEnd' | 'periodStart' | 'matchExposure';
+
+/** Real settlement months from M0 for a strip edge under the cash-delivery mode. */
+export function resolveStripCashSettleMonths(
+  edge: {
+    startMonth: number;
+    endMonth: number;
+    hedgeLocalM: number;
+  },
+  path: readonly ExposurePathPoint[],
+  mode: StripCashDeliveryAt,
+  windowMonths: number,
+): number {
+  const clamp = (t: number) =>
+    Math.min(Math.max(windowMonths, 0), Math.max(0, t));
+  if (mode === 'periodStart') {
+    return clamp(edge.startMonth);
+  }
+  if (mode === 'matchExposure') {
+    const tMeet = hedgeBreakevenMonths(path, edge.hedgeLocalM);
+    if (tMeet != null && tMeet > edge.startMonth - 1e-9) {
+      return clamp(tMeet);
+    }
+    return clamp(edge.endMonth);
+  }
+  return clamp(edge.endMonth);
+}
+
+/**
+ * Bullet forward cash settle from M0 under the same delivery modes as strip.
+ * Period end = Tf; period start ≈ M0; e∩H = first path match to cover H.
+ */
+export function resolveBulletCashSettleMonths(
+  hedgeLocalM: number,
+  path: readonly ExposurePathPoint[],
+  mode: StripCashDeliveryAt,
+  forecastMonths: number,
+): number {
+  const Tf = Math.max(0, forecastMonths);
+  const clamp = (t: number) => Math.min(Tf, Math.max(0, t));
+  if (mode === 'periodStart') return 0;
+  if (mode === 'matchExposure') {
+    const tMeet = hedgeBreakevenMonths(path, hedgeLocalM);
+    if (tMeet != null) return clamp(tMeet);
+    return clamp(Tf);
+  }
+  return clamp(Tf);
 }
 
 /** At t: positive = overhedged (|H| > |e|). */
@@ -205,6 +266,12 @@ export interface ResidualPathPoint {
   residualM: number;
   /** |e − H| — path shape / recognition timing. */
   absResidualM: number;
+  /**
+   * Accrued residual-VaR path factor √∫₀ᵗ (e−H)² dt.
+   * Flat hedge leaves an offset from t=0, so this grows immediately
+   * (≈ |r|√t when |e−H| is roughly constant) — not flat until BE.
+   */
+  cumPathFactor: number;
   /**
    * USD Budget Risk vs T0 spot from t to settle T:
    * |e−H| × S₀ × σ₁ₘ × z × √max(T−t, 0). Zero when matched at settle.
@@ -306,6 +373,29 @@ export function resyncHedgeRatiosToNearestRegime(
   return changed ? next : null;
 }
 
+/** ∫_a^b r(t)² dt on a linear residual segment r(t)=r0+(r1-r0)·(t-t0)/(t1-t0). */
+function integrateR2Segment(
+  t0: number,
+  t1: number,
+  r0: number,
+  r1: number,
+  a: number,
+  b: number,
+): number {
+  if (b <= a + 1e-15 || t1 <= t0 + 1e-15) return 0;
+  const lo = Math.max(a, t0);
+  const hi = Math.min(b, t1);
+  if (hi <= lo + 1e-15) return 0;
+  const span = t1 - t0;
+  const u0 = (lo - t0) / span;
+  const u1 = (hi - t0) / span;
+  const ru0 = r0 + (r1 - r0) * u0;
+  const ru1 = r0 + (r1 - r0) * u1;
+  const dt = hi - lo;
+  const dr = ru1 - ru0;
+  return ru0 * ru0 * dt + ru0 * dr * dt + (dr * dr * dt) / 3;
+}
+
 /**
  * USD Budget Risk vs T0 (USD M):
  *   |e−H| × S₀ × σ₁ₘ × z × √max(τ, 0)
@@ -330,8 +420,8 @@ export function budgetRiskUsdM(
 
 /**
  * Rose = |e−H| path shape (H flat or H(t) via opts.hedgeAt).
- * Orange = USD Budget Risk vs T0: |e−H| × S₀ × σ × z × √(T−t).
- * Target with e(T)=H → budget risk at T is 0.
+ * Orange = √∫₀ᵗ (e−H)² — residual path factor from t=0.
+ * budgetRiskUsdM = USD Budget Risk vs T0 when ccy/confidence supplied.
  */
 export function buildResidualPath(
   path: readonly ExposurePathPoint[],
@@ -363,16 +453,24 @@ export function buildResidualPath(
   const confidencePct = resolved.confidencePct;
 
   const out: ResidualPathPoint[] = [];
+  let integ = 0;
   for (let i = 0; i < path.length; i++) {
     const p = path[i]!;
     const Hp = Hof(p.t);
     const r = p.exposureM - Hp;
     const absR = Math.abs(r);
     const remaining = Math.max(0, endT - p.t);
+    if (i > 0) {
+      const prev = path[i - 1]!;
+      const Hprev = Hof(prev.t);
+      const r0 = prev.exposureM - Hprev;
+      integ += integrateR2Segment(prev.t, p.t, r0, r, prev.t, p.t);
+    }
     out.push({
       t: p.t,
       residualM: r,
       absResidualM: absR,
+      cumPathFactor: Math.sqrt(Math.max(0, integ)),
       budgetNetM,
       budgetRiskUsdM:
         ccy != null && confidencePct != null

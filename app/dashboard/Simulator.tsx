@@ -45,16 +45,20 @@ export type SimulatorTab =
   | 'hedging'
   | 'liveLadder'
   | 'analytics'
+  | 'liquidity'
+  | 'dataUpload'
   | 'monteCarlo';
 
 const ALL_TABS: { id: SimulatorTab; label: string }[] = [
   { id: 'simulator',   label: 'FX Simulator' },
+  { id: 'liquidity',   label: 'Liquidity' },
+  { id: 'analytics',   label: 'Analytics' },
+  { id: 'hedging',     label: 'Hedging Decision' },
+  { id: 'liveLadder',  label: 'Consolidated Live Ladder' },
+  { id: 'dataUpload',  label: 'Market data' },
   { id: 'sensitivity', label: 'Sensitivity Analysis' },
   { id: 'layers',      label: 'Layer Setup' },
   { id: 'irprofile',   label: 'IR Profile' },
-  { id: 'hedging',     label: 'Hedging Decision' },
-  { id: 'liveLadder',  label: 'Consolidated Live Ladder' },
-  { id: 'analytics',   label: 'Analytics' },
   { id: 'monteCarlo',  label: 'Monte Carlo' },
 ];
 
@@ -95,6 +99,8 @@ interface SimulatorProps {
   liveLadderPanel?: ReactNode;
   /** Analytics tab — VaR confidence setup. */
   analyticsPanel?: ReactNode;
+  /** Market data tab — overnight cash, term deposits, EURUSD swap points. */
+  dataUploadPanel?: ReactNode;
   /** Analytics VaR setup for Risk Metrics columns. */
   varSetup?: VarSetup;
   /** Sync FX Risk forecast period (and default VaR month) into parent answers. */
@@ -138,6 +144,7 @@ export function Simulator({
   hedgingPanel,
   liveLadderPanel,
   analyticsPanel,
+  dataUploadPanel,
   varSetup = DEFAULT_VAR_SETUP,
   onVarSetupChange,
   bookedHedges = [],
@@ -145,10 +152,18 @@ export function Simulator({
   onAnalyticsBookChange,
 }: SimulatorProps) {
   // Task Mode simplified book: never expose Sensitivity / Layer Setup / IR Profile.
-  // Live Ladder + Analytics are Task Mode only — hide in the full book unless shown.
+  // Live Ladder + Analytics + Liquidity + Market data are Task Mode only — hide in the full book unless shown.
   const effectiveHiddenTabs = simplifiedBook
     ? Array.from(new Set<SimulatorTab>([...hiddenTabs, 'sensitivity', 'layers', 'irprofile']))
-    : Array.from(new Set<SimulatorTab>([...hiddenTabs, 'liveLadder', 'analytics']));
+    : Array.from(
+        new Set<SimulatorTab>([
+          ...hiddenTabs,
+          'liveLadder',
+          'analytics',
+          'liquidity',
+          'dataUpload',
+        ]),
+      );
   const tabs = ALL_TABS.filter(t => !effectiveHiddenTabs.includes(t.id)).map(t => ({
     ...t,
     label: tabLabels?.[t.id] ?? t.label,
@@ -189,7 +204,12 @@ export function Simulator({
   const [usdNonNpCash, setUsdNonNpCash] = useState(seed.usdNonNpCash);
   const [usdParams, setUsdParams] = useState<UsdParams>(() => ({ ...seed.usdParams }));
   const [forecastProfile, setForecastProfile] = useState<ForecastProfileState>(
-    () => ({ ...DEFAULT_FORECAST_PROFILE, byCcy: {}, formulas: {} }),
+    () => ({
+      ...DEFAULT_FORECAST_PROFILE,
+      byCcy: {},
+      extrasByCcy: {},
+      formulas: {},
+    }),
   );
   const [forecastProfileOpen, setForecastProfileOpen] = useState(false);
 
@@ -408,19 +428,49 @@ export function Simulator({
         )}
         {!effectiveHiddenTabs.includes('hedging') && (
           <div className={activeTab === 'hedging' ? '' : 'hidden'}>
-            {hedgingPanel ?? <HedgingDecisionPanel r_USD={shared.r_USD} />}
+            {hedgingPanel && isValidElement(hedgingPanel)
+              ? cloneElement(
+                  hedgingPanel as ReactElement<{
+                    bookRows?: RowState[];
+                    forecastProfile?: ForecastProfileState;
+                  }>,
+                  {
+                    // Same live-injection pattern as Analytics/Liquidity tabs
+                    // below — without it this tab was stuck on whatever
+                    // bookRows/forecastProfile Task01App had at its last
+                    // render, lagging the Cash/Analytics/Liquidity tabs
+                    // which read Simulator's `rows` state directly.
+                    bookRows: rows,
+                    forecastProfile,
+                  },
+                )
+              : (hedgingPanel ?? <HedgingDecisionPanel r_USD={shared.r_USD} />)}
           </div>
         )}
         {!effectiveHiddenTabs.includes('liveLadder') && (
           <div className={activeTab === 'liveLadder' ? '' : 'hidden'}>
-            {liveLadderPanel ?? (
+            {liveLadderPanel && isValidElement(liveLadderPanel)
+              ? cloneElement(
+                  liveLadderPanel as ReactElement<{
+                    rows?: RowState[];
+                    forecastProfile?: ForecastProfileState;
+                  }>,
+                  {
+                    // Same live-injection pattern as Analytics/Liquidity —
+                    // this tab was also stuck on Task01App's last-rendered
+                    // rows/forecastProfile instead of Simulator's live state.
+                    rows,
+                    forecastProfile,
+                  },
+                )
+              : (liveLadderPanel ?? (
               <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-10 text-center">
                 <h3 className="text-sm font-semibold text-gray-800">Consolidated Live Ladder</h3>
                 <p className="mt-2 text-xs text-gray-500">
                   Stacked exposure vs hedges — available in Test Mode Group / entity FX dashboards.
                 </p>
               </div>
-            )}
+            ))}
           </div>
         )}
         {!effectiveHiddenTabs.includes('analytics') && (
@@ -446,6 +496,59 @@ export function Simulator({
                     </p>
                   </div>
                 ))}
+          </div>
+        )}
+        {!effectiveHiddenTabs.includes('liquidity') && (
+          <div className={activeTab === 'liquidity' ? '' : 'hidden'}>
+            {/*
+              Liquidity gap forecast and its management: Liquidity Book + Carry/Buffer (H*) +
+              Swap restructuring + Cash/Swap Carry, on the same live book as the FX Risk tab.
+              FX-hedge-specific content (Fwd/Option hedge, Hedge Carry, Portfolio VAR, hedging
+              strategy) is excluded — that lives in the FX Risk tab.
+            */}
+            <UnifiedSimulator
+              shared={shared}           onSharedChange={onSharedChange}
+              rows={rows}               setRows={setRows}
+              usdCash={usdCash}         setUsdCash={setUsdCash}
+              usdNonNpCash={usdNonNpCash} setUsdNonNpCash={setUsdNonNpCash}
+              usdParams={usdParams}     setUsdParams={setUsdParams}
+              onResetTable={onResetTable}
+              activeLayers={activeLayers}
+              onLayerToggle={onLayerToggle}
+              policyVAR={policyVAR}
+              onPolicyVARChange={setPolicyVAR}
+              portfolioSummary={dashboard.portfolioSummary}
+              fcyComputed={dashboard.fcyComputed}
+              usdComputed={dashboard.usdComputed}
+              showRates
+              showFxPosition
+              showLiquidity
+              showAdvancedBook
+              hideFxHedge
+              pnlColumns="carryOnly"
+              varSetup={varSetup}
+              onVarSetupChange={onVarSetupChange}
+              forecastProfile={forecastProfile}
+              onForecastProfileChange={setForecastProfile}
+              forecastProfileOpen={forecastProfileOpen}
+              onForecastProfileOpenChange={setForecastProfileOpen}
+              simDark={embedded}
+              formulas={formulas}
+              onFormulaChange={onFormulaChange}
+              onFormulaChanges={onFormulaChanges}
+            />
+          </div>
+        )}
+        {!effectiveHiddenTabs.includes('dataUpload') && (
+          <div className={activeTab === 'dataUpload' ? '' : 'hidden'}>
+            {dataUploadPanel ?? (
+              <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 p-10 text-center">
+                <h3 className="text-sm font-semibold text-gray-800">Market data</h3>
+                <p className="mt-2 text-xs text-gray-500">
+                  Overnight cash, term deposits, and EURUSD swap points — available in Test Mode Group / entity FX dashboards.
+                </p>
+              </div>
+            )}
           </div>
         )}
         {!effectiveHiddenTabs.includes('monteCarlo') && (

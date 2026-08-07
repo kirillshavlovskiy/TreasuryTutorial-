@@ -6,6 +6,7 @@ import {
   type RowState,
 } from '@/lib/fx-buffer';
 import {
+  effectiveForecastUncertainty1m,
   effectiveMonthlyFlowLocalM,
   monthlyFlowSeriesLocalM,
   periodFlowSumLocalM,
@@ -13,6 +14,7 @@ import {
 } from '@/lib/forecast-profile';
 import { computeTaskVar } from '@/lib/test-mode/task-var';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
+import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   DEFAULT_VAR_SETUP,
   VAR_HORIZON_OPTIONS,
@@ -27,11 +29,30 @@ import {
   horizonMonths,
   linearBulletNotionalFromVarUsdM,
   averageExposureForVaR,
+  monthlyVolForSetup,
   type VarExposureBasis,
   type VarHorizonId,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
-import type { VarConfidencePct } from '@/lib/test-mode/var-confidence';
+import {
+  zForConfidence,
+  type VarConfidencePct,
+} from '@/lib/test-mode/var-confidence';
+
+/** Apply line-level forecast σ (Revenue / max line) over global Analytics u₁ₘ. */
+export function varSetupWithLineUncertainty(
+  setup: VarSetup,
+  ccy: string,
+  forecastProfile?: ForecastProfileState | null,
+): VarSetup {
+  const u = effectiveForecastUncertainty1m(
+    forecastProfile,
+    ccy,
+    setup.forecastUncertainty1m,
+  );
+  if (Math.abs(u - (setup.forecastUncertainty1m ?? 0)) < 1e-12) return setup;
+  return { ...setup, forecastUncertainty1m: u };
+}
 
 /** Per-row Risk Metrics cell data for the FX table (VaR before P&L). */
 export interface RowRiskMetric {
@@ -260,18 +281,19 @@ export function fxTableRiskMetrics(
       // Constant hedge notional shifts the path: e_res(t) = (S − B) + F·t.
       const stockAfterHedgeM = stockM - totalHedgeLocalM;
       const flows = schedule.length > 0 ? schedule : undefined;
+      const rowSetup = varSetupWithLineUncertainty(setup, r.ccy, forecastProfile);
       const varBeforeUsdM = computeAnalyticsVarUsdM(
         stockM,
         flowForPath,
         r.ccy,
-        setup,
+        rowSetup,
         flows,
       );
       const varUsdM = computeAnalyticsVarUsdM(
         stockAfterHedgeM,
         flowForPath,
         r.ccy,
-        setup,
+        rowSetup,
         flows,
       );
       return {
@@ -383,13 +405,127 @@ export function analyticsOpenExposureLocalM(
 }
 
 /**
+ * Center of gravity of path VaR mass e(t)² on [0, T]:
+ *   t_cog = ∫ t·e(t)² dt / ∫ e(t)² dt
+ *   H     = e(t_cog)
+ *
+ * Open path VaR ∝ √∫e²dt — VN hedge is the exposure at that mass centroid.
+ * Same for simple / time-weighted / growth profiles (all path-CoG based).
+ * Flat F: S=1.9,F=1.2,T=12 → t_cog≈8.62m, H≈12.24 (Ē=9.1, RMS≈10.0).
+ */
+export function pathVarCogHedgeLocalM(
+  stockM: number,
+  monthlyFlowM: number,
+  tenureMonths: number,
+  monthlyFlows?: readonly number[],
+): number {
+  const T =
+    typeof tenureMonths === 'number' && tenureMonths > 1e-12 ? tenureMonths : 0;
+  const S = Number.isFinite(stockM) ? stockM : 0;
+  if (!(T > 0)) return S;
+  const flows =
+    monthlyFlows && monthlyFlows.length > 0
+      ? monthlyFlows
+      : Array.from({ length: Math.max(1, Math.ceil(T)) }, () => monthlyFlowM);
+  const eAt = (t: number) => accruedPositionFromScheduleM(S, flows, t);
+  const e0 = eAt(0);
+  const eT = eAt(T);
+
+  const n = Math.max(80, Math.ceil(T * 40));
+  const dt = T / n;
+  let mass = 0;
+  let moment = 0;
+  for (let i = 0; i < n; i++) {
+    const t0 = i * dt;
+    const t1 = Math.min(T, (i + 1) * dt);
+    const tm = 0.5 * (t0 + t1);
+    const em = eAt(tm);
+    const w = em * em * (t1 - t0);
+    mass += w;
+    moment += tm * w;
+  }
+  if (!(mass > 1e-18)) {
+    const signed =
+      Math.abs(eT) > 1e-12 ? (eT >= 0 ? 1 : -1) : e0 >= 0 ? 1 : -1;
+    return signed * Math.abs(eT || e0);
+  }
+  const tCog = moment / mass;
+  const H = eAt(Math.min(Math.max(tCog, 0), T));
+  const signed =
+    Math.abs(eT) > 1e-12 ? (eT >= 0 ? 1 : -1) : e0 >= 0 ? 1 : -1;
+  return signed * Math.min(Math.abs(H), Math.abs(eT) || Math.abs(H));
+}
+
+/** @deprecated use pathVarCogHedgeLocalM */
+export const riskBalanceHedgeLocalM = pathVarCogHedgeLocalM;
+
+/**
+ * VaR-neutral hedge notional at tenure T (months) — **profile-specific**:
+ *
+ * - stock: S
+ * - simpleAvg: mid Ē = (S+E_end)/2  (flat-Ē VaR model → CoG at T/2)
+ * - avgBuildup: time-weighted Ē = (1/T)∫e  (same as simple on flat F)
+ * - totalBuildup (growth): path-VaR CoG H = e(∫t e²/∫e²)
+ *
+ * Strip uses the same rule per window. Not the same H across regimes.
+ */
+export function equalVarNotionalAtTenureLocalM(
+  stockM: number,
+  monthlyFlowM: number,
+  _ccy: string,
+  setup: VarSetup,
+  tenureMonths: number,
+  monthlyFlows?: readonly number[],
+): number {
+  const T =
+    typeof tenureMonths === 'number' && tenureMonths > 1e-12 ? tenureMonths : 0;
+  if (!(T > 0)) {
+    return Number.isFinite(stockM) ? stockM : 0;
+  }
+
+  if (setup.exposureBasis === 'stock') {
+    return Number.isFinite(stockM) ? stockM : 0;
+  }
+
+  // Growth path only → e² CoG. Simple / TW stay on their Ē (different regimes).
+  if (setup.exposureBasis === 'totalBuildup') {
+    return pathVarCogHedgeLocalM(stockM, monthlyFlowM, T, monthlyFlows);
+  }
+
+  const eBar = averageExposureForVaR(
+    stockM,
+    monthlyFlowM,
+    setup,
+    monthlyFlows,
+    T,
+  );
+  const end =
+    monthlyFlows && monthlyFlows.length > 0
+      ? accruedPositionFromScheduleM(stockM, monthlyFlows, T)
+      : accruedPositionFromScheduleM(
+          stockM,
+          Array.from({ length: Math.max(1, Math.ceil(T)) }, () => monthlyFlowM),
+          T,
+        );
+  const sign =
+    Math.abs(end) > 1e-12
+      ? end >= 0
+        ? 1
+        : -1
+      : eBar >= 0
+        ? 1
+        : -1;
+  return sign * Math.min(Math.abs(eBar), Math.abs(end) || Math.abs(eBar));
+}
+
+/**
  * Equal-VaR linear hedge notional (exposure-signed):
  * invert Analytics VaR through the bullet formula |N|×σ×√Th×z, then cap by
  * |accrued end position at Th| (not by Ē).
  *
  * Weighted avg: VaR uses Ē=(1/T)∫e ⇒ |N|≈Ē ≪ |E_end| on a growing book.
- * Growth path: |N| = RMS-equivalent ≪ |E_end|. Cap binds when forecast-u
- * inflates VaR above what a bullet on the accrued position can offset.
+ * Growth path (default): path-VaR CoG H=e(t*). Cap binds when a
+ * caller-supplied path VaR invert exceeds accrued |E|.
  */
 export function equalVarLinearHedgeNotionalLocalM(
   stockM: number,
@@ -399,26 +535,42 @@ export function equalVarLinearHedgeNotionalLocalM(
   pathVarUsdM?: number,
   monthlyFlows?: readonly number[],
 ): { amountLocalM: number; uncappedAbsLocalM: number; capped: boolean } {
+  const Th = horizonMonths(setup.horizon);
   const varUsd =
     typeof pathVarUsdM === 'number'
       ? pathVarUsdM
       : computeAnalyticsVarUsdM(stockM, monthlyFlowM, ccy, setup, monthlyFlows);
   const uncappedAbs = linearBulletNotionalFromVarUsdM(varUsd, ccy, setup);
-  // Cap / sign from accrued end (Exposure @ Δ1) — never from Ē (that made N≡Exposure on avg).
+  const amountLocalM =
+    typeof pathVarUsdM === 'number'
+      ? (() => {
+          const end = analyticsOpenExposureLocalM(
+            stockM,
+            monthlyFlowM,
+            setup,
+            monthlyFlows,
+          );
+          const sign = end >= 0 ? 1 : -1;
+          return sign * Math.min(uncappedAbs, Math.abs(end));
+        })()
+      : equalVarNotionalAtTenureLocalM(
+          stockM,
+          monthlyFlowM,
+          ccy,
+          setup,
+          Th,
+          monthlyFlows,
+        );
   const end = analyticsOpenExposureLocalM(
     stockM,
     monthlyFlowM,
     setup,
     monthlyFlows,
   );
-  const capAbs = Math.abs(end);
-  const sign = end >= 0 ? 1 : -1;
-  const cappedAbs = Math.min(uncappedAbs, capAbs);
-  const capped = uncappedAbs > capAbs + 1e-12;
   return {
-    amountLocalM: sign * cappedAbs,
+    amountLocalM,
     uncappedAbsLocalM: uncappedAbs,
-    capped,
+    capped: uncappedAbs > Math.abs(end) + 1e-12,
   };
 }
 
@@ -494,14 +646,133 @@ export function liveHedgeTickets(
 /** Scope key for hedges booked on the Group FX consolidated book. */
 export const GROUP_HEDGE_SCOPE = '__group__';
 
+/**
+ * Analytics path-chart package staged for the Hedging Decision tab.
+ * Not on the live book until the user clicks Send in Decision.
+ */
+export interface PreparedHedgeLeg {
+  index: number;
+  startMonth: number;
+  endMonth: number;
+  /**
+   * Economic cash / forward settle from M0 (period end / start / e∩H).
+   * Defaults to endMonth when omitted.
+   */
+  settleMonths?: number;
+  hedgeLocalM: number;
+  label: string;
+  stockStartM?: number;
+  endExposureM?: number;
+  /**
+   * Incremental trade notional for this leg (Δ vs prior cumul H).
+   * Carry is computed on this amount, not cumulative hedgeLocalM.
+   */
+  tradeNotionalLocalM?: number;
+  /** Implied FWD carry from EURUSD swap points ($M). */
+  impliedCarryUsdM?: number;
+  swapPoints?: number;
+  swapPointsSide?: 'bid' | 'ask' | 'mid';
+}
+
+export interface PreparedHedgeProfile {
+  structure: 'bullet' | 'strip';
+  /** Path-chart regime used when preparing. */
+  basis: 'cash' | 'varNeutral' | 'totalExpected';
+  ticketBasis: VarExposureBasis;
+  /** Strip legs (empty for bullet). */
+  legs: PreparedHedgeLeg[];
+  /** Signed FCY M cover (bullet notional, or Σ strip). */
+  coverLocalM: number;
+  /** Bullet Decision % of Target (preview); strip usually 0 until sent. */
+  hedgeRatio: number;
+  /**
+   * Bullet: cash-delivery rule (period end / start / e∩H) used at Prepare.
+   * Strip uses per-leg settleMonths instead.
+   */
+  cashDeliveryAt?: 'periodEnd' | 'periodStart' | 'matchExposure';
+  /** Bullet: forward settle tenure in months from M0. */
+  settleMonths?: number;
+  /**
+   * Strip settle-window skew: neutral = equal Sched %; front / back tilt
+   * tenor early / late (same as FX Risk path-chart Front / Back).
+   */
+  settleSkew?: 'neutral' | 'front' | 'back';
+  /** Package Σ implied swap-points carry ($M) — bullet or strip. */
+  impliedCarryUsdM?: number;
+  swapPoints?: number;
+  swapPointsSide?: 'bid' | 'ask' | 'mid';
+  /**
+   * Which objective shaped this package — FX Risk's equal-VaR path chart
+   * ('var') or Cash Carry's Shape search / tick-trades editor ('carry').
+   * Surfaced in Hedging Decision so the desk knows which lens sized what's
+   * about to be booked. Undefined for packages prepared before this tag
+   * existed.
+   */
+  preparedFor?: 'var' | 'carry';
+}
+
+/**
+ * Cash Carry modal resume snapshot — persisted with the sandbox hedge book
+ * so Apply / Prebook / schedule edits survive page reload (local + Neon).
+ */
+export type CarryProfileSessionV1 = {
+  v: 1;
+  draft: PreparedHedgeProfile | null;
+  dirty: boolean;
+  appliedShape: {
+    legCount: number;
+    centerOfMass: number;
+    kurtosis: number;
+  } | null;
+  shapePreview: {
+    legCount: number;
+    centerOfMass: number;
+    kurtosis: number;
+  } | null;
+  pathScheduleEnds: number[] | null;
+  pathHedgeWeights: number[] | null;
+  pathStripLegCount: number | null;
+  pathStructure: 'bullet' | 'strip';
+  pathBasis: 'cash' | 'varNeutral' | 'totalExpected';
+  selectedSettleMonths: number | null;
+  shapeStartManual: boolean;
+};
+
 /** Per-entity (or group-scope) Decision-layer hedge book. */
 export interface EntityHedgeBook {
   bookedHedges: HedgeTicket[];
   hedgeRatios: Record<string, number>;
+  /** Staged Analytics packages keyed by CCY — Decision must Send to book. */
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  /** In-progress Cash Carry profile modals keyed by CCY. */
+  carrySessionsByCcy?: Record<string, CarryProfileSessionV1>;
 }
 
 export function emptyHedgeBook(): EntityHedgeBook {
-  return { bookedHedges: [], hedgeRatios: {} };
+  return {
+    bookedHedges: [],
+    hedgeRatios: {},
+    preparedByCcy: {},
+    carrySessionsByCcy: {},
+  };
+}
+
+export function setPreparedHedgeForCcy(
+  prepared: Record<string, PreparedHedgeProfile> | undefined,
+  ccy: string,
+  profile: PreparedHedgeProfile,
+): Record<string, PreparedHedgeProfile> {
+  return { ...(prepared ?? {}), [ccy]: profile };
+}
+
+export function clearPreparedHedgeForCcy(
+  prepared: Record<string, PreparedHedgeProfile> | undefined,
+  ccy: string,
+): Record<string, PreparedHedgeProfile> {
+  if (!prepared || !(ccy in prepared)) return prepared ?? {};
+  const next = { ...prepared };
+  delete next[ccy];
+  return next;
 }
 
 /** Flatten entity (+ optional group) booked tickets for consolidated metrics. */
@@ -549,11 +820,15 @@ export function applyConsolidatedBookedChange(
     out[id] = {
       bookedHedges: buckets[id] ?? [],
       hedgeRatios: prev[id]?.hedgeRatios ?? {},
+      preparedByCcy: prev[id]?.preparedByCcy ?? {},
+      carrySessionsByCcy: prev[id]?.carrySessionsByCcy ?? {},
     };
   }
   out[GROUP_HEDGE_SCOPE] = {
     bookedHedges: buckets[GROUP_HEDGE_SCOPE] ?? [],
     hedgeRatios: prev[GROUP_HEDGE_SCOPE]?.hedgeRatios ?? {},
+    preparedByCcy: prev[GROUP_HEDGE_SCOPE]?.preparedByCcy ?? {},
+    carrySessionsByCcy: prev[GROUP_HEDGE_SCOPE]?.carrySessionsByCcy ?? {},
   };
   return out;
 }
@@ -725,17 +1000,112 @@ export interface StripHedgedVarLeg {
 }
 
 /**
+ * Hedged-portfolio VaR vs exposure with an arbitrary cover path H(t).
+ * Resid VaR = V_open(t) · |e−H| / |E_ref|.
+ */
+export function buildHedgedVarProfileWithCoverAt(
+  stockM: number,
+  monthlyFlowM: number,
+  ccy: string,
+  setup: VarSetup,
+  coverAt: (t: number) => number,
+  monthlyFlows?: readonly number[],
+  stepMonths = 1,
+  referenceCoverLocalM?: number,
+  throughMonths?: number,
+  /** Extra sample times (e.g. strip maturity knots) for exact resid at dots. */
+  extraSampleMonths?: readonly number[],
+): StripHedgedVarProfilePoint[] {
+  const Tf =
+    typeof setup.forecastMonths === 'number' && setup.forecastMonths > 0
+      ? setup.forecastMonths
+      : 0;
+  if (Tf <= 0) return [];
+  const through =
+    typeof throughMonths === 'number' &&
+    Number.isFinite(throughMonths) &&
+    throughMonths > Tf + 1e-12
+      ? throughMonths
+      : Tf;
+  const flows =
+    monthlyFlows && monthlyFlows.length > 0
+      ? monthlyFlows
+      : Array.from({ length: Math.ceil(Tf) }, () => monthlyFlowM);
+  const Eref =
+    typeof referenceCoverLocalM === 'number' &&
+    Math.abs(referenceCoverLocalM) > 1e-12
+      ? Math.abs(referenceCoverLocalM)
+      : Math.abs(accruedPositionFromScheduleM(stockM, flows, Tf));
+  if (!(Eref > 1e-12)) return [];
+
+  const pointAt = (t: number): StripHedgedVarProfilePoint => {
+    const H = coverAt(t);
+    const e = accruedPositionFromScheduleM(stockM, flows, t);
+    const residualAbs = Math.abs(e - H);
+    const openVarUsdM =
+      t < 1e-9
+        ? 0
+        : computeAnalyticsVarUsdM(
+            stockM,
+            monthlyFlowM,
+            ccy,
+            setup,
+            flows,
+            t,
+          );
+    return {
+      t,
+      openVarUsdM,
+      hedgedVarUsdM: openVarUsdM * (residualAbs / Eref),
+      exposureLocalM: e,
+      cumulCoverLocalM: H,
+      residualCoverLocalM: residualAbs,
+    };
+  };
+  const step = stepMonths > 0 ? stepMonths : 1;
+  const out: StripHedgedVarProfilePoint[] = [];
+  const pushUnique = (t: number) => {
+    const pt = pointAt(t);
+    const prev = out[out.length - 1];
+    if (prev && Math.abs(prev.t - pt.t) < 1e-9) {
+      out[out.length - 1] = pt;
+      return;
+    }
+    out.push(pt);
+  };
+  for (let t = 0; t <= through + 1e-9; t += step) {
+    pushUnique(Math.min(t, through));
+  }
+  if (Tf < through - 1e-9) pushUnique(Tf);
+  pushUnique(through);
+  if (extraSampleMonths) {
+    for (const raw of extraSampleMonths) {
+      if (!Number.isFinite(raw)) continue;
+      pushUnique(Math.max(0, Math.min(through, raw)));
+    }
+  }
+  out.sort((a, b) => a.t - b.t);
+  const deduped: StripHedgedVarProfilePoint[] = [];
+  for (const p of out) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && Math.abs(prev.t - p.t) < 1e-9) {
+      deduped[deduped.length - 1] = p;
+    } else {
+      deduped.push(p);
+    }
+  }
+  return deduped;
+}
+
+/**
  * Hedged-portfolio VaR vs the realized exposure path.
  *
  * H(t) = Σ legs live by t (default: all M0 legs from day 0).
- * e(t) = accrued forecast exposure (flat at E(Tf) once the schedule ends).
- * residual = |e − H| — for VN, H≈Ē ≪ E(Tf) so |E_end−H| stays open after Tf.
- * hedged VaR = V(t) · |e−H| / E_ref
- *   → 0 only when matched (Target at/after Tf);
- *   → after Tf, V(t) keeps growing while notional gap is constant (VN track).
+ * Strip resid (all regimes): H(t) = Σ M0 legs live by t (default: all from 0).
  *
- * Samples [0, throughMonths]; default throughMonths = Tf. Pass a longer
- * horizon (e.g. 12m) to keep the post-forecast residual visible.
+ * e(t) = accrued forecast exposure (flat at E(Tf) once the schedule ends).
+ * residual = |e − H|
+ * hedged VaR = V(t) · |e−H| / E_ref
  */
 export function buildStripHedgedVarProfile(
   stockM: number,
@@ -761,72 +1131,33 @@ export function buildStripHedgedVarProfile(
   if (Tf <= 0 || legs.length === 0) return [];
   const Ntot = legs.reduce((s, l) => s + Math.abs(l.amountLocalM), 0);
   if (Ntot < 1e-12) return [];
-  const through =
-    typeof throughMonths === 'number' &&
-    Number.isFinite(throughMonths) &&
-    throughMonths > Tf + 1e-12
-      ? throughMonths
-      : Tf;
-  const flows =
-    monthlyFlows && monthlyFlows.length > 0
-      ? monthlyFlows
-      : Array.from({ length: Math.ceil(Tf) }, () => monthlyFlowM);
-  const Eref =
-    typeof referenceCoverLocalM === 'number' &&
-    Math.abs(referenceCoverLocalM) > 1e-12
-      ? Math.abs(referenceCoverLocalM)
-      : Math.abs(accruedPositionFromScheduleM(stockM, flows, Tf)) || Ntot;
   const recognizeAt = (l: StripHedgedVarLeg) =>
     typeof l.recognizeFromMonths === 'number' ? l.recognizeFromMonths : 0;
-  /** Signed cover H(t) — same sign as Σ legs (exposure cover). */
   const hedgeAt = (t: number) =>
     legs
       .filter(l => recognizeAt(l) <= t + 1e-9)
       .reduce((s, l) => s + l.amountLocalM, 0);
-  const pointAt = (t: number): StripHedgedVarProfilePoint => {
-    const H = hedgeAt(t);
-    // Accrual stops when the forecast schedule ends → e flat at E(Tf) for t>Tf.
-    const e = accruedPositionFromScheduleM(stockM, flows, t);
-    const residualAbs = Math.abs(e - H);
-    const openVarUsdM =
-      t < 1e-9
-        ? 0
-        : computeAnalyticsVarUsdM(
-            stockM,
-            monthlyFlowM,
-            ccy,
-            setup,
-            flows,
-            t,
-          );
-    return {
-      t,
-      openVarUsdM,
-      hedgedVarUsdM: Eref > 1e-12 ? openVarUsdM * (residualAbs / Eref) : 0,
-      exposureLocalM: e,
-      cumulCoverLocalM: H,
-      residualCoverLocalM: residualAbs,
-    };
-  };
-  const step = stepMonths > 0 ? stepMonths : 1;
-  const out: StripHedgedVarProfilePoint[] = [];
-  const pushUnique = (t: number) => {
-    const pt = pointAt(t);
-    const prev = out[out.length - 1];
-    if (prev && Math.abs(prev.t - pt.t) < 1e-9) {
-      out[out.length - 1] = pt;
-      return;
-    }
-    out.push(pt);
-  };
-  for (let t = 0; t <= through + 1e-9; t += step) {
-    pushUnique(Math.min(t, through));
-  }
-  // Always include Tf (forecast end) and the window end when they fall off-grid.
-  if (Tf < through - 1e-9) pushUnique(Tf);
-  pushUnique(through);
-  out.sort((a, b) => a.t - b.t);
-  return out;
+  return buildHedgedVarProfileWithCoverAt(
+    stockM,
+    monthlyFlowM,
+    ccy,
+    setup,
+    hedgeAt,
+    monthlyFlows,
+    stepMonths,
+    referenceCoverLocalM ??
+      (Math.abs(
+        accruedPositionFromScheduleM(
+          stockM,
+          monthlyFlows && monthlyFlows.length > 0
+            ? monthlyFlows
+            : Array.from({ length: Math.ceil(Tf) }, () => monthlyFlowM),
+          Tf,
+        ),
+      ) ||
+        Ntot),
+    throughMonths,
+  );
 }
 
 /** Live strip legs for a CCY (all dealt from M0). */
@@ -922,6 +1253,8 @@ export function buildHedgeVarSummary(
   bookedTickets: readonly HedgeTicket[] = [],
   /** Per-CCY custom month nets; when set, Analytics VaR uses the uneven schedule. */
   monthlyFlowsByCcy: Record<string, readonly number[]> = {},
+  /** When set, Revenue / line σ overrides global Analytics u₁ₘ per CCY. */
+  forecastProfile?: ForecastProfileState | null,
 ): HedgeVarSummary {
   const setup: VarSetup =
     typeof setupOrConfidence === 'number'
@@ -932,9 +1265,16 @@ export function buildHedgeVarSummary(
     .filter(r => r.bar.ccy !== 'USD')
     .map(row => {
       const { bar } = row;
+      const rowSetup = varSetupWithLineUncertainty(
+        setup,
+        bar.ccy,
+        forecastProfile,
+      );
       const stockM = bar.stockNetM;
       const flowM =
-        setup.forecastMonths > 0 && Math.abs(bar.flowM) > 1e-15 ? bar.flowM : 0;
+        rowSetup.forecastMonths > 0 && Math.abs(bar.flowM) > 1e-15
+          ? bar.flowM
+          : 0;
       const schedule = monthlyFlowsByCcy[bar.ccy];
       const flows =
         schedule && schedule.length > 0 ? schedule : undefined;
@@ -942,7 +1282,7 @@ export function buildHedgeVarSummary(
       const openLocalM = analyticsOpenExposureLocalM(
         stockM,
         flowM,
-        setup,
+        rowSetup,
         flows,
       );
       const stripAmt = stripCoverLocalM(bookedTickets, bar.ccy);
@@ -957,7 +1297,7 @@ export function buildHedgeVarSummary(
         )
         .reduce((s, t) => s + t.amountLocalM, 0);
       // Decision ladder: 100% = Total expected over full forecast (Target).
-      const Tf = setup.forecastMonths;
+      const Tf = rowSetup.forecastMonths;
       const totalRaw =
         flows && flows.length > 0 && Tf > 0
           ? accruedPositionFromScheduleM(stockM, flows, Tf)
@@ -983,30 +1323,36 @@ export function buildHedgeVarSummary(
         stockM,
         flowM,
         bar.ccy,
-        setup,
+        rowSetup,
         flows,
         hasStrip && Tf > 0 ? Tf : undefined,
       );
-      // VN column = Equal-VaR on the OPEN book at the sizing horizon.
-      const varOpenAtHorizonUsdM = computeAnalyticsVarUsdM(
+      // VN: growth → path CoG; simple/TW → Ē. Stock → growth so VN ≠ Cash.
+      const eqTenure = Tf > 0 ? Tf : horizonMonths(rowSetup.horizon);
+      const eqSetup: VarSetup =
+        rowSetup.exposureBasis === 'stock'
+          ? { ...rowSetup, exposureBasis: 'totalBuildup' }
+          : rowSetup;
+      const eqAmount = equalVarNotionalAtTenureLocalM(
         stockM,
         flowM,
         bar.ccy,
-        setup,
+        eqSetup,
+        eqTenure,
         flows,
       );
       const eqOpen = equalVarLinearHedgeNotionalLocalM(
         stockM,
         flowM,
         bar.ccy,
-        setup,
-        varOpenAtHorizonUsdM,
+        rowSetup,
+        undefined,
         flows,
       );
       const accruedCap = analyticsOpenExposureLocalM(
         stockM,
         flowM,
-        setup,
+        rowSetup,
         flows,
       );
       const sign =
@@ -1017,11 +1363,7 @@ export function buildHedgeVarSummary(
           : openLocalM >= 0
             ? 1
             : -1;
-      const equalAbs = Math.min(
-        Math.abs(eqOpen.amountLocalM),
-        Math.abs(accruedCap),
-      );
-      const equalVarHedgeLocalM = sign * equalAbs;
+      const equalVarHedgeLocalM = sign * Math.abs(eqAmount);
       // Leftover capacity after near-term cover (for cap flag only).
       const remainCapAbs = Math.max(
         0,
@@ -1031,10 +1373,10 @@ export function buildHedgeVarSummary(
       const hedgeNotionalLocalM = hasStrip
         ? stripAmt
         : targetHedgeLocalM * ratio;
-      // Path exposure at the VaR tenure (strip → Tf; bullet → min(Th,Tf)).
-      const Th = horizonMonths(setup.horizon);
-      const tenureForResid =
-        hasStrip && Tf > 0 ? Tf : Tf > 0 ? Math.min(Th, Tf) : Th;
+      // Residual vs path-end when forecasting: 100% Target → e(Tf)=H → Δ=0
+      // (bullet and strip). Th alone made Target look under-/over-hedged when Tf>Th.
+      const Th = horizonMonths(rowSetup.horizon);
+      const tenureForResid = Tf > 0 ? Tf : Th;
       const schedForPath =
         flows && flows.length > 0
           ? flows

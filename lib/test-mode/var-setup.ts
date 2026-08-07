@@ -288,7 +288,23 @@ export function isForecastPeriodId(v: unknown): v is ForecastPeriodId {
 export function parseVarExposureBasis(raw: string | undefined | null): VarExposureBasis | null {
   if (!raw) return null;
   const v = raw.trim();
-  return isVarExposureBasis(v) ? v : null;
+  if (isVarExposureBasis(v)) return v;
+  // Label aliases for VaR profiles only (not hedge regimes Cash / Target).
+  const key = v.toLowerCase().replace(/[\s_\-()]+/g, '');
+  if (key === 'totalbuildup' || key === 'growthpath' || key === 'growthpathaverage') {
+    return 'totalBuildup';
+  }
+  if (key === 'simpleaverage' || key === 'simpleavg' || key === 'midpoint') {
+    return 'simpleAvg';
+  }
+  if (
+    key === 'timeweightedaverage' ||
+    key === 'timeweighted' ||
+    key === 'avgbuildup'
+  ) {
+    return 'avgBuildup';
+  }
+  return null;
 }
 
 export function parseVarHorizonId(raw: string | undefined | null): VarHorizonId | null {

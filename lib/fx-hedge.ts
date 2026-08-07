@@ -183,6 +183,157 @@ export function fwdHedgeCarryUsdYr(
   return -notional * fcyToUsdM(1, ccy) * (r_USD - r_FCY) / 100;
 }
 
+/** Period carry breakdown for one strip/bullet forward (USD M over the path). */
+export interface StripHedgeCarryBreakdown {
+  /**
+   * Forward points carry over [0, settle] — from EURUSD Swap Points when
+   * provided, else deposit-rate CIP fallback.
+   */
+  fwdCarryUsdM: number;
+  /** Exposure-ccy interest from recognize → settle (USD-equivalent). */
+  fcyInterestUsdM: number;
+  /** Reporting-ccy (USD) interest from settle → forecast end. */
+  usdInterestUsdM: number;
+  totalUsdM: number;
+  /** Effective FCY overnight rate used (credit or debit by position sign). */
+  r_FCY_used?: number;
+  /** Effective USD overnight rate used (credit or debit by position sign). */
+  r_USD_used?: number;
+  r_FCY_side?: 'credit' | 'debit';
+  r_USD_side?: 'credit' | 'debit';
+  /** Swap points used for FWD carry (when from market curve). */
+  swapPoints?: number;
+  swapPointsSide?: 'bid' | 'ask' | 'mid';
+}
+
+export interface StripHedgeCarryRatesInput {
+  /** Long-cash earn rate % p.a. */
+  creditPct: number;
+  /** Short / OD pay rate % p.a. */
+  debitPct: number;
+}
+
+function pickSideRate(
+  signedAmount: number,
+  creditPct: number,
+  debitPct: number,
+): { ratePct: number; side: 'credit' | 'debit' } {
+  if (signedAmount >= 0) return { ratePct: creditPct, side: 'credit' };
+  return { ratePct: debitPct, side: 'debit' };
+}
+
+/**
+ * Carry on a hedge forward over the forecast path:
+ * - FWD: EURUSD Swap Points column (preferred) or deposit-rate CIP fallback
+ * - FCY / USD cash interest: overnight cash rates (separate input)
+ *
+ * Long → credit; short / OD → debit on overnight rates.
+ */
+export function stripHedgeLegCarryUsdM(input: {
+  notionalLocalM: number;
+  ccy: string;
+  /** Months when this incremental exposure is recognized (window start). */
+  recognizeMonths: number;
+  /** Forward settlement months from M0. */
+  settleMonths: number;
+  /** Forecast / reporting horizon end (months). */
+  forecastEndMonths: number;
+  /** @deprecated use fcyFwdRates / fcyCashRates */
+  r_FCY?: number;
+  /** @deprecated use usdFwdRates / usdCashRates */
+  r_USD?: number;
+  /**
+   * @deprecated Prefer fcyFwdRates + fcyCashRates.
+   * If only this is set, used for both CIP and cash interest.
+   */
+  fcyRates?: StripHedgeCarryRatesInput;
+  /** @deprecated Prefer usdFwdRates + usdCashRates. */
+  usdRates?: StripHedgeCarryRatesInput;
+  /** Term rates — CIP fallback only when swap points missing. */
+  fcyFwdRates?: StripHedgeCarryRatesInput;
+  usdFwdRates?: StripHedgeCarryRatesInput;
+  /** Overnight cash rates for FCY/USD interest legs. */
+  fcyCashRates?: StripHedgeCarryRatesInput;
+  usdCashRates?: StripHedgeCarryRatesInput;
+  /**
+   * Pre-computed FWD carry from market swap points ($M).
+   * When set, replaces deposit-rate CIP for the forward leg.
+   */
+  swapPointsCarryUsdM?: number;
+  swapPoints?: number;
+  swapPointsSide?: 'bid' | 'ask' | 'mid';
+}): StripHedgeCarryBreakdown {
+  const N = input.notionalLocalM;
+  const zero: StripHedgeCarryBreakdown = {
+    fwdCarryUsdM: 0,
+    fcyInterestUsdM: 0,
+    usdInterestUsdM: 0,
+    totalUsdM: 0,
+  };
+  if (Math.abs(N) < 1e-9) return zero;
+  const settle = Math.max(0, input.settleMonths);
+  const recog = Math.max(0, Math.min(input.recognizeMonths, settle));
+  const Tf = Math.max(settle, input.forecastEndMonths);
+  const usdNotional = N * fcyToUsdM(1, input.ccy);
+  const settleYr = settle / 12;
+  const fcyYr = Math.max(0, settle - recog) / 12;
+  const usdYr = Math.max(0, Tf - settle) / 12;
+
+  const fcyFwd = input.fcyFwdRates ?? input.fcyRates;
+  const usdFwd = input.usdFwdRates ?? input.usdRates;
+  const fcyCash = input.fcyCashRates ?? input.fcyRates;
+  const usdCash = input.usdCashRates ?? input.usdRates;
+
+  const fcyFwdCredit = fcyFwd?.creditPct ?? input.r_FCY ?? 0;
+  const fcyFwdDebit = fcyFwd?.debitPct ?? input.r_FCY ?? fcyFwdCredit;
+  const usdFwdCredit = usdFwd?.creditPct ?? input.r_USD ?? 0;
+  const usdFwdDebit = usdFwd?.debitPct ?? input.r_USD ?? usdFwdCredit;
+
+  const fcyCashCredit = fcyCash?.creditPct ?? input.r_FCY ?? fcyFwdCredit;
+  const fcyCashDebit =
+    fcyCash?.debitPct ?? input.r_FCY ?? fcyCashCredit;
+  const usdCashCredit = usdCash?.creditPct ?? input.r_USD ?? usdFwdCredit;
+  const usdCashDebit =
+    usdCash?.debitPct ?? input.r_USD ?? usdCashCredit;
+
+  const fcyFwdPick = pickSideRate(N, fcyFwdCredit, fcyFwdDebit);
+  const usdFwdPick = pickSideRate(usdNotional, usdFwdCredit, usdFwdDebit);
+  const fcyCashPick = pickSideRate(N, fcyCashCredit, fcyCashDebit);
+  const usdCashPick = pickSideRate(
+    usdNotional,
+    usdCashCredit,
+    usdCashDebit,
+  );
+
+  const useSwapPoints =
+    typeof input.swapPointsCarryUsdM === 'number' &&
+    Number.isFinite(input.swapPointsCarryUsdM);
+  const fwdCarryUsdM = useSwapPoints
+    ? input.swapPointsCarryUsdM!
+    : fwdHedgeCarryUsdYr(
+        N,
+        input.ccy,
+        fcyFwdPick.ratePct,
+        usdFwdPick.ratePct,
+      ) * settleYr;
+  const fcyInterestUsdM =
+    usdNotional * (fcyCashPick.ratePct / 100) * fcyYr;
+  const usdInterestUsdM =
+    usdNotional * (usdCashPick.ratePct / 100) * usdYr;
+  return {
+    fwdCarryUsdM,
+    fcyInterestUsdM,
+    usdInterestUsdM,
+    totalUsdM: fwdCarryUsdM + fcyInterestUsdM + usdInterestUsdM,
+    r_FCY_used: fcyCashPick.ratePct,
+    r_USD_used: usdCashPick.ratePct,
+    r_FCY_side: fcyCashPick.side,
+    r_USD_side: usdCashPick.side,
+    swapPoints: input.swapPoints,
+    swapPointsSide: input.swapPointsSide,
+  };
+}
+
 export interface GammaCarryResult {
   /** Carry on the forward delta-hedge leg (δ × notional hedged forward), $M/yr. */
   fwdLegCarryUsdYr: number;

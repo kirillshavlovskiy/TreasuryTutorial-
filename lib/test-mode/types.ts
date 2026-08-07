@@ -30,7 +30,10 @@ export interface TaskAnswers {
   largestMismatchAmount: string;
   /** VaR confidence % from Analytics (90 | 95 | 99). */
   varConfidencePct: string;
-  /** Exposure basis from Analytics (stock | simpleAvg | avgBuildup | totalBuildup). */
+  /**
+   * VaR profile from Analytics (simpleAvg | avgBuildup | totalBuildup).
+   * Not a hedge regime — Cash / Target are Decision hedging only.
+   */
   varExposureBasis: string;
   /** VaR analysis horizon from Analytics (1w | 1m | 3m | 6m | 9m | 1y) — vol √T only. */
   varHorizon: string;
