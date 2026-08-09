@@ -1195,14 +1195,22 @@ export function CfarAnalysisView({
               for the figures above, on exactly the legs ticked On.
             </p>
             {whatIf ? (
-              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-4">
                 <WhatIfDeltaRow
                   label="Net CFaR"
                   current={selected.bands.netCriticalCashUsdM}
                   proposed={whatIf.bands.netCriticalCashUsdM}
                   fmt={fmtK}
                   lowerIsBetter
-                  note="Spot risk (not-dealt + forecast uncertainty) + swap-bridge risk (dealt-not-settled, rate-diff vol) combined — more/better-spaced legs shrink the sawtooth in both and should lower this."
+                  note="Spot risk (not-dealt + forecast uncertainty, leg-count invariant by construction) RSS-combined with swap-bridge risk (dealt-not-settled, leg-sensitive). When spot dominates — any book below ~full cover — this total can look flat even as legs change; watch Swap-bridge risk below instead."
+                />
+                <WhatIfDeltaRow
+                  label="Swap-bridge risk"
+                  current={selected.bands.breakdown.swapPeakUsdM}
+                  proposed={whatIf.bands.breakdown.swapPeakUsdM}
+                  fmt={fmtK}
+                  lowerIsBetter
+                  note="Isolated dealt-but-not-settled component only — this is the piece leg count/spacing actually controls. More, better-spaced legs shrink the settlement sawtooth and should lower this even when Net CFaR above barely moves."
                 />
                 <WhatIfDeltaRow
                   label="Funding gap"
