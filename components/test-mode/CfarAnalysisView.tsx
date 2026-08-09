@@ -914,13 +914,13 @@ export function CfarAnalysisView({
         <p className="text-[9px] leading-relaxed text-slate-500">
           Net CFaR combines two independent risks in quadrature: spot risk on
           exposure with no forward dealt at all (full FX vol, plus forecast
-          uncertainty folded in), and swap-bridge risk on notional that's
+          uncertainty folded in), and swap-bridge risk on notional that&apos;s
           dealt but not yet settled (rate-differential vol only — bridging via
           spot+swap-back nets out the spot exposure once the forward
           eventually delivers). Both genuinely depend on leg count/spacing.
           Closed form, not simulated — each t is an independent point-in-time
           draw, not a compounding path. All CCY sums per-currency figures
-          (undiversified). Funding gap is the settlement gap g(t)=e−H_settled's
+          (undiversified). Funding gap is the settlement gap g(t)=e−H_settled&apos;s
           deterministic floor (zero volatility, either kind) and is not
           summed into Net CFaR.
         </p>
