@@ -75,11 +75,6 @@ interface RiskPerspectiveSelectorProps {
   moduleLabel?: string;
   /** Optional live figures per tab. Missing / inactive tabs show `—`. */
   tabStats?: Partial<Record<RiskPerspective, RiskPerspectiveTabStat>>;
-  /**
-   * Restrict which tabs render (e.g. modules that only implement FX Risk).
-   * Omit to show every perspective in {@link RISK_PERSPECTIVES}.
-   */
-  perspectives?: readonly RiskPerspective[];
   /** Forecast period months for the Tf chip (omit to hide). */
   tfMonths?: number | null;
   /** Gear / settings control on the context row. */
@@ -103,7 +98,6 @@ export function RiskPerspectiveSelector({
   variant = 'rail',
   moduleLabel = 'Analytics',
   tabStats,
-  perspectives,
   tfMonths,
   onOpenSettings,
   settingsDisabled = false,
@@ -113,9 +107,6 @@ export function RiskPerspectiveSelector({
   showDescription = true,
 }: RiskPerspectiveSelectorProps) {
   const meta = riskPerspectiveMeta(value);
-  const tabs = perspectives
-    ? RISK_PERSPECTIVES.filter(p => perspectives.includes(p.id))
-    : RISK_PERSPECTIVES;
 
   if (variant === 'chips') {
     const inactive = !meta.active;
@@ -126,7 +117,7 @@ export function RiskPerspectiveSelector({
           role="group"
           aria-label="Risk perspective"
         >
-          {tabs.map(p => (
+          {RISK_PERSPECTIVES.map(p => (
             <button
               key={p.id}
               type="button"
@@ -184,7 +175,7 @@ export function RiskPerspectiveSelector({
         role="tablist"
         aria-label={`${moduleLabel} modules`}
       >
-        {tabs.map(p => {
+        {RISK_PERSPECTIVES.map(p => {
           const on = value === p.id;
           const soon = !p.active;
           const stat = tabStats?.[p.id];

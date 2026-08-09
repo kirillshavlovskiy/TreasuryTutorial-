@@ -67,8 +67,6 @@ import {
   type RollingHedgeEdge,
 } from '@/lib/test-mode/rolling-hedge';
 import {
-  RiskPerspectiveSelector,
-  riskPerspectiveMeta,
   type RiskPerspective,
   type RiskPerspectiveTabStat,
 } from '@/components/test-mode/RiskPerspectiveSelector';
@@ -316,7 +314,6 @@ export function HedgingDecisionLayer({
     if (onHedgeStructureChange) onHedgeStructureChange(s);
     else setLocalStructure(s);
   };
-  const [perspective, setPerspective] = useState<RiskPerspective>('fxRisk');
   const ratios = controlledRatios ?? localRatios;
   const booked = controlledBooked ?? localBooked;
   const preparedByCcy = controlledPrepared ?? localPrepared;
@@ -1162,53 +1159,60 @@ export function HedgingDecisionLayer({
 
   return (
     <div className={`space-y-4 ${shell}`}>
-      <RiskPerspectiveSelector
-        value={perspective}
-        onChange={setPerspective}
-        moduleLabel="Hedging Decision"
-        perspectives={['fxRisk']}
-        tabStats={perspectiveTabStats}
-        tfMonths={varSetup.forecastMonths}
-        trailing={
-          <>
-            {rollingStrip && (
-              <button
-                type="button"
-                onClick={prepareRollingStrip}
-                disabled={stripAlreadyBooked}
-                title={
-                  stripAlreadyBooked
-                    ? 'Strip already on the book — cancel it to rebook'
-                    : stripAlreadyPrepared
-                      ? `Replace prepared ${rollingStrip.edges.length}-leg strip — then Send under ${rollingStrip.ccy}`
-                      : `Prepare ${rollingStrip.edges.length} forwards from M0 — Send under ${rollingStrip.ccy} to book`
-                }
-                className="rounded-md border border-violet-500/50 bg-violet-500/20 px-2.5 py-1 text-[11px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {stripAlreadyBooked
-                  ? 'Strip booked'
-                  : stripAlreadyPrepared
-                    ? `Prepared ${rollingStrip.edges.length}-leg strip`
-                    : `Prepare ${rollingStrip.edges.length}-leg strip`}
-              </button>
-            )}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-base font-semibold tracking-tight text-slate-50">
+            Hedging Decision
+          </h3>
+          <p className="mt-0.5 font-mono text-[11px] text-slate-500">
+            Resid VaR{' '}
+            <span className="font-semibold text-slate-300">
+              {perspectiveTabStats.fxRisk?.value ?? '—'}
+            </span>
+          </p>
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {rollingStrip && (
             <button
               type="button"
-              onClick={() => hedgeAll(0)}
-              className="rounded-md border border-slate-600 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
+              onClick={prepareRollingStrip}
+              disabled={stripAlreadyBooked}
+              title={
+                stripAlreadyBooked
+                  ? 'Strip already on the book — cancel it to rebook'
+                  : stripAlreadyPrepared
+                    ? `Replace prepared ${rollingStrip.edges.length}-leg strip — then Send under ${rollingStrip.ccy}`
+                    : `Prepare ${rollingStrip.edges.length} forwards from M0 — Send under ${rollingStrip.ccy} to book`
+              }
+              className="rounded-md border border-violet-500/50 bg-violet-500/20 px-2.5 py-1 text-[11px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              Unhedged
+              {stripAlreadyBooked
+                ? 'Strip booked'
+                : stripAlreadyPrepared
+                  ? `Prepared ${rollingStrip.edges.length}-leg strip`
+                  : `Prepare ${rollingStrip.edges.length}-leg strip`}
             </button>
-          </>
-        }
-      />
-
-      {perspective !== 'fxRisk' ? (
-        <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
-          {riskPerspectiveMeta(perspective).label} view is coming soon on Hedging
-          Decision.
+          )}
+          <button
+            type="button"
+            onClick={() => hedgeAll(0)}
+            className="rounded-md border border-slate-600 px-2.5 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
+          >
+            Unhedged
+          </button>
+          {varSetup.forecastMonths != null && (
+            <span className="inline-flex items-baseline gap-1.5 rounded-md border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-[11px] text-slate-500">
+              Tf
+              <span className="font-mono font-semibold tabular-nums text-sky-200">
+                {varSetup.forecastMonths === 0
+                  ? '0m'
+                  : `${varSetup.forecastMonths}m`}
+              </span>
+            </span>
+          )}
         </div>
-      ) : (
+      </div>
+
       <>
       <div className="grid gap-3 sm:grid-cols-3">
         <Stat
@@ -2197,7 +2201,6 @@ export function HedgingDecisionLayer({
           document.body,
         )}
       </>
-      )}
     </div>
   );
 }
