@@ -13,6 +13,7 @@ import {
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
 import { computeTaskVar } from '@/lib/test-mode/task-var';
+import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
@@ -746,6 +747,8 @@ export interface EntityHedgeBook {
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   /** In-progress Cash Carry profile modals keyed by CCY. */
   carrySessionsByCcy?: Record<string, CarryProfileSessionV1>;
+  /** Uploaded market-data curve (deposits + swap points) per CCY. */
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
 }
 
 export function emptyHedgeBook(): EntityHedgeBook {
@@ -754,6 +757,7 @@ export function emptyHedgeBook(): EntityHedgeBook {
     hedgeRatios: {},
     preparedByCcy: {},
     carrySessionsByCcy: {},
+    marketRatesByCcy: {},
   };
 }
 
@@ -763,6 +767,14 @@ export function setPreparedHedgeForCcy(
   profile: PreparedHedgeProfile,
 ): Record<string, PreparedHedgeProfile> {
   return { ...(prepared ?? {}), [ccy]: profile };
+}
+
+export function setMarketRatesForCcy(
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+  ccy: string,
+  bundle: FxMarketRatesBundle,
+): Record<string, FxMarketRatesBundle> {
+  return { ...(marketRatesByCcy ?? {}), [ccy]: bundle };
 }
 
 export function clearPreparedHedgeForCcy(
@@ -822,6 +834,7 @@ export function applyConsolidatedBookedChange(
       hedgeRatios: prev[id]?.hedgeRatios ?? {},
       preparedByCcy: prev[id]?.preparedByCcy ?? {},
       carrySessionsByCcy: prev[id]?.carrySessionsByCcy ?? {},
+      marketRatesByCcy: prev[id]?.marketRatesByCcy ?? {},
     };
   }
   out[GROUP_HEDGE_SCOPE] = {
@@ -829,6 +842,7 @@ export function applyConsolidatedBookedChange(
     hedgeRatios: prev[GROUP_HEDGE_SCOPE]?.hedgeRatios ?? {},
     preparedByCcy: prev[GROUP_HEDGE_SCOPE]?.preparedByCcy ?? {},
     carrySessionsByCcy: prev[GROUP_HEDGE_SCOPE]?.carrySessionsByCcy ?? {},
+    marketRatesByCcy: prev[GROUP_HEDGE_SCOPE]?.marketRatesByCcy ?? {},
   };
   return out;
 }

@@ -335,6 +335,8 @@ interface ExposureHedgePathChartProps {
   monthlyFlowM: number;
   monthlyFlows?: readonly number[];
   setup: VarSetup;
+  /** Pre-resolved market-data curve for `ccy` (Market data tab upload). */
+  marketRates?: FxMarketRatesBundle;
   /** Applied Decision hedge notional (local M). */
   appliedHedgeLocalM: number;
   hedgeRatio: number;
@@ -769,6 +771,7 @@ export function ExposureHedgePathChart({
   monthlyFlowM,
   monthlyFlows,
   setup,
+  marketRates: marketRatesProp,
   appliedHedgeLocalM,
   hedgeRatio,
   equalVarHedgeLocalM,
@@ -886,13 +889,17 @@ export function ExposureHedgePathChart({
    * Scales strip Δ and bullet notional before Prepare / auto-stage.
    */
   const [targetCoverPct, setTargetCoverPct] = useState(100);
-  /** EURUSD deposit credit/debit curves (seed or uploaded FXOCalculator xlsx). */
-  const [marketRates, setMarketRates] = useState<FxMarketRatesBundle>(() =>
-    getActiveMarketRates(),
-  );
+  /**
+   * EURUSD deposit credit/debit curves (seed or uploaded FXOCalculator xlsx).
+   * Prefer the caller-resolved per-CCY bundle; fall back to the legacy
+   * global-key upload for any caller that hasn't been wired to it yet.
+   */
+  const [legacyMarketRates, setLegacyMarketRates] =
+    useState<FxMarketRatesBundle>(() => getActiveMarketRates());
   useEffect(() => {
-    setMarketRates(getActiveMarketRates());
-  }, []);
+    if (!marketRatesProp) setLegacyMarketRates(getActiveMarketRates());
+  }, [marketRatesProp]);
+  const marketRates = marketRatesProp ?? legacyMarketRates;
   const controlled = hedgeStructureProp != null;
   const hedgeStructure = controlled ? hedgeStructureProp : localStructure;
   useEffect(() => {
@@ -4377,14 +4384,16 @@ export function ExposureHedgePathChart({
                         );
                       })()}
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => setMarketRates(getActiveMarketRates())}
-                      className="rounded border border-slate-600 px-1.5 py-0.5 text-[9px] text-sky-300/90 hover:bg-slate-800"
-                      title="Reload rates from Market data tab"
-                    >
-                      Refresh from Market data
-                    </button>
+                    {!marketRatesProp && (
+                      <button
+                        type="button"
+                        onClick={() => setLegacyMarketRates(getActiveMarketRates())}
+                        className="rounded border border-slate-600 px-1.5 py-0.5 text-[9px] text-sky-300/90 hover:bg-slate-800"
+                        title="Reload rates from Market data tab"
+                      >
+                        Refresh from Market data
+                      </button>
+                    )}
                   </div>
                   <table className="w-full min-w-[720px] text-left text-[10px]">
                     <thead>

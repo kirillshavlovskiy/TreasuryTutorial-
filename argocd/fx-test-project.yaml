@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/Deel-Playground/fx-test-project
+    repoURL: https://github.com/kirillshavlovskiy/TreasuryTutorial-
     targetRevision: main
     path: helm
     helm:

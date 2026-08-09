@@ -138,6 +138,7 @@ function normalizeHedges(
       hedgeRatios?: unknown;
       preparedByCcy?: unknown;
       carrySessionsByCcy?: unknown;
+      marketRatesByCcy?: unknown;
     };
     out[key] = {
       bookedHedges: Array.isArray(book.bookedHedges) ? book.bookedHedges : [],
@@ -152,6 +153,10 @@ function normalizeHedges(
       carrySessionsByCcy:
         book.carrySessionsByCcy && typeof book.carrySessionsByCcy === 'object'
           ? (book.carrySessionsByCcy as EntityHedgeBook['carrySessionsByCcy'])
+          : {},
+      marketRatesByCcy:
+        book.marketRatesByCcy && typeof book.marketRatesByCcy === 'object'
+          ? (book.marketRatesByCcy as EntityHedgeBook['marketRatesByCcy'])
           : {},
     };
   }
@@ -334,6 +339,10 @@ export function mergeHedgeBooksPreservingPrepared(
       carrySessionsByCcy: {
         ...(b?.carrySessionsByCcy ?? {}),
         ...(a?.carrySessionsByCcy ?? {}),
+      },
+      marketRatesByCcy: {
+        ...(b?.marketRatesByCcy ?? {}),
+        ...(a?.marketRatesByCcy ?? {}),
       },
     };
   }

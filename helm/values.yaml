@@ -24,7 +24,7 @@ database:
     enabled: false
     source: ""
   pgadmin:
-    email: "admin@deel.tools"
+    email: "admin@example.com"
   storage:
     size: "8Gi"
   bootstrapDatabase: "app"
@@ -82,6 +82,6 @@ tolerations:
 
 s3:
   enabled: true
-  bucket: "deel-playgrounds-data"
+  bucket: "playgrounds-data"
   accountId: "211125331032"
   oidcIssuer: "oidc.eks.eu-west-1.amazonaws.com/id/6D88D8938454CA111E105EEC1A1D5630"

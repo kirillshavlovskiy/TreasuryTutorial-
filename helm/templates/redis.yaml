@@ -9,7 +9,7 @@ metadata:
     app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
-    sandbox.deel/name: {{ .Values.sandboxName }}
+    sandbox.app/name: {{ .Values.sandboxName }}
 spec:
   replicas: 1
   selector:
@@ -50,7 +50,7 @@ metadata:
   namespace: {{ .Values.sandboxName }}
   labels:
     app.kubernetes.io/name: {{ .Values.sandboxName }}-redis
-    sandbox.deel/name: {{ .Values.sandboxName }}
+    sandbox.app/name: {{ .Values.sandboxName }}
 spec:
   selector:
     app.kubernetes.io/name: {{ .Values.sandboxName }}-redis

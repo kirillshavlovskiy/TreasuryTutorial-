@@ -837,12 +837,12 @@
   },
   "overnightCash": {
     "base": {
-      "creditPct": 1.78,
-      "debitPct": 2.21
+      "creditPct": 2.15,
+      "debitPct": 2.35
     },
     "usd": {
-      "creditPct": 3.5,
-      "debitPct": 3.89
+      "creditPct": 3.505,
+      "debitPct": 3.809
     }
   }
 }

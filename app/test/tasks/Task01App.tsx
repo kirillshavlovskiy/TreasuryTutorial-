@@ -20,6 +20,7 @@ import {
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
 import type { RowState } from '@/lib/fx-buffer';
+import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import {
   TEST_GUEST_USER_KEY,
   aggregateBookedHedges,
@@ -1120,6 +1121,7 @@ function GroupConsolidatedView({
   const hedgeRatios = groupBook.hedgeRatios;
   const preparedByCcy = groupBook.preparedByCcy ?? {};
   const carrySessionsByCcy = groupBook.carrySessionsByCcy ?? {};
+  const marketRatesByCcy = groupBook.marketRatesByCcy ?? {};
 
   const setHedgeRatios = (ratios: Record<string, number>) => {
     onHedgesByEntityIdChange(prev => {
@@ -1132,6 +1134,7 @@ function GroupConsolidatedView({
           hedgeRatios: ratios,
           preparedByCcy: g.preparedByCcy ?? {},
           carrySessionsByCcy: g.carrySessionsByCcy ?? {},
+          marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
       };
     });
@@ -1158,6 +1161,7 @@ function GroupConsolidatedView({
           ...g,
           preparedByCcy: next,
           carrySessionsByCcy: g.carrySessionsByCcy ?? {},
+          marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
       };
     });
@@ -1174,6 +1178,24 @@ function GroupConsolidatedView({
           ...g,
           preparedByCcy: g.preparedByCcy ?? {},
           carrySessionsByCcy: next,
+          marketRatesByCcy: g.marketRatesByCcy ?? {},
+        },
+      };
+    });
+  };
+
+  const setMarketRatesByCcy = (
+    next: Record<string, FxMarketRatesBundle>,
+  ) => {
+    onHedgesByEntityIdChange(prev => {
+      const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+      return {
+        ...prev,
+        [GROUP_HEDGE_SCOPE]: {
+          ...g,
+          preparedByCcy: g.preparedByCcy ?? {},
+          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
+          marketRatesByCcy: next,
         },
       };
     });
@@ -1191,6 +1213,7 @@ function GroupConsolidatedView({
           hedgeRatios: { ...g.hedgeRatios, [ticket.ccy]: 0 },
           preparedByCcy: g.preparedByCcy ?? {},
           carrySessionsByCcy: g.carrySessionsByCcy ?? {},
+          marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
       };
     });
@@ -1256,6 +1279,7 @@ function GroupConsolidatedView({
               onBookedHedgesChange={setBookedHedges}
               preparedByCcy={preparedByCcy}
               onPreparedByCcyChange={setPreparedByCcy}
+              marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={GROUP_HEDGE_SCOPE}
               hedgeStructure={hedgeStructure}
               onHedgeStructureChange={setHedgeStructure}
@@ -1288,6 +1312,8 @@ function GroupConsolidatedView({
               onBookedHedgesChange={setBookedHedges}
               preparedByCcy={preparedByCcy}
               onPreparedByCcyChange={setPreparedByCcy}
+              marketRatesByCcy={marketRatesByCcy}
+              onMarketRatesByCcyChange={setMarketRatesByCcy}
               hedgeStructure={hedgeStructure}
               onHedgeStructureChange={setHedgeStructure}
               title="Analytics — Group FX VaR setup"
@@ -1302,6 +1328,8 @@ function GroupConsolidatedView({
               scopeLabel={groupDashboardName}
               currencies={risk.map(r => r.bar.ccy)}
               title={`Market data — ${groupDashboardName}`}
+              marketRatesByCcy={marketRatesByCcy}
+              onMarketRatesByCcyChange={setMarketRatesByCcy}
             />
           }
         />
@@ -1898,6 +1926,7 @@ function DashboardView({
   const bookedHedges = hedgeBook.bookedHedges;
   const preparedByCcy = hedgeBook.preparedByCcy ?? {};
   const carrySessionsByCcy = hedgeBook.carrySessionsByCcy ?? {};
+  const marketRatesByCcy = hedgeBook.marketRatesByCcy ?? {};
 
   const setHedgeRatios = (ratios: Record<string, number>) => {
     onHedgeBookChange(prev => ({
@@ -1933,6 +1962,12 @@ function DashboardView({
       ...prev,
       preparedByCcy: prev.preparedByCcy ?? {},
       carrySessionsByCcy: next,
+    }));
+  };
+  const setMarketRatesByCcy = (next: Record<string, FxMarketRatesBundle>) => {
+    onHedgeBookChange(prev => ({
+      ...prev,
+      marketRatesByCcy: next,
     }));
   };
   const handleBookHedge = (ticket: HedgeTicket) => {
@@ -2134,6 +2169,7 @@ function DashboardView({
                         onBookedHedgesChange={setBookedHedges}
                         preparedByCcy={preparedByCcy}
                         onPreparedByCcyChange={setPreparedByCcy}
+                        marketRatesByCcy={marketRatesByCcy}
                         ratesScopeId={entity.id}
                         hedgeStructure={hedgeStructure}
                         onHedgeStructureChange={setHedgeStructure}
@@ -2170,6 +2206,8 @@ function DashboardView({
                         onBookedHedgesChange={setBookedHedges}
                         preparedByCcy={preparedByCcy}
                         onPreparedByCcyChange={setPreparedByCcy}
+                        marketRatesByCcy={marketRatesByCcy}
+                        onMarketRatesByCcyChange={setMarketRatesByCcy}
                         hedgeStructure={hedgeStructure}
                         onHedgeStructureChange={setHedgeStructure}
                         title={`Analytics — ${entity.name} VaR setup`}
@@ -2184,6 +2222,8 @@ function DashboardView({
                         scopeLabel={entity.name}
                         currencies={entityRisk.map(r => r.bar.ccy)}
                         title={`Market data — ${entity.name}`}
+                        marketRatesByCcy={marketRatesByCcy}
+                        onMarketRatesByCcyChange={setMarketRatesByCcy}
                       />
                     }
                   />

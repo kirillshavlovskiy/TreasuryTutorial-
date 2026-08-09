@@ -32,6 +32,21 @@ export interface OvernightCashRates {
   usd: DepositSideRates;
 }
 
+/**
+ * How cash interest months pick a rate in Cash Carry / forecast paths.
+ * - `current` — flat applied O/N for every month (e.g. NP EUR 1.78%)
+ * - `forward` — O/N near 0; SW→1Y deposit ladder for later months
+ */
+export type CashInterestMode = 'current' | 'forward';
+
+export const DEFAULT_CASH_INTEREST_MODE: CashInterestMode = 'forward';
+
+export function cashInterestModeOf(
+  bundle: FxMarketRatesBundle | null | undefined,
+): CashInterestMode {
+  return bundle?.cashInterestMode === 'current' ? 'current' : 'forward';
+}
+
 export interface FxMarketRatesBundle {
   pair: string;
   baseCcy: string;
@@ -44,6 +59,11 @@ export interface FxMarketRatesBundle {
    * funding, NOT for forward CIP pricing.
    */
   overnightCash?: OvernightCashRates;
+  /**
+   * Cash interest tenor selection for analytics (not swap-points FWD).
+   * Default: forward (term ladder).
+   */
+  cashInterestMode?: CashInterestMode;
   /** Term deposit / yield curve — used for forward CIP / points pricing. */
   deposits: DepositTenorRow[];
   volatility?: unknown[];
@@ -293,9 +313,150 @@ export function interpolateDepositSide(
   return { creditPct: last.creditPct, debitPct: last.debitPct };
 }
 
+export const SW_TO_ON_EUR: DepositSideRates = {
+  creditPct: 2.15,
+  debitPct: 2.35,
+};
+
+/** Overnight from short-end deposit row: ON → TN → SN → SW → 1W. */
+export function overnightCashFromDeposits(
+  deposits: readonly DepositTenorRow[],
+  baseCcy = 'EUR',
+): OvernightCashRates {
+  const onRow =
+    deposits.find(d => d.tenor === 'ON') ??
+    deposits.find(d => d.tenor === 'TN') ??
+    deposits.find(d => d.tenor === 'SN');
+  if (onRow) {
+    return { base: { ...onRow.eur }, usd: { ...onRow.usd } };
+  }
+
+  // No true O/N row — SW/1W is the short-end proxy. For EUR, desk O/N is
+  // fixed (not raw SW deposit bid/ask); USD still comes from the SW usd column.
+  const swRow =
+    deposits.find(d => d.tenor === 'SW') ??
+    deposits.find(d => d.tenor === '1W');
+  if (swRow) {
+    const base =
+      baseCcy.toUpperCase() === 'EUR'
+        ? { ...SW_TO_ON_EUR }
+        : { ...swRow.eur };
+    return { base, usd: { ...swRow.usd } };
+  }
+
+  return defaultOvernightCashFromNp(baseCcy);
+}
+
+const SHORT_END_TENORS = ['ON', 'TN', 'SN', 'SW', '1W'] as const;
+
+export function shortEndDepositTenor(
+  deposits: readonly DepositTenorRow[],
+): string | null {
+  for (const t of SHORT_END_TENORS) {
+    if (deposits.some(d => d.tenor === t)) return t;
+  }
+  return null;
+}
+
+/**
+ * Effective overnight for a bundle.
+ * Applied `overnightCash` wins (set via UI Apply or ON row in file).
+ * Else ON/TN/SN deposit row; else NP — SW is term-only until user Applies O/N.
+ */
+export function effectiveOvernightCash(
+  bundle: FxMarketRatesBundle | null | undefined,
+  baseCcy?: string,
+): OvernightCashRates {
+  const ccy = (baseCcy || bundle?.baseCcy || 'EUR').toUpperCase();
+  if (bundle?.overnightCash) {
+    return {
+      base: { ...bundle.overnightCash.base },
+      usd: { ...bundle.overnightCash.usd },
+    };
+  }
+  const deposits = bundle?.deposits ?? [];
+  const onRow =
+    deposits.find(d => d.tenor === 'ON') ??
+    deposits.find(d => d.tenor === 'TN') ??
+    deposits.find(d => d.tenor === 'SN');
+  if (onRow) {
+    return { base: { ...onRow.eur }, usd: { ...onRow.usd } };
+  }
+  return defaultOvernightCashFromNp(ccy);
+}
+
+/** Suggested O/N from SW (EUR desk 2.15/2.35; else copy SW deposits). */
+export function suggestOvernightFromSw(
+  deposits: readonly DepositTenorRow[],
+  baseCcy = 'EUR',
+): OvernightCashRates | null {
+  return overnightCashFromDeposits(
+    deposits.filter(d => !['ON', 'TN', 'SN'].includes(d.tenor)),
+    baseCcy,
+  );
+}
+
+/** Empty per-CCY shell — NP overnight, no term curve (until upload). */
+export function emptyMarketRatesForCcy(ccy: string): FxMarketRatesBundle {
+  const base = (ccy || 'EUR').toUpperCase();
+  return normalizeMarketRatesBundle({
+    pair: `${base}USD`,
+    baseCcy: base,
+    quoteCcy: 'USD',
+    sourceFile: 'NP defaults (no upload)',
+    overnightCash: defaultOvernightCashFromNp(base),
+    deposits: [],
+  });
+}
+
+/**
+ * Book-level USD O/N — same for every FCY pair (not from that pair’s USD column).
+ * Prefers any applied `overnightCash.usd`; else JPM NP USD.
+ */
+export function pickSharedUsdOvernight(
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+): DepositSideRates {
+  for (const bundle of Object.values(marketRatesByCcy ?? {})) {
+    const usd = bundle?.overnightCash?.usd;
+    if (
+      usd &&
+      Number.isFinite(usd.creditPct) &&
+      Number.isFinite(usd.debitPct)
+    ) {
+      return { creditPct: usd.creditPct, debitPct: usd.debitPct };
+    }
+  }
+  return { ...defaultOvernightCashFromNp('EUR').usd };
+}
+
+/** Stamp the same USD O/N onto every currency bundle in the book. */
+export function stampSharedUsdOvernight(
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+  usd: DepositSideRates,
+): Record<string, FxMarketRatesBundle> {
+  const map = { ...(marketRatesByCcy ?? {}) };
+  const shared = { creditPct: usd.creditPct, debitPct: usd.debitPct };
+  for (const ccy of Object.keys(map)) {
+    const bundle = map[ccy]!;
+    const on =
+      bundle.overnightCash ?? defaultOvernightCashFromNp(bundle.baseCcy || ccy);
+    map[ccy] = normalizeMarketRatesBundle({
+      ...bundle,
+      overnightCash: {
+        base: { ...on.base },
+        usd: { ...shared },
+      },
+    });
+  }
+  return map;
+}
+
 /**
  * Overnight cash credit/debit — for cash interest / funding only.
  * Separate from term deposits used to price forwards.
+ * Uses the bundle when it belongs to `ccy` (per-CCY upload map).
+ * USD O/N is book-shared (same on every pair); pass a peer FCY bundle that
+ * already has the stamped `overnightCash.usd`.
  */
 export function resolveOvernightCashRates(
   bundle: FxMarketRatesBundle | null | undefined,
@@ -306,18 +467,58 @@ export function resolveOvernightCashRates(
   source: string;
 } {
   const normalized = bundle ? normalizeMarketRatesBundle(bundle) : null;
-  const on = normalized?.overnightCash;
   const usdNp = CURRENCY_PARAMS.USD;
   const fcyNp = CURRENCY_PARAMS[ccy];
-  if (
-    on &&
-    (ccy === normalized?.baseCcy || ccy === 'EUR') &&
-    (normalized?.baseCcy === 'EUR' || normalized?.pair === 'EURUSD')
-  ) {
+  const hasShortEnd = Boolean(
+    normalized && shortEndDepositTenor(normalized.deposits),
+  );
+  const on = normalized ? effectiveOvernightCash(normalized, normalized.baseCcy) : null;
+  const shortLabel = normalized
+    ? shortEndDepositTenor(normalized.deposits)
+    : null;
+
+  // USD cash: use the USD side of a peer FCY×USD curve (no USD upload).
+  if (ccy === 'USD') {
+    if (on && (hasShortEnd || normalized?.overnightCash)) {
+      return {
+        fcy: { ...on.usd },
+        usd: { ...on.usd },
+        source: `${normalized?.sourceFile ?? 'rates'} · USD overnight (shared)${
+          shortLabel ? ` ← ${shortLabel}` : ''
+        }`,
+      };
+    }
+    return {
+      fcy: {
+        creditPct: usdNp?.carry ?? 3.5,
+        debitPct: usdNp?.r_OD ?? 3.89,
+      },
+      usd: {
+        creditPct: usdNp?.carry ?? 3.5,
+        debitPct: usdNp?.r_OD ?? 3.89,
+      },
+      source: 'CURRENCY_PARAMS NP · USD overnight',
+    };
+  }
+
+  const bundleForCcy =
+    on != null &&
+    normalized != null &&
+    (normalized.baseCcy === ccy ||
+      // Legacy: shared EURUSD seed still applies to EUR.
+      (ccy === 'EUR' &&
+        (normalized.baseCcy === 'EUR' || normalized.pair === 'EURUSD')));
+  if (bundleForCcy && on && (hasShortEnd || normalized.overnightCash)) {
     return {
       fcy: { ...on.base },
       usd: { ...on.usd },
-      source: `${normalized?.sourceFile ?? 'rates'} · overnight cash`,
+      source: `${normalized?.sourceFile ?? 'rates'} · overnight${
+        shortLabel === 'SW' || shortLabel === '1W'
+          ? ' ← SW→ O/N'
+          : shortLabel
+            ? ` ← ${shortLabel}`
+            : ''
+      } · USD shared`,
     };
   }
   return {
@@ -335,7 +536,8 @@ export function resolveOvernightCashRates(
 
 /**
  * Term deposit credit/debit at tenor — for forward CIP / points pricing only.
- * EURUSD curve when ccy=EUR; otherwise fall back to CURRENCY_PARAMS NP rates.
+ * Uses the uploaded curve when the bundle belongs to `ccy`; else NP.
+ * USD uses the USD deposit column of a peer FCY×USD file.
  */
 export function resolveForwardDepositRates(
   bundle: FxMarketRatesBundle | null | undefined,
@@ -360,19 +562,82 @@ export function resolveForwardDepositRates(
     source: 'CURRENCY_PARAMS NP · term',
   };
 
-  if (
-    ccy === 'EUR' &&
+  if (ccy === 'USD' && bundle?.deposits && bundle.deposits.length > 0) {
+    const usd = interpolateDepositSide(bundle.deposits, 'usd', months);
+    return {
+      fcy: usd,
+      usd,
+      source: `${bundle.sourceFile || 'uploaded curve'} · USD term (from pair file)`,
+    };
+  }
+
+  const bundleForCcy =
     bundle?.deposits &&
     bundle.deposits.length > 0 &&
-    (bundle.baseCcy === 'EUR' || bundle.pair === 'EURUSD')
-  ) {
+    (bundle.baseCcy === ccy ||
+      (ccy === 'EUR' &&
+        (bundle.baseCcy === 'EUR' || bundle.pair === 'EURUSD')));
+  if (bundleForCcy) {
     return {
       fcy: interpolateDepositSide(bundle.deposits, 'eur', months),
       usd: interpolateDepositSide(bundle.deposits, 'usd', months),
-      source: `${bundle.sourceFile || 'uploaded EURUSD curve'} · term fwd`,
+      source: `${bundle.sourceFile || 'uploaded curve'} · term fwd`,
     };
   }
   return fallback;
+}
+
+/**
+ * Cash interest rates for a holding horizon.
+ * Mode `current`: flat applied O/N for every tenor (e.g. NP 1.78%).
+ * Mode `forward` (default):
+ * - Near 0 / below SW → O/N
+ * - SW…1Y → interpolate deposit term structure (capped at 12m)
+ * Used for multi-month FCY/USD cash accrual; not for swap-points FWD.
+ */
+export function resolveCashRatesForHorizon(
+  bundle: FxMarketRatesBundle | null | undefined,
+  ccy: string,
+  months: number,
+  modeOverride?: CashInterestMode,
+): {
+  fcy: DepositSideRates;
+  usd: DepositSideRates;
+  source: string;
+} {
+  const mode = modeOverride ?? cashInterestModeOf(bundle);
+  const on = resolveOvernightCashRates(bundle, ccy);
+
+  if (mode === 'current') {
+    return {
+      fcy: on.fcy,
+      usd: on.usd,
+      source: `${on.source} · flat current @ ${Math.max(0, months).toFixed(2)}m`,
+    };
+  }
+
+  const t = Math.max(0, months);
+  // Below SW (~1w): overnight quote.
+  if (t < 7 / 30) {
+    return { fcy: on.fcy, usd: on.usd, source: on.source };
+  }
+
+  const capped = Math.min(t, 12);
+  const term = resolveForwardDepositRates(bundle, ccy, capped);
+  if (term.source.includes('uploaded') || term.source.includes('term')) {
+    return {
+      fcy: term.fcy,
+      usd: term.usd,
+      source: `${term.source.replace('term fwd', 'cash ← term')} @ ${capped.toFixed(2)}m`,
+    };
+  }
+
+  // NP fallback still tenor-flat; prefer overnight if no curve.
+  return {
+    fcy: on.fcy,
+    usd: on.usd,
+    source: `${on.source} (no term curve)`,
+  };
 }
 
 /** @deprecated use resolveForwardDepositRates — term curve for CIP */
@@ -465,18 +730,25 @@ export function parseFxoCalculatorWorkbook(
     );
   }
 
-  // Overnight cash: prefer ON / TN / SN row; else keep NP defaults (editable in UI).
+  // Pair drives base/quote — must match whichever currency was actually
+  // uploaded (GBPUSD, JPYUSD, ...), not a hardcoded EUR/USD assumption.
+  const pairCell = asStr(legs[0]?.[0]) ?? 'EURUSD';
+  const pairNormalized = pairCell.replace('/', '').toUpperCase();
+  const baseCcy = pairNormalized.slice(0, 3) || 'EUR';
+  const quoteCcy = pairNormalized.slice(3, 6) || 'USD';
+
+  // Overnight cash: prefer ON / TN / SN row only. SW stays on the term
+  // curve — O/N is applied separately in the market-data UI.
   const onRow =
     deposits.find(d => d.tenor === 'ON') ??
     deposits.find(d => d.tenor === 'TN') ??
     deposits.find(d => d.tenor === 'SN');
-  const overnightCash: OvernightCashRates = onRow
+  const overnightCash: OvernightCashRates | undefined = onRow
     ? { base: { ...onRow.eur }, usd: { ...onRow.usd } }
-    : defaultOvernightCashFromNp('EUR');
+    : undefined;
 
   let spotBid = 1;
   let spotAsk = 1;
-  const pairCell = asStr(legs[0]?.[0]) ?? 'EURUSD';
   const sb = asNum(legs[0]?.[1]);
   const sa = asNum(legs[0]?.[2]);
   if (sb != null && sa != null) {
@@ -503,9 +775,9 @@ export function parseFxoCalculatorWorkbook(
   }
 
   return normalizeMarketRatesBundle({
-    pair: pairCell.replace('/', ''),
-    baseCcy: 'EUR',
-    quoteCcy: 'USD',
+    pair: pairNormalized,
+    baseCcy,
+    quoteCcy,
     sourceFile: fileName,
     asOf: {
       tradeDate: excelSerialToIso(asNum(legs[1]?.[0])),
@@ -566,4 +838,74 @@ export function getActiveMarketRates(
   scopeId?: string | null,
 ): FxMarketRatesBundle {
   return loadStoredMarketRates(scopeId) ?? DEFAULT_EURUSD_MARKET_RATES;
+}
+
+/**
+ * Pick a FCY×USD upload that carries USD deposit / overnight columns.
+ * USD is never uploaded on its own — rates come from peer pair files.
+ */
+export function pickPeerMarketRatesForUsd(
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+  preferredCcy?: string | null,
+): { ccy: string; bundle: FxMarketRatesBundle } | null {
+  const map = marketRatesByCcy ?? {};
+  const prefer = (preferredCcy ?? '').toUpperCase();
+  const order = [
+    ...(prefer && prefer !== 'USD' ? [prefer] : []),
+    'EUR',
+    'GBP',
+    'PLN',
+    ...Object.keys(map).filter(
+      k =>
+        k !== 'USD' &&
+        k !== prefer &&
+        k !== 'EUR' &&
+        k !== 'GBP' &&
+        k !== 'PLN',
+    ),
+  ];
+  for (const ccy of order) {
+    const bundle = map[ccy];
+    if (bundle && (bundle.deposits?.length > 0 || bundle.overnightCash)) {
+      return { ccy, bundle };
+    }
+  }
+  return null;
+}
+
+/**
+ * Per-CCY market rates bundle: DB-persisted book map → legacy scoped
+ * localStorage (pre-per-CCY books, matching ccy) → EURUSD seed (EUR only)
+ * → NP empty shell for other currencies.
+ *
+ * USD: no dedicated upload — borrow a peer FCY×USD file (USD columns).
+ */
+export function resolveMarketRatesForCcy(
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+  ccy: string,
+  scopeId?: string | null,
+): FxMarketRatesBundle {
+  if (ccy === 'USD') {
+    const peer = pickPeerMarketRatesForUsd(marketRatesByCcy);
+    if (peer) return peer.bundle;
+    const scoped = loadStoredMarketRates(scopeId);
+    if (scoped?.deposits?.length) return scoped;
+    return DEFAULT_EURUSD_MARKET_RATES;
+  }
+
+  const fromBook = marketRatesByCcy?.[ccy];
+  if (fromBook) return fromBook;
+
+  const scoped = loadStoredMarketRates(scopeId);
+  if (
+    scoped &&
+    (scoped.baseCcy === ccy ||
+      (ccy === 'EUR' &&
+        (scoped.baseCcy === 'EUR' || scoped.pair === 'EURUSD')))
+  ) {
+    return scoped;
+  }
+
+  if (ccy === 'EUR') return DEFAULT_EURUSD_MARKET_RATES;
+  return emptyMarketRatesForCcy(ccy);
 }

@@ -1,7 +1,6 @@
 'use client';
 
 import {
-  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -43,10 +42,14 @@ import {
   varSetupWithLineUncertainty,
   type HedgeInstrument,
   type HedgeTicket,
+  type PreparedHedgeLeg,
   type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
 import { assignImpliedCarryFromSwapPoints } from '@/lib/test-mode/cash-carry-analytics';
-import { getActiveMarketRates } from '@/lib/fx-market-rates';
+import {
+  resolveMarketRatesForCcy,
+  type FxMarketRatesBundle,
+} from '@/lib/fx-market-rates';
 import {
   buildRollingHedgeEdges,
   bulletMaturityForForecast,
@@ -58,7 +61,6 @@ import {
   removeHedgeTicketOrStrip,
   resyncBookedRollingStrips,
   sizingForHedgePathBasis,
-  stripForwardLegsFromEdges,
   varSetupForHedgeStructure,
   varSetupForPathHedgeRegime,
   type ForecastHedgeStructure,
@@ -103,55 +105,39 @@ function fmtVarK(usdM: number): string {
   return `$${(usdM * 1000).toFixed(0)}K`;
 }
 
-/** Clickable Cash / VaR-neutral / Target notional — applies that size as Hedge N. */
-function ExposureApplyButton({
+/**
+ * Minimal dashed-underline click-to-apply control (Hedge Structuring card) —
+ * "VaR-neutral · click to apply" style from the design: no border/background,
+ * just a dashed emerald underline, matching the mockup exactly.
+ */
+function QuickApplyReadout({
+  label,
   valueLocalM,
   ccy,
-  label,
   varUsdM,
-  emphasize,
-  selected,
   disabled,
   onApply,
 }: {
+  label: string;
   valueLocalM: number;
   ccy: string;
-  label: string;
   varUsdM: number;
-  emphasize: boolean;
-  /** Currently applied Decision regime for this CCY. */
-  selected: boolean;
   disabled: boolean;
   onApply: () => void;
 }) {
   const empty = Math.abs(valueLocalM) < 1e-9;
-  const long = valueLocalM >= 0;
   return (
     <button
       type="button"
       disabled={disabled || empty}
       onClick={onApply}
-      aria-label={`Apply ${label} hedge ${fmtLocal(valueLocalM, ccy)}`}
-      aria-pressed={selected}
-      title={
-        selected
-          ? `Selected regime · ${label} · ${fmtLocal(valueLocalM, ccy)}`
-          : `Click → apply ${label} as Hedge N · ${fmtLocal(valueLocalM, ccy)} · ${fmtVarK(varUsdM)}`
-      }
-      className={`group w-full cursor-pointer rounded-lg border px-1.5 py-1 text-left font-mono transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-        selected
-          ? 'border-blue-500 bg-blue-500/20 text-blue-100 font-semibold'
-          : empty
-            ? 'border-transparent text-slate-500'
-            : long
-              ? 'border-slate-700 text-emerald-300 hover:border-slate-500'
-              : 'border-slate-700 text-rose-300 hover:border-slate-500'
-      }${emphasize && !selected ? ' border-sky-500/50' : ''}`}
+      title={`Click → apply ${label} as target · ${fmtLocal(valueLocalM, ccy)} · ${fmtVarK(varUsdM)}`}
+      className="flex flex-col items-start gap-1 border-0 border-b border-dashed border-emerald-500/50 bg-transparent pb-0.5 text-left disabled:cursor-not-allowed disabled:border-transparent disabled:opacity-40"
     >
-      <span className="block text-[9px] font-sans font-semibold uppercase tracking-wide opacity-80">
-        {label}
+      <span className="text-[9px] uppercase tracking-wide text-emerald-400/80">
+        {label} · click to apply
       </span>
-      <span className="underline decoration-dotted decoration-current/40 underline-offset-2 group-hover:decoration-solid">
+      <span className="font-mono text-xs text-emerald-300">
         {fmtLocal(valueLocalM, ccy)}
       </span>
     </button>
@@ -183,6 +169,75 @@ function ticketLabel(t: HedgeTicket): string {
   return t.entityName ? `${base} · ${t.entityName}` : base;
 }
 
+/**
+ * Strip leg shaping — how the target notional splits across legs.
+ * `optimized` = derived from a real prepared strip this component didn't
+ * build (e.g. the Cash Carry WAM shape-search) — settle/share come from
+ * that package's actual legs, not a formula, and no preset button is "on".
+ */
+type StripShaping = 'equal' | 'front' | 'carry' | 'optimized';
+
+/** Per-CCY structuring UI state — independent of the committed prepared profile. */
+interface StructCfg {
+  legCount: number;
+  shaping: StripShaping;
+  /** Settle month per leg — editable, may drift from the shaping preset. */
+  t: number[];
+  /** Share % per leg (of target) — editable, may not sum to 100. */
+  sh: number[];
+}
+
+/** n settle months, equally spaced, last leg pinned to Tf (never left short). */
+function stripSettleMonths(n: number, tf: number): number[] {
+  const T = tf > 0 ? tf : 1;
+  return Array.from({ length: n }, (_, i) => {
+    const k = i + 1;
+    return k === n ? T : Math.max(0.5, Math.round(((k * T) / n) * 2) / 2);
+  });
+}
+
+/**
+ * Share weights (0–100, summing to 100) for a shaping preset.
+ * `equal` = flat; `front` = front-loaded (early legs bigger, 1/(i+1)^1.4);
+ * `carry` = back-loaded (later legs — longer tenor — carry more, i+1).
+ */
+function stripShareWeights(n: number, shaping: StripShaping): number[] {
+  const w = Array.from({ length: n }, (_, i) =>
+    shaping === 'equal' ? 1 : shaping === 'front' ? 1 / Math.pow(i + 1, 1.4) : i + 1,
+  );
+  const s = w.reduce((a, b) => a + b, 0);
+  const out = w.map(x => Math.round((x / s) * 200) / 2);
+  out[n - 1] = +(100 - out.slice(0, n - 1).reduce((a, b) => a + b, 0)).toFixed(1);
+  return out;
+}
+
+/** Rescale arbitrary (possibly off-100) shares back to summing 100. */
+function rebalanceShares(shares: readonly number[]): number[] {
+  const s = shares.reduce((a, b) => a + b, 0);
+  if (s <= 0) return shares.map(() => +(100 / shares.length).toFixed(1));
+  const out = shares.map(x => Math.round((x / s) * 200) / 2);
+  out[out.length - 1] = +(
+    100 - out.slice(0, -1).reduce((a, b) => a + b, 0)
+  ).toFixed(1);
+  return out;
+}
+
+/** {t, sh} preset for a structure/legCount/shaping combination. */
+function structPreset(
+  structure: ForecastHedgeStructure,
+  legCount: number,
+  shaping: StripShaping,
+  tf: number,
+): { t: number[]; sh: number[] } {
+  return structure === 'bullet'
+    ? { t: [tf > 0 ? tf : 1], sh: [100] }
+    : { t: stripSettleMonths(legCount, tf), sh: stripShareWeights(legCount, shaping) };
+}
+
+function fmtShare(v: number): string {
+  return `${(Math.round(v * 10) / 10).toFixed(v % 1 ? 1 : 0)}%`;
+}
+
 interface HedgingDecisionLayerProps {
   risk: CurrencyRiskRow[];
   embedded?: boolean;
@@ -197,6 +252,8 @@ interface HedgingDecisionLayerProps {
   onPreparedByCcyChange?: (next: Record<string, PreparedHedgeProfile>) => void;
   /** Entity/group scope for Market data swap-points carry on Prepare. */
   ratesScopeId?: string;
+  /** DB-persisted market data per currency (Market data tab uploads). */
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   /** Shared with Analytics — bullet vs rolling strip. */
   hedgeStructure?: ForecastHedgeStructure;
   onHedgeStructureChange?: (s: ForecastHedgeStructure) => void;
@@ -221,6 +278,7 @@ export function HedgingDecisionLayer({
   preparedByCcy: controlledPrepared,
   onPreparedByCcyChange,
   ratesScopeId,
+  marketRatesByCcy = {},
   hedgeStructure: controlledStructure,
   onHedgeStructureChange,
   varSetup = DEFAULT_VAR_SETUP,
@@ -275,7 +333,6 @@ export function HedgingDecisionLayer({
     else setLocalPrepared(next);
   };
 
-  const ThM = horizonMonths(varSetup.horizon);
   const TfM =
     typeof varSetup.forecastMonths === 'number' && varSetup.forecastMonths > 0
       ? varSetup.forecastMonths
@@ -385,27 +442,6 @@ export function HedgingDecisionLayer({
     const next: Record<string, number> = {};
     for (const r of summary.rows) next[r.ccy] = clampPct(pct) / 100;
     setRatios(next);
-  };
-
-  /**
-   * Click Cash / VaR-neutral / Total → % of Target.
-   * Cash = stock/Target · VaR-neutral = Equal-VaR/Target · Total = 100%.
-   */
-  const applyTargetNotional = (
-    ccy: string,
-    targetLocalM: number,
-    basis: HedgePathBasisId,
-  ) => {
-    const r = summary.rows.find(row => row.ccy === ccy);
-    if (!r || Math.abs(r.targetHedgeLocalM) < 1e-9) return;
-    setPathBasis(basis);
-    setRatios({
-      ...ratios,
-      [ccy]: Math.min(
-        1,
-        hedgeRatioForNumber(targetLocalM, r.targetHedgeLocalM),
-      ),
-    });
   };
 
   const openPathChart = (ccy: string) => {
@@ -544,7 +580,11 @@ export function HedgingDecisionLayer({
           cashDeliveryAt,
         },
         {
-          marketRates: getActiveMarketRates(ratesScopeId),
+          marketRates: resolveMarketRatesForCcy(
+            marketRatesByCcy,
+            chartRow.ccy,
+            ratesScopeId,
+          ),
           bulletSettleMonths: defaultTf,
         },
       );
@@ -599,7 +639,11 @@ export function HedgingDecisionLayer({
         settleMonths: bulletSettleMonths,
       },
       {
-        marketRates: getActiveMarketRates(ratesScopeId),
+        marketRates: resolveMarketRatesForCcy(
+          marketRatesByCcy,
+          chartRow.ccy,
+          ratesScopeId,
+        ),
         bulletSettleMonths,
       },
     );
@@ -748,9 +792,6 @@ export function HedgingDecisionLayer({
     setRatios({ ...ratios, [ticket.ccy]: 0 });
   };
 
-  /** Show Bullet / Strip picker whenever a forecast period is on. */
-  const canChooseStructure = TfM > 0;
-
   const rollingStrip = useMemo(() => {
     if (!stripAvailable || effectiveStructure !== 'strip') return null;
     const eur = risk.find(r => r.bar.ccy === 'EUR') ?? risk[0];
@@ -827,7 +868,11 @@ export function HedgingDecisionLayer({
         hedgeRatio: 0,
       },
       {
-        marketRates: getActiveMarketRates(ratesScopeId),
+        marketRates: resolveMarketRatesForCcy(
+          marketRatesByCcy,
+          rollingStrip.ccy,
+          ratesScopeId,
+        ),
         bulletSettleMonths:
           varSetup.forecastMonths || horizonMonths(varSetup.horizon),
       },
@@ -840,12 +885,219 @@ export function HedgingDecisionLayer({
     );
   };
 
+  /**
+   * Hedge Structuring — per-CCY expand/collapse card (structure/legs/shaping)
+   * on top of the existing prepared-package pipeline. `structCfg` only tracks
+   * the editable leg layout (settle/share); the committed `PreparedHedgeProfile`
+   * itself still lives in `preparedByCcy`, same as every other prepare path in
+   * this file, so Send/Discard/Book below are unchanged.
+   */
+  const [structCcy, setStructCcy] = useState<string | null>(null);
+  const [structCfg, setStructCfg] = useState<Record<string, StructCfg>>({});
+
+  /**
+   * First-touch cfg for a CCY: if a real strip is already prepared (booked
+   * elsewhere — Cash Carry's WAM shape-search, a rolling-strip Prepare, etc.)
+   * read its actual legs so opening this card / nudging the ratio can never
+   * silently discard that shape for a generic equal/3-leg default. Only a
+   * fresh CCY with nothing prepared gets the equal/3-leg starting point.
+   */
+  const deriveStructCfg = (ccy: string): StructCfg => {
+    const prep = preparedByCcy[ccy];
+    if (prep?.structure === 'strip' && prep.legs.length >= 2) {
+      const total = prep.coverLocalM;
+      let prevCum = 0;
+      const t = prep.legs.map(l => l.settleMonths ?? l.endMonth);
+      const sh = prep.legs.map(l => {
+        const delta =
+          l.tradeNotionalLocalM ?? l.hedgeLocalM - prevCum;
+        prevCum = l.hedgeLocalM;
+        return Math.abs(total) > 1e-9
+          ? +((delta / total) * 100).toFixed(1)
+          : 0;
+      });
+      return { legCount: prep.legs.length, shaping: 'optimized', t, sh };
+    }
+    const preset = structPreset('strip', 3, 'equal', TfM);
+    return { legCount: 3, shaping: 'equal', t: preset.t, sh: preset.sh };
+  };
+
+  const ticketBasisForStruct = (basis: HedgePathBasisId): VarExposureBasis =>
+    basis === 'cash'
+      ? 'stock'
+      : basis === 'totalExpected'
+        ? 'totalBuildup'
+        : varSetup.exposureBasis === 'stock'
+          ? 'simpleAvg'
+          : varSetup.exposureBasis;
+
+  const buildStructuredProfile = (
+    ccy: string,
+    targetLocalM: number,
+    structure: ForecastHedgeStructure,
+    cfg: StructCfg,
+    basis: HedgePathBasisId,
+  ): PreparedHedgeProfile => {
+    const rates = resolveMarketRatesForCcy(marketRatesByCcy, ccy, ratesScopeId);
+    const bulletTf = TfM > 0 ? TfM : horizonMonths(varSetup.horizon);
+    if (structure === 'bullet' || cfg.t.length < 2) {
+      return assignImpliedCarryFromSwapPoints(
+        {
+          structure: 'bullet',
+          basis,
+          ticketBasis: ticketBasisForStruct(basis),
+          legs: [],
+          coverLocalM: targetLocalM,
+          hedgeRatio: 0,
+          settleMonths: cfg.t[0] ?? bulletTf,
+        },
+        { marketRates: rates, bulletSettleMonths: bulletTf },
+      );
+    }
+    let cum = 0;
+    const legs: PreparedHedgeLeg[] = cfg.t.map((t, i) => {
+      const tradeNotionalLocalM = (targetLocalM * (cfg.sh[i] ?? 0)) / 100;
+      cum += tradeNotionalLocalM;
+      return {
+        index: i,
+        startMonth: 0,
+        endMonth: t,
+        settleMonths: t,
+        hedgeLocalM: cum,
+        tradeNotionalLocalM,
+        label: `L${i + 1}`,
+      };
+    });
+    return assignImpliedCarryFromSwapPoints(
+      {
+        structure: 'strip',
+        basis,
+        ticketBasis: ticketBasisForStruct(basis),
+        legs,
+        coverLocalM: cum,
+        hedgeRatio: 0,
+      },
+      { marketRates: rates, bulletSettleMonths: bulletTf },
+    );
+  };
+
+  const structPctFor = (ccy: string) => Math.round((ratios[ccy] ?? 0) * 100);
+  const structureFor = (ccy: string): ForecastHedgeStructure =>
+    preparedByCcy[ccy]?.structure ?? 'bullet';
+
+  const commitStructured = (
+    ccy: string,
+    ratioPct: number,
+    structure: ForecastHedgeStructure,
+    cfg: StructCfg,
+    basis: HedgePathBasisId = pathBasis,
+  ) => {
+    const row = summary.rows.find(r => r.ccy === ccy);
+    if (!row) return;
+    const targetLocalM = row.targetHedgeLocalM * (ratioPct / 100);
+    if (Math.abs(targetLocalM) < 1e-9) {
+      setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+      return;
+    }
+    const profile = buildStructuredProfile(
+      ccy,
+      targetLocalM,
+      structure,
+      cfg,
+      basis,
+    );
+    setPreparedByCcy(
+      setPreparedHedgeForCcy(preparedByCcy, ccy, {
+        ...profile,
+        preparedFor: 'var',
+      }),
+    );
+  };
+
+  /** Cash / VaR-neutral / Target quick-apply — sets ratio and restructures. */
+  const applyStructRegime = (
+    ccy: string,
+    targetLocalM: number,
+    basis: HedgePathBasisId,
+  ) => {
+    const row = summary.rows.find(r => r.ccy === ccy);
+    if (!row || Math.abs(row.targetHedgeLocalM) < 1e-9) return;
+    setPathBasis(basis);
+    const ratio = Math.min(
+      1,
+      hedgeRatioForNumber(targetLocalM, row.targetHedgeLocalM),
+    );
+    setRatios({ ...ratios, [ccy]: ratio });
+    const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
+    commitStructured(ccy, ratio * 100, structureFor(ccy), cfg, basis);
+  };
+
+  const setStructRatio = (ccy: string, pct: number) => {
+    setRatio(ccy, pct);
+    const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
+    commitStructured(ccy, pct, structureFor(ccy), cfg);
+  };
+
+  const setStructStructure = (ccy: string, structure: ForecastHedgeStructure) => {
+    const prev = structCfg[ccy] ?? deriveStructCfg(ccy);
+    const preset = structPreset(
+      structure,
+      structure === 'bullet' ? 1 : prev.legCount,
+      prev.shaping,
+      TfM,
+    );
+    const cfg: StructCfg = { ...prev, t: preset.t, sh: preset.sh };
+    setStructCfg(p => ({ ...p, [ccy]: cfg }));
+    commitStructured(ccy, structPctFor(ccy), structure, cfg);
+  };
+
+  const setStructLegCount = (ccy: string, n: number) => {
+    const clamped = Math.max(2, Math.min(6, n));
+    const prev = structCfg[ccy] ?? deriveStructCfg(ccy);
+    const preset = structPreset('strip', clamped, prev.shaping, TfM);
+    const cfg: StructCfg = { legCount: clamped, shaping: prev.shaping, t: preset.t, sh: preset.sh };
+    setStructCfg(p => ({ ...p, [ccy]: cfg }));
+    commitStructured(ccy, structPctFor(ccy), 'strip', cfg);
+  };
+
+  const setStructShaping = (ccy: string, shaping: StripShaping) => {
+    const prev = structCfg[ccy] ?? deriveStructCfg(ccy);
+    const preset = structPreset('strip', prev.legCount, shaping, TfM);
+    const cfg: StructCfg = { legCount: prev.legCount, shaping, t: preset.t, sh: preset.sh };
+    setStructCfg(p => ({ ...p, [ccy]: cfg }));
+    commitStructured(ccy, structPctFor(ccy), 'strip', cfg);
+  };
+
+  const legSettleStep = (ccy: string, i: number, dir: 1 | -1) => {
+    const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
+    const t = cfg.t.map((v, j) =>
+      j === i ? Math.max(0.5, Math.min(TfM || v, +(v + dir * 0.5).toFixed(1))) : v,
+    );
+    const next: StructCfg = { ...cfg, t };
+    setStructCfg(p => ({ ...p, [ccy]: next }));
+    commitStructured(ccy, structPctFor(ccy), 'strip', next);
+  };
+
+  const legShareStep = (ccy: string, i: number, dir: 1 | -1) => {
+    const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
+    const sh = cfg.sh.map((v, j) => (j === i ? Math.max(0, Math.min(100, v + dir * 5)) : v));
+    const next: StructCfg = { ...cfg, sh };
+    setStructCfg(p => ({ ...p, [ccy]: next }));
+    commitStructured(ccy, structPctFor(ccy), 'strip', next);
+  };
+
+  const rebalanceLegs = (ccy: string) => {
+    const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
+    const next: StructCfg = { ...cfg, sh: rebalanceShares(cfg.sh) };
+    setStructCfg(p => ({ ...p, [ccy]: next }));
+    commitStructured(ccy, structPctFor(ccy), 'strip', next);
+  };
+
   const shell = embedded
     ? 'rounded-xl border border-slate-800 bg-slate-900/60 p-5 text-slate-200'
     : 'rounded-xl border border-gray-200 bg-white p-5 text-gray-900';
   const muted = embedded ? 'text-slate-500' : 'text-gray-500';
   const head = embedded ? 'text-slate-500' : 'text-gray-500';
-  const rowHover = embedded ? 'hover:bg-slate-800/50' : 'hover:bg-gray-50';
   const border = embedded ? 'border-slate-800' : 'border-gray-200';
 
   /** FX Exposure overview — read-only per-currency snapshot (Cash Carry-style summary table). */
@@ -914,21 +1166,9 @@ export function HedgingDecisionLayer({
         value={perspective}
         onChange={setPerspective}
         moduleLabel="Hedging Decision"
+        perspectives={['fxRisk']}
         tabStats={perspectiveTabStats}
         tfMonths={varSetup.forecastMonths}
-        metaLine={[
-          'Hedge-add % of Target · Cash = min · VN = Equal-VaR · Total = 100%',
-          `${hedgeSizingSetup.confidencePct}%`,
-          hedgeSizingSetup.horizon,
-          effectiveStructure === 'bullet' &&
-          hedgeSizingSetup.horizon !== varSetup.horizon
-            ? '(bullet=forecast)'
-            : null,
-          hedgeSizingSetup.exposureBasis,
-          TfM > 0 ? `forecast ${TfM}m` : null,
-        ]
-          .filter(Boolean)
-          .join(' · ')}
         trailing={
           <>
             {rollingStrip && (
@@ -970,86 +1210,6 @@ export function HedgingDecisionLayer({
         </div>
       ) : (
       <>
-      {canChooseStructure ? (
-        <div className="rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-3">
-          <div className="mb-2 text-[11px] font-medium text-slate-400">
-            Hedge structure
-          </div>
-          <div
-            className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-            role="group"
-            aria-label="Hedge structure"
-          >
-            {(
-              [
-                {
-                  id: 'bullet' as const,
-                  label: 'Bullet',
-                  blurb: 'One forward at t=0 for full forecast (Cash / VN / Target)',
-                  enabled: true,
-                },
-                {
-                  id: 'strip' as const,
-                  label: 'Rolling strip',
-                  blurb: stripAvailable
-                    ? `Staggered forwards from M0 (${ThM}m windows) — each leg own size + tenure`
-                    : `Needs VaR tenor < forecast (now ${ThM}m ≥ ${TfM}m) — shorten horizon or lengthen forecast in Analytics`,
-                  enabled: stripAvailable,
-                },
-              ] as const
-            ).map(opt => {
-              const on = effectiveStructure === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  aria-pressed={on}
-                  disabled={!opt.enabled}
-                  title={opt.blurb}
-                  onClick={() => setHedgeStructure(opt.id)}
-                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                    on
-                      ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                      : 'text-slate-500 hover:text-slate-300'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
-          {!stripAvailable ? (
-            <p className={`mt-2 text-[10px] ${muted}`}>
-              Rolling strip needs VaR tenor &lt; forecast (now {ThM}m ≥ {TfM}m).
-            </p>
-          ) : null}
-          {effectiveStructure === 'strip' && rollingStrip && (
-            <div className="mt-2 flex flex-wrap gap-2 font-mono text-[10px] text-violet-100/90">
-              {stripForwardLegsFromEdges(rollingStrip.edges).map(leg => (
-                <span
-                  key={leg.index}
-                  className="rounded border border-violet-700/50 bg-slate-950/40 px-1.5 py-0.5"
-                  title={`Cumul ${fmtLocal(leg.cumulCoverLocalM, rollingStrip.ccy)} · E@mat ${fmtLocal(leg.endExposureM, rollingStrip.ccy)}`}
-                >
-                  {leg.label} → {fmtLocal(leg.amountLocalM, rollingStrip.ccy)} Δ
-                </span>
-              ))}
-            </div>
-          )}
-          {effectiveStructure === 'bullet' && (
-            <p className={`mt-2 text-[10px] ${muted}`}>
-              Bullet sizes at forecast tenor {TfM}m (
-              {hedgeSizingSetup.horizon}). VaR-neutral = path CoG (growth) or
-              Ē (simple/TW); Target = end buildup. One forward at t=0.
-            </p>
-          )}
-        </div>
-      ) : (
-        <p className={`text-[11px] ${muted}`}>
-          Set a forecast period in Analytics (&gt; 0m) to choose Bullet vs Rolling strip.
-        </p>
-      )}
-
       <div className="grid gap-3 sm:grid-cols-3">
         <Stat
           label="VaR at Δ = 1"
@@ -1126,9 +1286,19 @@ export function HedgingDecisionLayer({
               {exposureOverviewRows.map(r => (
                 <tr
                   key={r.ccy}
-                  className={`border-b ${border}/60${
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setStructCcy(r.ccy)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setStructCcy(r.ccy);
+                    }
+                  }}
+                  title={`Structure ${r.ccy} hedge`}
+                  className={`cursor-pointer border-b ${border}/60 hover:bg-violet-500/10${
                     r.direction === 'flat' ? ' opacity-50' : ''
-                  }`}
+                  }${structCcy === r.ccy ? ' bg-violet-500/10' : ''}`}
                 >
                   <td className="py-2 pr-3 font-semibold text-white">
                     {r.ccy}
@@ -1199,51 +1369,17 @@ export function HedgingDecisionLayer({
         </div>
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[900px] text-left text-xs">
-          <thead>
-            <tr className={`border-b ${border} ${head}`}>
-              <th className="py-2 pr-2 font-medium">CCY / Trade</th>
-              <th
-                className="max-w-[5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="Click → Cash / stock hedge (min on Target scale). Blue highlight = selected."
-              >
-                Cash (stock)
-              </th>
-              <th
-                className="max-w-[5.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="Click → VaR-neutral (Equal-VaR). Blue highlight = selected."
-              >
-                VaR-neutral
-              </th>
-              <th
-                className="max-w-[5.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal"
-                title="Click → 100% Target (Total expected). Blue highlight = selected."
-              >
-                Target (Total)
-              </th>
-              <th
-                className="py-2 pr-2 font-medium"
-                title="Trade Δ notional (strip leg) or Hedge % on CCY row"
-              >
-                Size / %
-              </th>
-              <th className="py-2 pr-2 font-medium" title="Forward settle from M0">
-                Settle
-              </th>
-              <th className="max-w-[3.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal">
-                VaR @ Δ1
-              </th>
-              <th className="py-2 pr-2 font-medium">Delta</th>
-              <th className="py-2 pr-2 font-medium">Residual</th>
-              <th className="max-w-[3.5rem] py-2 pr-2 font-medium leading-tight whitespace-normal">
-                VaR after
-              </th>
-              <th className="py-2 font-medium">Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {summary.rows.map(r => {
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+            Hedge structuring · adjust before booking
+          </div>
+          <div className="font-mono text-[9px] text-slate-600">
+            {TfM}m horizon · {summary.rows.length} currencies ·{' '}
+            {booked.length === 0 ? 'nothing booked' : `${booked.length} booked`}
+          </div>
+        </div>
+        {summary.rows.map(r => {
               const riskRow = riskByCcy.get(r.ccy);
               const stockRaw = riskRow?.bar.stockNetM ?? r.stockHedgeLocalM;
               const flowRaw = riskRow?.bar.flowM ?? 0;
@@ -1268,41 +1404,13 @@ export function HedgingDecisionLayer({
                       return sign * Math.abs(eq);
                     })()
                   : r.equalVarHedgeLocalM;
-              const varStock = computeAnalyticsVarUsdM(stockRaw, 0, r.ccy, {
-                ...varSetup,
-                exposureBasis: 'stock',
-              });
               const varNeutralUsd = computeParametricVarUsdM(
                 varNeutralM,
                 r.ccy,
                 pathRegimeSetup,
               );
-              const varTotal = computeAnalyticsVarUsdM(
-                stockRaw,
-                flowForVar,
-                r.ccy,
-                {
-                  ...varSetup,
-                  exposureBasis: 'totalBuildup',
-                },
-              );
-              const higherBasis: VarExposureBasis =
-                varTotal >= varNeutralUsd && varTotal > varStock + 1e-12
-                  ? 'totalBuildup'
-                  : varNeutralUsd > varStock + 1e-12
-                    ? 'simpleAvg'
-                    : 'stock';
               const flat = Math.abs(totalM) < 1e-9;
               const canBook = !flat;
-              const selectedRegime: HedgePathBasisId | null =
-                Math.abs(r.hedgeNotionalLocalM) < 1e-9
-                  ? null
-                  : inferHedgePathBasis(
-                      r.hedgeNotionalLocalM,
-                      stockM,
-                      totalM,
-                      varNeutralM,
-                    );
               const prepared = preparedByCcy[r.ccy];
               const regimeLabel =
                 prepared?.basis === 'cash'
@@ -1345,113 +1453,553 @@ export function HedgingDecisionLayer({
                     : [];
               const tradeCount =
                 preparedLegs.length + bookedForCcy.length;
+              const open = structCcy === r.ccy;
+              const cfg = structCfg[r.ccy] ?? deriveStructCfg(r.ccy);
+              const structure = structureFor(r.ccy);
+              const isStrip = structure === 'strip';
+              const sumShare = cfg.sh.reduce((a, b) => a + b, 0);
+              const needsRebalance = isStrip && Math.abs(sumShare - 100) > 0.05;
+              const shapeBtn = (on: boolean) =>
+                `rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                  on
+                    ? 'bg-violet-500/25 text-violet-100'
+                    : `${muted} hover:text-slate-300`
+                }`;
               return (
-                <Fragment key={r.ccy}>
-                  <tr
-                    className={`border-b ${border} ${rowHover}${flat ? ' opacity-50' : ''}${
-                      prepared ? ' bg-violet-500/[0.04]' : ''
+                <div
+                  key={r.ccy}
+                  className={`rounded-lg border ${
+                    open
+                      ? 'border-violet-500/40 bg-slate-950/60'
+                      : `${border} bg-slate-950/30`
+                  }`}
+                >
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    title={`Structure ${r.ccy} hedge`}
+                    onClick={() => setStructCcy(open ? null : r.ccy)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setStructCcy(open ? null : r.ccy);
+                      }
+                    }}
+                    className={`flex cursor-pointer flex-wrap items-center gap-4 px-3 py-2.5 ${
+                      flat ? 'opacity-50' : ''
                     }`}
                   >
-                    <td className="py-2.5 pr-2 align-middle">
-                      <div className="font-semibold text-white">{r.ccy}</div>
-                      {tradeCount > 0 && (
-                        <div className={`mt-0.5 text-[10px] ${muted}`}>
-                          {preparedLegs.length > 0 && (
-                            <span className="text-violet-300">
-                              {preparedLegs.length} prepared
-                              {prepared?.structure === 'strip'
-                                ? ' strip'
-                                : ' bullet'}
-                            </span>
-                          )}
-                          {preparedLegs.length > 0 &&
-                            bookedForCcy.length > 0 && (
-                              <span className="text-slate-600"> · </span>
-                            )}
-                          {bookedForCcy.length > 0 && (
-                            <span className="text-emerald-300/90">
-                              {bookedForCcy.length} booked
-                            </span>
-                          )}
+                    <div className="flex w-[120px] flex-none flex-col gap-0.5">
+                      <span className="text-sm font-semibold text-violet-200">
+                        {r.ccy}
+                      </span>
+                      <span className={`text-[9px] ${muted}`}>
+                        {tradeCount === 0
+                          ? isStrip
+                            ? `${cfg.legCount} prepared strip`
+                            : '1 prepared bullet'
+                          : [
+                              preparedLegs.length > 0
+                                ? `${preparedLegs.length} prepared ${
+                                    prepared?.structure === 'strip'
+                                      ? 'strip'
+                                      : 'bullet'
+                                  }`
+                                : null,
+                              bookedForCcy.length > 0
+                                ? `${bookedForCcy.length} booked`
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                      </span>
+                    </div>
+                    <div className="flex w-[150px] flex-none flex-col gap-0.5">
+                      <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                        Target (total)
+                      </span>
+                      <span className="font-mono text-xs font-semibold text-sky-300">
+                        {fmtLocal(r.hedgeNotionalLocalM, r.ccy)}
+                      </span>
+                    </div>
+                    <div className="flex w-[130px] flex-none flex-col gap-0.5">
+                      <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                        Residual
+                      </span>
+                      <span
+                        className={`font-mono text-xs ${
+                          Math.abs(r.residualLocalM) < 1e-9
+                            ? muted
+                            : 'text-amber-300'
+                        }`}
+                      >
+                        {fmtLocal(r.residualLocalM, r.ccy)}
+                      </span>
+                    </div>
+                    <div className="flex w-[120px] flex-none flex-col gap-0.5">
+                      <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                        VaR after
+                      </span>
+                      <span
+                        className={`font-mono text-xs font-semibold ${
+                          r.varAfterUsdM < r.varBeforeUsdM - 1e-9
+                            ? 'text-emerald-300'
+                            : 'text-amber-300'
+                        }`}
+                      >
+                        {fmtVarK(r.varAfterUsdM)}
+                      </span>
+                    </div>
+                    <div className="flex w-[120px] flex-none flex-col gap-0.5">
+                      <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                        Carry
+                      </span>
+                      <span className="font-mono text-xs font-semibold text-emerald-300">
+                        {prepared?.impliedCarryUsdM != null
+                          ? fmtVarK(prepared.impliedCarryUsdM)
+                          : '—'}
+                      </span>
+                    </div>
+                    <span className="flex-1" />
+                    <span className={`text-[10px] ${muted}`}>
+                      {open ? 'Structuring' : 'Click to structure'}
+                    </span>
+                  </div>
+
+                  {open && (
+                    <div
+                      className={`flex flex-col gap-3 border-t ${border} bg-slate-950/40 px-3 py-3.5`}
+                    >
+                      <div className="flex flex-wrap items-end gap-5">
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                            Cash (stock)
+                          </span>
+                          <span className={`font-mono text-xs ${muted}`}>
+                            {fmtLocal(stockM, r.ccy)}
+                          </span>
                         </div>
-                      )}
-                    </td>
-                    <td className="max-w-[4.5rem] py-2.5 pr-2 align-middle">
-                      <ExposureApplyButton
-                        valueLocalM={stockM}
-                        ccy={r.ccy}
-                        label="Cash (stock)"
-                        varUsdM={varStock}
-                        emphasize={higherBasis === 'stock'}
-                        selected={selectedRegime === 'cash'}
-                        disabled={flat}
-                        onApply={() =>
-                          applyTargetNotional(r.ccy, stockM, 'cash')
-                        }
-                      />
-                    </td>
-                    <td className="max-w-[5.5rem] py-2.5 pr-2 align-middle">
-                      <ExposureApplyButton
-                        valueLocalM={varNeutralM}
-                        ccy={r.ccy}
-                        label="VaR-neutral"
-                        varUsdM={varNeutralUsd}
-                        emphasize={higherBasis === 'simpleAvg'}
-                        selected={selectedRegime === 'varNeutral'}
-                        disabled={flat || Math.abs(varNeutralM) < 1e-9}
-                        onApply={() =>
-                          applyTargetNotional(r.ccy, varNeutralM, 'varNeutral')
-                        }
-                      />
-                    </td>
-                    <td className="max-w-[5.5rem] py-2.5 pr-2 align-middle">
-                      <ExposureApplyButton
-                        valueLocalM={totalM}
-                        ccy={r.ccy}
-                        label="Target (Total)"
-                        varUsdM={varTotal}
-                        emphasize={higherBasis === 'totalBuildup'}
-                        selected={selectedRegime === 'totalExpected'}
-                        disabled={flat}
-                        onApply={() =>
-                          applyTargetNotional(r.ccy, totalM, 'totalExpected')
-                        }
-                      />
-                    </td>
-                    <td className="py-2.5 pr-3 align-middle">
-                      <HedgeRatioControl
-                        pct={Math.round(r.hedgeRatio * 100)}
-                        notional={fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}
-                        mutedClass={muted}
-                        disabled={flat}
-                        onChange={pct => setRatio(r.ccy, pct)}
-                      />
-                    </td>
-                    <td className={`py-2.5 pr-3 align-middle text-[10px] ${muted}`}>
-                      —
-                    </td>
-                    <td className="py-2.5 pr-3 font-mono font-semibold align-middle">
-                      {fmtVarK(r.varBeforeUsdM)}
-                    </td>
-                    <td className="py-2.5 pr-3 font-mono text-amber-300 align-middle">
-                      {r.delta.toFixed(2)}
-                    </td>
-                    <td className="py-2.5 pr-3 font-mono text-slate-400 align-middle">
-                      {fmtLocal(r.residualLocalM, r.ccy)}
-                    </td>
-                    <td className="py-2.5 pr-3 font-mono font-semibold text-emerald-300 align-middle">
-                      {fmtVarK(r.varAfterUsdM)}
-                    </td>
-                    <td className="py-2.5 align-middle">
-                      <div className="flex flex-col gap-1">
+                        <QuickApplyReadout
+                          label="VaR-neutral"
+                          valueLocalM={varNeutralM}
+                          ccy={r.ccy}
+                          varUsdM={varNeutralUsd}
+                          disabled={flat || Math.abs(varNeutralM) < 1e-9}
+                          onApply={() =>
+                            applyStructRegime(r.ccy, varNeutralM, 'varNeutral')
+                          }
+                        />
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                            Net exposure
+                          </span>
+                          <span className={`font-mono text-xs ${muted}`}>
+                            {fmtLocal(totalM, r.ccy)}
+                          </span>
+                        </div>
+                        <div className="flex min-w-[280px] flex-col gap-1">
+                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                            Hedge ratio
+                          </span>
+                          <HedgeRatioControl
+                            pct={Math.round(r.hedgeRatio * 100)}
+                            notional={fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}
+                            mutedClass={muted}
+                            disabled={flat}
+                            onChange={pct => setStructRatio(r.ccy, pct)}
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                            Target (total)
+                          </span>
+                          <span className="font-mono text-sm font-semibold text-sky-300">
+                            {fmtLocal(r.hedgeNotionalLocalM, r.ccy)}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div
+                        className={`flex flex-wrap items-center gap-4 border-y ${border} py-2.5`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                            Structure
+                          </span>
+                          <span className="inline-flex rounded-lg border border-slate-700 bg-slate-950/60 p-0.5">
+                            <button
+                              type="button"
+                              onClick={() => setStructStructure(r.ccy, 'bullet')}
+                              className={shapeBtn(!isStrip)}
+                            >
+                              Bullet
+                            </button>
+                            <button
+                              type="button"
+                              disabled={!stripAvailable}
+                              onClick={() => setStructStructure(r.ccy, 'strip')}
+                              className={`${shapeBtn(isStrip)} disabled:cursor-not-allowed disabled:opacity-40`}
+                            >
+                              Strip
+                            </button>
+                          </span>
+                        </div>
+
+                        {isStrip && (
+                          <>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                                Legs
+                              </span>
+                              <span className="inline-flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setStructLegCount(r.ccy, cfg.legCount - 1)
+                                  }
+                                  className="flex h-5 w-5 items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-slate-300 hover:bg-slate-800"
+                                >
+                                  −
+                                </button>
+                                <span className="w-3 text-center font-mono text-xs text-slate-100">
+                                  {cfg.legCount}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setStructLegCount(r.ccy, cfg.legCount + 1)
+                                  }
+                                  className="flex h-5 w-5 items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-slate-300 hover:bg-slate-800"
+                                >
+                                  +
+                                </button>
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                                Shaping
+                              </span>
+                              <span className="inline-flex rounded-lg border border-slate-700 bg-slate-950/60 p-0.5">
+                                {(
+                                  [
+                                    { id: 'equal' as const, label: 'Equal' },
+                                    { id: 'front' as const, label: 'Front-loaded' },
+                                    { id: 'carry' as const, label: 'Carry-shaped' },
+                                  ] as const
+                                ).map(opt => (
+                                  <button
+                                    key={opt.id}
+                                    type="button"
+                                    onClick={() =>
+                                      setStructShaping(r.ccy, opt.id)
+                                    }
+                                    className={shapeBtn(cfg.shaping === opt.id)}
+                                  >
+                                    {opt.label}
+                                  </button>
+                                ))}
+                              </span>
+                              {cfg.shaping === 'optimized' && (
+                                <span
+                                  className="text-[9px] font-semibold uppercase tracking-wide text-violet-300/90"
+                                  title="Legs match the prepared package as-is (e.g. Cash Carry's WAM shape-search) — picking a preset above replaces this shape"
+                                >
+                                  Optimized · as prepared
+                                </span>
+                              )}
+                            </div>
+                          </>
+                        )}
+
+                        <span className="flex-1" />
+                        <span
+                          className={`text-[10px] ${
+                            needsRebalance ? 'text-amber-300' : muted
+                          }`}
+                        >
+                          {isStrip
+                            ? needsRebalance
+                              ? `Σ share ${fmtShare(sumShare)} · off target`
+                              : 'Σ share 100% · balanced'
+                            : null}
+                        </span>
+                        {needsRebalance && (
+                          <button
+                            type="button"
+                            onClick={() => rebalanceLegs(r.ccy)}
+                            className="rounded border border-amber-700/50 bg-amber-500/10 px-2.5 py-1 text-[10px] font-semibold text-amber-200 hover:bg-amber-500/20"
+                          >
+                            Rebalance to 100%
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="overflow-x-auto">
+                        <table className="w-full min-w-[720px] text-left text-[11px]">
+                          <thead>
+                            <tr className={muted}>
+                              <th className="py-0 pb-1.5 pr-3 font-medium">
+                                Leg
+                              </th>
+                              <th className="py-0 pb-1.5 pr-3 font-medium">
+                                Settle
+                              </th>
+                              <th className="py-0 pb-1.5 pr-3 font-medium">
+                                Share
+                              </th>
+                              <th className="py-0 pb-1.5 pr-3 font-medium">
+                                Notional
+                              </th>
+                              <th className="py-0 pb-1.5 pr-3 font-medium">
+                                Cumulative H
+                              </th>
+                              <th className="py-0 pb-1.5 pr-3 font-medium text-emerald-300/70">
+                                Implied carry
+                              </th>
+                              <th className="py-0 pb-1.5 font-medium">
+                                Status
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {preparedLegs.map((leg, i) => {
+                              const prev =
+                                i > 0 ? preparedLegs[i - 1]!.hedgeLocalM : 0;
+                              const delta = leg.hedgeLocalM - prev;
+                              const settle = leg.settleMonths ?? leg.endMonth;
+                              const settleLabel =
+                                Math.abs(settle - Math.round(settle)) < 1e-6
+                                  ? `M${Math.round(settle)}`
+                                  : `t=${settle.toFixed(1)}`;
+                              const carry =
+                                leg.impliedCarryUsdM ??
+                                (prepared?.structure === 'bullet'
+                                  ? prepared.impliedCarryUsdM
+                                  : undefined);
+                              return (
+                                <tr
+                                  key={`${r.ccy}-prep-${leg.index}`}
+                                  className={`border-t ${border}/80`}
+                                >
+                                  <td className="py-1.5 pr-3">
+                                    <span className="inline-flex items-center gap-1.5">
+                                      <span className="rounded bg-violet-500/20 px-1 py-0.5 text-[9px] font-semibold text-violet-200">
+                                        FWD
+                                      </span>
+                                      <span className="font-mono text-slate-100">
+                                        {isStrip ? `L${i + 1}` : leg.label}
+                                      </span>
+                                    </span>
+                                  </td>
+                                  <td className="py-1.5 pr-3">
+                                    {isStrip ? (
+                                      <span className="inline-flex items-center gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            legSettleStep(r.ccy, i, -1)
+                                          }
+                                          className="flex h-[18px] w-[18px] items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-slate-300 hover:bg-slate-800"
+                                        >
+                                          −
+                                        </button>
+                                        <span className="w-10 text-center font-mono text-amber-200/90">
+                                          {settleLabel}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            legSettleStep(r.ccy, i, 1)
+                                          }
+                                          className="flex h-[18px] w-[18px] items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-slate-300 hover:bg-slate-800"
+                                        >
+                                          +
+                                        </button>
+                                      </span>
+                                    ) : (
+                                      <span className="font-mono text-amber-200/90">
+                                        {settleLabel}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-1.5 pr-3">
+                                    {isStrip ? (
+                                      <span className="inline-flex items-center gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            legShareStep(r.ccy, i, -1)
+                                          }
+                                          className="flex h-[18px] w-[18px] items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-slate-300 hover:bg-slate-800"
+                                        >
+                                          −
+                                        </button>
+                                        <span className="w-9 text-center font-mono text-slate-100">
+                                          {fmtShare(cfg.sh[i] ?? 0)}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            legShareStep(r.ccy, i, 1)
+                                          }
+                                          className="flex h-[18px] w-[18px] items-center justify-center rounded border border-slate-700 bg-slate-950/60 text-slate-300 hover:bg-slate-800"
+                                        >
+                                          +
+                                        </button>
+                                      </span>
+                                    ) : (
+                                      <span className="font-mono text-slate-100">
+                                        100%
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="py-1.5 pr-3 font-mono font-semibold text-emerald-300">
+                                    {fmtLocal(delta, r.ccy)}
+                                  </td>
+                                  <td className={`py-1.5 pr-3 font-mono ${muted}`}>
+                                    {fmtLocal(leg.hedgeLocalM, r.ccy)}
+                                  </td>
+                                  <td className="py-1.5 pr-3 font-mono text-emerald-300/90">
+                                    {carry == null
+                                      ? '—'
+                                      : fmtVarK(Math.abs(carry) * 1000).replace(
+                                          '$',
+                                          carry >= 0 ? '+$' : '−$',
+                                        )}
+                                  </td>
+                                  <td className={`py-1.5 text-[10px] ${muted}`}>
+                                    {prepared
+                                      ? [
+                                          prepared.preparedFor === 'carry'
+                                            ? 'Cash Carry'
+                                            : 'prepared',
+                                          regimeLabel,
+                                        ]
+                                          .filter(Boolean)
+                                          .join(' · ')
+                                      : '—'}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                            {bookedForCcy.map(t => {
+                              const scheduled = !isLiveHedgeTicket(t);
+                              return (
+                                <tr
+                                  key={t.id}
+                                  className={`border-t ${border}/80 bg-emerald-500/[0.04]`}
+                                >
+                                  <td className="py-1.5 pr-3">
+                                    <span className="inline-flex items-center gap-1.5">
+                                      <span className="rounded bg-emerald-500/20 px-1 py-0.5 text-[9px] font-semibold text-emerald-300">
+                                        {t.instrument.toUpperCase()}
+                                      </span>
+                                      <span className="font-mono text-slate-100">
+                                        {ticketLabel(t)}
+                                      </span>
+                                    </span>
+                                  </td>
+                                  <td className="py-1.5 pr-3 font-mono text-amber-200/90">
+                                    {t.maturityLabel ?? t.maturity ?? '—'}
+                                  </td>
+                                  <td className={`py-1.5 pr-3 font-mono ${muted}`}>
+                                    —
+                                  </td>
+                                  <td className="py-1.5 pr-3 font-mono font-semibold text-emerald-300">
+                                    {fmtLocal(t.amountLocalM, r.ccy)}
+                                  </td>
+                                  <td className={`py-1.5 pr-3 font-mono ${muted}`}>
+                                    —
+                                  </td>
+                                  <td className="py-1.5 pr-3 font-mono text-slate-400">
+                                    {fmtVarK(t.varUsdM)}
+                                  </td>
+                                  <td className="py-1.5 text-[10px]">
+                                    <span
+                                      className={
+                                        scheduled
+                                          ? 'text-amber-200'
+                                          : 'text-emerald-300/80'
+                                      }
+                                    >
+                                      {scheduled ? 'PENDING' : 'live'}
+                                    </span>{' '}
+                                    <button
+                                      type="button"
+                                      title={
+                                        t.stripId
+                                          ? 'Cancel entire rolling strip'
+                                          : 'Cancel this hedge transaction'
+                                      }
+                                      onClick={() => requestCancellation(t)}
+                                      className="ml-1 rounded border border-rose-600/40 bg-rose-500/10 px-1.5 py-0.5 text-[9px] font-medium text-rose-300 hover:bg-rose-500/20"
+                                    >
+                                      {t.stripId ? 'Cancel strip' : 'Cancel'}
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-3">
+                        <span className="flex flex-wrap gap-x-4 gap-y-1 text-[10px]">
+                          <span className={muted}>
+                            VaR @ Δ1{' '}
+                            <span className="font-mono text-slate-300">
+                              {fmtVarK(r.varBeforeUsdM)}
+                            </span>
+                          </span>
+                          <span className={muted}>
+                            Delta{' '}
+                            <span className="font-mono text-amber-300">
+                              {r.delta.toFixed(2)}
+                            </span>
+                          </span>
+                          <span className={muted}>
+                            Residual{' '}
+                            <span className="font-mono text-slate-300">
+                              {fmtLocal(r.residualLocalM, r.ccy)}
+                            </span>
+                          </span>
+                          <span className={muted}>
+                            VaR after{' '}
+                            <span className="font-mono font-semibold text-emerald-300">
+                              {fmtVarK(r.varAfterUsdM)}
+                            </span>
+                          </span>
+                        </span>
+                        <span className="flex-1" />
+                        <button
+                          type="button"
+                          disabled={!prepared}
+                          title="Discard prepared package"
+                          onClick={() => discardPrepared(r.ccy)}
+                          className="rounded-md border border-slate-600 px-3 py-1.5 text-[11px] font-semibold text-slate-400 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          Discard
+                        </button>
                         <button
                           type="button"
                           disabled={flat}
                           title="Open exposure path + residual VaR charts"
                           onClick={() => openPathChart(r.ccy)}
-                          className="whitespace-nowrap rounded-md border border-violet-500/50 bg-violet-500/15 px-2.5 py-1.5 text-[11px] font-medium text-violet-200 hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-30"
+                          className="rounded-md border border-violet-500/50 bg-violet-500/15 px-3 py-1.5 text-[11px] font-semibold text-violet-200 hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-30"
                         >
                           Path charts
+                        </button>
+                        <button
+                          type="button"
+                          disabled={
+                            !prepared || hasRollingStripForCcy(booked, r.ccy)
+                          }
+                          title="Book this prepared package onto the Decision book"
+                          onClick={() => sendPreparedToDecision(r.ccy)}
+                          className="rounded-md border border-emerald-600/60 bg-emerald-500/20 px-3 py-1.5 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          Send to decision book
                         </button>
                         <button
                           type="button"
@@ -1462,270 +2010,16 @@ export function HedgingDecisionLayer({
                               : 'Open book-hedge proposal (auto size & timeline)'
                           }
                           onClick={() => openBookModal(r.ccy)}
-                          className="whitespace-nowrap rounded-md border border-sky-600/50 bg-sky-500/10 px-2.5 py-1.5 text-[11px] font-medium text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-30"
+                          className="rounded-md border border-sky-600/50 bg-sky-500/10 px-3.5 py-1.5 text-[11px] font-semibold text-sky-300 hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-30"
                         >
                           Book hedge
                         </button>
                       </div>
-                    </td>
-                  </tr>
-
-                  {/* Analytics-prepared strip / bullet — nested under CCY */}
-                  {prepared && preparedLegs.length > 0 && (
-                    <tr className="bg-violet-500/10">
-                      <td
-                        colSpan={11}
-                        className={`border-b ${border}/60 px-2 py-1.5`}
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-2 text-[10px]">
-                            <span className="rounded border border-violet-500/40 bg-violet-500/20 px-1.5 py-0.5 font-semibold text-violet-100">
-                              From Analytics
-                            </span>
-                            {prepared.preparedFor && (
-                              <span
-                                className={`rounded border px-1.5 py-0.5 font-semibold ${
-                                  prepared.preparedFor === 'carry'
-                                    ? 'border-amber-500/40 bg-amber-500/15 text-amber-200'
-                                    : 'border-sky-500/40 bg-sky-500/15 text-sky-200'
-                                }`}
-                                title={
-                                  prepared.preparedFor === 'carry'
-                                    ? 'Shaped in Cash Carry — sized for carry / Enhancement, not equal-VaR'
-                                    : 'Shaped in FX Risk — sized for equal-VaR hedge ratio'
-                                }
-                              >
-                                {prepared.preparedFor === 'carry'
-                                  ? 'Carry-shaped'
-                                  : 'VaR-shaped'}
-                              </span>
-                            )}
-                            <span className="font-medium text-violet-100">
-                              {r.ccy} ·{' '}
-                              {prepared.structure === 'strip'
-                                ? `${preparedLegs.length}-leg strip`
-                                : 'Bullet forward'}
-                            </span>
-                            {regimeLabel && (
-                              <span className={muted}>· {regimeLabel}</span>
-                            )}
-                            <span className={`font-mono ${muted}`}>
-                              Σ {fmtLocal(prepared.coverLocalM, r.ccy)}
-                            </span>
-                            {typeof prepared.impliedCarryUsdM === 'number' && (
-                              <span
-                                className={`font-mono ${
-                                  prepared.impliedCarryUsdM >= 0
-                                    ? 'text-emerald-300/90'
-                                    : 'text-rose-300/90'
-                                }`}
-                                title="Package Σ implied swap-points carry"
-                              >
-                                Carry {fmtVarK(prepared.impliedCarryUsdM)}
-                              </span>
-                            )}
-                            {Math.abs(
-                              Math.abs(prepared.coverLocalM) -
-                                Math.abs(r.hedgeNotionalLocalM),
-                            ) >
-                              Math.max(
-                                0.01,
-                                0.02 * Math.abs(prepared.coverLocalM),
-                              ) && (
-                              <span
-                                className="rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-0.5 font-semibold text-rose-200"
-                                title={`VaR after (${fmtVarK(r.varAfterUsdM)}) above reflects the ratio slider (${fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}), not this prepared Σ (${fmtLocal(prepared.coverLocalM, r.ccy)}) — Send books the prepared package, not the slider.`}
-                              >
-                                Σ ≠ ratio slider
-                              </span>
-                            )}
-                          </div>
-                          <div className="flex gap-1.5">
-                            <button
-                              type="button"
-                              title="Book these Analytics trades onto the Decision book"
-                              onClick={() => sendPreparedToDecision(r.ccy)}
-                              disabled={hasRollingStripForCcy(booked, r.ccy)}
-                              className="rounded-md border border-emerald-500/50 bg-emerald-500/15 px-2.5 py-1 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-40"
-                            >
-                              Send to Decision book
-                            </button>
-                            <button
-                              type="button"
-                              title="Discard prepared package"
-                              onClick={() => discardPrepared(r.ccy)}
-                              className="rounded-md border border-slate-600 px-2 py-1 text-[10px] text-slate-400 hover:bg-slate-800"
-                            >
-                              Discard
-                            </button>
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
+                    </div>
                   )}
-                  {preparedLegs.map((leg, i) => {
-                    const prev =
-                      i > 0 ? preparedLegs[i - 1]!.hedgeLocalM : 0;
-                    const delta = leg.hedgeLocalM - prev;
-                    const settle = leg.settleMonths ?? leg.endMonth;
-                    const settleLabel =
-                      Math.abs(settle - Math.round(settle)) < 1e-6
-                        ? `M${Math.round(settle)}`
-                        : `t=${settle.toFixed(1)}`;
-                    const isLast = i === preparedLegs.length - 1;
-                    return (
-                      <tr
-                        key={`${r.ccy}-prep-${leg.index}`}
-                        className={`bg-violet-500/[0.06] ${
-                          isLast && bookedForCcy.length === 0
-                            ? `border-b ${border}`
-                            : `border-b ${border}/40`
-                        }`}
-                      >
-                        <td className="py-2 pr-2 align-middle pl-3">
-                          <div className="flex items-center gap-1.5 font-mono text-[11px]">
-                            <span className="text-slate-600">└</span>
-                            <span className="rounded bg-violet-500/20 px-1 py-0.5 text-[9px] font-semibold text-violet-200">
-                              FWD
-                            </span>
-                            <span className="text-emerald-300">
-                              {leg.label}
-                            </span>
-                          </div>
-                          <div className={`pl-5 text-[9px] ${muted}`}>
-                            prepared · {r.ccy}
-                          </div>
-                        </td>
-                        <td
-                          colSpan={3}
-                          className={`py-2 pr-2 align-middle text-[10px] ${muted}`}
-                        >
-                          {prepared?.structure === 'strip'
-                            ? 'Strip leg'
-                            : 'Bullet'}{' '}
-                          · Analytics
-                          {regimeLabel ? ` · ${regimeLabel}` : ''}
-                        </td>
-                        <td className="py-2 pr-3 font-mono font-semibold text-emerald-300 align-middle">
-                          {fmtLocal(delta, r.ccy)}
-                          <div className={`text-[9px] font-normal ${muted}`}>
-                            H {fmtLocal(leg.hedgeLocalM, r.ccy)}
-                          </div>
-                        </td>
-                        <td className="py-2 pr-3 font-mono text-amber-200/90 align-middle">
-                          {settleLabel}
-                        </td>
-                        <td
-                          colSpan={4}
-                          className={`py-2 pr-3 align-middle text-[10px] font-mono ${
-                            leg.impliedCarryUsdM != null
-                              ? 'text-emerald-300/90'
-                              : muted
-                          }`}
-                          title={
-                            leg.swapPoints != null
-                              ? `Swap pts ${leg.swapPoints.toFixed(2)} ${leg.swapPointsSide ?? ''} → implied carry`
-                              : prepared?.impliedCarryUsdM != null &&
-                                  prepared.structure === 'bullet'
-                                ? `Swap pts ${prepared.swapPoints?.toFixed(2) ?? '—'} → implied carry`
-                                : 'Implied carry from EURUSD swap points (Market data)'
-                          }
-                        >
-                          {(() => {
-                            const carry =
-                              leg.impliedCarryUsdM ??
-                              (prepared?.structure === 'bullet'
-                                ? prepared.impliedCarryUsdM
-                                : undefined);
-                            if (carry == null) return '—';
-                            const k = carry * 1000;
-                            const sign = k >= 0 ? '+' : '−';
-                            return `${sign}${Math.abs(k).toFixed(1)}K implied`;
-                          })()}
-                        </td>
-                        <td className={`py-2 align-middle text-[10px] ${muted}`}>
-                          pending Send
-                        </td>
-                      </tr>
-                    );
-                  })}
-
-                  {/* Booked trades under same CCY */}
-                  {bookedForCcy.map((t, i) => {
-                    const scheduled = !isLiveHedgeTicket(t);
-                    const isLast = i === bookedForCcy.length - 1;
-                    return (
-                      <tr
-                        key={t.id}
-                        className={`bg-emerald-500/[0.04] ${
-                          isLast
-                            ? `border-b ${border}`
-                            : `border-b ${border}/40`
-                        }`}
-                      >
-                        <td className="py-2 pr-2 align-middle pl-3">
-                          <div className="flex items-center gap-1.5 font-mono text-[11px]">
-                            <span className="text-slate-600">└</span>
-                            <span className="rounded bg-emerald-500/20 px-1 py-0.5 text-[9px] font-semibold text-emerald-300">
-                              {t.instrument.toUpperCase()}
-                            </span>
-                            <span className="text-slate-200">
-                              {t.maturityLabel ?? t.maturity ?? 'spot'}
-                            </span>
-                          </div>
-                          <div className={`pl-5 text-[9px] ${muted}`}>
-                            booked · {r.ccy}
-                            {t.stripId ? ' · strip' : ''}
-                          </div>
-                        </td>
-                        <td
-                          colSpan={3}
-                          className={`py-2 pr-2 align-middle text-[10px] ${muted}`}
-                        >
-                          {ticketLabel(t)}
-                        </td>
-                        <td className="py-2 pr-3 font-mono text-emerald-300 align-middle">
-                          {fmtLocal(t.amountLocalM, r.ccy)}
-                        </td>
-                        <td className="py-2 pr-3 font-mono text-amber-200/90 align-middle">
-                          {t.maturityLabel ?? t.maturity ?? '—'}
-                        </td>
-                        <td className="py-2 pr-3 font-mono text-slate-400 align-middle">
-                          {fmtVarK(t.varUsdM)}
-                        </td>
-                        <td
-                          colSpan={2}
-                          className={`py-2 pr-3 align-middle text-[10px] ${
-                            scheduled ? 'text-amber-200' : 'text-emerald-300/80'
-                          }`}
-                        >
-                          {scheduled ? 'PENDING' : 'live'}
-                        </td>
-                        <td className={`py-2 pr-3 align-middle text-[10px] ${muted}`}>
-                          —
-                        </td>
-                        <td className="py-2 align-middle">
-                          <button
-                            type="button"
-                            title={
-                              t.stripId
-                                ? 'Cancel entire rolling strip'
-                                : 'Cancel this hedge transaction'
-                            }
-                            onClick={() => requestCancellation(t)}
-                            className="rounded-md border border-rose-600/40 bg-rose-500/10 px-2 py-1 text-[10px] font-medium text-rose-300 hover:bg-rose-500/20"
-                          >
-                            {t.stripId ? 'Cancel strip' : 'Cancel'}
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </Fragment>
+                </div>
               );
             })}
-          </tbody>
-        </table>
       </div>
 
       {draft && (
@@ -1872,6 +2166,11 @@ export function HedgingDecisionLayer({
                   varSetup,
                   chartRow.ccy,
                   forecastProfile,
+                )}
+                marketRates={resolveMarketRatesForCcy(
+                  marketRatesByCcy,
+                  chartRow.ccy,
+                  ratesScopeId,
                 )}
                 appliedHedgeLocalM={chartRow.hedgeNotionalLocalM}
                 hedgeRatio={chartRow.hedgeRatio}

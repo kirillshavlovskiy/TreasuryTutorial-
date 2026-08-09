@@ -10,7 +10,7 @@ metadata:
     app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
-    sandbox.deel/name: {{ .Values.sandboxName }}
+    sandbox.app/name: {{ .Values.sandboxName }}
 spec:
   replicas: 1
   selector:
@@ -127,7 +127,7 @@ metadata:
     app.kubernetes.io/name: {{ .Values.sandboxName }}-pgadmin
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
-    sandbox.deel/name: {{ .Values.sandboxName }}
+    sandbox.app/name: {{ .Values.sandboxName }}
 spec:
   type: ClusterIP
   selector:

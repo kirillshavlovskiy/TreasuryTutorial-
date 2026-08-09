@@ -19,6 +19,7 @@ import { stripHedgeLegCarryUsdM } from '@/lib/fx-hedge';
 import {
   fwdCarryFromSwapPointsUsdM,
   interpolateSwapPoints,
+  resolveCashRatesForHorizon,
   resolveForwardDepositRates,
   resolveOvernightCashRates,
   selectCreditDebitRate,
@@ -225,6 +226,8 @@ export function cashInterestPathToHorizon(input: {
   debitPct: number;
   ccy: string;
   throughMonths: number;
+  /** When set, month m uses SW→1Y term cash rates (else flat credit/debit). */
+  marketRates?: FxMarketRatesBundle;
 }): {
   interestUsdM: number;
   revenueInflowM: number;
@@ -280,11 +283,13 @@ export function cashInterestPathToHorizon(input: {
     const start = cash;
     const end = cash + net;
     const avg = (start + end) / 2;
-    const pick = selectCreditDebitRate(
-      avg,
-      input.creditPct,
-      input.debitPct,
-    );
+    const monthTenor = i + dt;
+    const rates = input.marketRates
+      ? resolveCashRatesForHorizon(input.marketRates, input.ccy, monthTenor)
+      : null;
+    const creditPct = rates?.fcy.creditPct ?? input.creditPct;
+    const debitPct = rates?.fcy.debitPct ?? input.debitPct;
+    const pick = selectCreditDebitRate(avg, creditPct, debitPct);
     interestUsdM += avg * usdPer * (pick.ratePct / 100) * (dt / 12);
     cashTime += avg * dt;
     revenueInflowM += rev;
@@ -589,17 +594,23 @@ export function buildCashForecastSchedule(input: {
     const midUsd = usd;
     const avgFcy = (startFcy + midFcy) / 2;
     const avgUsd = (startUsd + midUsd) / 2;
+    // Month m cash rate from term structure (SW→1Y); near 0 → O/N.
+    const monthRates = resolveCashRatesForHorizon(
+      input.marketRates,
+      input.ccy,
+      month,
+    );
     const eurPick = selectCreditDebitRate(
       avgFcy,
-      overnight.fcy.creditPct,
-      overnight.fcy.debitPct,
+      monthRates.fcy.creditPct,
+      monthRates.fcy.debitPct,
     );
     const monthResidualEur =
       avgFcy * usdPer * (eurPick.ratePct / 100) * (1 / 12);
     const usdPick = selectCreditDebitRate(
       avgUsd,
-      overnight.usd.creditPct,
-      overnight.usd.debitPct,
+      monthRates.usd.creditPct,
+      monthRates.usd.debitPct,
     );
     const monthUsdInt =
       avgUsd * (usdPick.ratePct / 100) * (1 / 12);
@@ -753,6 +764,96 @@ export function buildCashForecastCarryComparison(input: {
   };
 }
 
+/** Live swap-curve FWD for one prepared strip leg (trade Δ × pts). */
+export function preparedLegFwdCarryUsdM(
+  leg: PreparedHedgeProfile['legs'][number],
+  prevHedgeLocalM: number,
+  marketRates: FxMarketRatesBundle,
+): number {
+  const settle = Math.max(0, leg.settleMonths ?? leg.endMonth);
+  if (settle < 1 - 1e-9) return 0;
+  const delta =
+    typeof leg.tradeNotionalLocalM === 'number'
+      ? leg.tradeNotionalLocalM
+      : leg.hedgeLocalM - prevHedgeLocalM;
+  if (Math.abs(delta) < 1e-12) return 0;
+  return (
+    fwdCarryFromSwapPointsUsdM({
+      notionalLocalM: delta,
+      settleMonths: settle,
+      bundle: marketRates,
+    })?.fwdCarryUsdM ?? 0
+  );
+}
+
+/** Live swap-curve FWD for a prepared strip (Σ trade Δ × pts). */
+export function preparedStripFwdCarryUsdM(
+  prep: PreparedHedgeProfile,
+  marketRates: FxMarketRatesBundle,
+): number {
+  let prev = 0;
+  let sum = 0;
+  for (const leg of prep.legs) {
+    sum += preparedLegFwdCarryUsdM(leg, prev, marketRates);
+    prev = leg.hedgeLocalM;
+  }
+  return sum;
+}
+
+/** Live swap-curve FWD for a prepared bullet. */
+export function preparedBulletFwdCarryUsdM(
+  prep: PreparedHedgeProfile,
+  marketRates: FxMarketRatesBundle,
+  fallbackUsdM: number,
+): number {
+  const settle = Math.max(0, prep.settleMonths ?? 0);
+  if (settle < 1 - 1e-9 || Math.abs(prep.coverLocalM) < 1e-12) {
+    return fallbackUsdM;
+  }
+  return (
+    fwdCarryFromSwapPointsUsdM({
+      notionalLocalM: prep.coverLocalM,
+      settleMonths: settle,
+      bundle: marketRates,
+    })?.fwdCarryUsdM ?? fallbackUsdM
+  );
+}
+
+/**
+ * Total carry = Income Σ with live prepared FWD (same as Cash Carry table).
+ * Strip/bullet FWD from the swap curve replaces any double-counted forecast FWD.
+ */
+export function resolvedHedgedTotalCarryUsdM(input: {
+  comparison: CashForecastCarryComparison;
+  prepared?: PreparedHedgeProfile | null;
+  marketRates: FxMarketRatesBundle;
+}): {
+  fwdCarryUsdM: number;
+  totalCarryUsdM: number;
+  benefitUsdM: number;
+} {
+  const { comparison: cmp, prepared: prep, marketRates } = input;
+  let fwdCarryUsdM = cmp.categories.fwdCarryUsdM;
+  if (prep?.structure === 'strip' && (prep.legs?.length ?? 0) >= 2) {
+    fwdCarryUsdM = preparedStripFwdCarryUsdM(prep, marketRates);
+  } else if (
+    prep?.structure === 'bullet' &&
+    Math.abs(prep.coverLocalM) >= 1e-12
+  ) {
+    fwdCarryUsdM = preparedBulletFwdCarryUsdM(
+      prep,
+      marketRates,
+      cmp.categories.fwdCarryUsdM,
+    );
+  }
+  const fwdAdjust = fwdCarryUsdM - cmp.categories.fwdCarryUsdM;
+  return {
+    fwdCarryUsdM,
+    totalCarryUsdM: cmp.categories.hedgedIncomeUsdM + fwdAdjust,
+    benefitUsdM: cmp.categories.hedgeVsNoHedgeUsdM + fwdAdjust,
+  };
+}
+
 function cashPathForCcy(input: {
   ccy: string;
   bookRows?: readonly RowState[];
@@ -782,6 +883,7 @@ function cashPathForCcy(input: {
     debitPct: overnight.fcy.debitPct,
     ccy: input.ccy,
     throughMonths: input.throughMonths,
+    marketRates: input.marketRates,
   });
   return {
     ...path,
@@ -790,7 +892,7 @@ function cashPathForCcy(input: {
     growthRateMoM: profile.growthRateMoM ?? 0,
     creditPct: overnight.fcy.creditPct,
     debitPct: overnight.fcy.debitPct,
-    source: overnight.source,
+    source: `${overnight.source} · future ← SW–1Y term`,
   };
 }
 
@@ -821,7 +923,10 @@ export function assignImpliedCarryFromSwapPoints(
     let prev = 0;
     let sum = 0;
     const legs = profile.legs.map(leg => {
-      const delta = leg.hedgeLocalM - prev;
+      const delta =
+        typeof leg.tradeNotionalLocalM === 'number'
+          ? leg.tradeNotionalLocalM
+          : leg.hedgeLocalM - prev;
       prev = leg.hedgeLocalM;
       const settle = Math.max(0, leg.settleMonths ?? leg.endMonth);
       // Spot / start conversion (< 1m) — no forward points.
@@ -887,11 +992,16 @@ function pushFwdCarryRow(
 ): string {
   const settle = Math.max(input.settleMonths, 0);
   const overnight = resolveOvernightCashRates(input.marketRates, input.ccy);
-  const pts = fwdCarryFromSwapPointsUsdM({
-    notionalLocalM: input.amountLocalM,
-    settleMonths: Math.max(settle, 0.25),
-    bundle: input.marketRates,
-  });
+  // Spot / start (< 1m): no forward points — do not floor to 0.25 (that
+  // invented SW pts on M0).
+  const pts =
+    settle < 1 - 1e-9
+      ? null
+      : fwdCarryFromSwapPointsUsdM({
+          notionalLocalM: input.amountLocalM,
+          settleMonths: settle,
+          bundle: input.marketRates,
+        });
   // Leg table = swap-points only. Residual EUR / USD int live on the dual
   // cash-forecast book (not per-leg notional overnight).
   const fwdCarryUsdM = pts?.fwdCarryUsdM ?? 0;
@@ -933,8 +1043,10 @@ function collectHedgeLegs(input: {
   horizon: number;
 }): HedgeLegSample[] {
   const legs: HedgeLegSample[] = [];
+  const preparedCcys = new Set<string>();
   for (const [ccy, prep] of Object.entries(input.preparedByCcy ?? {})) {
     if (prep.structure === 'strip' && prep.legs.length > 0) {
+      preparedCcys.add(ccy);
       let prev = 0;
       for (const leg of prep.legs) {
         const delta =
@@ -952,6 +1064,7 @@ function collectHedgeLegs(input: {
         });
       }
     } else if (Math.abs(prep.coverLocalM) >= 1e-12) {
+      preparedCcys.add(ccy);
       legs.push({
         ccy,
         amountLocalM: prep.coverLocalM,
@@ -964,6 +1077,8 @@ function collectHedgeLegs(input: {
   }
   for (const t of input.bookedHedges.filter(isLiveHedgeTicket)) {
     if (t.instrument === 'spot') continue;
+    // Prepared package already represents this CCY — don't double-count FWD.
+    if (preparedCcys.has(t.ccy)) continue;
     legs.push({
       ccy: t.ccy,
       amountLocalM: t.amountLocalM,
@@ -1017,23 +1132,43 @@ export function hedgeImprovementBreakdownToT(
       leg.ccy,
       Math.max(settle, 0.25),
     );
-    const overnight = resolveOvernightCashRates(marketRates, leg.ccy);
-    const pts = fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: leg.amountLocalM,
-      settleMonths: settle,
-      bundle: marketRates,
-    });
+    // Cash interest: O/N only near 0; else SW→1Y term at holding tenor.
+    const fcyHorizon = Math.max(0, settle - recog);
+    const usdHorizon = Math.max(0, Math.max(t, settle) - settle);
+    const fcyCash = resolveCashRatesForHorizon(
+      marketRates,
+      leg.ccy,
+      fcyHorizon,
+    );
+    const usdCash = resolveCashRatesForHorizon(
+      marketRates,
+      leg.ccy,
+      usdHorizon,
+    );
+    const pts =
+      settle < 1 - 1e-9
+        ? null
+        : fwdCarryFromSwapPointsUsdM({
+            notionalLocalM: leg.amountLocalM,
+            settleMonths: settle,
+            bundle: marketRates,
+          });
     const reportT = Math.max(t, 1e-12);
 
     if (t + 1e-9 < settle) {
       // Before settle: only partial FCY accrual; no FWD lock-in / USD post-settle yet.
       const usdNotional = leg.amountLocalM * fcyToUsdM(1, leg.ccy);
+      const elapsed = Math.max(0, Math.min(t, settle) - recog);
+      const fcyCashElapsed = resolveCashRatesForHorizon(
+        marketRates,
+        leg.ccy,
+        elapsed,
+      );
       const fcyPick = selectCreditDebitRate(
         leg.amountLocalM,
-        overnight.fcy.creditPct,
-        overnight.fcy.debitPct,
+        fcyCashElapsed.fcy.creditPct,
+        fcyCashElapsed.fcy.debitPct,
       );
-      const elapsed = Math.max(0, Math.min(t, settle) - recog);
       fcyInterestUsdM +=
         usdNotional * (fcyPick.ratePct / 100) * (elapsed / 12);
       continue;
@@ -1047,8 +1182,8 @@ export function hedgeImprovementBreakdownToT(
       forecastEndMonths: reportT,
       fcyFwdRates: fwd.fcy,
       usdFwdRates: fwd.usd,
-      fcyCashRates: overnight.fcy,
-      usdCashRates: overnight.usd,
+      fcyCashRates: fcyCash.fcy,
+      usdCashRates: usdCash.usd,
       swapPointsCarryUsdM: pts?.fwdCarryUsdM ?? 0,
       swapPoints: pts?.points,
       swapPointsSide: pts?.side,
@@ -1116,20 +1251,17 @@ function overnightInterestUsdM(
  * Month-step dual cash book M0→Tf — same convention as
  * `buildCashForecastSchedule`:
  *   1) apply forecast net + any settles this month
- *   2) accrue FCY/USD overnight on mid-month averages (USD earns in settle month)
+ *   2) accrue FCY/USD cash interest on mid-month averages
  *
+ * Rates: month m uses term structure at tenor m (SW→1Y); near 0 → O/N.
  * Month index: 0 = opening spot settles (before M1); 1…Tf = month-end Mm.
- * Strip = staggered leg CFs. Overhedge → FCY OD / debit.
  */
 function simulateSettleCashPath(input: {
   openingCashM: number;
   monthlyNets: readonly number[];
   throughMonths: number;
   settleCashFlowsByMonth: ReadonlyMap<number, number>;
-  fcyCreditPct: number;
-  fcyDebitPct: number;
-  usdCreditPct: number;
-  usdDebitPct: number;
+  marketRates: FxMarketRatesBundle;
   ccy: string;
 }): {
   fcyInterestUsdM: number;
@@ -1171,16 +1303,22 @@ function simulateSettleCashPath(input: {
     fcy += net;
     const fcyAvg = (fcyStart + fcy) / 2;
     const usdAvg = (usdStart + usd) / 2;
+    // Future cash rate from term structure at month tenor (SW…1Y).
+    const rates = resolveCashRatesForHorizon(
+      input.marketRates,
+      input.ccy,
+      m,
+    );
     fcyInterestUsdM += overnightInterestUsdM(
       fcyAvg * usdPer,
-      input.fcyCreditPct,
-      input.fcyDebitPct,
+      rates.fcy.creditPct,
+      rates.fcy.debitPct,
       1,
     );
     usdInterestUsdM += overnightInterestUsdM(
       usdAvg,
-      input.usdCreditPct,
-      input.usdDebitPct,
+      rates.usd.creditPct,
+      rates.usd.debitPct,
       1,
     );
     takeSettle(m);
@@ -1388,16 +1526,12 @@ export function buildSettleWamScenarios(input: {
     ? monthlyFlowSeriesLocalM(bookRow, Tsched, profile)
     : Array.from({ length: Tsched }, () => 0);
   const openingCashM = bookRow ? interestBearingCashM(bookRow) : 0;
-  const overnight = resolveOvernightCashRates(input.marketRates, input.ccy);
 
   const pathBase = {
     openingCashM,
     monthlyNets,
     throughMonths: reportT,
-    fcyCreditPct: overnight.fcy.creditPct,
-    fcyDebitPct: overnight.fcy.debitPct,
-    usdCreditPct: overnight.usd.creditPct,
-    usdDebitPct: overnight.usd.debitPct,
+    marketRates: input.marketRates,
     ccy: input.ccy,
   };
 
@@ -1704,15 +1838,11 @@ export function scoreStripShapeAroundWam(input: {
   const monthlyNets = bookRow
     ? monthlyFlowSeriesLocalM(bookRow, reportT, profile)
     : Array.from({ length: reportT }, () => 0);
-  const overnight = resolveOvernightCashRates(input.marketRates, input.ccy);
   const pathBase = {
     openingCashM: bookRow ? interestBearingCashM(bookRow) : 0,
     monthlyNets,
     throughMonths: reportT,
-    fcyCreditPct: overnight.fcy.creditPct,
-    fcyDebitPct: overnight.fcy.debitPct,
-    usdCreditPct: overnight.usd.creditPct,
-    usdDebitPct: overnight.usd.debitPct,
+    marketRates: input.marketRates,
     ccy: input.ccy,
   };
 
@@ -2309,7 +2439,6 @@ export function buildCarryEvolutionLegBarsFromSamples(input: {
   const Tf = Math.max(0, Math.floor(TfRaw + 1e-12));
   if (Tf < 1 || input.legs.length === 0) return [];
 
-  const overnight = resolveOvernightCashRates(input.marketRates, input.ccy);
   const reportT = Math.max(Tf, 1e-12);
   const multi = input.legs.length > 1;
 
@@ -2325,6 +2454,24 @@ export function buildCarryEvolutionLegBarsFromSamples(input: {
       input.ccy,
       Math.max(settle, 0.25),
     );
+    const fcyHorizon = Math.max(0, settle - recog);
+    const usdHorizon = Math.max(0, reportT - settle);
+    const fcyCash = resolveCashRatesForHorizon(
+      input.marketRates,
+      input.ccy,
+      fcyHorizon,
+    );
+    const usdCash = resolveCashRatesForHorizon(
+      input.marketRates,
+      input.ccy,
+      usdHorizon,
+    );
+    // Do-nothing: FCY cash for full Tf at term-matched tenor.
+    const defaultCash = resolveCashRatesForHorizon(
+      input.marketRates,
+      input.ccy,
+      reportT,
+    );
     const pts =
       settle < 1 - 1e-12
         ? null
@@ -2336,10 +2483,9 @@ export function buildCarryEvolutionLegBarsFromSamples(input: {
     const usdNotional = leg.amountLocalM * fcyToUsdM(1, input.ccy);
     const fcyPick = selectCreditDebitRate(
       leg.amountLocalM,
-      overnight.fcy.creditPct,
-      overnight.fcy.debitPct,
+      defaultCash.fcy.creditPct,
+      defaultCash.fcy.debitPct,
     );
-    // Do-nothing: keep this Δ notional in FCY overnight for the full Tf.
     const defaultCarryUsdM =
       usdNotional * (fcyPick.ratePct / 100) * (reportT / 12);
 
@@ -2351,8 +2497,8 @@ export function buildCarryEvolutionLegBarsFromSamples(input: {
       forecastEndMonths: reportT,
       fcyFwdRates: fwd.fcy,
       usdFwdRates: fwd.usd,
-      fcyCashRates: overnight.fcy,
-      usdCashRates: overnight.usd,
+      fcyCashRates: fcyCash.fcy,
+      usdCashRates: usdCash.usd,
       swapPointsCarryUsdM: pts?.fwdCarryUsdM ?? 0,
       swapPoints: pts?.points,
       swapPointsSide: pts?.side,
@@ -2658,8 +2804,18 @@ export function buildCashCarryAnalytics(input: {
     });
   }
 
-  // Layer 2b — live booked
+  // Layer 2b — live booked (skip CCY that already has a prepared package)
+  const preparedCcys = new Set(
+    Object.entries(input.preparedByCcy ?? {})
+      .filter(
+        ([, prep]) =>
+          (prep.structure === 'strip' && prep.legs.length > 0) ||
+          Math.abs(prep.coverLocalM) >= 1e-12,
+      )
+      .map(([ccy]) => ccy),
+  );
   for (const t of input.bookedHedges.filter(isLiveHedgeTicket)) {
+    if (preparedCcys.has(t.ccy)) continue;
     const settle = tenureMonthsFromTicket(t, input.setup);
     if (t.instrument === 'spot') {
       const overnight = resolveOvernightCashRates(input.marketRates, t.ccy);

@@ -23,6 +23,9 @@ import {
   buildCashForecastSchedule,
   buildSettleWamScenarios,
   optimizeStripShapeAroundWam,
+  resolvedHedgedTotalCarryUsdM,
+  preparedLegFwdCarryUsdM,
+  preparedBulletFwdCarryUsdM,
   scoreStripShapeAroundWam,
   type CarryEvolutionBar,
   type CashCarryAnalytics,
@@ -59,15 +62,23 @@ import {
 } from '@/lib/test-mode/remodel-prepared-hedge';
 import {
   VAR_HORIZON_OPTIONS,
+  VAR_VOL_SOURCE_OPTIONS,
   horizonMonths,
+  monthlyVolForSetup,
   type VarHorizonId,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
 import {
-  fwdCarryFromSwapPointsUsdM,
-  getActiveMarketRates,
+  VAR_CONFIDENCE_OPTIONS,
+  zForConfidence,
+} from '@/lib/test-mode/var-confidence';
+import {
+  cashInterestModeOf,
+  resolveMarketRatesForCcy,
+  type CashInterestMode,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
+import { setMarketRatesForCcy } from '@/lib/test-mode/hedge-var';
 import type { RowState } from '@/lib/fx-buffer';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -400,20 +411,6 @@ function shortHorizonLabel(label: string): string {
     .replace(/^M0–/, '');
 }
 
-/** Map a forecast month bar → nearest VaR horizon chip. */
-function varHorizonForMonths(months: number): VarHorizonId {
-  let best = VAR_HORIZON_OPTIONS[0]!;
-  let bestD = Infinity;
-  for (const h of VAR_HORIZON_OPTIONS) {
-    const d = Math.abs(h.months - months);
-    if (d < bestD) {
-      bestD = d;
-      best = h;
-    }
-  }
-  return best.id;
-}
-
 /** `${ccy}:all` · `${ccy}:bullet` · `${ccy}:leg:${index}` */
 type HedgeTradeSelectionKey = string;
 
@@ -473,59 +470,6 @@ function bookedHedgesForTradeSelection(
   return booked.filter(t => t.ccy !== ccy);
 }
 
-/** Full-tenor FWD pts for a prepared strip leg (stored implied, else curve). */
-function preparedLegFwdCarryUsdM(
-  leg: PreparedHedgeProfile['legs'][number],
-  prevHedgeLocalM: number,
-  marketRates: FxMarketRatesBundle,
-): number {
-  if (
-    typeof leg.impliedCarryUsdM === 'number' &&
-    Number.isFinite(leg.impliedCarryUsdM)
-  ) {
-    return leg.impliedCarryUsdM;
-  }
-  const settle = Math.max(0, leg.settleMonths ?? leg.endMonth);
-  if (settle < 1 - 1e-9) return 0;
-  const delta =
-    typeof leg.tradeNotionalLocalM === 'number'
-      ? leg.tradeNotionalLocalM
-      : leg.hedgeLocalM - prevHedgeLocalM;
-  if (Math.abs(delta) < 1e-12) return 0;
-  return (
-    fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: delta,
-      settleMonths: settle,
-      bundle: marketRates,
-    })?.fwdCarryUsdM ?? 0
-  );
-}
-
-/** Full-tenor FWD pts for a prepared bullet (stored implied, else curve). */
-function preparedBulletFwdCarryUsdM(
-  prep: PreparedHedgeProfile,
-  marketRates: FxMarketRatesBundle,
-  fallbackUsdM: number,
-): number {
-  if (
-    typeof prep.impliedCarryUsdM === 'number' &&
-    Number.isFinite(prep.impliedCarryUsdM)
-  ) {
-    return prep.impliedCarryUsdM;
-  }
-  const settle = Math.max(0, prep.settleMonths ?? 0);
-  if (settle < 1 - 1e-9 || Math.abs(prep.coverLocalM) < 1e-12) {
-    return fallbackUsdM;
-  }
-  return (
-    fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: prep.coverLocalM,
-      settleMonths: settle,
-      bundle: marketRates,
-    })?.fwdCarryUsdM ?? fallbackUsdM
-  );
-}
-
 function tradeSelectionLabel(
   tradeKey: HedgeTradeSelectionKey,
   preparedByCcy: Record<string, PreparedHedgeProfile>,
@@ -549,6 +493,8 @@ function tradeSelectionLabel(
 interface CashCarryAnalyticsViewProps {
   risk: CurrencyRiskRow[];
   setup: VarSetup;
+  /** Edit the shared VaR setup (σ source + confidence) from the Cash Carry tab. */
+  onSetupChange?: (setup: VarSetup) => void;
   bookedHedges: readonly HedgeTicket[];
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   /** Stage remodelled bullet/strip packages (same as FX Risk Prepare). */
@@ -568,11 +514,15 @@ interface CashCarryAnalyticsViewProps {
   forecastProfile?: ForecastProfileState | null;
   ratesScopeId?: string;
   marketRates?: FxMarketRatesBundle;
+  /** DB-persisted market data per currency — preferred over `marketRates`/`ratesScopeId`. */
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  /** Persist cash-interest mode / O/N edits from Cash Carry. */
+  onMarketRatesByCcyChange?: (
+    next: Record<string, FxMarketRatesBundle>,
+  ) => void;
   /** Optional tab heading (Liquidity tab). */
   title?: string;
   subtitle?: string;
-  /** Click a bar ≤ Tf → set active hedge / VaR horizon (like VaR evolution). */
-  onHorizonChange?: (horizon: VarHorizonId) => void;
 }
 
 /** Prefer M12 for legend inspect; else last available month. */
@@ -589,14 +539,12 @@ function CarryEvolutionBarChart({
   activeHorizon,
   ccy,
   mode,
-  onSelect,
 }: {
   bars: CarryEvolutionBar[];
   Tf: number;
   activeHorizon: VarHorizonId;
   ccy: string;
   mode: 'structure' | 'leg';
-  onSelect: (bar: CarryEvolutionBar, beyondForecast: boolean) => void;
 }) {
   const activeMonths = horizonMonths(activeHorizon);
   const perLeg = mode === 'leg';
@@ -937,7 +885,6 @@ function CarryEvolutionBarChart({
                       : bar.months,
                   );
                 }
-                onSelect(bar, beyondForecast);
               }}
               className={`flex flex-col items-center rounded-md px-0.5 py-1 transition-colors ${
                 expanded
@@ -1096,7 +1043,7 @@ function CarryEvolutionBarChart({
           <>
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
               <span className="inline-block h-2 w-2 rounded-sm bg-amber-300/90" />
-              <span className="text-slate-500">Residual int</span>
+              <span className="text-amber-300/90">Residual int</span>
               <span
                 className={
                   (inspected?.hedgeBreakdown.fcyInterestUsdM ?? 0) >= 0
@@ -1109,7 +1056,7 @@ function CarryEvolutionBarChart({
             </span>
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
               <span className="inline-block h-2 w-2 rounded-sm bg-emerald-400/85" />
-              <span className="text-slate-500">FWD pts</span>
+              <span className="text-emerald-300/90">FWD pts</span>
               <span
                 className={
                   (inspected?.hedgeBreakdown.fwdCarryUsdM ?? 0) >= 0
@@ -1122,7 +1069,7 @@ function CarryEvolutionBarChart({
             </span>
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
               <span className="inline-block h-2 w-2 rounded-sm bg-sky-400/85" />
-              <span className="text-slate-500">USD int</span>
+              <span className="text-sky-300/90">USD int</span>
               <span
                 className={
                   (inspected?.hedgeBreakdown.usdInterestUsdM ?? 0) >= 0
@@ -1747,14 +1694,12 @@ function CarryPeriodComponentsChart({
   Tf,
   activeHorizon,
   ccy,
-  onSelectMonth,
 }: {
   hedgedMonths: CashForecastMonthRow[];
   unhedgedMonths?: CashForecastMonthRow[];
   Tf: number;
   activeHorizon: VarHorizonId;
   ccy: string;
-  onSelectMonth: (monthIndex: number, beyondForecast: boolean) => void;
 }) {
   const activeMonths = horizonMonths(activeHorizon);
   const [inspectMonth, setInspectMonth] = useState(() =>
@@ -1865,10 +1810,7 @@ function CarryPeriodComponentsChart({
                 `USD int ${fmtK(m.usdInterestUsdM)}`,
                 `Income Σ ${fmtK(income)}`,
               ].join(' · ')}
-              onClick={() => {
-                setInspectMonth(m.monthIndex);
-                onSelectMonth(m.monthIndex, beyondForecast);
-              }}
+              onClick={() => setInspectMonth(m.monthIndex)}
               className={`flex flex-col items-center rounded-md px-0.5 py-1 transition-colors ${
                 selected
                   ? 'bg-emerald-500/15 ring-1 ring-emerald-400/45'
@@ -1953,11 +1895,11 @@ function CarryPeriodComponentsChart({
         </span>
         <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
           <span className="inline-block h-2 w-2 rounded-sm bg-amber-300/90" />
-          <span className="text-slate-500">Residual int</span>
+          <span className="text-amber-300/90">Residual int</span>
           <span
             className={
               (inspected?.residualEurInterestUsdM ?? 0) >= 0
-                ? 'text-emerald-300/90'
+                ? 'text-amber-300'
                 : 'text-rose-300/90'
             }
           >
@@ -1966,7 +1908,7 @@ function CarryPeriodComponentsChart({
         </span>
         <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
           <span className="inline-block h-2 w-2 rounded-sm bg-emerald-400/85" />
-          <span className="text-slate-500">FWD pts</span>
+          <span className="text-emerald-300/90">FWD pts</span>
           <span
             className={
               (inspected?.fwdCarryUsdM ?? 0) >= 0
@@ -1979,11 +1921,11 @@ function CarryPeriodComponentsChart({
         </span>
         <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
           <span className="inline-block h-2 w-2 rounded-sm bg-sky-400/85" />
-          <span className="text-slate-500">USD int</span>
+          <span className="text-sky-300/90">USD int</span>
           <span
             className={
               (inspected?.usdInterestUsdM ?? 0) >= 0
-                ? 'text-emerald-300/90'
+                ? 'text-sky-300/90'
                 : 'text-rose-300/90'
             }
           >
@@ -1991,11 +1933,11 @@ function CarryPeriodComponentsChart({
           </span>
         </span>
         <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
-          <span className="text-slate-500">Income Σ</span>
+          <span className="text-slate-300">Income Σ</span>
           <span
             className={
               (inspected?.incomeUsdM ?? 0) >= 0
-                ? 'font-semibold text-emerald-100'
+                ? 'font-semibold text-slate-100'
                 : 'font-semibold text-rose-300/90'
             }
           >
@@ -2304,15 +2246,15 @@ function SettleWamDeltaVsBookChart({
         <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] text-slate-500">
           <span className="inline-flex items-center gap-1.5">
             <span className="inline-block h-2 w-2 rounded-sm bg-amber-300/90" />
-            Residual int
+            <span className="text-amber-300/90">Residual int</span>
           </span>
           <span className="inline-flex items-center gap-1.5">
             <span className="inline-block h-2 w-2 rounded-sm bg-emerald-400/85" />
-            FWD pts
+            <span className="text-emerald-300/90">FWD pts</span>
           </span>
           <span className="inline-flex items-center gap-1.5">
             <span className="inline-block h-2 w-2 rounded-sm bg-sky-400/85" />
-            USD int
+            <span className="text-sky-300/90">USD int</span>
           </span>
           <span className="font-mono text-slate-400">
             Σ enh {fmtK(enhSum)} · {legBars.length} leg
@@ -3049,6 +2991,7 @@ function SettleWamDeltaVsBookChart({
 export function CashCarryAnalyticsView({
   risk,
   setup,
+  onSetupChange,
   bookedHedges,
   preparedByCcy = {},
   onPreparedByCcyChange,
@@ -3058,12 +3001,23 @@ export function CashCarryAnalyticsView({
   forecastProfile,
   ratesScopeId,
   marketRates: marketRatesProp,
+  marketRatesByCcy = {},
+  onMarketRatesByCcyChange,
   title,
   subtitle,
-  onHorizonChange,
 }: CashCarryAnalyticsViewProps) {
-  const marketRates =
-    marketRatesProp ?? getActiveMarketRates(ratesScopeId);
+  /** Resolve the uploaded curve for any CCY — multi-ccy table rows use this directly. */
+  const marketRatesFor = useCallback(
+    (ccy: string): FxMarketRatesBundle =>
+      marketRatesProp ??
+      resolveMarketRatesForCcy(marketRatesByCcy, ccy, ratesScopeId),
+    [marketRatesProp, marketRatesByCcy, ratesScopeId],
+  );
+
+  const patch = (partial: Partial<VarSetup>) =>
+    onSetupChange?.({ ...setup, ...partial });
+  const sigmaMonthly = monthlyVolForSetup(setup);
+  const zConf = zForConfidence(setup.confidencePct);
 
   const chartCcys = useMemo(
     () =>
@@ -3073,6 +3027,19 @@ export function CashCarryAnalyticsView({
     [risk],
   );
   const [chartCcy, setChartCcy] = useState('EUR');
+  /** Curve for the currently open modal / chart CCY — most call sites use this. */
+  const marketRates = marketRatesFor(chartCcy);
+  const cashInterestMode = cashInterestModeOf(marketRates);
+
+  const setCashInterestMode = (mode: CashInterestMode) => {
+    if (!onMarketRatesByCcyChange) return;
+    onMarketRatesByCcyChange(
+      setMarketRatesForCcy(marketRatesByCcy, chartCcy, {
+        ...marketRates,
+        cashInterestMode: mode,
+      }),
+    );
+  };
   /** Settle-WAM / analytical profile modal (VarAnalytics pattern). */
   const [profileCcy, setProfileCcy] = useState<string | null>(null);
   useEffect(() => {
@@ -3086,7 +3053,6 @@ export function CashCarryAnalyticsView({
     }
   }, [chartCcys, chartCcy, profileCcy]);
 
-  const [postTfNotice, setPostTfNotice] = useState<string | null>(null);
   const [pathInfoOpen, setPathInfoOpen] = useState(false);
   /** Carry + cash flow charts: per-month vs running cumulative. */
   const [pathPresentationMode, setPathPresentationMode] = useState<
@@ -3319,12 +3285,19 @@ export function CashCarryAnalyticsView({
           bookRows,
           forecastProfile,
           forecastMonths: setup.forecastMonths,
-          marketRates,
+          marketRates: marketRatesFor(ccy),
           bookedHedges,
           preparedByCcy,
           setup,
         });
         if (!cmp) return null;
+        const prep = preparedByCcy[ccy];
+        const rates = marketRatesFor(ccy);
+        const resolved = resolvedHedgedTotalCarryUsdM({
+          comparison: cmp,
+          prepared: prep,
+          marketRates: rates,
+        });
         return {
           ccy,
           openingCashM: cmp.hedged.openingCashM,
@@ -3332,11 +3305,11 @@ export function CashCarryAnalyticsView({
           endUsdCashM: cmp.hedged.totals.endUsdCashM,
           residualEurInterestUsdM:
             cmp.categories.residualEurInterestUsdM,
-          fwdCarryUsdM: cmp.categories.fwdCarryUsdM,
+          fwdCarryUsdM: resolved.fwdCarryUsdM,
           usdInterestUsdM: cmp.categories.usdInterestUsdM,
-          totalCarryUsdM: cmp.categories.hedgedIncomeUsdM,
+          totalCarryUsdM: resolved.totalCarryUsdM,
           doNothingUsdM: cmp.categories.unhedgedIncomeUsdM,
-          benefitUsdM: cmp.categories.hedgeVsNoHedgeUsdM,
+          benefitUsdM: resolved.benefitUsdM,
           hasHedge: cmp.hasHedge,
           hedgeCashOutM: cmp.hedged.totals.hedgeCashOutM,
           cmp,
@@ -3377,14 +3350,12 @@ export function CashCarryAnalyticsView({
 
   const selectCcyRow = (ccy: string) => {
     setChartCcy(ccy);
-    setPostTfNotice(null);
     setSelectedTradeKey(null);
   };
 
   const selectTradeForPath = (tradeKey: HedgeTradeSelectionKey) => {
     const ccy = tradeKey.split(':')[0];
     if (ccy) setChartCcy(ccy);
-    setPostTfNotice(null);
     setSelectedTradeKey(prev => (prev === tradeKey ? null : tradeKey));
   };
 
@@ -3543,7 +3514,6 @@ export function CashCarryAnalyticsView({
   const openCcyProfile = (ccy: string) => {
     setChartCcy(ccy);
     setProfileCcy(ccy);
-    setPostTfNotice(null);
     setPathSummaryMetrics(null);
     setPathPerfPanelHost(null);
     setPathSchedulePanelHost(null);
@@ -4500,6 +4470,81 @@ export function CashCarryAnalyticsView({
           )}
         </div>
       )}
+      {/* Risk settings · σ source + confidence — shared VaR setup (drives FX Risk / CFaR). */}
+      <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
+        <div className="mb-2 font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
+          Risk settings · σ &amp; confidence
+        </div>
+        <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
+          <div>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
+              Volatility σ₁ₘ
+            </div>
+            <div
+              className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+              role="group"
+              aria-label="Volatility source"
+            >
+              {VAR_VOL_SOURCE_OPTIONS.map(opt => {
+                const on = setup.volSource === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    title={opt.description}
+                    disabled={!onSetupChange}
+                    onClick={() => patch({ volSource: opt.id })}
+                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+                      on
+                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-300'
+                    } ${onSetupChange ? '' : 'cursor-default opacity-80'}`}
+                  >
+                    {opt.label}
+                    <span className="ml-1 font-mono text-[10px] font-normal opacity-80">
+                      {(opt.monthlyVol * 100).toFixed(1)}%
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-blue-300">
+              Confidence
+            </div>
+            <div
+              className="inline-flex rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+              role="group"
+              aria-label="Confidence level"
+            >
+              {VAR_CONFIDENCE_OPTIONS.map(opt => {
+                const on = setup.confidencePct === opt.pct;
+                return (
+                  <button
+                    key={opt.pct}
+                    type="button"
+                    title={`z = ${opt.z}`}
+                    disabled={!onSetupChange}
+                    onClick={() => patch({ confidencePct: opt.pct })}
+                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+                      on
+                        ? 'bg-blue-500/20 text-blue-100 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-300'
+                    } ${onSetupChange ? '' : 'cursor-default opacity-80'}`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <p className="font-mono text-[10px] text-slate-500">
+            Shared VaR setup · drives FX Risk &amp; CFaR (carry is deterministic) ·
+            σ₁ₘ={(sigmaMonthly * 100).toFixed(2)}% · z={zConf.toFixed(2)}
+          </p>
+        </div>
+      </section>
       {/* ── All currencies — module chrome (meta / Tf / gear) lives on RiskPerspectiveSelector ── */}
       <div className="space-y-3">
         {multiCcyRows.length === 0 ? (
@@ -4825,6 +4870,12 @@ export function CashCarryAnalyticsView({
                         <dt className="text-slate-500">Rates</dt>
                         <dd className="max-w-[12rem] text-right text-slate-300">
                           {analytics.ratesSource}
+                          <div className="mt-0.5 text-[10px] text-slate-500">
+                            Cash:{' '}
+                            {cashInterestMode === 'current'
+                              ? 'Current (flat O/N)'
+                              : 'Forward (ladder)'}
+                          </div>
                         </dd>
                       </div>
                     </dl>
@@ -4832,32 +4883,36 @@ export function CashCarryAnalyticsView({
                 )}
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                {chartCcys.length > 0 && (
-                  <div
-                    className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-                    role="group"
-                    aria-label="Evolution currency"
-                  >
-                    {chartCcys.map(ccy => {
-                      const on = chartCcy === ccy;
-                      return (
-                        <button
-                          key={ccy}
-                          type="button"
-                          title={`Show ${ccy} carry vs tenure`}
-                          onClick={() => selectCcyRow(ccy)}
-                          className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
-                            on
-                              ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                              : 'text-slate-500 hover:text-slate-300'
-                          }`}
-                        >
-                          {ccy}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
+                <div
+                  className="inline-flex shrink-0 rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+                  role="group"
+                  aria-label="Cash interest rate mode"
+                  title="Current = flat O/N; Forward = SW→1Y ladder"
+                >
+                  {(
+                    [
+                      { id: 'current' as const, label: 'Current' },
+                      { id: 'forward' as const, label: 'Forward' },
+                    ] as const
+                  ).map(opt => {
+                    const on = cashInterestMode === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        disabled={!onMarketRatesByCcyChange}
+                        onClick={() => setCashInterestMode(opt.id)}
+                        className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors disabled:opacity-50 ${
+                          on
+                            ? 'bg-sky-500/25 text-sky-100 shadow-sm'
+                            : 'text-slate-500 hover:text-slate-300'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
                 <div
                   className="inline-flex shrink-0 rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
                   role="group"
@@ -5023,21 +5078,6 @@ export function CashCarryAnalyticsView({
                     activeHorizon={setup.horizon}
                     ccy={chartCcy}
                     mode="structure"
-                    onSelect={(bar, beyondForecast) => {
-                      if (beyondForecast) {
-                        setPostTfNotice(
-                          `${shortHorizonLabel(bar.label)} is beyond forecast (Tf = ${Tf}m) — not applied.`,
-                        );
-                        return;
-                      }
-                      setPostTfNotice(null);
-                      const horizonId = VAR_HORIZON_OPTIONS.find(
-                        h => h.id === bar.id,
-                      )?.id;
-                      onHorizonChange?.(horizonId ?? varHorizonForMonths(
-                        Math.max(1, Math.round(bar.months)),
-                      ));
-                    }}
                   />
                 </>
               )
@@ -5048,18 +5088,6 @@ export function CashCarryAnalyticsView({
                 Tf={Tf}
                 activeHorizon={setup.horizon}
                 ccy={chartCcy}
-                onSelectMonth={(monthIndex, beyondForecast) => {
-                  if (beyondForecast) {
-                    setPostTfNotice(
-                      `M${monthIndex} is beyond forecast (Tf = ${Tf}m) — not applied.`,
-                    );
-                    return;
-                  }
-                  setPostTfNotice(null);
-                  onHorizonChange?.(
-                    varHorizonForMonths(Math.max(1, Math.round(monthIndex))),
-                  );
-                }}
               />
             )
           ) : ccyPathView === 'cashflow' ? (
@@ -5259,14 +5287,6 @@ export function CashCarryAnalyticsView({
                 </table>
               </div>
           )}
-          {postTfNotice && (
-            <p
-              role="status"
-              className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-center text-[10px] text-amber-100"
-            >
-              {postTfNotice}
-            </p>
-          )}
           </div>
         </section>
       )}
@@ -5329,6 +5349,7 @@ export function CashCarryAnalyticsView({
                       ? `M${Math.round(prep.settleMonths)}`
                       : '—';
                   const hedgeDelta = prep?.coverLocalM ?? 0;
+                  const fwdPtsUsdM = r.fwdCarryUsdM;
                   const open = profileCcy === r.ccy;
                   const skewLabel = !isStrip
                     ? '—'
@@ -5380,7 +5401,7 @@ export function CashCarryAnalyticsView({
                         {Math.abs(hedgeDelta) < 1e-12 ? '—' : fmtM(hedgeDelta)}
                       </td>
                       <td className="py-2 pr-3 font-mono text-emerald-300/90">
-                        {fmtK(r.fwdCarryUsdM)}
+                        {fmtK(fwdPtsUsdM)}
                       </td>
                       <td
                         className={`py-2 pr-3 font-mono font-semibold ${
@@ -5427,7 +5448,7 @@ export function CashCarryAnalyticsView({
                           const legFwd = preparedLegFwdCarryUsdM(
                             leg,
                             prevHedge,
-                            marketRates,
+                            marketRatesFor(r.ccy),
                           );
                           return [
                             <tr
@@ -5477,7 +5498,7 @@ export function CashCarryAnalyticsView({
                             const selected = selectedTradeKey === tradeKey;
                             const bulletFwd = preparedBulletFwdCarryUsdM(
                               prep,
-                              marketRates,
+                              marketRatesFor(r.ccy),
                               r.fwdCarryUsdM,
                             );
                             return (
@@ -5676,12 +5697,20 @@ export function CashCarryAnalyticsView({
                               </span>
                               <span
                                 className={`font-mono text-base font-semibold tabular-nums ${
-                                  (optScore?.newCarryUsdM ?? 0) >= 0
+                                  ((optScore?.newCarryUsdM ?? 0) +
+                                    (optScore?.fwdCarryUsdM ?? 0)) >=
+                                  0
                                     ? 'text-emerald-100'
                                     : 'text-rose-300'
                                 }`}
+                                title="Total carry = New (FCY+USD int) + FWD pts — same as table"
                               >
-                                {optScore ? fmtK(optScore.newCarryUsdM) : '—'}
+                                {optScore
+                                  ? fmtK(
+                                      optScore.newCarryUsdM +
+                                        optScore.fwdCarryUsdM,
+                                    )
+                                  : '—'}
                               </span>
                             </div>
                             <div className="inline-flex items-baseline gap-1.5">
@@ -6259,51 +6288,7 @@ export function CashCarryAnalyticsView({
                         {(() => {
                           const staged = appliedShapeScore ?? stripShapeOpt.best;
                           const locked = appliedShapeScore != null;
-                          return (
-                        <div className="rounded border border-emerald-700/40 bg-emerald-950/30 px-2.5 py-1.5">
-                          <div className="text-[9px] font-semibold uppercase tracking-wide text-emerald-400/80">
-                            {locked ? 'Applied strip' : 'Best strip setup'}
-                          </div>
-                          <div className="mt-0.5 font-mono text-[11px] font-semibold text-emerald-100">
-                            {staged.structure === 'bullet'
-                              ? 'Bullet'
-                              : `Strip · ${staged.legCount}`}
-                            {staged.structure === 'strip' && (
-                              <>
-                                {' '}
-                                · CoM{' '}
-                                {(staged.centerOfMass * 100).toFixed(0)}% · kurt{' '}
-                                {staged.kurtosis.toFixed(1)}
-                              </>
-                            )}
-                          </div>
-                          <div className="mt-0.5 font-mono text-[10px] text-amber-200/90">
-                            {staged.settleScheduleLabel}
-                            {' · '}Σ {fmtM(staged.hedgeDeltaLocalM)}
-                          </div>
-                          <div className="mt-0.5 flex flex-wrap items-baseline gap-x-2">
-                            <span
-                              className={`font-mono text-sm font-semibold ${
-                                staged.enhancementUsdM >= 0
-                                  ? 'text-emerald-100'
-                                  : 'text-rose-300'
-                              }`}
-                            >
-                              {fmtK(staged.enhancementUsdM)}
-                            </span>
-                            <span className="font-mono text-[10px] text-sky-300/90">
-                              vs bullet {fmtK(staged.vsBulletUsdM)}
-                            </span>
-                          </div>
-                        </div>
-                          );
-                        })()}
-                        {(() => {
-                          // Always score the live ladder (Hedge % / settle /
-                          // cover edits). appliedShapeScore is the last Apply
-                          // snapshot only — preferring it made Hedge % a no-op.
                           const live = shapePreviewScore;
-                          if (!live) return null;
                           const coverScale =
                             typeof profileDraft?.hedgeRatio === 'number' &&
                             profileDraft.hedgeRatio > 1e-9 &&
@@ -6315,43 +6300,107 @@ export function CashCarryAnalyticsView({
                               : 1;
                           const bulletEnh =
                             stripShapeOpt.bullet.enhancementUsdM * coverScale;
+                          // Live ladder for carry figures (Hedge % / settle edits).
+                          const metrics = live ?? staged;
+                          const totalCarry =
+                            metrics.newCarryUsdM + metrics.fwdCarryUsdM;
                           return (
                             <>
-                        <div className="rounded border border-slate-700 bg-slate-900/60 px-2.5 py-1.5">
-                          <div className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                            Total carry
-                          </div>
-                          <div
-                            className={`font-mono text-sm font-semibold ${
-                              live.enhancementUsdM >= 0
-                                ? 'text-slate-100'
-                                : 'text-rose-300'
-                            }`}
-                          >
-                            {fmtK(live.enhancementUsdM)}
-                          </div>
-                          <div className="mt-0.5 font-mono text-[10px] text-slate-500">
-                            live · {live.settleScheduleLabel}
-                            {' · '}Σ {fmtM(live.hedgeDeltaLocalM)}
-                          </div>
-                        </div>
-                        <div className="rounded border border-slate-700 bg-slate-900/60 px-2.5 py-1.5">
-                          <div className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                            vs bullet @ WAM
-                          </div>
-                          <div
-                            className={`font-mono text-sm font-semibold ${
-                              live.enhancementUsdM - bulletEnh >= 0
-                                ? 'text-emerald-200'
-                                : 'text-rose-300'
-                            }`}
-                          >
-                            {fmtK(live.enhancementUsdM - bulletEnh)}
-                          </div>
-                          <div className="mt-0.5 font-mono text-[10px] text-slate-500">
-                            bullet {fmtK(bulletEnh)}
-                          </div>
-                        </div>
+                              <div className="rounded border border-emerald-700/40 bg-emerald-950/30 px-2.5 py-1.5">
+                                <div className="text-[9px] font-semibold uppercase tracking-wide text-emerald-400/80">
+                                  {locked ? 'Applied strip' : 'Best strip setup'}
+                                </div>
+                                <div
+                                  className={`mt-0.5 font-mono text-sm font-semibold ${
+                                    staged.enhancementUsdM >= 0
+                                      ? 'text-emerald-100'
+                                      : 'text-rose-300'
+                                  }`}
+                                  title="Enhancement = Resid + USD + FWD − Old"
+                                >
+                                  Enh {fmtK(staged.enhancementUsdM)}
+                                </div>
+                                {(() => {
+                                  const oldCarry =
+                                    staged.newCarryUsdM -
+                                    staged.interestDeltaUsdM;
+                                  return (
+                                    <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[9px] tabular-nums">
+                                      <span
+                                        className="text-amber-300/90"
+                                        title="Residual FCY int"
+                                      >
+                                        Resid {fmtK(staged.fcyInterestUsdM)}
+                                      </span>
+                                      <span
+                                        className="text-sky-300/90"
+                                        title="USD int"
+                                      >
+                                        USD {fmtK(staged.usdInterestUsdM)}
+                                      </span>
+                                      <span
+                                        className="text-emerald-300/90"
+                                        title="FWD pts"
+                                      >
+                                        FWD {fmtK(staged.fwdCarryUsdM)}
+                                      </span>
+                                      <span
+                                        className="text-slate-400"
+                                        title="Do-nothing Old (unhedged FCY int)"
+                                      >
+                                        Old {fmtK(-oldCarry)}
+                                      </span>
+                                    </div>
+                                  );
+                                })()}
+                                <div className="mt-0.5 font-mono text-[10px] text-amber-200/90">
+                                  {staged.settleScheduleLabel}
+                                  {' · '}Σ {fmtM(staged.hedgeDeltaLocalM)}
+                                </div>
+                              </div>
+                              <div className="rounded border border-slate-700 bg-slate-900/60 px-2.5 py-1.5">
+                                <div className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
+                                  Total carry
+                                </div>
+                                <div
+                                  className={`mt-0.5 font-mono text-sm font-semibold ${
+                                    totalCarry >= 0
+                                      ? 'text-slate-100'
+                                      : 'text-rose-300'
+                                  }`}
+                                  title="Resid + FWD + USD int"
+                                >
+                                  {fmtK(totalCarry)}
+                                </div>
+                                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-[9px] tabular-nums">
+                                  <span className="text-amber-300/90">
+                                    Resid {fmtK(metrics.fcyInterestUsdM)}
+                                  </span>
+                                  <span className="text-emerald-300/90">
+                                    FWD {fmtK(metrics.fwdCarryUsdM)}
+                                  </span>
+                                  <span className="text-sky-300/90">
+                                    USD {fmtK(metrics.usdInterestUsdM)}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="rounded border border-slate-700 bg-slate-900/60 px-2.5 py-1.5">
+                                <div className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
+                                  vs bullet @ WAM
+                                </div>
+                                <div
+                                  className={`font-mono text-sm font-semibold ${
+                                    metrics.enhancementUsdM - bulletEnh >= 0
+                                      ? 'text-emerald-200'
+                                      : 'text-rose-300'
+                                  }`}
+                                >
+                                  {fmtK(metrics.enhancementUsdM - bulletEnh)}
+                                </div>
+                                <div className="mt-0.5 font-mono text-[10px] text-slate-500">
+                                  bullet enh {fmtK(bulletEnh)}
+                                </div>
+                              </div>
                             </>
                           );
                         })()}
@@ -6457,36 +6506,85 @@ export function CashCarryAnalyticsView({
                             aria-label={`${chartCcy} strip schedule setup`}
                           />
                           {shapePreviewScore && (
-                            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 pt-2 text-[9px] text-slate-500">
-                              <span>
-                                Preview path · WAM≈
-                                {shapePreviewScore.wamMonths.toFixed(1)}
-                                {' · '}Σ {fmtM(shapePreviewScore.hedgeDeltaLocalM)}
-                                {' · '}Enhancement{' '}
-                                <span
-                                  className={
-                                    shapePreviewScore.enhancementUsdM >= 0
-                                      ? 'font-mono text-emerald-200/90'
-                                      : 'font-mono text-rose-300'
-                                  }
-                                >
-                                  {fmtK(shapePreviewScore.enhancementUsdM)}
-                                </span>
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() => setWamChartView('execution')}
-                                className="font-semibold text-violet-300/90 hover:text-violet-100"
-                              >
-                                Open Strip execution chart →
-                              </button>
+                            <div className="mt-2 space-y-1 border-t border-slate-800 pt-2 text-[9px] text-slate-500">
+                              {(() => {
+                                const s = shapePreviewScore;
+                                const total =
+                                  s.newCarryUsdM + s.fwdCarryUsdM;
+                                const oldCarry =
+                                  s.newCarryUsdM - s.interestDeltaUsdM;
+                                return (
+                                  <>
+                                    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+                                      <span>
+                                        Preview · WAM≈{s.wamMonths.toFixed(1)}
+                                        {' · '}Σ {fmtM(s.hedgeDeltaLocalM)}
+                                      </span>
+                                      <span className="inline-flex flex-wrap items-baseline gap-x-2 font-mono tabular-nums">
+                                        <span
+                                          className={
+                                            total >= 0
+                                              ? 'font-semibold text-slate-200'
+                                              : 'font-semibold text-rose-300'
+                                          }
+                                        >
+                                          Carry {fmtK(total)}
+                                        </span>
+                                        <span className="text-amber-300/90">
+                                          Resid {fmtK(s.fcyInterestUsdM)}
+                                        </span>
+                                        <span className="text-emerald-300/90">
+                                          FWD {fmtK(s.fwdCarryUsdM)}
+                                        </span>
+                                        <span className="text-sky-300/90">
+                                          USD {fmtK(s.usdInterestUsdM)}
+                                        </span>
+                                      </span>
+                                    </div>
+                                    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+                                      <span className="inline-flex flex-wrap items-baseline gap-x-2 font-mono tabular-nums">
+                                        <span
+                                          className={
+                                            s.enhancementUsdM >= 0
+                                              ? 'font-semibold text-emerald-200/90'
+                                              : 'font-semibold text-rose-300'
+                                          }
+                                        >
+                                          Enh {fmtK(s.enhancementUsdM)}
+                                        </span>
+                                        <span className="text-amber-300/90">
+                                          Resid {fmtK(s.fcyInterestUsdM)}
+                                        </span>
+                                        <span className="text-sky-300/90">
+                                          USD {fmtK(s.usdInterestUsdM)}
+                                        </span>
+                                        <span className="text-emerald-300/90">
+                                          FWD {fmtK(s.fwdCarryUsdM)}
+                                        </span>
+                                        <span className="text-slate-400">
+                                          Old {fmtK(-oldCarry)}
+                                        </span>
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setWamChartView('execution')
+                                        }
+                                        className="ml-auto font-semibold text-violet-300/90 hover:text-violet-100"
+                                      >
+                                        Open Strip execution chart →
+                                      </button>
+                                    </div>
+                                  </>
+                                );
+                              })()}
                             </div>
                           )}
                         </div>
                       )}
 
                       <div className="overflow-x-auto">
-                        <table className="w-full min-w-[640px] text-left text-[10px]">
+                        <table className="w-full min-w-[720px] text-left text-[10px]">
                           <thead>
                             <tr className="text-slate-500">
                               <th className="py-1 pr-2 font-medium">Rank</th>
@@ -6494,8 +6592,17 @@ export function CashCarryAnalyticsView({
                               <th className="py-1 pr-2 font-medium">CoM</th>
                               <th className="py-1 pr-2 font-medium">Kurt</th>
                               <th className="py-1 pr-2 font-medium">Schedule</th>
-                              <th className="py-1 pr-2 text-right font-medium text-emerald-200/80">
-                                Enhancement
+                              <th
+                                className="py-1 pr-2 text-right font-medium text-slate-300"
+                                title="Total carry = Resid + FWD + USD"
+                              >
+                                Carry
+                              </th>
+                              <th
+                                className="py-1 pr-2 text-right font-medium text-emerald-200/80"
+                                title="Enhancement = Carry − Old"
+                              >
+                                Enh
                               </th>
                               <th className="py-1 text-right font-medium text-sky-200/80">
                                 vs bullet
@@ -6524,9 +6631,11 @@ export function CashCarryAnalyticsView({
                                 ) < 0.03 &&
                                 c.settleScheduleLabel ===
                                   appliedShapeScore.settleScheduleLabel;
+                              const totalCarry =
+                                c.newCarryUsdM + c.fwdCarryUsdM;
                               return (
                                 <tr
-                                  key={`${c.legCount}-${c.centerOfMass}-${c.kurtosis}-${c.settleScheduleLabel}`}
+                                  key={`rank-${i}-${c.legCount}-${c.centerOfMass}-${c.kurtosis}-${c.settleScheduleLabel}-${c.enhancementUsdM.toFixed(6)}`}
                                   className={`cursor-pointer border-t border-slate-800/80 font-mono text-slate-300 hover:bg-slate-800/50${
                                     staged
                                       ? ' bg-emerald-500/15'
@@ -6557,6 +6666,15 @@ export function CashCarryAnalyticsView({
                                   </td>
                                   <td className="py-1.5 pr-2 text-slate-400">
                                     {c.settleScheduleLabel}
+                                  </td>
+                                  <td
+                                    className={`py-1.5 pr-2 text-right font-semibold ${
+                                      totalCarry >= 0
+                                        ? 'text-slate-100'
+                                        : 'text-rose-300'
+                                    }`}
+                                  >
+                                    {fmtK(totalCarry)}
                                   </td>
                                   <td
                                     className={`py-1.5 pr-2 text-right font-semibold ${
@@ -6602,6 +6720,7 @@ export function CashCarryAnalyticsView({
                   monthlyFlowM={pathFlowM}
                   monthlyFlows={pathFlows}
                   setup={setup}
+                  marketRates={marketRates}
                   appliedHedgeLocalM={pathAppliedHedgeLocalM}
                   hedgeRatio={prepared?.hedgeRatio ?? 0}
                   equalVarHedgeLocalM={pathEqualVarLocalM}

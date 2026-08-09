@@ -2,7 +2,12 @@
 
 import type { ReactNode } from 'react';
 
-export type RiskPerspective = 'fxRisk' | 'cashCarry' | 'dv01' | 'greeks';
+export type RiskPerspective =
+  | 'fxRisk'
+  | 'cashCarry'
+  | 'cfar'
+  | 'dv01'
+  | 'greeks';
 
 export type RiskPerspectiveTabStat = {
   /** Mono headline under the tab label (e.g. `$1.24M`, `+1.73K`, `—`). */
@@ -43,22 +48,14 @@ export const RISK_PERSPECTIVES: {
     defaultStatLabel: 'Total carry',
   },
   {
-    id: 'dv01',
-    label: 'DV01',
-    title: 'DV01',
-    active: false,
-    description: 'Rate sensitivity stack on debt / investments (preview).',
-    yLabel: 'DV01 / bp (M)',
-    defaultStatLabel: 'Not enabled',
-  },
-  {
-    id: 'greeks',
-    label: 'Greeks',
-    title: 'Greeks',
-    active: false,
-    description: 'δ-effective stack vs hedge overlay (preview).',
-    yLabel: 'δ-notional (M)',
-    defaultStatLabel: 'Not enabled',
+    id: 'cfar',
+    label: 'CFaR',
+    title: 'Cash-flow-at-risk — critical cash absorption',
+    active: true,
+    description:
+      'Worst running drawdown of accrued cash P&L from the FX position over the horizon (95/99% across MC paths), net of the carry earned by the drawdown peak — the peak funding the desk must be able to cover.',
+    yLabel: 'Cash drawdown $K',
+    defaultStatLabel: 'Net CFaR',
   },
 ];
 
@@ -78,31 +75,22 @@ interface RiskPerspectiveSelectorProps {
   moduleLabel?: string;
   /** Optional live figures per tab. Missing / inactive tabs show `—`. */
   tabStats?: Partial<Record<RiskPerspective, RiskPerspectiveTabStat>>;
+  /**
+   * Restrict which tabs render (e.g. modules that only implement FX Risk).
+   * Omit to show every perspective in {@link RISK_PERSPECTIVES}.
+   */
+  perspectives?: readonly RiskPerspective[];
   /** Forecast period months for the Tf chip (omit to hide). */
   tfMonths?: number | null;
   /** Gear / settings control on the context row. */
   onOpenSettings?: () => void;
   settingsDisabled?: boolean;
   settingsTitle?: string;
-  /** Override the mono meta line under the rail. */
-  metaLine?: string;
   /** Extra controls on the right of the context row (e.g. Unhedged). */
   trailing?: ReactNode;
   className?: string;
   /** Chips variant only — show description under the row. */
   showDescription?: boolean;
-}
-
-/** Context meta under the tab rail. Tf lives on the chip — do not repeat it here. */
-function defaultMetaLine(id: RiskPerspective): string {
-  if (id === 'fxRisk') {
-    return 'Group VaR · all currencies';
-  }
-  if (id === 'cashCarry') {
-    return 'Cash carry · all currencies · click a currency row to set the carry chart';
-  }
-  const meta = riskPerspectiveMeta(id);
-  return meta.active ? meta.label : `${meta.label} · not enabled`;
 }
 
 /**
@@ -115,16 +103,19 @@ export function RiskPerspectiveSelector({
   variant = 'rail',
   moduleLabel = 'Analytics',
   tabStats,
+  perspectives,
   tfMonths,
   onOpenSettings,
   settingsDisabled = false,
   settingsTitle = 'Forecast profile',
-  metaLine,
   trailing,
   className = '',
   showDescription = true,
 }: RiskPerspectiveSelectorProps) {
   const meta = riskPerspectiveMeta(value);
+  const tabs = perspectives
+    ? RISK_PERSPECTIVES.filter(p => perspectives.includes(p.id))
+    : RISK_PERSPECTIVES;
 
   if (variant === 'chips') {
     const inactive = !meta.active;
@@ -135,7 +126,7 @@ export function RiskPerspectiveSelector({
           role="group"
           aria-label="Risk perspective"
         >
-          {RISK_PERSPECTIVES.map(p => (
+          {tabs.map(p => (
             <button
               key={p.id}
               type="button"
@@ -167,7 +158,6 @@ export function RiskPerspectiveSelector({
     );
   }
 
-  const resolvedMeta = metaLine ?? defaultMetaLine(value);
   const showTf = tfMonths != null;
   const tfText = tfMonths === 0 ? '0m' : `${tfMonths}m`;
   /** Analytics keeps the long per-tab titles from guideline 1c; other modules use the short label. */
@@ -194,7 +184,7 @@ export function RiskPerspectiveSelector({
         role="tablist"
         aria-label={`${moduleLabel} modules`}
       >
-        {RISK_PERSPECTIVES.map(p => {
+        {tabs.map(p => {
           const on = value === p.id;
           const soon = !p.active;
           const stat = tabStats?.[p.id];
@@ -259,34 +249,33 @@ export function RiskPerspectiveSelector({
         })}
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2 px-0 py-2.5">
-        <div className="min-w-0 font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
-          {resolvedMeta}
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center gap-2">
-          {trailing}
-          {showTf ? (
-            <span className="inline-flex items-baseline gap-1.5 rounded-md border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-[11px] text-slate-500">
-              Tf
-              <span className="font-mono font-semibold tabular-nums text-sky-200">
-                {tfText}
+      {(trailing || showTf || onOpenSettings) && (
+        <div className="flex flex-wrap items-center justify-end gap-2 px-0 py-2.5">
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {trailing}
+            {showTf ? (
+              <span className="inline-flex items-baseline gap-1.5 rounded-md border border-slate-700 bg-slate-950/60 px-2 py-0.5 text-[11px] text-slate-500">
+                Tf
+                <span className="font-mono font-semibold tabular-nums text-sky-200">
+                  {tfText}
+                </span>
               </span>
-            </span>
-          ) : null}
-          {onOpenSettings ? (
-            <button
-              type="button"
-              aria-label={settingsTitle}
-              title={settingsTitle}
-              disabled={settingsDisabled}
-              onClick={onOpenSettings}
-              className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <GearIcon className="h-3.5 w-3.5" />
-            </button>
-          ) : null}
+            ) : null}
+            {onOpenSettings ? (
+              <button
+                type="button"
+                aria-label={settingsTitle}
+                title={settingsTitle}
+                disabled={settingsDisabled}
+                onClick={onOpenSettings}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <GearIcon className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

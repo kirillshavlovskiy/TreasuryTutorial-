@@ -267,6 +267,12 @@ export function ConsolidatedLiveLadder({
           sources = carry.filter(s => Math.abs(s.value) > 1e-12);
           hedge = toUnit(hedgeSigned * m);
           net = sources.reduce((s, seg) => s + seg.value, 0) + hedge;
+        } else if (perspective === 'cfar') {
+          // CFaR is a path/liquidity metric — analysed in the Analytics tab,
+          // not a per-CCY stacked ladder. Render empty here.
+          sources = [];
+          hedge = 0;
+          net = 0;
         } else if (perspective === 'dv01') {
           const dur = r.ir_net_dur > 0 ? r.ir_net_dur : 1;
           const debtDv = -(Math.abs(debt) || 0) * dur * 0.0001;
@@ -364,17 +370,6 @@ export function ConsolidatedLiveLadder({
         moduleLabel="Live Ladder"
         tabStats={perspectiveTabStats}
         tfMonths={varSetup.forecastMonths}
-        metaLine={[
-          'Wired to Hedging Decision',
-          bookedHedges.length > 0
-            ? `${bookedHedges.length} booked`
-            : null,
-          `VaR ${varSetup.confidencePct}%`,
-          varSetup.horizon,
-          varSetup.exposureBasis,
-        ]
-          .filter(Boolean)
-          .join(' · ')}
         trailing={
           <div className="flex rounded-md border border-slate-700 p-0.5 text-[11px]">
             <button
@@ -435,7 +430,11 @@ export function ConsolidatedLiveLadder({
         </span>
       </div>
 
-      {bars.length === 0 ? (
+      {perspective === 'cfar' ? (
+        <p className="py-8 text-center text-xs text-slate-500">
+          CFaR (critical cash absorption) is analysed in the Analytics → CFaR tab.
+        </p>
+      ) : bars.length === 0 ? (
         <p className="py-8 text-center text-xs text-slate-500">No FCY rows to ladder.</p>
       ) : (
         <VerticalStackedChart
