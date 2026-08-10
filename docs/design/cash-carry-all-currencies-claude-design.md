@@ -36,6 +36,8 @@ No screenshots required — use component list + sample data below.
 
 ## Locked style
 
+Reuse **`docs/design/design-system-claude.md`**.
+
 - Panel: `rounded-xl border border-slate-800 bg-slate-900/60 p-5`
 - Section: `rounded-lg border border-slate-700 bg-slate-950/40 p-3`
 - Title: `text-[11px] font-semibold uppercase text-amber-200/90`

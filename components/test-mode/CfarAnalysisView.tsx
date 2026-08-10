@@ -10,6 +10,7 @@ import {
 import { CfarDrawdownChart } from '@/components/test-mode/CfarDrawdownChart';
 import {
   buildCashForecastCarryComparison,
+  buildCarryEvolutionLegBarsFromSamples,
   resolvedHedgedTotalCarryUsdM,
   sumCashCarryTotalUsdM,
 } from '@/lib/test-mode/cash-carry-analytics';
@@ -17,11 +18,16 @@ import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import { type CfarBandsResult } from '@/lib/test-mode/cfar-drawdown';
 import {
   buildSyntheticHedgeProfile,
-  computeHedgeCfarBands,
+  RATE_DIFF_VOL_BP_YR,
   settlementFundingGapForHedge,
-  type CfarRiskBreakdown,
   type FundingGapResult,
 } from '@/lib/test-mode/cfar-residual';
+import {
+  computeMonteCarloMismatchCfar,
+  type McHedgeSettleLeg,
+  type McCfarDiagnostics,
+} from '@/lib/test-mode/cfar-montecarlo';
+import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   VAR_CONFIDENCE_OPTIONS,
   zForConfidence,
@@ -48,12 +54,14 @@ import {
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
 import { stripHedgeLegCarryUsdM } from '@/lib/fx-hedge';
-import type { RowState } from '@/lib/fx-buffer';
+import { CURRENCY_PARAMS, type RowState } from '@/lib/fx-buffer';
 import {
   DEFAULT_FORECAST_PROFILE,
   clearLineUncertainties,
   effectiveForecastUncertainty1m,
   monthlyFlowSeriesLocalM,
+  monthlyInflowSeriesLocalM,
+  monthlyOutflowSeriesLocalM,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
 
@@ -189,6 +197,7 @@ function GearIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
 function fmtPct(pct: number): string {
   return `${pct.toFixed(0)}%`;
 }
@@ -343,6 +352,50 @@ function hedgeDetailForCcy(
   return { source: 'none', legs: [], totalNotionalLocalM: 0 };
 }
 
+/** HedgeDetail.legs → the deterministic settlement schedule the Monte Carlo
+ * cash-mismatch engine needs (settle month + signed notional per leg). */
+function scheduleFromHedgeDetail(detail: HedgeDetail): McHedgeSettleLeg[] {
+  return detail.legs.map(l => ({
+    settleMonths: l.settleMonths,
+    notionalLocalM: l.tradeNotionalLocalM,
+  }));
+}
+
+/** Same, from a (possibly synthetic/what-if) PreparedHedgeProfile directly. */
+function scheduleFromPreparedProfile(
+  prep: PreparedHedgeProfile,
+  tenureMonths: number,
+): McHedgeSettleLeg[] {
+  if (prep.structure === 'strip' && prep.legs.length > 0) {
+    return prep.legs.map(l => ({
+      settleMonths: l.settleMonths ?? l.endMonth,
+      notionalLocalM: l.tradeNotionalLocalM ?? l.hedgeLocalM,
+    }));
+  }
+  if (Math.abs(prep.coverLocalM) > 1e-9) {
+    return [{ settleMonths: prep.settleMonths ?? tenureMonths, notionalLocalM: prep.coverLocalM }];
+  }
+  return [];
+}
+
+/**
+ * Stochastic carry parameters for the mismatch — mean from the same JPM NP
+ * rate differential the Cash Carry module's own carry is sourced from
+ * (CURRENCY_PARAMS), vol from the flat per-currency rate-differential vol
+ * table (RATE_DIFF_VOL_BP_YR, converted bp/year → %/year). Both genuinely
+ * random per the 2026-08-10 decision — this is carry earned/paid on the
+ * MISMATCH itself (an open FCY balance), a separate, stochastic quantity
+ * from the real hedge's own deterministic forward-point carry shown in the
+ * Carry column.
+ */
+function mcCarryParamsFor(ccy: string): { carryMeanPctPa: number; carryVolPctPa: number } {
+  const fcy = CURRENCY_PARAMS[ccy]?.carry;
+  const usd = CURRENCY_PARAMS.USD?.carry;
+  const carryMeanPctPa = fcy !== undefined && usd !== undefined ? usd - fcy : 0;
+  const carryVolPctPa = (RATE_DIFF_VOL_BP_YR[ccy] ?? 80) / 100;
+  return { carryMeanPctPa, carryVolPctPa };
+}
+
 /** One editable row in the What-if hedge table — mirrors the real Strip
  * Schedule · Tick Trades table (On / Settle / Notional Δ) in the Cash Carry
  * hedging modal, so this editor has the same shape as the real thing. */
@@ -378,7 +431,7 @@ function seedWhatIfLegs(detail: HedgeDetail | null, tenureMonths: number): WhatI
   }));
 }
 
-/** Current → proposed comparison row for the what-if panel. */
+/** Current → proposed comparison card — notes live in ⓘ popup only. */
 function WhatIfDeltaRow({
   label,
   current,
@@ -392,7 +445,6 @@ function WhatIfDeltaRow({
   proposed: number;
   fmt: (v: number) => string;
   lowerIsBetter: boolean;
-  /** Explanation — shown in an ⓘ popover, not inline. */
   note?: string;
 }) {
   const delta = proposed - current;
@@ -403,12 +455,6 @@ function WhatIfDeltaRow({
     : worsened
       ? 'text-rose-300'
       : 'text-slate-500';
-  const deltaLabel = (() => {
-    if (Math.abs(delta) < 1e-12) return fmt(0);
-    const sign = delta >= 0 ? '+' : '−';
-    const body = fmt(Math.abs(delta)).replace(/^[+\−\-]/, '');
-    return `${sign}${body}`;
-  })();
   return (
     <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
       <div className="mb-0.5 flex items-center justify-between gap-1">
@@ -425,7 +471,7 @@ function WhatIfDeltaRow({
         <span className="font-semibold text-slate-100">{fmt(proposed)}</span>
       </div>
       <div className={`font-mono text-[9px] ${deltaColor}`}>
-        Δ {deltaLabel}
+        Δ {fmtSignedK(delta)}
       </div>
     </div>
   );
@@ -466,7 +512,7 @@ interface CfarRow {
   totalCarryUsdM: number;
   doNothingUsdM: number;
   benefitUsdM: number;
-  bands: CfarBandsResult & { breakdown: CfarRiskBreakdown };
+  bands: CfarBandsResult & McCfarDiagnostics;
   fundingGap: FundingGapResult | null;
 }
 
@@ -474,7 +520,7 @@ interface CfarRow {
 interface WhatIfResult {
   totalNotionalLocalM: number;
   hedged: boolean;
-  bands: CfarBandsResult & { breakdown: CfarRiskBreakdown };
+  bands: CfarBandsResult & McCfarDiagnostics;
   fundingGap: FundingGapResult | null;
   totalCarryUsdM: number;
   doNothingUsdM: number;
@@ -731,7 +777,7 @@ export function CfarAnalysisView({
   const [whatIfLegs, setWhatIfLegs] = useState<WhatIfLegRow[]>(() =>
     seedWhatIfLegs(appliedDetail, T),
   );
-  /** Per-leg On / Settle / Notional editor — behind amber gear (same pattern as Strip Schedule). */
+  /** Gear open = edit Settle / Notional; closed = read-only legs + metric chips. */
   const [whatIfScheduleOpen, setWhatIfScheduleOpen] = useState(false);
   const syncedCcyRef = useRef<string | null>(null);
   useEffect(() => {
@@ -742,11 +788,8 @@ export function CfarAnalysisView({
     setWhatIfScheduleOpen(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?.ccy]);
-  const resetWhatIfToApplied = () => {
+  const resetWhatIfToApplied = () =>
     setWhatIfLegs(seedWhatIfLegs(appliedDetail, T));
-    // Show tick trades with Carry so Reset surfaces the same params as Cash Carry.
-    setWhatIfScheduleOpen(true);
-  };
   const updateWhatIfLeg = (id: number, patch: Partial<WhatIfLegRow>) =>
     setWhatIfLegs(prev => prev.map(l => (l.id === id ? { ...l, ...patch } : l)));
   /**
@@ -772,6 +815,60 @@ export function CfarAnalysisView({
       }),
     );
   };
+
+  /**
+   * Per-leg Carry + Enhancement vs do-nothing — same engine as Cash Carry
+   * carry-evolution leg bars (`buildCarryEvolutionLegBarsFromSamples`).
+   */
+  const whatIfLegMetricsById = useMemo(() => {
+    type LegMetric = {
+      carryUsdM: number;
+      enhancementUsdM: number;
+      doNothingUsdM: number;
+      fwdCarryUsdM: number;
+      fcyInterestUsdM: number;
+      usdInterestUsdM: number;
+    };
+    const out = new Map<number, LegMetric>();
+    if (!selected) return out;
+    const active = [...whatIfLegs]
+      .filter(l => l.on && Math.abs(l.amountLocalM) > 1e-12)
+      .sort((a, b) => a.settleMonths - b.settleMonths);
+    if (active.length === 0) return out;
+    const bars = buildCarryEvolutionLegBarsFromSamples({
+      ccy: selected.ccy,
+      setup,
+      marketRates: marketRatesFor(selected.ccy),
+      legs: active.map(l => ({
+        settleMonths: l.settleMonths,
+        amountLocalM: l.amountLocalM,
+        recognizeMonths: 0,
+        structure: active.length >= 2 ? 'strip' : 'bullet',
+      })),
+    });
+    active.forEach((leg, i) => {
+      const bar = bars[i];
+      if (!bar) return;
+      out.set(leg.id, {
+        carryUsdM: bar.improvedCarryUsdM,
+        enhancementUsdM: bar.hedgeImprovementUsdM,
+        doNothingUsdM: bar.defaultCarryUsdM,
+        fwdCarryUsdM: bar.hedgeBreakdown?.fwdCarryUsdM ?? 0,
+        fcyInterestUsdM: bar.hedgeBreakdown?.fcyInterestUsdM ?? 0,
+        usdInterestUsdM: bar.hedgeBreakdown?.usdInterestUsdM ?? 0,
+      });
+    });
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    selected?.ccy,
+    whatIfLegs,
+    setup,
+    marketRatesProp,
+    marketRatesByCcy,
+    ratesScopeId,
+    T,
+  ]);
 
   const whatIf = useMemo<WhatIfResult | null>(() => {
     if (!selected) return null;
@@ -1340,327 +1437,33 @@ export function CfarAnalysisView({
             </div>
           </div>
 
-          {/* Applied hedge — Cash Carry–style params + legs (Cover / Carry / etc.) */}
-          {(() => {
-            const detail =
-              appliedDetail ?? {
-                source: 'none' as const,
-                legs: [],
-                totalNotionalLocalM: 0,
-              };
-            const coverPct =
-              Math.abs(selected.endM) > 1e-9
-                ? (detail.totalNotionalLocalM / selected.endM) * 100
-                : 0;
-            const sourceLabel =
-              detail.source === 'booked'
-                ? 'Booked'
-                : detail.source === 'prepared-strip'
-                  ? 'Prepared · strip (staged, not booked)'
-                  : detail.source === 'prepared-bullet'
-                    ? 'Prepared · bullet (staged, not booked)'
-                    : 'None — open book';
-            const rates = marketRatesFor(selected.ccy);
-            const cmp = buildCashForecastCarryComparison({
-              ccy: selected.ccy,
-              bookRows,
-              forecastProfile,
-              forecastMonths: setup.forecastMonths,
-              marketRates: rates,
-              bookedHedges,
-              preparedByCcy,
-              setup,
-            });
-            const resolved = cmp
-              ? resolvedHedgedTotalCarryUsdM({
-                  comparison: cmp,
-                  prepared: preparedByCcy?.[selected.ccy],
-                  marketRates: rates,
-                })
-              : null;
-            const doNothingUsdM = cmp?.categories.unhedgedIncomeUsdM ?? 0;
-            const totalCarryUsdM =
-              resolved?.totalCarryUsdM ?? selected.totalCarryUsdM;
-            const benefitUsdM = resolved?.benefitUsdM ?? 0;
-            const onRates = resolveOvernightCashRates(rates, selected.ccy);
-            const fwd1m = resolveForwardDepositRates(rates, selected.ccy, 1);
-            const chip =
-              'inline-flex items-baseline gap-1 rounded border border-slate-700 bg-slate-950/70 px-1.5 py-0.5';
-            const chipLbl =
-              'text-[8px] font-semibold uppercase tracking-wide text-slate-500';
-            const chipVal = 'font-mono text-[11px] font-semibold tabular-nums';
-            return (
-              <div className="mb-2 rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
-                <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-2">
-                  <div className="flex items-center gap-1.5">
-                    <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
-                      Applied hedge · {selected.ccy}
-                    </div>
-                    <InfoTip label="Applied hedge">
-                      <p>
-                        Same package Cash Carry uses for this CCY — Cover,
-                        Legs, Total carry, Do nothing, Benefit (Δ), and Net
-                        CFaR. What-if below starts from these legs; Reset
-                        restores them.
-                      </p>
-                    </InfoTip>
-                  </div>
-                  <div className="font-mono text-[10px] text-slate-400">
-                    {sourceLabel}
-                  </div>
-                </div>
-
-                <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-                  <span className={chip} title="Total dealt notional · % of Tf exposure">
-                    <span className={chipLbl}>Cover</span>
-                    <span className={`${chipVal} text-slate-100`}>
-                      {fmtM(detail.totalNotionalLocalM)}
-                    </span>
-                    {Math.abs(selected.endM) > 1e-9 && (
-                      <span className={`${chipVal} text-slate-500`}>
-                        {fmtPct(coverPct)}
-                      </span>
-                    )}
-                  </span>
-                  <span className={chip} title="Forward legs in the applied package">
-                    <span className={chipLbl}>Legs</span>
-                    <span className={`${chipVal} text-sky-200`}>
-                      {detail.legs.length > 0 ? detail.legs.length : '—'}
-                    </span>
-                  </span>
-                  <span
-                    className={chip}
-                    title="Total carry @ Tf — same as Cash Carry Total for this CCY"
-                  >
-                    <span className={chipLbl}>Carry</span>
-                    <span
-                      className={`${chipVal} ${
-                        totalCarryUsdM >= 0 ? 'text-emerald-200' : 'text-rose-300'
-                      }`}
-                    >
-                      {fmtCarryK(totalCarryUsdM)}
-                    </span>
-                  </span>
-                  <span
-                    className={chip}
-                    title="Do-nothing / unhedged income @ Tf"
-                  >
-                    <span className={chipLbl}>Do nothing</span>
-                    <span
-                      className={`${chipVal} ${
-                        doNothingUsdM >= 0 ? 'text-amber-200/90' : 'text-rose-300'
-                      }`}
-                    >
-                      {fmtCarryK(doNothingUsdM)}
-                    </span>
-                  </span>
-                  <span
-                    className={chip}
-                    title="Benefit = Total − Do nothing (hedge enhancement)"
-                  >
-                    <span className={chipLbl}>Δ</span>
-                    <span
-                      className={`${chipVal} ${
-                        benefitUsdM >= 0 ? 'text-emerald-200' : 'text-rose-300'
-                      }`}
-                    >
-                      {fmtCarryK(benefitUsdM)}
-                    </span>
-                  </span>
-                  <span className={chip} title="Net CFaR for this currency">
-                    <span className={chipLbl}>Net CFaR</span>
-                    <span className={`${chipVal} text-yellow-200`}>
-                      {fmtK(selected.bands.netCriticalCashUsdM)}
-                    </span>
-                  </span>
-                </div>
-
-                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 rounded border border-slate-700/80 bg-slate-950/60 px-2 py-1 text-[10px]">
-                  <span className="text-slate-400">
-                    Carry rates ·{' '}
-                    <span className="font-mono text-slate-300">
-                      {rates.sourceFile || 'CURRENCY_PARAMS'}
-                    </span>
-                    {' · '}
-                    <span className="font-mono text-amber-200/90">
-                      ON {selected.ccy} {onRates.fcy.creditPct.toFixed(2)}%/
-                      {onRates.fcy.debitPct.toFixed(2)}% · fwd 1M{' '}
-                      {fwd1m.fcy.creditPct.toFixed(2)}%/
-                      {fwd1m.fcy.debitPct.toFixed(2)}%
-                    </span>
-                  </span>
-                </div>
-
-                {detail.legs.length === 0 ? (
-                  <p className="text-[9px] text-slate-500">
-                    No booked or prepared hedge for {selected.ccy} — CFaR
-                    above is the open (unhedged) path.
-                  </p>
-                ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-[560px] text-left text-[10px]">
-                      <thead>
-                        <tr className="border-b border-slate-800 text-slate-500">
-                          <th className="py-1 pr-3 font-medium">Leg</th>
-                          <th className="py-1 pr-3 font-medium">Settle</th>
-                          <th className="py-1 pr-3 font-medium">Trade Δ</th>
-                          <th className="py-1 pr-3 font-medium">Cumul. cover</th>
-                          <th
-                            className="py-1 font-medium"
-                            title="Per-leg path carry (FWD + FCY int + USD int) — same engine as Cash Carry tick trades"
-                          >
-                            Carry
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {detail.legs.map((leg, i) => {
-                          const carry = legCarryBreakdown(
-                            selected.ccy,
-                            leg.tradeNotionalLocalM,
-                            leg.settleMonths,
-                            T,
-                            rates,
-                          );
-                          return (
-                            <tr
-                              key={`${leg.label}-${i}`}
-                              className="border-b border-slate-900/80 font-mono text-slate-300"
-                            >
-                              <td className="py-1 pr-3">{leg.label}</td>
-                              <td className="py-1 pr-3">
-                                M
-                                {leg.settleMonths.toFixed(
-                                  leg.settleMonths < 10 ? 1 : 0,
-                                )}
-                              </td>
-                              <td className="py-1 pr-3">
-                                {fmtM(leg.tradeNotionalLocalM)}
-                              </td>
-                              <td className="py-1 pr-3">
-                                {fmtM(leg.cumulCoverLocalM)}
-                              </td>
-                              <CarryCell
-                                totalUsdM={carry.totalUsdM}
-                                fwdCarryUsdM={carry.fwdCarryUsdM}
-                                fcyInterestUsdM={carry.fcyInterestUsdM}
-                                usdInterestUsdM={carry.usdInterestUsdM}
-                                titleLines={[
-                                  `Total ${fmtCarryK(carry.totalUsdM)}`,
-                                  carry.swapPoints != null
-                                    ? `FWD points ${fmtCarryK(carry.fwdCarryUsdM)} (swap ${carry.swapPoints.toFixed(2)} ${carry.swapPointsSide ?? ''})`
-                                    : `FWD CIP ${fmtCarryK(carry.fwdCarryUsdM)}`,
-                                  `FCY int ${fmtCarryK(carry.fcyInterestUsdM)}`,
-                                  `USD int ${fmtCarryK(carry.usdInterestUsdM)}`,
-                                ]}
-                              />
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            );
-          })()}
-
-          <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-yellow-800/40 bg-yellow-950/20 px-2.5 py-1.5">
-            <div className="flex items-baseline gap-1">
-              <span className="text-[9px] uppercase tracking-wide text-yellow-400/80">
-                {Math.abs(selected.totalCarryUsdM) > 1e-9 ? 'Net CFaR' : 'Max CFaR'}
-              </span>
-              <span className="font-mono text-sm font-semibold text-yellow-100">
-                {fmtK(selected.bands.netCriticalCashUsdM)}
-              </span>
-            </div>
-            <span className="text-[10px] text-slate-400">
-              gross {fmtK(selected.bands.criticalCashUsdM)} · gross peak M
-              {(selected.bands.grossPeakMonth > 0
-                ? selected.bands.grossPeakMonth
-                : selected.bands.peakMonth
-              ).toFixed(1)}
-              {selected.bands.netCriticalCashUsdM > 1e-9
-                ? ` · net peak M${selected.bands.peakMonth.toFixed(1)}`
-                : ' · net fully offset by carry'}{' '}
-              ·{' '}
-              {selected.hedged
-                ? 'settlement gap g(t)=e−H_settled · point-in-time'
-                : 'open exposure e(t) · point-in-time'}
-            </span>
-            <span
-              className="text-[10px] text-slate-500"
-              title="Spot = not-dealt + forecast σ_E (leg-count invariant when fully dealt). Swap = dealt-not-settled × rate-diff vol — shrinks with more legs. Swap-expected points are diagnostic only (not netted into Net CFaR)."
-            >
-              spot {fmtK(selected.bands.breakdown.spotPeakUsdM)} · swap{' '}
-              {fmtK(selected.bands.breakdown.swapPeakUsdM)} (RSS-combined) ·
-              swap-exp (info){' '}
-              {fmtSignedK(selected.bands.breakdown.swapExpectedCostUsdM)}
-              {' · '}
-              u₁ₘ{' '}
-              {(
-                effectiveForecastUncertainty1m(
-                  forecastProfile,
-                  selected.ccy,
-                  setup.forecastUncertainty1m,
-                ) * 100
-              ).toFixed(0)}
-              %
-            </span>
-            {selected.fundingGap && (
-              <span
-                className="text-[10px] text-fuchsia-300/80"
-                title="Settlement funding gap — depends on leg count/spacing, not FX volatility"
-              >
-                funding gap {fmtK(selected.fundingGap.maxGapUsdM)} · M
-                {selected.fundingGap.peakMonth.toFixed(1)} ·{' '}
-                {selected.fundingGap.legCount} settlement
-                {selected.fundingGap.legCount === 1 ? '' : 's'}
-              </span>
-            )}
-          </div>
-
-          {/* What-if hedge — same toolbar as Strip Schedule (Reset | Legs −/+ | gear);
-              per-leg Settle / Notional only behind amber gear. */}
+          {/* What-if: review (chips + read-only legs) by default; gear = edit tick trades.
+              Legs −/+ always available in both modes. */}
           <div className="mb-2 rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
             <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-1.5">
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
-                  What-if hedge
+                  What-if hedge · tick trades
                 </div>
                 <InfoTip label="What-if hedge">
                   <p>
-                    Seeded from the {selected.ccy} hedge actually applied above
-                    ({appliedDetail?.source ?? 'none'}). Chips show Cover / Legs
-                    / Carry / Do nothing / Δ / Net CFaR (Cash Carry package).
-                    Reset restores Applied legs and opens tick trades with
-                    Carry. Legs −/+ redistributes equal spacing; amber gear
-                    toggles Settle · Notional · Carry.
+                    Review mode shows Cover / Legs / Carry chips and a read-only
+                    strip table. Legs −/+ always redistribute. Amber gear opens
+                    Settle · Notional editing. Reset restores Applied legs.
                   </p>
                 </InfoTip>
-                {whatIf && (
-                  <span className="font-mono text-[10px] text-slate-500">
-                    {whatIfLegs.filter(l => l.on).length >= 2 ? 'Strip' : 'Bullet'}
-                    {' · '}
-                    {fmtM(whatIf.totalNotionalLocalM)}
-                  </span>
-                )}
               </div>
               <div className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-0.5">
                 <button
                   type="button"
                   onClick={resetWhatIfToApplied}
                   className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-200"
-                  title="Re-seed What-if from Applied hedge — Cover, Legs, Carry, Do nothing, Benefit match Cash Carry"
+                  title="Re-seed from the currently applied hedge"
                 >
                   Reset
                 </button>
                 <span className="text-[9px] text-slate-600">|</span>
-                <span className="text-[9px] text-slate-500">
-                  {whatIfLegs.filter(l => l.on).length >= 2
-                    ? 'Strip legs'
-                    : 'Bullet · legs'}
-                </span>
+                <span className="text-[9px] text-slate-500">Legs</span>
                 <button
                   type="button"
                   disabled={whatIfLegs.length <= 1}
@@ -1687,8 +1490,8 @@ export function CfarAnalysisView({
                   type="button"
                   title={
                     whatIfScheduleOpen
-                      ? 'Close tick-trades schedule'
-                      : 'Strip schedule — Settle · Notional per leg'
+                      ? 'Close schedule edit — back to review table'
+                      : 'Edit Settle · Notional per leg'
                   }
                   aria-label="What-if schedule settings"
                   aria-pressed={whatIfScheduleOpen}
@@ -1704,8 +1507,7 @@ export function CfarAnalysisView({
               </div>
             </div>
 
-            {/* Absolute Cash Carry–style params (Reset restores Applied values) */}
-            {whatIf && (
+            {!whatIfScheduleOpen && whatIf && (
               <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                 {(() => {
                   const chip =
@@ -1721,10 +1523,7 @@ export function CfarAnalysisView({
                   const legsOn = whatIfLegs.filter(l => l.on).length;
                   return (
                     <>
-                      <span
-                        className={chip}
-                        title="What-if dealt notional · % of Tf exposure"
-                      >
+                      <span className={chip} title="What-if dealt notional">
                         <span className={chipLbl}>Cover</span>
                         <span className={`${chipVal} text-slate-100`}>
                           {fmtM(whatIf.totalNotionalLocalM)}
@@ -1741,10 +1540,7 @@ export function CfarAnalysisView({
                           {legsOn}
                         </span>
                       </span>
-                      <span
-                        className={chip}
-                        title="What-if Total carry @ Tf — Cash Carry Total"
-                      >
+                      <span className={chip} title="What-if Total carry @ Tf">
                         <span className={chipLbl}>Carry</span>
                         <span
                           className={`${chipVal} ${
@@ -1756,10 +1552,7 @@ export function CfarAnalysisView({
                           {fmtCarryK(whatIf.totalCarryUsdM)}
                         </span>
                       </span>
-                      <span
-                        className={chip}
-                        title="Do-nothing / unhedged income @ Tf"
-                      >
+                      <span className={chip} title="Do-nothing income @ Tf">
                         <span className={chipLbl}>Do nothing</span>
                         <span
                           className={`${chipVal} ${
@@ -1771,10 +1564,7 @@ export function CfarAnalysisView({
                           {fmtCarryK(whatIf.doNothingUsdM)}
                         </span>
                       </span>
-                      <span
-                        className={chip}
-                        title="Benefit = Total − Do nothing"
-                      >
+                      <span className={chip} title="Benefit = Total − Do nothing">
                         <span className={chipLbl}>Δ</span>
                         <span
                           className={`${chipVal} ${
@@ -1798,10 +1588,10 @@ export function CfarAnalysisView({
               </div>
             )}
 
-            {whatIfScheduleOpen && (
+            {whatIfScheduleOpen ? (
               <div className="mb-1.5 rounded border border-amber-500/25 bg-slate-950/70 p-1.5">
                 <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-wide text-amber-200/90">
-                  Tick trades · Settle · Notional · Carry
+                  Edit · Settle · Notional · Carry
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full min-w-[520px] text-left text-[10px]">
@@ -1812,40 +1602,42 @@ export function CfarAnalysisView({
                         <th className="py-1 pr-3 font-medium">Notional Δ</th>
                         <th className="py-1 pr-3 font-medium">Cumul. cover</th>
                         <th
-                          className="py-1 font-medium"
-                          title="Per-leg path carry — same engine as Cash Carry tick trades"
+                          className="py-1 pr-3 font-medium"
+                          title="Hedged path carry (FWD + FCY int + USD int)"
                         >
                           Carry
+                        </th>
+                        <th
+                          className="py-1 font-medium"
+                          title="Enhancement vs do-nothing on this leg notional (Carry − DN)"
+                        >
+                          Enhancement
                         </th>
                       </tr>
                     </thead>
                     <tbody>
                       {(() => {
-                        const rates = marketRatesFor(selected.ccy);
                         let cum = 0;
                         return [...whatIfLegs]
                           .sort((a, b) => a.settleMonths - b.settleMonths)
                           .map(row => {
                             if (row.on) cum += row.amountLocalM;
-                            const carry = row.on
-                              ? legCarryBreakdown(
-                                  selected.ccy,
-                                  row.amountLocalM,
-                                  row.settleMonths,
-                                  T,
-                                  rates,
-                                )
-                              : null;
-                            return { row, cum, carry };
+                            return { row, cum };
                           });
-                      })().map(({ row, cum, carry }) => (
+                      })().map(({ row, cum }) => {
+                        const m = row.on
+                          ? whatIfLegMetricsById.get(row.id)
+                          : undefined;
+                        return (
                         <tr key={row.id} className="border-b border-slate-900/80">
                           <td className="py-1 pr-2">
                             <input
                               type="checkbox"
                               checked={row.on}
                               onChange={e =>
-                                updateWhatIfLeg(row.id, { on: e.target.checked })
+                                updateWhatIfLeg(row.id, {
+                                  on: e.target.checked,
+                                })
                               }
                               className="h-3.5 w-3.5 accent-sky-500"
                             />
@@ -1886,57 +1678,172 @@ export function CfarAnalysisView({
                           <td className="py-1 pr-3 font-mono text-slate-400">
                             {row.on ? fmtM(cum) : '—'}
                           </td>
-                          {carry ? (
+                          {m ? (
                             <CarryCell
-                              totalUsdM={carry.totalUsdM}
-                              fwdCarryUsdM={carry.fwdCarryUsdM}
-                              fcyInterestUsdM={carry.fcyInterestUsdM}
-                              usdInterestUsdM={carry.usdInterestUsdM}
+                              totalUsdM={m.carryUsdM}
+                              fwdCarryUsdM={m.fwdCarryUsdM}
+                              fcyInterestUsdM={m.fcyInterestUsdM}
+                              usdInterestUsdM={m.usdInterestUsdM}
                             />
                           ) : (
-                            <td className="py-1 font-mono text-slate-600">—</td>
+                            <td className="py-1 pr-3 font-mono text-slate-600">—</td>
                           )}
+                          <td
+                            className={`py-1 font-mono ${
+                              !m
+                                ? 'text-slate-600'
+                                : m.enhancementUsdM >= 0
+                                  ? 'text-emerald-200'
+                                  : 'text-rose-300'
+                            }`}
+                            title={
+                              m
+                                ? `Enhancement ${fmtCarryK(m.enhancementUsdM)} = Carry ${fmtCarryK(m.carryUsdM)} − Do nothing ${fmtCarryK(m.doNothingUsdM)}`
+                                : undefined
+                            }
+                          >
+                            {m ? (
+                              <span className="inline-flex flex-col leading-tight">
+                                <span className="font-semibold">
+                                  {fmtCarryK(m.enhancementUsdM)}
+                                </span>
+                                <span className="text-[8px] font-normal text-slate-500">
+                                  vs DN {fmtCarryK(m.doNothingUsdM)}
+                                </span>
+                              </span>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
               </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[520px] text-left text-[10px]">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-500">
+                      <th className="py-1 pr-3 font-medium">Leg</th>
+                      <th className="py-1 pr-3 font-medium">Settle</th>
+                      <th className="py-1 pr-3 font-medium">Trade Δ</th>
+                      <th className="py-1 pr-3 font-medium">Cumul. cover</th>
+                      <th
+                        className="py-1 pr-3 font-medium"
+                        title="Hedged path carry (FWD + FCY int + USD int)"
+                      >
+                        Carry
+                      </th>
+                      <th
+                        className="py-1 font-medium"
+                        title="Enhancement vs do-nothing on this leg notional (Carry − DN)"
+                      >
+                        Enhancement
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      let cum = 0;
+                      let i = 0;
+                      return [...whatIfLegs]
+                        .sort((a, b) => a.settleMonths - b.settleMonths)
+                        .filter(row => row.on)
+                        .map(row => {
+                          i += 1;
+                          cum += row.amountLocalM;
+                          return {
+                            row,
+                            cum,
+                            i,
+                            m: whatIfLegMetricsById.get(row.id),
+                          };
+                        });
+                    })().map(({ row, cum, i, m }) => (
+                      <tr
+                        key={row.id}
+                        className="border-b border-slate-900/80 font-mono text-slate-300"
+                      >
+                        <td className="py-1 pr-3">L{i}</td>
+                        <td className="py-1 pr-3">
+                          M
+                          {row.settleMonths.toFixed(
+                            row.settleMonths < 10 ? 1 : 0,
+                          )}
+                        </td>
+                        <td className="py-1 pr-3">
+                          {fmtM(row.amountLocalM)}
+                        </td>
+                        <td className="py-1 pr-3">{fmtM(cum)}</td>
+                        {m ? (
+                          <CarryCell
+                            totalUsdM={m.carryUsdM}
+                            fwdCarryUsdM={m.fwdCarryUsdM}
+                            fcyInterestUsdM={m.fcyInterestUsdM}
+                            usdInterestUsdM={m.usdInterestUsdM}
+                          />
+                        ) : (
+                          <td className="py-1 pr-3 text-slate-600">—</td>
+                        )}
+                        <td
+                          className={`py-1 ${
+                            !m
+                              ? 'text-slate-600'
+                              : m.enhancementUsdM >= 0
+                                ? 'text-emerald-200'
+                                : 'text-rose-300'
+                          }`}
+                          title={
+                            m
+                              ? `Enhancement ${fmtCarryK(m.enhancementUsdM)} = Carry ${fmtCarryK(m.carryUsdM)} − Do nothing ${fmtCarryK(m.doNothingUsdM)}`
+                              : undefined
+                          }
+                        >
+                          {m ? (
+                            <span className="inline-flex flex-col leading-tight">
+                              <span className="font-semibold">
+                                {fmtCarryK(m.enhancementUsdM)}
+                              </span>
+                              <span className="text-[8px] font-normal text-slate-500">
+                                vs DN {fmtCarryK(m.doNothingUsdM)}
+                              </span>
+                            </span>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
+            <p className="mb-2 mt-1.5 text-[9px] leading-relaxed text-slate-500">
+              Seeded from the {selected.ccy} hedge applied above (
+              {appliedDetail?.source ?? 'none'}). Use Legs −/+ any time; open
+              the gear to edit Settle / Notional per leg.
+            </p>
             {whatIf ? (
-              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
                 <WhatIfDeltaRow
-                  label="Carry"
-                  current={selected.totalCarryUsdM}
-                  proposed={whatIf.totalCarryUsdM}
-                  fmt={fmtCarryK}
-                  lowerIsBetter={false}
-                  note="Total carry @ Tf — same as Cash Carry Total for this CCY."
+                  label="Net CFaR"
+                  current={selected.bands.netCriticalCashUsdM}
+                  proposed={whatIf.bands.netCriticalCashUsdM}
+                  fmt={fmtK}
+                  lowerIsBetter
+                  note="Spot risk RSS-combined with swap-bridge. When spot dominates, watch Swap-bridge below."
                 />
                 <WhatIfDeltaRow
-                  label="Do nothing"
-                  current={selected.doNothingUsdM}
-                  proposed={whatIf.doNothingUsdM}
-                  fmt={fmtCarryK}
-                  lowerIsBetter={false}
-                  note="Unhedged income @ Tf — Cash Carry Do nothing column."
-                />
-                <WhatIfDeltaRow
-                  label="Δ Benefit"
-                  current={selected.benefitUsdM}
-                  proposed={whatIf.benefitUsdM}
-                  fmt={fmtCarryK}
-                  lowerIsBetter={false}
-                  note="Total − Do nothing — Cash Carry Δ / enhancement."
-                />
-                <WhatIfDeltaRow
-                  label="Cover Δ"
-                  current={appliedDetail?.totalNotionalLocalM ?? 0}
-                  proposed={whatIf.totalNotionalLocalM}
-                  fmt={fmtM}
-                  lowerIsBetter={false}
-                  note="Total dealt notional (local M) — the FX delta locked from trade date."
+                  label="Swap-bridge risk"
+                  current={selected.bands.breakdown.swapPeakUsdM}
+                  proposed={whatIf.bands.breakdown.swapPeakUsdM}
+                  fmt={fmtK}
+                  lowerIsBetter
+                  note="Isolated dealt-but-not-settled component — leg count/spacing controls this."
                 />
                 <WhatIfDeltaRow
                   label="Resid spot"
@@ -1944,28 +1851,53 @@ export function CfarAnalysisView({
                   proposed={whatIf.bands.breakdown.spotPeakUsdM}
                   fmt={fmtK}
                   lowerIsBetter
-                  note="Undelt FX + forecast σ_E peak — residual spot risk after the dealt hedge."
+                  note="Undelt FX + forecast σ_E peak."
                 />
                 <WhatIfDeltaRow
-                  label="Swap-bridge"
-                  current={selected.bands.breakdown.swapPeakUsdM}
-                  proposed={whatIf.bands.breakdown.swapPeakUsdM}
+                  label="Funding gap"
+                  current={selected.fundingGap?.maxGapUsdM ?? 0}
+                  proposed={whatIf.fundingGap?.maxGapUsdM ?? 0}
                   fmt={fmtK}
                   lowerIsBetter
-                  note="Dealt-but-not-settled × rate-diff vol — the piece leg count/spacing controls."
+                  note="Deterministic settlement residual floor."
                 />
                 <WhatIfDeltaRow
-                  label="Net CFaR"
-                  current={selected.bands.netCriticalCashUsdM}
-                  proposed={whatIf.bands.netCriticalCashUsdM}
-                  fmt={fmtK}
-                  lowerIsBetter
-                  note="RSS(spot, swap) net of real FWD hedge carry."
+                  label="Carry"
+                  current={selected.totalCarryUsdM}
+                  proposed={whatIf.totalCarryUsdM}
+                  fmt={fmtCarryK}
+                  lowerIsBetter={false}
+                  note="Total carry @ Tf — same as Cash Carry Total."
+                />
+                <WhatIfDeltaRow
+                  label="Do nothing"
+                  current={selected.doNothingUsdM}
+                  proposed={whatIf.doNothingUsdM}
+                  fmt={fmtCarryK}
+                  lowerIsBetter={false}
+                  note="Unhedged income @ Tf."
+                />
+                <WhatIfDeltaRow
+                  label="Δ Benefit"
+                  current={selected.benefitUsdM}
+                  proposed={whatIf.benefitUsdM}
+                  fmt={fmtCarryK}
+                  lowerIsBetter={false}
+                  note="Total − Do nothing."
+                />
+                <WhatIfDeltaRow
+                  label="Cover"
+                  current={appliedDetail?.totalNotionalLocalM ?? 0}
+                  proposed={whatIf.totalNotionalLocalM}
+                  fmt={fmtM}
+                  lowerIsBetter={false}
+                  note="Total dealt notional (local M)."
                 />
               </div>
             ) : (
               <p className="text-[9px] text-slate-500">
-                No legs ticked On — open the gear and turn a leg on to see impact.
+                No legs ticked On — open the gear and turn a leg on to see
+                impact.
               </p>
             )}
           </div>

@@ -48,6 +48,8 @@ Hedging summary row → `{CCY} — hedge carry profile` · max-w-5xl · 90vh scr
 
 ## Locked style
 
+Reuse **`docs/design/design-system-claude.md`**.
+
 - Panel: `rounded-xl border border-slate-700 bg-slate-900`
 - Section: `rounded-lg border border-slate-700 bg-slate-950 p-3`
 - Cards: 4-up grid · `text-[9px]` labels · `font-mono text-sm` values

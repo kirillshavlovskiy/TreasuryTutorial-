@@ -816,6 +816,43 @@ export function monthlyInflowSeriesLocalM(
   );
 }
 
+/**
+ * Per-month gross outflows (magnitude, ≥0) — mirrors
+ * {@link monthlyInflowSeriesLocalM} using monthOutflowsAbs instead of
+ * monthInflows. Needed alongside the inflow series wherever gross in/out
+ * timing (not just their net) matters — e.g. Monte Carlo cash-mismatch CFaR,
+ * where an outflow due before its offsetting inflow lands creates a real,
+ * separate, intra-month gap even when the two roughly net out over the month.
+ */
+export function monthlyOutflowSeriesLocalM(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): number[] {
+  const T = Math.max(
+    0,
+    Math.floor(
+      Number.isFinite(forecastMonths) && forecastMonths >= 0
+        ? forecastMonths
+        : 1,
+    ),
+  );
+  if (T === 0) return [];
+  if (profile?.mode === 'custom') {
+    const months = resizeMonthSeries(
+      profile.byCcy[row.ccy],
+      T,
+      row,
+      profile.extrasByCcy?.[row.ccy],
+    );
+    return months.map(m => roundMoney(monthOutflowsAbs(m)));
+  }
+  const extras = normalizeExtras(profile?.extrasByCcy?.[row.ccy]);
+  return Array.from({ length: T }, (_, k) =>
+    roundMoney(monthOutflowsAbs(flatMonthFlowAt(row, extras, profile, k))),
+  );
+}
+
 /** Same series from a bare flat monthly rate (consolidate / tests without RowState). */
 export function flatMonthlyFlowSeries(
   monthlyFlowM: number,
