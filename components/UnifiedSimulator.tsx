@@ -537,9 +537,20 @@ export function UnifiedSimulator({
           u1m,
         ),
       );
+      // Keep Analytics / CFaR top-section u₁ₘ chips in sync with the line
+      // editor (Revenue is the quantity-risk driver; other lines still bump
+      // the shared control so Gross/Net CFaR visibly track the modal).
+      if (onVarSetupChange) {
+        const base = varSetup ?? DEFAULT_VAR_SETUP;
+        if (Math.abs((base.forecastUncertainty1m ?? 0) - u1m) > 1e-12) {
+          onVarSetupChange({ ...base, forecastUncertainty1m: u1m });
+        }
+      }
     },
     [
       onForecastProfileChange,
+      onVarSetupChange,
+      varSetup,
       forecastProfile,
       rows,
       forecastMonths,
@@ -557,7 +568,10 @@ export function UnifiedSimulator({
       e.stopPropagation();
       if (!onForecastProfileChange) return;
       const rect = e.currentTarget.getBoundingClientRect();
-      const u = lineUncertainty1m(forecastProfile, ccy, field);
+      const lineU = lineUncertainty1m(forecastProfile, ccy, field);
+      const globalU = varSetup?.forecastUncertainty1m ?? 0;
+      // Prefer line override; else seed the editor from the shared top-section u₁ₘ.
+      const u = lineU > 0 ? lineU : globalU > 0 ? globalU : 0;
       setLineUncertaintyDraft(
         u > 0 ? Number((u * 100).toFixed(2)).toString() : '',
       );
@@ -569,7 +583,7 @@ export function UnifiedSimulator({
         left: Math.max(8, rect.left),
       });
     },
-    [onForecastProfileChange, forecastProfile],
+    [onForecastProfileChange, forecastProfile, varSetup],
   );
 
   const offsetFor = useCallback(

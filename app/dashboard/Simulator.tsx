@@ -480,11 +480,15 @@ export function Simulator({
                   analyticsPanel as ReactElement<{
                     bookRows?: RowState[];
                     forecastProfile?: ForecastProfileState;
+                    onForecastProfileChange?: (
+                      profile: ForecastProfileState,
+                    ) => void;
                     onOpenForecastProfile?: () => void;
                   }>,
                   {
                     bookRows: rows,
                     forecastProfile,
+                    onForecastProfileChange: setForecastProfile,
                     onOpenForecastProfile: () => setForecastProfileOpen(true),
                   },
                 )

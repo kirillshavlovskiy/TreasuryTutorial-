@@ -854,6 +854,45 @@ export function resolvedHedgedTotalCarryUsdM(input: {
   };
 }
 
+/**
+ * Σ Total carry across currencies — same pipeline as Cash Carry “All CCY”
+ * Total (buildCashForecastCarryComparison + resolvedHedgedTotalCarryUsdM).
+ * Used by the Analytics tab rail so the headline cannot drift from the table.
+ */
+export function sumCashCarryTotalUsdM(input: {
+  ccys: readonly string[];
+  bookRows?: readonly RowState[];
+  forecastProfile?: ForecastProfileState | null;
+  forecastMonths: number;
+  marketRatesFor: (ccy: string) => FxMarketRatesBundle;
+  bookedHedges: readonly HedgeTicket[];
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  setup: VarSetup;
+}): number {
+  let sum = 0;
+  for (const ccy of input.ccys) {
+    if (!ccy || ccy === 'USD') continue;
+    const marketRates = input.marketRatesFor(ccy);
+    const cmp = buildCashForecastCarryComparison({
+      ccy,
+      bookRows: input.bookRows,
+      forecastProfile: input.forecastProfile,
+      forecastMonths: input.forecastMonths,
+      marketRates,
+      bookedHedges: input.bookedHedges,
+      preparedByCcy: input.preparedByCcy,
+      setup: input.setup,
+    });
+    if (!cmp) continue;
+    sum += resolvedHedgedTotalCarryUsdM({
+      comparison: cmp,
+      prepared: input.preparedByCcy?.[ccy],
+      marketRates,
+    }).totalCarryUsdM;
+  }
+  return sum;
+}
+
 function cashPathForCcy(input: {
   ccy: string;
   bookRows?: readonly RowState[];

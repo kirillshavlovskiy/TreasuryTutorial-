@@ -311,19 +311,36 @@ export function maxLineUncertainty1m(
 }
 
 /**
- * Quantity-risk u₁ₘ for Analytics: Revenue line if set, else max line σ,
- * else `fallback` (global setup).
+ * Quantity-risk u₁ₘ for Analytics / CFaR: max of global setup fallback and
+ * any per-line σ on this CCY (Revenue preferred when present among lines).
+ * Raising either the top-section chips or a Forecast-profile line raises risk;
+ * previously a sticky line override ignored the global control entirely.
  */
 export function effectiveForecastUncertainty1m(
   profile: ForecastProfileState | null | undefined,
   ccy: string,
   fallback = 0,
 ): number {
+  const global =
+    typeof fallback === 'number' && Number.isFinite(fallback) && fallback > 0
+      ? fallback
+      : 0;
   const rev = lineUncertainty1m(profile, ccy, 'collections');
-  if (rev > 0) return rev;
-  const max = maxLineUncertainty1m(profile, ccy);
-  if (max > 0) return max;
-  return typeof fallback === 'number' && fallback > 0 ? fallback : 0;
+  const line = rev > 0 ? rev : maxLineUncertainty1m(profile, ccy);
+  return Math.max(global, line);
+}
+
+/** Drop all per-line projection σ so global Analytics / CFaR u₁ₘ applies. */
+export function clearLineUncertainties(
+  profile: ForecastProfileState,
+): ForecastProfileState {
+  if (
+    !profile.uncertainty1mByCcy ||
+    Object.keys(profile.uncertainty1mByCcy).length === 0
+  ) {
+    return profile;
+  }
+  return { ...profile, uncertainty1mByCcy: {} };
 }
 
 export function withLineUncertainty1m(

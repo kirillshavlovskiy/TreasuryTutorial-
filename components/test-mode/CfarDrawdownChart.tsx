@@ -1,9 +1,66 @@
 'use client';
 
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { CfarBandsResult } from '@/lib/test-mode/cfar-drawdown';
 
 function fmtK(usdM: number): string {
   return `$${(usdM * 1000).toFixed(0)}K`;
+}
+
+function ChartInfoTip({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div ref={rootRef} className="relative inline-flex shrink-0">
+      <button
+        type="button"
+        aria-label={label}
+        aria-expanded={open}
+        title={label}
+        onClick={() => setOpen(v => !v)}
+        className={`flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-bold leading-none transition-colors ${
+          open
+            ? 'border-sky-500/60 bg-sky-500/20 text-sky-100'
+            : 'border-slate-600 bg-slate-900 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+        }`}
+      >
+        i
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          aria-label={label}
+          className="absolute right-0 top-full z-30 mt-1.5 w-72 rounded-lg border border-slate-600 bg-slate-900 p-3 text-left text-[10px] leading-relaxed text-slate-300 shadow-xl"
+        >
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+            {label}
+          </div>
+          {children}
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface CfarDrawdownChartProps {
@@ -61,7 +118,17 @@ export function CfarDrawdownChart({
     yMax = Math.max(yMax, p.p95, p.carryUsdM);
     yMin = Math.min(yMin, p.p05, p.netP05);
   }
-  yMin = Math.min(yMin, -bands.netCriticalCashUsdM);
+  // Headline peaks use setup confidence (criticalCash / netCriticalCash).
+  // Fan paths stay at fixed visual p05/p95 — do not label peaks from p05 or
+  // 90% conf reads as ~$2.0M while the table shows ~$1.6M (z₉₅/z₉₀).
+  const grossPeakUsdM = bands.criticalCashUsdM;
+  const netPeakUsdM = bands.netCriticalCashUsdM;
+  const grossPeakT =
+    typeof bands.grossPeakMonth === 'number' && bands.grossPeakMonth > 0
+      ? bands.grossPeakMonth
+      : bands.peakMonth;
+  const netPeakT = bands.peakMonth;
+  yMin = Math.min(yMin, -netPeakUsdM, -grossPeakUsdM);
   const spanRaw = yMax - yMin || 1;
   const pad = spanRaw * 0.08;
   yMax += pad;
@@ -78,7 +145,7 @@ export function CfarDrawdownChart({
   const spreadOuter = band(p => p.p05, p => p.p95);
   const spreadInner = band(p => p.p25, p => p.p75);
   const y0 = y(0);
-  const yFloor = y(-bands.netCriticalCashUsdM);
+  const yFloor = y(-netPeakUsdM);
 
   // Settlement funding gap g(t) — its own secondary axis (local FCY M), only
   // set up when the caller actually supplies it.
@@ -102,63 +169,45 @@ export function CfarDrawdownChart({
   const lastM = Math.max(1, Math.round(T));
   const monthTicks: number[] = [];
   for (let m = 0; m <= lastM; m += 1) monthTicks.push(m);
-  // Peak draw = deepest point of the plotted net-p05 adverse floor (argmin),
-  // so the marker sits on the curve trough rather than the mean-peak time.
-  let troughIdx = 0;
-  for (let i = 1; i < pts.length; i += 1) {
-    if (pts[i]!.netP05 < pts[troughIdx]!.netP05) troughIdx = i;
-  }
-  const trough = pts[troughIdx]!;
-  const xPeak = x(trough.t);
-  const yPeak = y(trough.netP05);
-  const peakNearRight = trough.t > T * 0.82;
-  // Gross peak = deepest point of the pre-carry p05 floor. Tracked separately
-  // from the net trough above — carry only offsets the net line, so the gross
-  // adverse floor can (and typically does) bottom out deeper and/or earlier,
-  // before enough carry has accrued to cushion it.
-  let grossTroughIdx = 0;
-  for (let i = 1; i < pts.length; i += 1) {
-    if (pts[i]!.p05 < pts[grossTroughIdx]!.p05) grossTroughIdx = i;
-  }
-  const grossTrough = pts[grossTroughIdx]!;
-  const xGrossPeak = x(grossTrough.t);
-  const yGrossPeak = y(grossTrough.p05);
-  const grossPeakNearRight = grossTrough.t > T * 0.82;
-  // Avoid stacking both peak labels on top of each other when they land at
-  // (near) the same time — nudge the gross label down a touch in that case.
+  const xPeak = x(netPeakT);
+  const yPeak = y(-netPeakUsdM);
+  const peakNearRight = netPeakT > T * 0.82;
+  const xGrossPeak = x(grossPeakT);
+  const yGrossPeak = y(-grossPeakUsdM);
+  const grossPeakNearRight = grossPeakT > T * 0.82;
   const peaksOverlap = Math.abs(xGrossPeak - xPeak) < 26;
   const hasCarry = Math.abs(pts[pts.length - 1]!.carryUsdM) > 1e-9;
-  const tailPct =
-    confidencePct % 1 !== 0
-      ? (100 - confidencePct).toFixed(1)
-      : String(100 - confidencePct).padStart(2, '0');
+  const fmtM = (t: number) => t.toFixed(t < 10 ? 1 : 0);
   return (
     <div className={className}>
       {showHeader && (
         <>
-          <div className="mb-0.5 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
-              CFaR drawdown profile
-            </span>
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
+                CFaR drawdown profile
+              </span>
+              <ChartInfoTip label="How to read the fan">
+                <p>
+                  Markers = CriticalCash at {confidencePct}% (same as the
+                  table). Shaded fan is a fixed visual p05–p95 band (not the
+                  confidence chip). Yellow floor = net; amber = gross before
+                  carry.
+                  {fundingGapLine
+                    ? ' Fuchsia dashed = funding gap g(t) (zero vol, local M).'
+                    : ''}
+                </p>
+              </ChartInfoTip>
+            </div>
             <span className="text-[9px] text-slate-500">
-              net M{trough.t.toFixed(trough.t < 10 ? 1 : 0)} · {fmtK(-trough.netP05)}
+              net M{fmtM(netPeakT)} · {fmtK(netPeakUsdM)}
               {' · '}
               <span className="text-amber-400/80">
-                gross M{grossTrough.t.toFixed(grossTrough.t < 10 ? 1 : 0)} ·{' '}
-                {fmtK(-grossTrough.p05)}
+                gross M{fmtM(grossPeakT)} · {fmtK(grossPeakUsdM)}
               </span>
+              <span className="text-slate-600"> · {confidencePct}%</span>
             </span>
           </div>
-          <p className="mb-2 text-[9px] leading-relaxed text-slate-500">
-            CriticalCash = maxₜ z·S₀·σ·√t·|g(t)| at {confidencePct}% — the cost
-            of bridge-funding the settlement gap via spot+swap at whichever
-            point in time is worst, closed form (no simulation). Yellow floor
-            = net CFaR; amber marker = gross (before carry offset) — gross
-            bottoms out deeper (and often earlier) since carry hasn't accrued
-            yet to cushion it.
-            {fundingGapLine &&
-              ' Fuchsia dashed = the same gap g(t) with zero FX volatility (deterministic floor).'}
-          </p>
         </>
       )}
       <svg
@@ -214,7 +263,7 @@ export function CfarDrawdownChart({
             opacity={0.9}
           />
         )}
-        {/* gross peak marker: vertical guide + dot on the pre-carry p05 trough */}
+        {/* Confidence-calibrated peaks (match table / Net·Gross cards) */}
         <line x1={xGrossPeak} y1={padT} x2={xGrossPeak} y2={H - padB} stroke="rgba(245,158,11,0.35)" strokeWidth={1} strokeDasharray="2 2" />
         <circle cx={xGrossPeak} cy={yGrossPeak} r={3} fill="#0b1220" stroke="#f59e0b" strokeWidth={2} />
         <text
@@ -225,9 +274,8 @@ export function CfarDrawdownChart({
           fontWeight={600}
           fill="#fbbf24"
         >
-          gross M{grossTrough.t.toFixed(grossTrough.t < 10 ? 1 : 0)} · {fmtK(-grossTrough.p05)}
+          gross M{fmtM(grossPeakT)} · {fmtK(grossPeakUsdM)}
         </text>
-        {/* peak-draw marker: vertical guide + dot on the net-p05 trough */}
         <line x1={xPeak} y1={padT} x2={xPeak} y2={H - padB} stroke="rgba(234,179,8,0.4)" strokeWidth={1} />
         <circle cx={xPeak} cy={yPeak} r={3.5} fill="#0b1220" stroke="#facc15" strokeWidth={2} />
         <text
@@ -238,22 +286,22 @@ export function CfarDrawdownChart({
           fontWeight={600}
           fill="#fde047"
         >
-          net M{trough.t.toFixed(trough.t < 10 ? 1 : 0)} · {fmtK(-trough.netP05)}
+          net M{fmtM(netPeakT)} · {fmtK(netPeakUsdM)}
         </text>
         <text x={padL - 4} y={y0 + 3} textAnchor="end" fontSize={8} fill="#64748b">$0</text>
         <text x={padL - 4} y={yFloor + 3} textAnchor="end" fontSize={8} fill="#fde047">
-          {fmtK(-bands.netCriticalCashUsdM)}
+          {fmtK(netPeakUsdM)}
         </text>
       </svg>
       <div className="mt-1.5 flex flex-wrap items-center gap-3 text-[9px] text-slate-500">
-        <span><span className="mr-1 inline-block h-2 w-3.5 rounded-sm bg-yellow-400/25 align-middle" />p25–p75 · p05–p95 fan</span>
-        <span><span className="mr-1 inline-block h-0.5 w-3 bg-yellow-400 align-middle" />net cash path · p{tailPct} (dashed = gross)</span>
+        <span><span className="mr-1 inline-block h-2 w-3.5 rounded-sm bg-yellow-400/25 align-middle" />visual p05–p95 fan</span>
+        <span><span className="mr-1 inline-block h-0.5 w-3 bg-yellow-400 align-middle" />net path (fan p05; dashed = gross)</span>
         {hasCarry && (
           <span><span className="mr-1 inline-block h-0.5 w-3 border-t border-dashed border-emerald-400 align-middle" />carry accrual</span>
         )}
         <span><span className="mr-1 inline-block h-0.5 w-3 border-t border-dashed border-slate-400 align-middle" />median path</span>
-        <span><span className="mr-1 inline-block h-0.5 w-3 border-t-2 border-dotted border-yellow-500 align-middle" />net critical cash floor</span>
-        <span className="text-amber-400/80"><span className="mr-1 inline-block h-2 w-2 rounded-full border-2 border-amber-500 align-middle" />gross peak (pre-carry)</span>
+        <span><span className="mr-1 inline-block h-0.5 w-3 border-t-2 border-dotted border-yellow-500 align-middle" />net critical cash @ {confidencePct}%</span>
+        <span className="text-amber-400/80"><span className="mr-1 inline-block h-2 w-2 rounded-full border-2 border-amber-500 align-middle" />gross peak @ {confidencePct}%</span>
         {fundingGapLine && (
           <span className="text-fuchsia-300/90">
             <span className="mr-1 inline-block h-0.5 w-3 border-t-2 border-dashed border-fuchsia-400 align-middle" />

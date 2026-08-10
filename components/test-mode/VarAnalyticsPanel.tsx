@@ -15,6 +15,7 @@ import {
 } from '@/components/test-mode/ExposureHedgePathChart';
 import {
   DEFAULT_FORECAST_PROFILE,
+  clearLineUncertainties,
   monthlyFlowSeriesLocalM,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
@@ -62,6 +63,7 @@ import {
   assignImpliedCarryFromSwapPoints,
   buildCashForecastCarryComparison,
   resolvedHedgedTotalCarryUsdM,
+  sumCashCarryTotalUsdM,
 } from '@/lib/test-mode/cash-carry-analytics';
 import { residualCfarClosedFormUsdM } from '@/lib/test-mode/cfar-residual';
 import {
@@ -130,6 +132,8 @@ interface VarAnalyticsPanelProps {
   bookRows?: RowState[];
   /** Flat or custom Revenue/Expenses schedule from FX Risk. */
   forecastProfile?: ForecastProfileState;
+  /** Sync Forecast-profile line σ when Analytics / CFaR u₁ₘ chips change. */
+  onForecastProfileChange?: (profile: ForecastProfileState) => void;
   /** Opens the same Forecast profile modal as FX Risk. */
   onOpenForecastProfile?: () => void;
   /** Entity/group scope for overnight cash + swap-points curves (Market data). */
@@ -303,6 +307,7 @@ export function VarAnalyticsPanel({
   title: _moduleTitle = 'Analytics — VaR setup',
   bookRows,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
+  onForecastProfileChange,
   onOpenForecastProfile,
   ratesScopeId,
   marketRatesByCcy = {},
@@ -1095,49 +1100,31 @@ export function VarAnalyticsPanel({
   const showEvoHedge = evoProfile.length > 0;
 
   const patch = (partial: Partial<VarSetup>) => onSetupChange({ ...setup, ...partial });
+  /** Top-section u₁ₘ: write global setup and clear sticky Forecast-profile line overrides. */
+  const patchUncertainty1m = (value: number) => {
+    onSetupChange({ ...setup, forecastUncertainty1m: value });
+    if (onForecastProfileChange) {
+      const cleared = clearLineUncertainties(forecastProfile);
+      if (cleared !== forecastProfile) onForecastProfileChange(cleared);
+    }
+  };
 
-  /** Hedged-package Total carry @ Tf (live FWD) — matches Cash Carry CCY rows with a hedge. */
+  /** Same Σ as Cash Carry “All CCY” Total — risk CCYs only (matches the table). */
   const cashCarryTotalUsdM = useMemo(() => {
-    const ccys = new Set<string>();
-    for (const r of risk) ccys.add(r.bar.ccy);
-    for (const row of bookRows ?? []) {
-      if (row.ccy) ccys.add(row.ccy);
-    }
-    let hedgedSum = 0;
-    let hedgedN = 0;
-    let allSum = 0;
-    for (const ccy of ccys) {
-      if (ccy === 'USD') continue;
-      const marketRates = resolveMarketRatesForCcy(
-        marketRatesByCcy,
-        ccy,
-        ratesScopeId,
-      );
-      const cmp = buildCashForecastCarryComparison({
-        ccy,
-        bookRows,
-        forecastProfile,
-        forecastMonths: setup.forecastMonths,
-        marketRates,
-        bookedHedges,
-        preparedByCcy,
-        setup,
-      });
-      if (!cmp) continue;
-      const total = resolvedHedgedTotalCarryUsdM({
-        comparison: cmp,
-        prepared: preparedByCcy[ccy],
-        marketRates,
-      }).totalCarryUsdM;
-      allSum += total;
-      if (cmp.hasHedge) {
-        hedgedSum += total;
-        hedgedN += 1;
-      }
-    }
-    // Prefer Σ of hedged CCYs so the tab matches the active package (e.g. EUR
-    // strip), not unhedged residual on PLN/GBP pulling the figure down.
-    return hedgedN > 0 ? hedgedSum : allSum;
+    const ccys = risk
+      .map(r => r.bar.ccy)
+      .filter(ccy => ccy !== 'USD' && ccy.length > 0);
+    return sumCashCarryTotalUsdM({
+      ccys,
+      bookRows,
+      forecastProfile,
+      forecastMonths: setup.forecastMonths,
+      marketRatesFor: ccy =>
+        resolveMarketRatesForCcy(marketRatesByCcy, ccy, ratesScopeId),
+      bookedHedges,
+      preparedByCcy,
+      setup,
+    });
   }, [
     risk,
     bookRows,
@@ -1148,6 +1135,18 @@ export function VarAnalyticsPanel({
     bookedHedges,
     preparedByCcy,
   ]);
+
+  /**
+   * When Cash Carry is open, prefer the table footer total so the tab rail
+   * cannot drift from All CCY · Total (old hedged-only Σ was e.g. +508.2K).
+   */
+  const [cashCarryTableTotalUsdM, setCashCarryTableTotalUsdM] = useState<
+    number | null
+  >(null);
+  const cashCarryTabUsdM =
+    cashCarryTableTotalUsdM != null
+      ? cashCarryTableTotalUsdM
+      : cashCarryTotalUsdM;
 
   /** Aggregate net CFaR @ setup confidence — closed form (no MC) for the tab. */
   const cfarNetTotalUsdM = useMemo(() => {
@@ -1203,6 +1202,7 @@ export function VarAnalyticsPanel({
         prepared: preparedByCcy[ccy],
         tenureMonths: T,
         carryUsdM: carry,
+        forecastProfile,
       }).netCashUsdM;
     }
     return net;
@@ -1226,7 +1226,7 @@ export function VarAnalyticsPanel({
         label: 'Resid VaR',
       },
       cashCarry: {
-        value: fmtTabCarryK(cashCarryTotalUsdM),
+        value: fmtTabCarryK(cashCarryTabUsdM),
         label: 'Total carry',
       },
       cfar: {
@@ -1234,7 +1234,7 @@ export function VarAnalyticsPanel({
         label: 'Net CFaR',
       },
     };
-  }, [summary.totalVarAfterUsdM, cashCarryTotalUsdM, cfarNetTotalUsdM]);
+  }, [summary.totalVarAfterUsdM, cashCarryTabUsdM, cfarNetTotalUsdM]);
 
   const growthMoM = forecastProfile.growthRateMoM ?? 0;
 
@@ -1274,12 +1274,14 @@ export function VarAnalyticsPanel({
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
           onMarketRatesByCcyChange={onMarketRatesByCcyChange}
+          onAllCcyTotalCarryUsdMChange={setCashCarryTableTotalUsdM}
         />
       ) : perspective === 'cfar' ? (
         <CfarAnalysisView
           risk={risk}
           setup={setup}
           onSetupChange={onSetupChange}
+          onForecastProfileChange={onForecastProfileChange}
           bookedHedges={bookedHedges}
           preparedByCcy={preparedByCcy}
           bookRows={bookRows}
@@ -1364,7 +1366,7 @@ export function VarAnalyticsPanel({
                     disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
                     onClick={() => {
                       setUCustomOpen(false);
-                      patch({ forecastUncertainty1m: opt.value });
+                      patchUncertainty1m(opt.value);
                     }}
                     className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                       on
@@ -1386,7 +1388,7 @@ export function VarAnalyticsPanel({
                   if (u1m <= 0) {
                     const starter = 0.15;
                     setUCustomDraft('15');
-                    patch({ forecastUncertainty1m: starter });
+                    patchUncertainty1m(starter);
                   }
                 }}
                 className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
@@ -1415,7 +1417,7 @@ export function VarAnalyticsPanel({
                     const pct = Number(e.target.value);
                     if (!Number.isFinite(pct) || pct < 0) return;
                     setUCustomOpen(true);
-                    patch({ forecastUncertainty1m: pct / 100 });
+                    patchUncertainty1m(pct / 100);
                   }}
                 />
                 <span className="text-slate-500">%</span>
@@ -1425,7 +1427,7 @@ export function VarAnalyticsPanel({
           <p className="mt-1.5 text-[10px] text-slate-500">
             {setup.forecastMonths === 0
               ? 'Pick a forecast period &gt; 0 to enable quantity uncertainty.'
-              : `σ_E = |F|×${(u1m * 100).toFixed(2).replace(/\.?0+$/, '')}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — global default. Per-CCY line σ in Forecast profile (click Revenue / line name) overrides when set.`}
+              : `σ_E = |F|×${(u1m * 100).toFixed(2).replace(/\.?0+$/, '')}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — synced with Forecast profile line σ (top chips clear line overrides; modal line edits update this control).`}
           </p>
         </div>
       </section>

@@ -151,14 +151,27 @@ export interface CfarBandsResult {
   criticalCashUsdM: number;
   /** Peak net-of-carry bridge-funding VaR (USD M). */
   netCriticalCashUsdM: number;
-  /** Month of the worst net point. */
+  /** Month of the worst net point (0 when net is fully offset by carry). */
   peakMonth: number;
+  /** Month of the worst gross (pre-carry) point. */
+  grossPeakMonth: number;
   /** No longer meaningful (point-in-time calc has no running-max uplift) — always 1. */
   kEmpirical: number;
 }
 
-/** Standard-normal quantiles for the percentile bands (closed form). */
+/**
+ * Standard-normal quantiles for the percentile bands (closed form), at the
+ * conventional 90/95/99 confidence family. Only the p25/p75-to-p05/p95 RATIO
+ * is used at runtime (0.6745/1.6449 ≈ 0.41) — the outer band itself is
+ * rescaled to the caller's actual chosen confidence (see INNER_OUTER_RATIO
+ * below), so the whole fan visibly resizes when confidence changes instead
+ * of only the headline marker moving against a frozen shape.
+ */
 const Z_QUANTILE = { p05: -1.6449, p25: -0.6745, p50: 0, p75: 0.6745, p95: 1.6449 } as const;
+/** Inner (p25/p75) band as a fraction of the outer (p05/p95) band — kept
+ * constant across confidence levels so the fan's nesting proportions don't
+ * change, only its overall size. */
+const INNER_OUTER_RATIO = Z_QUANTILE.p25 / Z_QUANTILE.p05;
 
 /**
  * CFaR bands: closed-form point-in-time bridge-funding VaR at each t, plus
@@ -216,6 +229,7 @@ export function computeCfarBands(input: {
       criticalCashUsdM: 0,
       netCriticalCashUsdM: 0,
       peakMonth: 0,
+      grossPeakMonth: 0,
       kEmpirical: 1,
     };
   }
@@ -224,11 +238,15 @@ export function computeCfarBands(input: {
   let criticalCashUsdM = 0;
   let netCriticalCashUsdM = 0;
   let peakMonth = 0;
+  let grossPeakMonth = 0;
   const checkPeak = (t: number) => {
     const carry = carryAt(t);
     const scale = Math.abs(exposureAtKnots(knots, t)) * spotUsd * sigmaMonthly * Math.sqrt(t);
     const confMag = scale * zConf;
-    if (confMag > criticalCashUsdM) criticalCashUsdM = confMag;
+    if (confMag > criticalCashUsdM) {
+      criticalCashUsdM = confMag;
+      grossPeakMonth = t;
+    }
     const netConfMag = confMag - carry;
     if (netConfMag > netCriticalCashUsdM) {
       netCriticalCashUsdM = netConfMag;
@@ -242,17 +260,20 @@ export function computeCfarBands(input: {
     // fixed notional has the same-shaped P&L distribution regardless of
     // g(t)'s sign, so only the magnitude matters.
     const scale = Math.abs(exposureAtKnots(knots, t)) * spotUsd * sigmaMonthly * Math.sqrt(t);
-    const p05 = scale * Z_QUANTILE.p05;
+    // Outer band matches the caller's actual confidence exactly (so the
+    // headline marker always lands ON the p05/p95 boundary); inner band
+    // keeps the same proportion of it regardless of confidence.
+    const p05 = scale * -zConf;
     const netP05 = p05 + carry;
     points.push({
       t,
       exposureLocalM: exposureAtKnots(knots, t),
       carryUsdM: carry,
       p05,
-      p25: scale * Z_QUANTILE.p25,
+      p25: scale * -zConf * INNER_OUTER_RATIO,
       p50: 0,
-      p75: scale * Z_QUANTILE.p75,
-      p95: scale * Z_QUANTILE.p95,
+      p75: scale * zConf * INNER_OUTER_RATIO,
+      p95: scale * zConf,
       netP05,
       netP50: carry,
     });
@@ -271,6 +292,7 @@ export function computeCfarBands(input: {
     criticalCashUsdM,
     netCriticalCashUsdM,
     peakMonth,
+    grossPeakMonth,
     kEmpirical: 1,
   };
 }

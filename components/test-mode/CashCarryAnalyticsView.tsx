@@ -523,6 +523,11 @@ interface CashCarryAnalyticsViewProps {
   /** Optional tab heading (Liquidity tab). */
   title?: string;
   subtitle?: string;
+  /**
+   * Live All-CCY Total carry (same as table footer) — keeps Analytics tab rail
+   * in lockstep with the Cash Carry table.
+   */
+  onAllCcyTotalCarryUsdMChange?: (totalCarryUsdM: number) => void;
 }
 
 /** Prefer M12 for legend inspect; else last available month. */
@@ -626,123 +631,51 @@ function CarryEvolutionBarChart({
     );
   };
 
-  /** Default cumulative look: Do nothing + Enhancement. */
+  /**
+   * Cumulative do-nothing vs cumulative enhancement — bipolar by sign:
+   * · Yellow = do-nothing on its own side of the axis (neg → below, pos → above)
+   * · Green = positive improvement ALWAYS above the axis
+   * · Red = disimprovement ALWAYS below the axis
+   * Same rule for every month bar (PLN: yellow down + green up).
+   */
   const renderStructureStack = (
     doNothing: number,
-    total: number,
+    _total: number,
     diff: number,
     ring: string,
   ) => {
     const posSegs: { h: number; cls: string; title: string }[] = [];
     const negSegs: { h: number; cls: string; title: string }[] = [];
+    const amber = 'bg-amber-300/90';
+    const green = 'bg-emerald-400/85';
+    const red = 'bg-rose-400/75';
 
-    if (doNothing > 0 || (doNothing >= 0 && Math.abs(total) < 1e-12)) {
-      if (diff > 1e-12) {
-        posSegs.push(
-          {
-            h: hOf(doNothing),
-            cls: 'bg-amber-300/90',
-            title: `Do nothing ${fmtK(doNothing)}`,
-          },
-          {
-            h: hOf(diff),
-            cls: 'bg-emerald-400/85',
-            title: `Enhancement ${fmtK(diff)}`,
-          },
-        );
-      } else if (diff < -1e-12) {
-        posSegs.push(
-          {
-            h: hOf(total),
-            cls: 'bg-emerald-400/85',
-            title: `Total carry ${fmtK(total)}`,
-          },
-          {
-            h: hOf(Math.abs(diff)),
-            cls: 'bg-rose-400/75',
-            title: `Enhancement ${fmtK(diff)}`,
-          },
-        );
-      } else if (doNothing > 1e-12) {
-        posSegs.push({
-          h: hOf(doNothing),
-          cls: 'bg-amber-300/90',
-          title: `Do nothing ${fmtK(doNothing)}`,
-        });
-      }
-    } else if (doNothing < 0) {
-      if (diff > 1e-12) {
-        negSegs.push(
-          {
-            h: hOf(Math.abs(doNothing)),
-            cls: 'bg-amber-300/90',
-            title: `Do nothing ${fmtK(doNothing)}`,
-          },
-          {
-            h: hOf(diff),
-            cls: 'bg-emerald-400/85',
-            title: `Enhancement ${fmtK(diff)}`,
-          },
-        );
-      } else if (diff < -1e-12) {
-        negSegs.push(
-          {
-            h: hOf(Math.abs(doNothing)),
-            cls: 'bg-amber-300/90',
-            title: `Do nothing ${fmtK(doNothing)}`,
-          },
-          {
-            h: hOf(Math.abs(diff)),
-            cls: 'bg-rose-400/75',
-            title: `Enhancement ${fmtK(diff)}`,
-          },
-        );
-      } else {
-        negSegs.push({
-          h: hOf(Math.abs(doNothing)),
-          cls: 'bg-amber-300/90',
-          title: `Do nothing ${fmtK(doNothing)}`,
-        });
-      }
-    } else if (total > 1e-12) {
+    if (doNothing > 1e-12) {
       posSegs.push({
-        h: hOf(total),
-        cls: 'bg-emerald-400/85',
-        title: `Total carry ${fmtK(total)}`,
+        h: hOf(doNothing),
+        cls: amber,
+        title: `Do nothing ${fmtK(doNothing)}`,
       });
-    } else if (total < -1e-12) {
+    } else if (doNothing < -1e-12) {
       negSegs.push({
-        h: hOf(Math.abs(total)),
-        cls: 'bg-emerald-400/85',
-        title: `Total carry ${fmtK(total)}`,
+        h: hOf(Math.abs(doNothing)),
+        cls: amber,
+        title: `Do nothing ${fmtK(doNothing)}`,
       });
     }
 
-    if (doNothing < 0 && total > 0) {
-      negSegs.length = 0;
-      posSegs.length = 0;
-      negSegs.push({
-        h: hOf(Math.abs(doNothing)),
-        cls: 'bg-amber-300/90',
-        title: `Do nothing ${fmtK(doNothing)}`,
-      });
+    if (diff > 1e-12) {
+      // Improvement always stacks on the positive (top) side.
       posSegs.push({
-        h: hOf(total),
-        cls: 'bg-emerald-400/85',
-        title: `Total carry ${fmtK(total)}`,
+        h: hOf(diff),
+        cls: green,
+        title: `Enhancement ${fmtK(diff)}`,
       });
-    } else if (doNothing > 0 && total < 0) {
-      negSegs.length = 0;
-      posSegs.length = 0;
-      posSegs.push({
-        h: hOf(doNothing),
-        cls: 'bg-amber-300/90',
-        title: `Do nothing ${fmtK(doNothing)}`,
-      });
+    } else if (diff < -1e-12) {
       negSegs.push({
-        h: hOf(Math.abs(total)),
-        cls: 'bg-emerald-400/85',
-        title: `Total carry ${fmtK(total)}`,
+        h: hOf(Math.abs(diff)),
+        cls: red,
+        title: `Enhancement ${fmtK(diff)}`,
       });
     }
 
@@ -817,7 +750,6 @@ function CarryEvolutionBarChart({
           const total = bar.improvedCarryUsdM;
           const doNothing = bar.defaultCarryUsdM;
           const diff = bar.hedgeImprovementUsdM;
-          const totalH = hOf(Math.abs(total));
           const beyondForecast = Tf > 0 && bar.months > Tf + 1e-9;
           const horizonOn = perLeg
             ? Math.abs(bar.months - activeMonths) < 0.51 && !beyondForecast
@@ -916,37 +848,7 @@ function CarryEvolutionBarChart({
                 }`}
                 style={{ height: CARRY_CHART_BODY_H }}
               >
-                {perLeg ? (
-                  <>
-                    <div
-                      className="flex w-full flex-1 flex-col items-center justify-end"
-                      style={{ height: halfPx }}
-                    >
-                      {total >= 0 && totalH > 0 && (
-                        <div
-                          className={`w-7 rounded-t-sm sm:w-8 bg-emerald-400/85 ${
-                            horizonOn ? 'ring-1 ring-emerald-400/50' : ''
-                          }`}
-                          style={{ height: totalH }}
-                          title={`Final accrued ${fmtK(total)}`}
-                        />
-                      )}
-                    </div>
-                    <div className="h-px w-full bg-slate-500/80" />
-                    <div
-                      className="flex w-full flex-col items-center justify-start"
-                      style={{ height: halfPx }}
-                    >
-                      {total < 0 && totalH > 0 && (
-                        <div
-                          className="w-7 rounded-b-sm bg-rose-400/80 sm:w-8"
-                          style={{ height: totalH }}
-                          title={`Final accrued ${fmtK(total)}`}
-                        />
-                      )}
-                    </div>
-                  </>
-                ) : expanded ? (
+                {expanded ? (
                   renderComponentStack(
                     bar.hedgeBreakdown.fcyInterestUsdM,
                     bar.hedgeBreakdown.fwdCarryUsdM,
@@ -1014,19 +916,26 @@ function CarryEvolutionBarChart({
         {perLeg ? (
           <>
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
-              <span className="inline-block h-2 w-2 rounded-sm bg-emerald-400/85" />
-              <span className="text-slate-500">Accrued</span>
+              <span className="inline-block h-2 w-2 rounded-sm bg-amber-300/90" />
+              <span className="text-slate-500">Do nothing</span>
               <span
                 className={
-                  (inspected?.improvedCarryUsdM ?? 0) >= 0
-                    ? 'text-emerald-300/90'
+                  (inspected?.defaultCarryUsdM ?? 0) >= 0
+                    ? 'text-amber-200/90'
                     : 'text-rose-300/90'
                 }
               >
-                {fmtK(inspected?.improvedCarryUsdM ?? 0)}
+                {fmtK(inspected?.defaultCarryUsdM ?? 0)}
               </span>
             </span>
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
+              <span
+                className={`inline-block h-2 w-2 rounded-sm ${
+                  (inspected?.hedgeImprovementUsdM ?? 0) >= 0
+                    ? 'bg-emerald-400/85'
+                    : 'bg-rose-400/75'
+                }`}
+              />
               <span className="text-slate-500">Enhancement</span>
               <span
                 className={
@@ -1036,6 +945,18 @@ function CarryEvolutionBarChart({
                 }
               >
                 {fmtK(inspected?.hedgeImprovementUsdM ?? 0)}
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
+              <span className="text-slate-500">Carry Σ</span>
+              <span
+                className={
+                  (inspected?.improvedCarryUsdM ?? 0) >= 0
+                    ? 'font-semibold text-emerald-100'
+                    : 'font-semibold text-rose-300/90'
+                }
+              >
+                {fmtK(inspected?.improvedCarryUsdM ?? 0)}
               </span>
             </span>
           </>
@@ -1094,7 +1015,13 @@ function CarryEvolutionBarChart({
               </span>
             </span>
             <span className="inline-flex items-center gap-1.5 font-mono tabular-nums">
-              <span className="inline-block h-2 w-2 rounded-sm bg-emerald-400/85" />
+              <span
+                className={`inline-block h-2 w-2 rounded-sm ${
+                  (inspected?.hedgeImprovementUsdM ?? 0) >= 0
+                    ? 'bg-emerald-400/85'
+                    : 'bg-rose-400/75'
+                }`}
+              />
               <span className="text-slate-500">Enhancement</span>
               <span
                 className={
@@ -2134,6 +2061,7 @@ function SettleWamDeltaVsBookChart({
         ...legBars!.map(b =>
           Math.max(
             Math.abs(b.improvedCarryUsdM),
+            Math.abs(b.defaultCarryUsdM),
             Math.abs(b.hedgeImprovementUsdM),
           ),
         ),
@@ -2787,15 +2715,13 @@ function SettleWamDeltaVsBookChart({
             {legBars!.map((bar, i) => {
               const cx = xOf(bar.months);
               const total = bar.improvedCarryUsdM;
+              const doNothing = bar.defaultCarryUsdM;
               const diff = bar.hedgeImprovementUsdM;
-              const totalH = Math.max(
-                Math.abs(total) > 1e-12 ? 3 : 0,
-                Math.round((Math.abs(total) / legMaxAbs) * legHalfPx),
-              );
-              const diffH = Math.max(
-                Math.abs(diff) > 1e-12 ? 3 : 0,
-                Math.round((Math.abs(diff) / legMaxAbs) * legHalfPx),
-              );
+              const hPx = (abs: number) =>
+                Math.max(
+                  abs > 1e-12 ? 3 : 0,
+                  Math.round((abs / legMaxAbs) * legHalfPx),
+                );
               const x = cx - legBarW / 2;
               const active =
                 selectedSettleMonths != null &&
@@ -2805,68 +2731,88 @@ function SettleWamDeltaVsBookChart({
                 bar.amountLocalM != null
                   ? `Δ ${bar.amountLocalM.toFixed(2)}M`
                   : null,
-                `accrued ${fmtK(total)}`,
+                `do nothing ${fmtK(doNothing)}`,
                 `enhancement ${fmtK(diff)}`,
+                `accrued ${fmtK(total)}`,
               ]
                 .filter(Boolean)
                 .join(' · ');
+              const amber = 'rgba(252, 211, 77, 0.9)';
+              const green = 'rgba(52, 211, 153, 0.85)';
+              const red = 'rgba(251, 113, 133, 0.75)';
+              // Same bipolar rule as CarryEvolutionBarChart: yellow by
+              // do-nothing sign; green improvement always above mid-line.
+              const upSegs: { h: number; fill: string }[] = [];
+              const dnSegs: { h: number; fill: string }[] = [];
+              if (doNothing > 1e-12) {
+                upSegs.push({ h: hPx(doNothing), fill: amber });
+              } else if (doNothing < -1e-12) {
+                dnSegs.push({ h: hPx(Math.abs(doNothing)), fill: amber });
+              }
+              if (diff > 1e-12) {
+                upSegs.push({ h: hPx(diff), fill: green });
+              } else if (diff < -1e-12) {
+                dnSegs.push({ h: hPx(Math.abs(diff)), fill: red });
+              }
+              const upExtent = upSegs.reduce((s, x) => s + x.h, 0);
+              const dnExtent = dnSegs.reduce((s, x) => s + x.h, 0);
               return (
                 <g key={`leg-bar-${bar.id}-${i}`}>
                   <title>{title}</title>
-                  {totalH > 0 && (
-                    <rect
-                      x={x}
-                      y={legBarMidY - totalH}
-                      width={legBarW}
-                      height={totalH}
-                      rx={1.5}
-                      fill={
-                        total >= 0
-                          ? 'rgba(52, 211, 153, 0.85)'
-                          : 'rgba(251, 113, 133, 0.8)'
+                  {upSegs.map((s, si) => {
+                    let acc = 0;
+                    for (let j = upSegs.length - 1; j > si; j -= 1) {
+                      acc += upSegs[j]!.h;
+                    }
+                    const rectY = legBarMidY - upExtent + acc;
+                    return (
+                      <rect
+                        key={`u-${si}`}
+                        x={x}
+                        y={rectY}
+                        width={legBarW}
+                        height={s.h}
+                        rx={si === 0 ? 1.5 : 0}
+                        fill={s.fill}
+                        stroke={active ? '#a7f3d0' : 'transparent'}
+                        strokeWidth={active ? 1.25 : 0}
+                      />
+                    );
+                  })}
+                  {dnSegs.map((s, si) => {
+                    let acc = 0;
+                    for (let j = 0; j < si; j += 1) acc += dnSegs[j]!.h;
+                    return (
+                      <rect
+                        key={`d-${si}`}
+                        x={x}
+                        y={legBarMidY + acc}
+                        width={legBarW}
+                        height={s.h}
+                        rx={si === dnSegs.length - 1 ? 1.5 : 0}
+                        fill={s.fill}
+                        stroke={active ? '#a7f3d0' : 'transparent'}
+                        strokeWidth={active ? 1.25 : 0}
+                      />
+                    );
+                  })}
+                  {(upExtent > 0 || dnExtent > 0) && (
+                    <text
+                      x={cx}
+                      y={
+                        upExtent >= dnExtent
+                          ? legBarMidY - upExtent - 3
+                          : legBarMidY + dnExtent + 9
                       }
-                      stroke={active ? '#a7f3d0' : 'transparent'}
-                      strokeWidth={active ? 1.25 : 0}
-                    />
+                      textAnchor="middle"
+                      fill={diff >= 0 ? '#6ee7b7' : '#fda4af'}
+                      fontSize={7}
+                      fontFamily="ui-monospace, monospace"
+                      pointerEvents="none"
+                    >
+                      {fmtK(total)}
+                    </text>
                   )}
-                  {diffH > 0 && (
-                    <rect
-                      x={x}
-                      y={legBarMidY}
-                      width={legBarW}
-                      height={diffH}
-                      rx={1.5}
-                      fill={
-                        diff >= 0
-                          ? 'rgba(56, 189, 248, 0.85)'
-                          : 'rgba(251, 113, 133, 0.8)'
-                      }
-                      stroke={active ? '#7dd3fc' : 'transparent'}
-                      strokeWidth={active ? 1.25 : 0}
-                    />
-                  )}
-                  <text
-                    x={cx}
-                    y={legBarMidY - totalH - 3}
-                    textAnchor="middle"
-                    fill="#6ee7b7"
-                    fontSize={7}
-                    fontFamily="ui-monospace, monospace"
-                    pointerEvents="none"
-                  >
-                    {fmtK(total)}
-                  </text>
-                  <text
-                    x={cx}
-                    y={Math.min(legBarMidY + diffH + 9, legNameY - 2)}
-                    textAnchor="middle"
-                    fill={diff >= 0 ? '#7dd3fc' : '#fda4af'}
-                    fontSize={7}
-                    fontFamily="ui-monospace, monospace"
-                    pointerEvents="none"
-                  >
-                    {fmtK(diff)}
-                  </text>
                   <text
                     x={cx}
                     y={legNameY}
@@ -3005,6 +2951,7 @@ export function CashCarryAnalyticsView({
   onMarketRatesByCcyChange,
   title,
   subtitle,
+  onAllCcyTotalCarryUsdMChange,
 }: CashCarryAnalyticsViewProps) {
   /** Resolve the uploaded curve for any CCY — multi-ccy table rows use this directly. */
   const marketRatesFor = useCallback(
@@ -3347,6 +3294,10 @@ export function CashCarryAnalyticsView({
       },
     );
   }, [multiCcyRows]);
+
+  useEffect(() => {
+    onAllCcyTotalCarryUsdMChange?.(multiCcyTotals.totalCarryUsdM);
+  }, [multiCcyTotals.totalCarryUsdM, onAllCcyTotalCarryUsdMChange]);
 
   const selectCcyRow = (ccy: string) => {
     setChartCcy(ccy);
