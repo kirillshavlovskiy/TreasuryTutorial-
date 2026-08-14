@@ -6,6 +6,7 @@ export type RiskPerspective =
   | 'fxRisk'
   | 'cashCarry'
   | 'cfar'
+  | 'liquidity'
   | 'dv01'
   | 'greeks';
 
@@ -56,6 +57,16 @@ export const RISK_PERSPECTIVES: {
       'Worst running drawdown of accrued cash P&L from the FX position over the horizon (95/99% across MC paths), net of the carry earned by the drawdown peak — the peak funding the desk must be able to cover.',
     yLabel: 'Cash drawdown $K',
     defaultStatLabel: 'Net CFaR',
+  },
+  {
+    id: 'liquidity',
+    label: 'Liquidity',
+    title: 'Liquidity funding — swap strategy comparison',
+    active: true,
+    description:
+      'How the dip in the dated cash path gets covered, and what each way of covering it costs. The overdraft baseline, a leg per cycle rolled, the same strip pre-booked, and one committed term swap — all priced on the same annual interest ledger.',
+    yLabel: 'Funding cost $K',
+    defaultStatLabel: 'Funding cost',
   },
 ];
 

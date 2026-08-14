@@ -46,6 +46,17 @@ export interface TaskAnswers {
   varForecastUncertainty: string;
   /** FX vol source for σ₁ₘ: historical | implied. */
   varVolSource: string;
+  /**
+   * σ₁ₘ overrides replacing the desk presets, as fractions ("0.032"). Held
+   * per source so each keeps its own edited value. Empty = use the preset.
+   */
+  varVolHistorical: string;
+  varVolImplied: string;
+  /**
+   * Rate-differential vol override in bp/year ("120"), replacing the
+   * per-currency desk table for every currency. Empty = use the table.
+   */
+  varRateVol: string;
   /** Average sampling: midMonth | monthEnd. */
   varAveragingConvention: string;
   /**

@@ -14,12 +14,17 @@ import {
   type HedgePathSummaryMetrics,
 } from '@/components/test-mode/ExposureHedgePathChart';
 import {
+  chipsFromPathSummary,
+  HedgeStagingHeader,
+} from '@/components/test-mode/HedgeStagingHeader';
+import {
   DEFAULT_FORECAST_PROFILE,
   clearLineUncertainties,
   monthlyFlowSeriesLocalM,
   type ForecastProfileState,
+  type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
-import type { RowState } from '@/lib/fx-buffer';
+import type { LayerId, RowState } from '@/lib/fx-buffer';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   hedgeBasisNotionalLocalM,
@@ -59,6 +64,7 @@ import {
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
 import { CashCarryAnalyticsView } from '@/components/test-mode/CashCarryAnalyticsView';
 import { CfarAnalysisView } from '@/components/test-mode/CfarAnalysisView';
+import { LiquidityAnalyticsView } from '@/components/test-mode/LiquidityAnalyticsView';
 import {
   assignImpliedCarryFromSwapPoints,
   buildCashForecastCarryComparison,
@@ -66,6 +72,14 @@ import {
   sumCashCarryTotalUsdM,
 } from '@/lib/test-mode/cash-carry-analytics';
 import { residualCfarClosedFormUsdM } from '@/lib/test-mode/cfar-residual';
+import {
+  liquidityStrategyInputFrom,
+  liveLiquidityCostUsdYrM,
+} from '@/lib/test-mode/liquidity-strategies';
+import {
+  DEFAULT_LIQUIDITY_TIMING,
+  resolveLiquidityTiming,
+} from '@/lib/liquidity-ladder';
 import {
   resolveMarketRatesForCcy,
   type FxMarketRatesBundle,
@@ -91,6 +105,7 @@ import {
   VAR_PROFILE_OPTIONS,
   VAR_VOL_SOURCE_OPTIONS,
   volForHorizon,
+  volForSource,
   type VarHorizonId,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
@@ -143,11 +158,19 @@ interface VarAnalyticsPanelProps {
   onMarketRatesByCcyChange?: (
     next: Record<string, FxMarketRatesBundle>,
   ) => void;
+  /** Desk layers — Liquidity Analytics sizes counterfactuals on the same stack. */
+  activeLayers?: Set<LayerId>;
+  /** Desk-computed funded plan per CCY. Live strategy uses this strip as-is. */
+  livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
 }
 
 function fmtVarK(usdM: number): string {
   return `$${(usdM * 1000).toFixed(0)}K`;
 }
+
+/** Stable default — a `= {}` literal would be a fresh object every render, and
+ * the CFaR panel keys its Monte Carlo memos on this map. */
+const EMPTY_MARKET_RATES_BY_CCY: Record<string, FxMarketRatesBundle> = {};
 
 /** Tab-rail Resid VaR — $M when ≥ $0.1M, else $K. */
 function fmtTabResidVar(usdM: number): string {
@@ -278,7 +301,7 @@ function stubRowFromBar(ccy: string, flowM: number): RowState {
     payout: 0,
     collections: flowM,
     fcastFX: 0,
-    nonNpCash: 0,
+    nonLpCash: 0,
     cash_floor: 0,
     ir_asset_notional: 0,
     ir_asset_rate: 0,
@@ -310,8 +333,10 @@ export function VarAnalyticsPanel({
   onForecastProfileChange,
   onOpenForecastProfile,
   ratesScopeId,
-  marketRatesByCcy = {},
+  marketRatesByCcy = EMPTY_MARKET_RATES_BY_CCY,
   onMarketRatesByCcyChange,
+  activeLayers,
+  livePlanByCcy,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -663,7 +688,9 @@ export function VarAnalyticsPanel({
     setup.confidencePct,
     setup.forecastUncertainty1m,
     lineUncertaintySig,
-    setup.volSource,
+    // Effective σ₁ₘ, not just the source id — an edited override changes the
+    // vol without changing which source is selected.
+    monthlyVolForSetup(setup),
     chartSizingSetup.horizon,
     chartSizingSetup.exposureBasis,
   ].join('|');
@@ -1217,6 +1244,41 @@ export function VarAnalyticsPanel({
     preparedByCcy,
   ]);
 
+  /**
+   * Net annual cost of the funding regime the book is running, on the same
+   * evaluator the Liquidity tab tables — not a second computation that has to
+   * be kept in step with it.
+   */
+  const liquidityCostUsdYrM = useMemo(() => {
+    const timing =
+      resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
+    return liveLiquidityCostUsdYrM(
+      liquidityStrategyInputFrom({
+        setup,
+        bookRows,
+        forecastProfile,
+        bookedHedges,
+        preparedByCcy,
+        ratesScopeId,
+        marketRatesByCcy,
+        activeLayers,
+        livePlanByCcy,
+      }),
+      timing.sizingBasis ?? 'horizon',
+      timing.bookingMode ?? 'rolling',
+    );
+  }, [
+    setup,
+    bookRows,
+    forecastProfile,
+    bookedHedges,
+    preparedByCcy,
+    ratesScopeId,
+    marketRatesByCcy,
+    activeLayers,
+    livePlanByCcy,
+  ]);
+
   const perspectiveTabStats = useMemo((): Partial<
     Record<RiskPerspective, RiskPerspectiveTabStat>
   > => {
@@ -1233,8 +1295,17 @@ export function VarAnalyticsPanel({
         value: fmtTabResidVar(cfarNetTotalUsdM),
         label: 'Net CFaR',
       },
+      liquidity: {
+        value: fmtTabCarryK(-liquidityCostUsdYrM),
+        label: 'Funding cost',
+      },
     };
-  }, [summary.totalVarAfterUsdM, cashCarryTabUsdM, cfarNetTotalUsdM]);
+  }, [
+    summary.totalVarAfterUsdM,
+    cashCarryTabUsdM,
+    cfarNetTotalUsdM,
+    liquidityCostUsdYrM,
+  ]);
 
   const growthMoM = forecastProfile.growthRateMoM ?? 0;
 
@@ -1288,6 +1359,19 @@ export function VarAnalyticsPanel({
           forecastProfile={forecastProfile}
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
+        />
+      ) : perspective === 'liquidity' ? (
+        <LiquidityAnalyticsView
+          setup={setup}
+          bookRows={bookRows}
+          forecastProfile={forecastProfile}
+          onForecastProfileChange={onForecastProfileChange}
+          bookedHedges={bookedHedges}
+          preparedByCcy={preparedByCcy}
+          ratesScopeId={ratesScopeId}
+          marketRatesByCcy={marketRatesByCcy}
+          activeLayers={activeLayers}
+          livePlanByCcy={livePlanByCcy}
         />
       ) : perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
@@ -1543,11 +1627,17 @@ export function VarAnalyticsPanel({
                   >
                     {VAR_VOL_SOURCE_OPTIONS.map(opt => {
                       const on = setup.volSource === opt.id;
+                      const eff = volForSource(setup, opt.id);
+                      const edited = Math.abs(eff - opt.monthlyVol) > 1e-12;
                       return (
                         <button
                           key={opt.id}
                           type="button"
-                          title={opt.description}
+                          title={
+                            edited
+                              ? `${opt.description}\nOverridden on the CFaR tab — desk preset is ${(opt.monthlyVol * 100).toFixed(1)}%.`
+                              : opt.description
+                          }
                           onClick={() => patch({ volSource: opt.id })}
                           className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
                             on
@@ -1556,8 +1646,13 @@ export function VarAnalyticsPanel({
                           }`}
                         >
                           {opt.label}
-                          <span className="ml-1 font-mono text-[10px] font-normal opacity-80">
-                            {(opt.monthlyVol * 100).toFixed(1)}%
+                          <span
+                            className={`ml-1 font-mono text-[10px] font-normal ${
+                              edited ? 'text-emerald-300' : 'opacity-80'
+                            }`}
+                          >
+                            {(eff * 100).toFixed(1)}%
+                            {edited ? '*' : ''}
                           </span>
                         </button>
                       );
@@ -2144,15 +2239,11 @@ export function VarAnalyticsPanel({
           >
             <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
               <div className="sticky top-0 z-30 shrink-0 border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <h4
-                      id="exposure-path-title"
-                      className="text-sm font-semibold text-white"
-                    >
-                      {chartCcy} — hedge profile
-                    </h4>
-                    <p className="mt-0.5 text-[11px] text-slate-400">
+                <HedgeStagingHeader
+                  titleId="exposure-path-title"
+                  title={`${chartCcy} — hedge profile`}
+                  subtitle={
+                    <>
                       Structure:{' '}
                       <span className="font-semibold text-violet-200">
                         {effectiveStructure === 'strip' ? 'Strip' : 'Bullet'}
@@ -2166,83 +2257,17 @@ export function VarAnalyticsPanel({
                             ? 'VaR-neutral'
                             : 'Target (Total)'}
                       </span>
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
-                    {pathPrepareAction && (
-                      <button
-                        type="button"
-                        disabled={pathPrepareAction.disabled}
-                        onClick={() => pathPrepareAction.run()}
-                        title={pathPrepareAction.title}
-                        className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        {pathPrepareAction.label}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={closePathChart}
-                      className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
-                    >
-                      Close
-                    </button>
-                  </div>
-                </div>
-                {pathSummaryMetrics && (
-                  <div className="mt-2 flex flex-wrap items-center gap-1">
-                    {(
-                      [
-                        [
-                          'Cover',
-                          pathSummaryMetrics.coverValue,
-                          pathSummaryMetrics.coverPct,
-                          pathSummaryMetrics.coverSub,
-                          'text-emerald-200',
-                        ],
-                        [
-                          'Legs',
-                          pathSummaryMetrics.legsValue,
-                          null,
-                          pathSummaryMetrics.legsSub,
-                          'text-sky-200',
-                        ],
-                        [
-                          'Resid',
-                          pathSummaryMetrics.residVarValue,
-                          pathSummaryMetrics.residVarPct,
-                          pathSummaryMetrics.residVarSub,
-                          'text-rose-300',
-                        ],
-                        [
-                          'BE',
-                          pathSummaryMetrics.breakevenValue,
-                          null,
-                          pathSummaryMetrics.breakevenSub,
-                          'text-amber-200/90',
-                        ],
-                      ] as const
-                    ).map(([label, value, pct, title, tone]) => (
-                      <span
-                        key={label}
-                        title={title ?? undefined}
-                        className="inline-flex items-center gap-1 rounded border border-slate-700/80 bg-slate-950/90 px-1.5 py-0.5 text-[10px] text-slate-500"
-                      >
-                        {label}{' '}
-                        <span
-                          className={`font-mono font-semibold tabular-nums ${tone}`}
-                        >
-                          {value}
-                        </span>
-                        {pct != null && (
-                          <span className="font-mono font-semibold tabular-nums text-slate-400">
-                            {pct}
-                          </span>
-                        )}
-                      </span>
-                    ))}
-                  </div>
-                )}
+                    </>
+                  }
+                  chips={
+                    pathSummaryMetrics
+                      ? chipsFromPathSummary(pathSummaryMetrics)
+                      : undefined
+                  }
+                  isPrebooked={Boolean(chartCcy && preparedByCcy[chartCcy])}
+                  prepareAction={pathPrepareAction}
+                  onClose={closePathChart}
+                />
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
               <ExposureHedgePathChart

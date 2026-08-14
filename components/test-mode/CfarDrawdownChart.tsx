@@ -2,6 +2,11 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { CfarBandsResult } from '@/lib/test-mode/cfar-drawdown';
+import {
+  splineBand,
+  splinePath,
+  type SplinePt,
+} from '@/components/test-mode/spline';
 
 function fmtK(usdM: number): string {
   return `$${(usdM * 1000).toFixed(0)}K`;
@@ -112,10 +117,15 @@ export function CfarDrawdownChart({
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
   const T = pts[pts.length - 1]!.t || 1;
+  // The banded curves are running maxima and only ratchet down-ward on the
+  // chart; the live curve is the same shortfall at that instant, so it
+  // releases back to zero when a position closes without converting. Only the
+  // simulated engine can supply it.
   let yMax = 0;
   let yMin = 0;
   for (const p of pts) {
-    yMax = Math.max(yMax, p.p95, p.carryUsdM);
+    // net is signed — above zero once carry outruns the live drawdown.
+    yMax = Math.max(yMax, p.p95, p.carryUsdM, p.netP05);
     yMin = Math.min(yMin, p.p05, p.netP05);
   }
   // Headline peaks use setup confidence (criticalCash / netCriticalCash).
@@ -127,21 +137,33 @@ export function CfarDrawdownChart({
     typeof bands.grossPeakMonth === 'number' && bands.grossPeakMonth > 0
       ? bands.grossPeakMonth
       : bands.peakMonth;
+  // The marker belongs ON the reserve floor, at the same depth as the headline
+  // Net CFaR and the summary card — not on the yellow curve's own trough. The
+  // two are different quantities and the floor is legitimately the deeper of
+  // them: the reserve percentiles each path's RUNNING MAX shortfall, so a path
+  // at its worst uncovered moment in M7 still counts even after it recovers by
+  // M12, while the curve only ever shows where things stand right now.
   const netPeakT = bands.peakMonth;
-  yMin = Math.min(yMin, -netPeakUsdM, -grossPeakUsdM);
+  const netCovered = netPeakUsdM <= 1e-9;
+  yMin = Math.min(yMin, -grossPeakUsdM);
+  if (!netCovered) yMin = Math.min(yMin, -netPeakUsdM);
   const spanRaw = yMax - yMin || 1;
   const pad = spanRaw * 0.08;
   yMax += pad;
   yMin -= pad;
   const x = (t: number) => padL + (t / T) * plotW;
   const y = (v: number) => padT + ((yMax - v) / (yMax - yMin)) * plotH;
-  const line = (sel: (p: (typeof pts)[number]) => number) =>
-    pts.map(p => `${x(p.t).toFixed(1)},${y(sel(p)).toFixed(1)}`).join(' ');
-  const band = (lo: (p: (typeof pts)[number]) => number, hi: (p: (typeof pts)[number]) => number) =>
-    `M ${pts.map(p => `${x(p.t).toFixed(1)},${y(hi(p)).toFixed(1)}`).join(' L ')} L ${[...pts]
-      .reverse()
-      .map(p => `${x(p.t).toFixed(1)},${y(lo(p)).toFixed(1)}`)
-      .join(' L ')} Z`;
+  // Monotone splines rather than straight segments: the reserve trough is the
+  // number the whole chart is about, and on a polyline it lands on a hard
+  // corner between two grid points. The monotone clamp rounds that basin
+  // without letting any curve overshoot the simulated values on either side.
+  const at = (sel: (p: (typeof pts)[number]) => number): SplinePt[] =>
+    pts.map(p => [x(p.t), y(sel(p))] as SplinePt);
+  const line = (sel: (p: (typeof pts)[number]) => number) => splinePath(at(sel));
+  const band = (
+    lo: (p: (typeof pts)[number]) => number,
+    hi: (p: (typeof pts)[number]) => number,
+  ) => splineBand(at(hi), at(lo));
   const spreadOuter = band(p => p.p05, p => p.p95);
   const spreadInner = band(p => p.p25, p => p.p75);
   const y0 = y(0);
@@ -161,9 +183,9 @@ export function CfarDrawdownChart({
   const gHi = gMax + gPad;
   const gLo = gMin - gPad;
   const yG = (v: number) => padT + ((gHi - v) / (gHi - gLo)) * plotH;
-  const fundingGapLine = gapPts
-    .map(g => `${x(g.t).toFixed(1)},${yG(g.gapLocalM).toFixed(1)}`)
-    .join(' ');
+  const fundingGapLine = splinePath(
+    gapPts.map(g => [x(g.t), yG(g.gapLocalM)] as SplinePt),
+  );
 
   // Month gridline ticks M0…M{round(T)} — matches the Resid VaR profile axis.
   const lastM = Math.max(1, Math.round(T));
@@ -191,8 +213,28 @@ export function CfarDrawdownChart({
                 <p>
                   Markers = CriticalCash at {confidencePct}% (same as the
                   table). Shaded fan is a fixed visual p05–p95 band (not the
-                  confidence chip). Yellow floor = net; amber = gross before
-                  carry.
+                  confidence chip). Amber = gross drawdown before carry.
+                  Yellow = amber plus green, read off the same axis: each
+                  path&apos;s own carry banked by t, less that path&apos;s worst
+                  drawdown up to t, percentiled. Above $0 the carry covers it.
+                  Netting per path rather than subtracting the two plotted
+                  lines is what makes it honest — carry and drawdown share the
+                  same balances, so the percentile has to land where BOTH went
+                  badly. With no risk at all the drawdown is zero and this is
+                  simply the carry P&amp;L.
+                </p>
+                <p className="mt-1">
+                  The dotted floor and its marker are the headline Net CFaR,
+                  and they can sit BELOW the yellow curve&apos;s own lowest
+                  point — by around 8% on a hedged book that earns carry. That
+                  is not a mismatch. The curve shows where the book stands at
+                  each instant; the reserve percentiles each path&apos;s WORST
+                  moment so far, so a path caught uncovered in M7 still counts
+                  against the facility even after carry has pulled it back by
+                  M12. Read the curve for where you end up and the floor for
+                  what you had to have on hand. They coincide exactly whenever
+                  carry is zero or the book pays it, because then nothing ever
+                  recovers.
                   {fundingGapLine
                     ? ' Fuchsia dashed = funding gap g(t) (zero vol, local M).'
                     : ''}
@@ -200,7 +242,8 @@ export function CfarDrawdownChart({
               </ChartInfoTip>
             </div>
             <span className="text-[9px] text-slate-500">
-              net M{fmtM(netPeakT)} · {fmtK(netPeakUsdM)}
+              net M{fmtM(netPeakT)} ·{' '}
+              {netCovered ? 'carry covers it' : fmtK(netPeakUsdM)}
               {' · '}
               <span className="text-amber-400/80">
                 gross M{fmtM(grossPeakT)} · {fmtK(grossPeakUsdM)}
@@ -239,23 +282,31 @@ export function CfarDrawdownChart({
         <line x1={padL} y1={y0} x2={W - padR} y2={y0} stroke="#475569" strokeWidth={1} />
         <path d={spreadOuter} fill="rgba(250,204,21,0.10)" />
         <path d={spreadInner} fill="rgba(250,204,21,0.20)" />
-        <polyline points={line(p => p.p50)} fill="none" stroke="#94a3b8" strokeWidth={1} strokeDasharray="3 3" />
-        <polyline
-          points={line(p => p.p05)}
+        <path d={line(p => p.p50)} fill="none" stroke="#94a3b8" strokeWidth={1} strokeDasharray="3 3" />
+        <path
+          d={line(p => p.p05)}
           fill="none"
           stroke="rgba(250,204,21,0.55)"
           strokeWidth={1.25}
           strokeDasharray="4 3"
         />
-        <polyline points={line(p => p.netP05)} fill="none" stroke="#facc15" strokeWidth={2} />
+        <path
+          d={line(p => p.netP05)}
+          fill="none"
+          stroke="#facc15"
+          strokeWidth={2}
+          strokeLinecap="round"
+        />
         {hasCarry && (
-          <polyline points={line(p => p.carryUsdM)} fill="none" stroke="#34d399" strokeWidth={1.25} strokeDasharray="4 2" />
+          <path d={line(p => p.carryUsdM)} fill="none" stroke="#34d399" strokeWidth={1.25} strokeDasharray="4 2" />
         )}
-        <line x1={padL} y1={yFloor} x2={W - padR} y2={yFloor} stroke="rgba(234,179,8,0.8)" strokeWidth={1} strokeDasharray="2 3" />
+        {!netCovered && (
+          <line x1={padL} y1={yFloor} x2={W - padR} y2={yFloor} stroke="rgba(234,179,8,0.8)" strokeWidth={1} strokeDasharray="2 3" />
+        )}
         {/* settlement funding gap g(t)=e−H_settled — own secondary axis */}
         {fundingGapLine && (
-          <polyline
-            points={fundingGapLine}
+          <path
+            d={fundingGapLine}
             fill="none"
             stroke="#e879f9"
             strokeWidth={1.5}
@@ -286,21 +337,25 @@ export function CfarDrawdownChart({
           fontWeight={600}
           fill="#fde047"
         >
-          net M{fmtM(netPeakT)} · {fmtK(netPeakUsdM)}
+          {netCovered
+            ? `net M${fmtM(netPeakT)} · carry covers it`
+            : `net M${fmtM(netPeakT)} · ${fmtK(netPeakUsdM)}`}
         </text>
         <text x={padL - 4} y={y0 + 3} textAnchor="end" fontSize={8} fill="#64748b">$0</text>
-        <text x={padL - 4} y={yFloor + 3} textAnchor="end" fontSize={8} fill="#fde047">
-          {fmtK(netPeakUsdM)}
-        </text>
+        {!netCovered && (
+          <text x={padL - 4} y={yFloor + 3} textAnchor="end" fontSize={8} fill="#fde047">
+            {fmtK(netPeakUsdM)}
+          </text>
+        )}
       </svg>
       <div className="mt-1.5 flex flex-wrap items-center gap-3 text-[9px] text-slate-500">
         <span><span className="mr-1 inline-block h-2 w-3.5 rounded-sm bg-yellow-400/25 align-middle" />visual p05–p95 fan</span>
-        <span><span className="mr-1 inline-block h-0.5 w-3 bg-yellow-400 align-middle" />net path (fan p05; dashed = gross)</span>
+        <span><span className="mr-1 inline-block h-0.5 w-3 bg-yellow-400 align-middle" />net = gross + carry (above $0 = carry covers it)</span>
         {hasCarry && (
           <span><span className="mr-1 inline-block h-0.5 w-3 border-t border-dashed border-emerald-400 align-middle" />carry accrual</span>
         )}
         <span><span className="mr-1 inline-block h-0.5 w-3 border-t border-dashed border-slate-400 align-middle" />median path</span>
-        <span><span className="mr-1 inline-block h-0.5 w-3 border-t-2 border-dotted border-yellow-500 align-middle" />net critical cash @ {confidencePct}%</span>
+        <span title="The reserve to hold, from each path's worst moment so far — so it can sit below the curve's own trough."><span className="mr-1 inline-block h-0.5 w-3 border-t-2 border-dotted border-yellow-500 align-middle" />net critical cash @ {confidencePct}%</span>
         <span className="text-amber-400/80"><span className="mr-1 inline-block h-2 w-2 rounded-full border-2 border-amber-500 align-middle" />gross peak @ {confidencePct}%</span>
         {fundingGapLine && (
           <span className="text-fuchsia-300/90">

@@ -46,9 +46,13 @@ import {
   parseVarHorizonId,
   parseVarSetup,
   parseVarVolSource,
+  parseVolOverrides,
   resetSandboxPersistent,
   saveSandboxPersistent,
   scoreTask01,
+  parseRateVolBpYr,
+  serializeRateVolOverride,
+  serializeVolOverride,
   simSeedForEntity,
   setupLabel,
   VAR_PROFILE_OPTIONS,
@@ -83,6 +87,7 @@ import {
   TASK01_INACTIVE_FX_INPUTS,
   updateDashboardFormula,
   updateDashboardFormulas,
+  updateDashboardForecastProfile,
   updateDashboardTiming,
   updateFxProfileConfig,
   type AnalyticalLayer,
@@ -119,11 +124,20 @@ const TASK01_TAB_LABELS: Partial<Record<SimulatorTab, string>> = {
   monteCarlo: 'Monte Carlo',
 };
 
-/** Always hide NP Layer Setup / IR Profile / Sensitivity in Task 01. */
+/** Always hide LP Layer Setup / IR Profile / Sensitivity in Task 01. */
 const TASK01_BASE_HIDDEN: SimulatorTab[] = ['layers', 'irprofile', 'sensitivity'];
 
 /** Analytical layers selectable in Task Mode create/edit (Sensitivity blocked). */
 const TASK01_SELECTABLE_ANALYTICAL = new Set<AnalyticalLayer>(['riskMetrics']);
+
+/**
+ * Shared fallback for a book that does not exist yet. Calling emptyHedgeBook()
+ * inline in render would hand every consumer a new object identity on each
+ * pass, and the CFaR panel keys its Monte Carlo memos on the market-rate map
+ * inside it — so an un-booked entity would re-run the simulation on every
+ * keystroke. Only ever read, never mutated.
+ */
+const EMPTY_HEDGE_BOOK = emptyHedgeBook();
 
 function hiddenTabsForLayers(
   decision: readonly DecisionLayer[],
@@ -482,6 +496,11 @@ export function Task01App({
       DEFAULT_VAR_SETUP.forecastUncertainty1m,
     volSource:
       parseVarVolSource(answers.varVolSource ?? '') ?? DEFAULT_VAR_SETUP.volSource,
+    volOverrides: parseVolOverrides({
+      varVolHistorical: answers.varVolHistorical,
+      varVolImplied: answers.varVolImplied,
+    }),
+    rateVolOverrideBpYr: parseRateVolBpYr(answers.varRateVol) ?? undefined,
     averagingConvention:
       parseVarAveragingConvention(answers.varAveragingConvention ?? '') ??
       DEFAULT_VAR_SETUP.averagingConvention,
@@ -500,6 +519,9 @@ export function Task01App({
         varForecastUncertainty:
           next.forecastUncertainty1m > 0 ? String(next.forecastUncertainty1m) : '',
         varVolSource: next.volSource,
+        varVolHistorical: serializeVolOverride(next, 'historical'),
+        varVolImplied: serializeVolOverride(next, 'implied'),
+        varRateVol: serializeRateVolOverride(next),
         varAveragingConvention: next.averagingConvention,
       },
       progress: markStep(progress, 'setVarConfidence'),
@@ -730,7 +752,7 @@ export function Task01App({
               onAdd={() => setModal('profile')}
               varSetup={varSetup}
               onVarSetupChange={setVarSetup}
-              hedgeBook={hedgesByEntityId[entity.id] ?? emptyHedgeBook()}
+              hedgeBook={hedgesByEntityId[entity.id] ?? EMPTY_HEDGE_BOOK}
               onHedgeBookChange={updater =>
                 updateHedges(prev => ({
                   ...prev,
@@ -792,6 +814,20 @@ export function Task01App({
                       entity.id,
                       dashboard.id,
                       updates,
+                    ),
+                  };
+                })
+              }
+              onForecastProfileChange={profile =>
+                update(prev => {
+                  if (!entity || !dashboard) return prev;
+                  return {
+                    ...prev,
+                    workspace: updateDashboardForecastProfile(
+                      prev.workspace,
+                      entity.id,
+                      dashboard.id,
+                      profile,
                     ),
                   };
                 })
@@ -1117,7 +1153,7 @@ function GroupConsolidatedView({
     () => aggregateBookedHedges(hedgesByEntityId, entityIds, true),
     [hedgesByEntityId, entityIds],
   );
-  const groupBook = hedgesByEntityId[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+  const groupBook = hedgesByEntityId[GROUP_HEDGE_SCOPE] ?? EMPTY_HEDGE_BOOK;
   const hedgeRatios = groupBook.hedgeRatios;
   const preparedByCcy = groupBook.preparedByCcy ?? {};
   const carrySessionsByCcy = groupBook.carrySessionsByCcy ?? {};
@@ -1259,10 +1295,11 @@ function GroupConsolidatedView({
           varSetup={varSetup}
           onVarSetupChange={onVarSetupChange}
           bookedHedges={bookedHedges}
+          preparedByCcy={preparedByCcy}
           hedgeRatios={hedgeRatios}
           initialRows={book.rows}
           initialUsdCash={book.usdCash}
-          initialUsdNonNpCash={book.usdNonNpCash}
+          initialUsdNonLpCash={book.usdNonLpCash}
           initialUsdParams={book.usdParams}
           initialActiveLayers={[]}
           fxInputs={[...TASK01_REQUIRED_FX_INPUTS]}
@@ -1880,6 +1917,7 @@ function DashboardView({
   onTimingChange,
   onFormulaChange,
   onFormulaChanges,
+  onForecastProfileChange,
   varSetup,
   onVarSetupChange,
   hedgeBook,
@@ -1895,6 +1933,7 @@ function DashboardView({
   onTimingChange: (t: TimingProfile) => void;
   onFormulaChange: (cellKey: string, formula: string) => void;
   onFormulaChanges: (updates: Record<string, string>) => void;
+  onForecastProfileChange: (profile: ForecastProfileState) => void;
   varSetup: VarSetup;
   onVarSetupChange: (setup: VarSetup) => void;
   hedgeBook: EntityHedgeBook;
@@ -2125,13 +2164,14 @@ function DashboardView({
                         : seed.rows
                     }
                     initialUsdCash={seed.usdCash}
-                    initialUsdNonNpCash={seed.usdNonNpCash}
+                    initialUsdNonLpCash={seed.usdNonLpCash}
                     initialUsdParams={seed.usdParams}
                     initialActiveLayers={[]}
                     simplifiedBook
                     varSetup={varSetup}
                     onVarSetupChange={onVarSetupChange}
                     bookedHedges={bookedHedges}
+                    preparedByCcy={preparedByCcy}
                     hedgeRatios={hedgeRatios}
                     onAnalyticsBookChange={setAnalyticsBook}
                     showRiskMetrics={
@@ -2146,6 +2186,8 @@ function DashboardView({
                     formulas={dashboard.formulas}
                     onFormulaChange={onFormulaChange}
                     onFormulaChanges={onFormulaChanges}
+                    forecastProfile={dashboard.forecastProfile}
+                    onForecastProfileChange={onForecastProfileChange}
                     hiddenTabs={hiddenTabsForLayers(
                       // Match Group FX: missing layers → Task 01 required defaults
                       // (empty decisionLayers hid Hedging + Live Ladder and collapsed the tab nav).

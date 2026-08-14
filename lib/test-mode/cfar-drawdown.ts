@@ -138,9 +138,15 @@ export interface CfarBandPoint {
   p50: number;
   p75: number;
   p95: number;
-  /** Net-of-carry adverse (p05) and median band. */
+  /** Drawdown measured against the carry buffer: carryUsdM − |p05|. Positive
+   * means the carry banked by t covers the worst drawdown reached by t. */
   netP05: number;
   netP50: number;
+  /**
+   * Point-in-time equivalents of the banded curves live on the simulated
+   * engine's own component points ({@link McCfarComponentPoint.rawGrossUsdM}
+   * and rawNetUsdM), not here — the bands are all high-water marks.
+   */
 }
 
 export interface CfarBandsResult {

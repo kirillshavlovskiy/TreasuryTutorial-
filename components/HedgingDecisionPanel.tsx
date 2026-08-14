@@ -2,30 +2,31 @@
 
 import { useState } from 'react';
 import { CURRENCY_PARAMS } from '@/lib/fx-buffer';
+import { DeskStepper } from '@/components/DeskStepper';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface HedgeRow {
   id: string;
   ccy: string;
-  cash: number;         // F: current NP cash balance (M FCY)
+  cash: number;         // F: current LP cash balance (M FCY)
   payout: number;       // G: forecast monthly outflow (M FCY, negative)
   collections: number;  // expected inflows arriving AFTER payouts (M FCY, positive)
-  nonNpCash: number;    // Model 2/3 FCY outside NP (M FCY)
+  nonLpCash: number;    // Model 2/3 FCY outside LP (M FCY)
   fxRatio: number;      // 0–1: fraction of structural change hedged via outright FX
                         //   auto-locked to 0 for EARN CARRY; user-editable for PAY CARRY
 }
 
 const DEMO_ROWS: HedgeRow[] = [
-  { id: '1', ccy: 'EUR', cash:  3.50, payout:  -4.00, collections: 1.50, nonNpCash: 0.00, fxRatio: 0 },
-  { id: '2', ccy: 'GBP', cash:  2.20, payout:  -2.50, collections: 1.00, nonNpCash: 0.50, fxRatio: 0 },
-  { id: '3', ccy: 'AUD', cash:  4.50, payout:  -5.00, collections: 2.00, nonNpCash: 0.00, fxRatio: 0 },
-  { id: '4', ccy: 'CAD', cash:  2.80, payout:  -3.20, collections: 1.20, nonNpCash: 0.00, fxRatio: 0 },
-  { id: '5', ccy: 'JPY', cash: 150.0, payout: -200.0, collections: 50.0, nonNpCash: 0.00, fxRatio: 0 },
-  { id: '6', ccy: 'MXN', cash:  5.50, payout:  -7.00, collections: 3.00, nonNpCash: 1.00, fxRatio: 0 },
-  { id: '7', ccy: 'TRY', cash: 12.00, payout: -15.00, collections: 5.00, nonNpCash: 0.00, fxRatio: 0 },
-  { id: '8', ccy: 'ZAR', cash:  8.00, payout: -10.00, collections: 4.00, nonNpCash: 0.00, fxRatio: 0 },
-  { id: '9', ccy: 'CHF', cash:  1.80, payout:  -2.00, collections: 0.50, nonNpCash: 0.00, fxRatio: 0 },
+  { id: '1', ccy: 'EUR', cash:  3.50, payout:  -4.00, collections: 1.50, nonLpCash: 0.00, fxRatio: 0 },
+  { id: '2', ccy: 'GBP', cash:  2.20, payout:  -2.50, collections: 1.00, nonLpCash: 0.50, fxRatio: 0 },
+  { id: '3', ccy: 'AUD', cash:  4.50, payout:  -5.00, collections: 2.00, nonLpCash: 0.00, fxRatio: 0 },
+  { id: '4', ccy: 'CAD', cash:  2.80, payout:  -3.20, collections: 1.20, nonLpCash: 0.00, fxRatio: 0 },
+  { id: '5', ccy: 'JPY', cash: 150.0, payout: -200.0, collections: 50.0, nonLpCash: 0.00, fxRatio: 0 },
+  { id: '6', ccy: 'MXN', cash:  5.50, payout:  -7.00, collections: 3.00, nonLpCash: 1.00, fxRatio: 0 },
+  { id: '7', ccy: 'TRY', cash: 12.00, payout: -15.00, collections: 5.00, nonLpCash: 0.00, fxRatio: 0 },
+  { id: '8', ccy: 'ZAR', cash:  8.00, payout: -10.00, collections: 4.00, nonLpCash: 0.00, fxRatio: 0 },
+  { id: '9', ccy: 'CHF', cash:  1.80, payout:  -2.00, collections: 0.50, nonLpCash: 0.00, fxRatio: 0 },
 ];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -56,18 +57,18 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
     const earn_carry  = delta_r >= 0;
 
     // ── TIMING layer (FX Swap) ────────────────────────────────────────────
-    // Trough: after payouts, before collections arrive — worst-case NP cash
+    // Trough: after payouts, before collections arrive — worst-case LP cash
     const trough      = r.cash + r.payout;
     // Month-end: after all flows settle
-    const month_end   = r.cash + r.payout + r.collections + r.nonNpCash;
+    const month_end   = r.cash + r.payout + r.collections + r.nonLpCash;
     // Swap needed to cover trough (buy FCY near if trough < 0, zero if already positive)
     const swap_needed = Math.max(-trough, 0);
     // As collections arrive they reduce the open near-leg need
     const swap_remaining = Math.max(swap_needed - r.collections, 0);
 
     // ── STRUCTURAL layer (FX Hedge) ───────────────────────────────────────
-    // Net structural change = total monthly FCY position change (payouts + inflows + non-NP)
-    const net_structural = r.payout + r.collections + r.nonNpCash;
+    // Net structural change = total monthly FCY position change (payouts + inflows + non-LP)
+    const net_structural = r.payout + r.collections + r.nonLpCash;
     // FX ratio: user-controlled for all currencies; earn carry default is 0 but can be overridden
     const ratio = r.fxRatio;
     // Amount hedged outright via spot/forward — reduces delta
@@ -110,7 +111,7 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
         <div className="rounded-lg border border-orange-200 bg-orange-50 p-3 text-xs space-y-1.5">
           <div className="font-semibold text-orange-800 text-sm">Layer 1 — FX Swap (Timing)  ·  Δdelta = 0</div>
           <div className="text-gray-600">
-            Payouts leave the NP before collections arrive. Swap near leg buys FCY to cover
+            Payouts leave the LP before collections arrive. Swap near leg buys FCY to cover
             the trough gap. As collections flow in, the near-leg need unwinds — swap remaining
             shrinks toward zero by month-end.
           </div>
@@ -132,7 +133,7 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
             how much is hedged vs held.
           </div>
           <div className="font-mono text-blue-700 space-y-0.5">
-            <div>net_structural = payout + collections + nonNP</div>
+            <div>net_structural = payout + collections + nonLP</div>
             <div>fx_hedged      = net_structural × ratio</div>
             <div>unhedged       = net_structural × (1 − ratio)</div>
             <div>ratio = 0 (default) for EARN CARRY → hold for carry income</div>
@@ -160,7 +161,7 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
               <th className={`${th} bg-white`}>Cash F</th>
               <th className={`${th} bg-white`}>Payout G</th>
               <th className={`${th} bg-white`}>Collections</th>
-              <th className={`${th} bg-white`}>Non-NP</th>
+              <th className={`${th} bg-white`}>Non-LP</th>
               <th className={`${th} bg-sky-50`}>Trough</th>
               <th className={`${th} bg-sky-50`}>Month-End</th>
               <th className={`${th} bg-yellow-50`}>r_FCY</th>
@@ -197,10 +198,10 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
                     onChange={e => edit(r.id, 'collections', parseFloat(e.target.value) || 0)}
                     className={`${inp} text-green-700`} />
                 </td>
-                {/* Non-NP */}
+                {/* Non-LP */}
                 <td className={`${td} bg-white`}>
-                  <input type="number" step="0.5" value={r.nonNpCash}
-                    onChange={e => edit(r.id, 'nonNpCash', parseFloat(e.target.value) || 0)}
+                  <input type="number" step="0.5" value={r.nonLpCash}
+                    onChange={e => edit(r.id, 'nonLpCash', parseFloat(e.target.value) || 0)}
                     className={inp} />
                 </td>
 
@@ -239,14 +240,19 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
                 </td>
                 {/* FX ratio slider — available for all currencies */}
                 <td className={`${td} bg-blue-50`}>
-                  <div className="flex items-center gap-1 justify-end">
-                    <input type="range" min={0} max={1} step={0.05} value={r.fxRatio}
-                      onChange={e => edit(r.id, 'fxRatio', parseFloat(e.target.value))}
-                      className="w-12 accent-blue-600" />
-                    <span className={`w-7 text-right text-xs ${r.fxRatio > 0 ? 'text-blue-700' : 'text-gray-400'}`}>
-                      {Math.round(r.fxRatio * 100)}%
-                    </span>
-                  </div>
+                  <DeskStepper
+                    label=""
+                    value={r.fxRatio}
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    onChange={v => edit(r.id, 'fxRatio', v)}
+                    formatValue={v => `${Math.round(v * 100)}%`}
+                    editable
+                    tickValues={[0, 0.25, 0.5, 0.75, 1]}
+                    className="w-[200px] ml-auto"
+                    ariaLabel="FX hedge ratio"
+                  />
                 </td>
                 {/* FX hedged amount */}
                 <td className={`${td} bg-blue-50 ${r.fx_hedged !== 0 ? clr(r.fx_hedged) : 'text-gray-300'}`}>
@@ -265,10 +271,10 @@ export function HedgingDecisionPanel({ r_USD = 3.50 }: { r_USD?: number }) {
 
       {/* Notes */}
       <div className="text-xs text-gray-400 space-y-0.5 border-t border-gray-100 pt-2">
-        <p><strong className="text-gray-500">Trough</strong> = cash + payout — lowest NP balance during month (before collections arrive)</p>
+        <p><strong className="text-gray-500">Trough</strong> = cash + payout — lowest LP balance during month (before collections arrive)</p>
         <p><strong className="text-gray-500">Swap needed</strong> = MAX(−trough, 0) — near leg buys FCY to bridge the gap · far leg sells back at month-end · Δdelta = 0</p>
         <p><strong className="text-gray-500">Swap remaining</strong> = MAX(swap_needed − collections, 0) — open near-leg exposure as collections flow in and unwind it</p>
-        <p><strong className="text-gray-500">Structural</strong> = payout + collections + nonNP — net FCY position change over the month</p>
+        <p><strong className="text-gray-500">Structural</strong> = payout + collections + nonLP — net FCY position change over the month</p>
         <p><strong className="text-gray-500">FX hedged</strong> = structural × ratio — outright spot/forward · default ratio = 0 for all; user-set to partially hedge regardless of carry direction</p>
         <p><strong className="text-gray-500">Δ monthly</strong> = structural × (1 − ratio) — delta contribution from monthly change after FX hedge; swap adds 0</p>
       </div>

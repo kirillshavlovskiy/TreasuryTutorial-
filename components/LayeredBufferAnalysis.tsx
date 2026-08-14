@@ -15,6 +15,7 @@ import {
   type SharedGlobals,
 } from '@/lib/fx-buffer';
 import type { LayerTargetRow } from '@/lib/dashboard-model';
+import { DeskStepper } from '@/components/DeskStepper';
 
 // ─── Layer definitions ────────────────────────────────────────────────────────
 
@@ -42,7 +43,7 @@ const LAYER_DEFS: LayerDef[] = [
     id: 'carryOptim',
     label: 'Carry Adjustment',
     formula: 'Rate-driven buffer shift',
-    hint: 'EARN carry (NP rate > USD rate): holding more FCY earns money — buffer grows. PAY carry: holding FCY costs money — buffer shrinks to reduce opportunity cost.',
+    hint: 'EARN carry (LP rate > USD rate): holding more FCY earns money — buffer grows. PAY carry: holding FCY costs money — buffer shrinks to reduce opportunity cost.',
     activeColor: '#f59e0b',
     textColor: 'text-amber-700',
     bg: 'bg-amber-50 border-amber-200',
@@ -60,7 +61,7 @@ const LAYER_DEFS: LayerDef[] = [
     id: 'portfolioDiv',
     label: 'Portfolio VAR',
     formula: 'Cross-currency USD risk',
-    hint: 'Carry overlay on |np_cash|: PAY (CAD, JPY) → negative target (sell), EARN (MXN, GBP) → positive (buy). One scale factor sizes every currency to fill the portfolio VAR limit.',
+    hint: 'Carry overlay on |lp_cash|: PAY (CAD, JPY) → negative target (sell), EARN (MXN, GBP) → positive (buy). One scale factor sizes every currency to fill the portfolio VAR limit.',
     activeColor: '#8b5cf6',
     textColor: 'text-violet-700',
     bg: 'bg-violet-50 border-violet-200',
@@ -154,7 +155,7 @@ export function LayeredBufferAnalysis({
   shared, onSharedChange, simRows, onRowFieldChange, activeLayers, onLayerToggle,
   layerRows,
   policyVAR, onPolicyVARChange,
-  usdCash, usdPayout, usdNonNpCash = 0, onUsdCashChange, onUsdPayoutChange,
+  usdCash, usdPayout, usdNonLpCash = 0, onUsdCashChange, onUsdPayoutChange,
 }: {
   shared: SharedGlobals;
   onSharedChange: (key: keyof SharedGlobals, value: number) => void;
@@ -166,12 +167,12 @@ export function LayeredBufferAnalysis({
   layerRows: LayerTargetRow[];
   policyVAR: number;
   onPolicyVARChange: (v: number) => void;
-  /** USD NP cash ($M) — synced with FX Simulator USD row */
+  /** USD LP cash ($M) — synced with FX Simulator USD row */
   usdCash: number;
   /** USD expected payout ($M, negative = outflow) — synced with FX Simulator */
   usdPayout: number;
-  /** USD local/non-NP cash ($M) — synced with FX Simulator */
-  usdNonNpCash?: number;
+  /** USD local/non-LP cash ($M) — synced with FX Simulator */
+  usdNonLpCash?: number;
   onUsdCashChange: (v: number) => void;
   onUsdPayoutChange: (v: number) => void;
 }) {
@@ -215,7 +216,7 @@ export function LayeredBufferAnalysis({
 
   // Portfolio VAR summary panel — OVERLAY VAR (deviation of targets from the
   // hold-the-book base), matching the optimizer and the policy limit. Existing
-  // NP holdings are not charged against the P&L budget.
+  // LP holdings are not charged against the P&L budget.
   const portfolioResult = useMemo(() => {
     if (!portfolioActive) return null;
     const inputs: PortfolioVARInput[] = layerRows
@@ -241,8 +242,8 @@ export function LayeredBufferAnalysis({
           {/* Global params */}
           <div className="flex gap-5 flex-wrap">
             <NumInput label="Forecast uncertainty" value={shared.σ_P * 100} min={0} max={100} step={1} unit="%" onChange={v => onSharedChange('σ_P', v / 100)} />
-            <NumInput label="USD NP credit rate" value={shared.r_USD} min={-10} max={50} step={0.05} unit="% p.a." onChange={v => onSharedChange('r_USD', v)} />
-            <NumInput label="USD cash in NP" value={usdCash} min={0} max={1e9} step={10} unit="$M" onChange={onUsdCashChange} />
+            <NumInput label="USD LP credit rate" value={shared.r_USD} min={-10} max={50} step={0.05} unit="% p.a." onChange={v => onSharedChange('r_USD', v)} />
+            <NumInput label="USD cash in LP" value={usdCash} min={0} max={1e9} step={10} unit="$M" onChange={onUsdCashChange} />
           </div>
 
           {/* Layer toggles + view toggle + calc log button */}
@@ -337,7 +338,7 @@ export function LayeredBufferAnalysis({
               </th>
               <th className="bg-sky-50 border-l border-sky-200 px-2 py-1 text-center text-xs font-semibold text-sky-700 tracking-wide" colSpan={12}>
                 TARGET &amp; SWAP ACTION — P&amp;L
-                <span className="ml-1 font-normal text-sky-400">NP carry vs USD {shared.r_USD.toFixed(2)}%</span>
+                <span className="ml-1 font-normal text-sky-400">LP carry vs USD {shared.r_USD.toFixed(2)}%</span>
               </th>
             </tr>
 
@@ -355,7 +356,7 @@ export function LayeredBufferAnalysis({
               </th>
               {/* Carry rates — now under TARGET & SWAP ACTION group */}
               <th className={`${th} bg-sky-50 border-l border-sky-200`}>
-                NP Rate<br/><span className="font-normal text-sky-400">r_FCY · Δr vs USD</span>
+                LP Rate<br/><span className="font-normal text-sky-400">r_FCY · Δr vs USD</span>
               </th>
               <th className={`${th} bg-sky-50 text-center`}>
                 Dir<br/><span className="font-normal text-sky-400">EARN / PAY</span>
@@ -417,7 +418,7 @@ export function LayeredBufferAnalysis({
               const deltaR = r.r_FCY - shared.r_USD;
               const threshold_minus_precash = r.cash_threshold - r.total_cash;
               return (
-                <tr key={r.ccy} className="border-b border-gray-100 hover:bg-gray-50/60">
+                <tr key={r.ccy} className="border-b border-gray-100 hover:bg-gray-50">
                   {/* CCY */}
                   <td className="sticky left-0 z-10 bg-white px-2 py-1.5 text-xs font-bold text-gray-900">
                     {r.ccy}
@@ -493,7 +494,7 @@ export function LayeredBufferAnalysis({
                         />
                     }
                   </td>
-                  {/* NP Rate + Δr differential — single line */}
+                  {/* LP Rate + Δr differential — single line */}
                   <td className={`${td} bg-sky-50 border-l border-sky-200 whitespace-nowrap`}
                     title={`r_FCY = ${r.r_FCY.toFixed(3)}% | r_USD = ${shared.r_USD.toFixed(2)}% | Δr = r_FCY − r_USD = ${deltaR.toFixed(3)}% (${deltaR < -0.05 ? 'EARN: hold more FCY' : deltaR > 0.05 ? 'PAY: reduce FCY holding' : 'neutral'})`}
                   >
@@ -649,14 +650,14 @@ export function LayeredBufferAnalysis({
             const total_post_swap_usd = layerRows.reduce((s, r) => s + r.post_swap_cash * r.spot, 0);
             return (
               <tfoot>
-                <tr className="border-t-2 border-sky-200 bg-sky-50/50">
+                <tr className="border-t-2 border-sky-200 bg-sky-50">
                   <td className="sticky left-0 z-10 px-2 py-1.5 text-xs font-bold text-sky-800 bg-sky-50 whitespace-nowrap">
                     TOTAL
                   </td>
                   {/* spacer cols for inputs + carry cols */}
-                  <td colSpan={3} className="bg-sky-50/30 px-2 py-1.5"/>
-                  {/* NP Rate + Δr: show weighted avg carry differential */}
-                  <td colSpan={2} className="bg-sky-50/30 text-xs text-sky-500 italic px-2 py-1.5 text-right">
+                  <td colSpan={3} className="bg-sky-50 px-2 py-1.5"/>
+                  {/* LP Rate + Δr: show weighted avg carry differential */}
+                  <td colSpan={2} className="bg-sky-50 text-xs text-sky-500 italic px-2 py-1.5 text-right">
                     {`${layerRows.length} CCY · annual`}
                   </td>
                   {/* Fcast Cash total in USD */}
@@ -766,7 +767,7 @@ export function LayeredBufferAnalysis({
             </div>
             {payoutGap > 0.001 && (
               <div className="text-red-700 font-sans font-medium">
-                USD payout gap ${f2(payoutGap)}M — NP cash below payout buffer reservation
+                USD payout gap ${f2(payoutGap)}M — LP cash below payout buffer reservation
               </div>
             )}
             {stressTrimmed.length > 0 && (
@@ -785,7 +786,7 @@ export function LayeredBufferAnalysis({
               </div>
             )}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 font-mono">
-              <div><span className="text-gray-500">NP cash</span><div className="font-bold">${f2(usdCash)}M</div></div>
+              <div><span className="text-gray-500">LP cash</span><div className="font-bold">${f2(usdCash)}M</div></div>
               <div><span className="text-gray-500">Reserved (H* USD)</span><div className="font-bold text-amber-800">${f2(reserved)}M</div><div className="text-gray-400 font-sans text-[10px]">|payout| + min floor + σ buffer</div></div>
               <div><span className="text-gray-500">Available for FCY</span><div className={`font-bold ${available < Math.max(0, fcySwapUsd) ? 'text-orange-700' : 'text-green-700'}`}>${f2(available)}M</div></div>
               <div><span className="text-gray-500">FCY swap need</span><div className="font-bold">${f2(fcySwapUsd)}M</div></div>
@@ -804,7 +805,7 @@ export function LayeredBufferAnalysis({
             </span>
             <span className="text-xs text-violet-500">— 1-month 95% VAR, {portfolioResult.currencies.length} currencies</span>
             {/* Policy VAR limit selector — feeds into portfolio carry optimizer */}
-            <div className="ml-auto flex items-center gap-2">
+            <div className="ml-auto flex flex-wrap items-end gap-2">
               <span className="text-xs text-violet-600 font-medium">Policy limit:</span>
               {POLICY_LIMITS.map(pl => (
                 <button
@@ -820,30 +821,22 @@ export function LayeredBufferAnalysis({
                   {pl.label}
                 </button>
               ))}
-              <input
-                type="range"
+              <DeskStepper
+                label="Policy VAR"
+                value={policyVAR}
                 min={0.5}
                 max={25}
                 step={0.5}
-                value={policyVAR}
-                onChange={e => onPolicyVARChange(Number(e.target.value))}
-                className="w-36 accent-violet-700"
-                title="Drag to set any intermediate P&L limit ($0.5M–$25M, $0.5M steps)"
+                onChange={onPolicyVARChange}
+                formatValue={v => `$${v.toFixed(1)}M`}
+                editable
+                accent="violet"
+                tickValues={[0.5, 5, 10, 20, 25]}
+                className="min-w-[220px] w-[240px]"
+                editClassName="w-14"
+                title="Drag or type any intermediate P&L limit ($0.5M–$25M, $0.5M steps)"
+                ariaLabel="Policy VAR P&L limit"
               />
-              <input
-                type="number"
-                min={0.5}
-                max={25}
-                step={0.5}
-                value={policyVAR}
-                onChange={e => {
-                  const v = Number(e.target.value);
-                  if (Number.isFinite(v) && v > 0) onPolicyVARChange(Math.min(25, Math.max(0.5, v)));
-                }}
-                className="w-16 rounded border border-violet-300 bg-white px-1.5 py-0.5 text-right text-xs font-mono text-violet-800 focus:ring-1 focus:ring-violet-400 outline-none"
-                title="Type an exact P&L limit in $M"
-              />
-              <span className="text-xs text-violet-600">$M</span>
             </div>
           </div>
           {/* Portfolio VAR fill status row — shows when portfolio optimizer ran */}
@@ -902,7 +895,7 @@ export function LayeredBufferAnalysis({
               return (
                 <>
                   <div className="rounded bg-white border border-violet-100 px-3 py-2">
-                    <div className="text-xs text-gray-500">USD cash in NP</div>
+                    <div className="text-xs text-gray-500">USD cash in LP</div>
                     <div className="text-base font-bold text-gray-700">${f2(usdCash)}M</div>
                     <div className="text-xs text-gray-400">
                       {usdPayout < 0 ? `−$${f2(-usdPayout)}M payout → $${f2(fcyBudget)}M for FCY` : 'Budget constraint'}
@@ -914,7 +907,7 @@ export function LayeredBufferAnalysis({
                       ${f2(usdCommitted)}M
                     </div>
                     <div className={`text-xs ${anyBudgetBinding ? 'text-orange-500' : isHigh ? 'text-amber-500' : 'text-gray-400'}`}>
-                      {usedPct.toFixed(1)}% of NP balance{anyBudgetBinding ? ' — budget binding' : ''}
+                      {usedPct.toFixed(1)}% of LP balance{anyBudgetBinding ? ' — budget binding' : ''}
                     </div>
                   </div>
                   <div className={`rounded border px-3 py-2 ${free < 0 ? 'bg-red-50 border-red-200' : free < fcyBudget * 0.2 ? 'bg-amber-50 border-amber-200' : 'bg-green-50 border-green-200'}`}>
@@ -991,7 +984,7 @@ export function LayeredBufferAnalysis({
           <span className="text-rose-700 font-medium">Rose −</span> = PAY carry short target applied (pushed to −var_FCY).{' '}
           <span className="text-orange-600 font-medium">Orange −</span> = EARN carry cap (raw_sum above +var_FCY).{' '}
           <span className="text-emerald-700 font-medium">⌊floor⌋</span> = carry reduced below floor contribution (layers 1-3 only).
-          <span className="text-rose-600 font-medium"> Red threshold</span> = negative H_final (PAY carry — accept NP overdraft, earns carry spread).
+          <span className="text-rose-600 font-medium"> Red threshold</span> = negative H_final (PAY carry — accept LP overdraft, earns carry spread).
         </p>
         <p>
           <strong>Swap Near</strong> = MAX(Cash Threshold − Forecasted Cash, −(Spot + Fwd)).{' '}
@@ -1007,12 +1000,12 @@ export function LayeredBufferAnalysis({
           Near leg always = −Far leg (I + J = 0).
         </p>
         <p>
-          <strong>EARN carry</strong> (NP Rate &gt; USD rate): holding more FCY is profitable — safety margin grows.{' '}
-          <strong>PAY carry</strong> (NP Rate &lt; USD rate): holding FCY costs money — safety margin shrinks.
+          <strong>EARN carry</strong> (LP Rate &gt; USD rate): holding more FCY is profitable — safety margin grows.{' '}
+          <strong>PAY carry</strong> (LP Rate &lt; USD rate): holding FCY costs money — safety margin shrinks.
         </p>
         <p>
-          <strong>NP Rate</strong> = JPM Notional Pool credit rate (Jan 2026).
-          TRY NP = 1.16% (vs ~46% nominal) — most currencies pay carry vs USD NP 3.50%.
+          <strong>LP Rate</strong> = JPM Notional Pool credit rate (Jan 2026).
+          TRY LP = 1.16% (vs ~46% nominal) — most currencies pay carry vs USD LP 3.50%.
           EARN carry: GBP 3.57%, HUF 5.69%, MXN 6.19%, ZAR 6.01%.
         </p>
         {portfolioActive && (
@@ -1083,7 +1076,7 @@ export function LayeredBufferAnalysis({
                 <div className="text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">Global Parameters</div>
                 <div className="flex gap-5 flex-wrap bg-gray-50 rounded border border-gray-200 px-3 py-2">
                   <span>σ_P = <strong>{(shared.σ_P * 100).toFixed(0)}%</strong> <span className="text-gray-400">(forecast uncertainty)</span></span>
-                  <span>r_USD = <strong>{shared.r_USD.toFixed(2)}%</strong> <span className="text-gray-400">(USD NP credit rate)</span></span>
+                  <span>r_USD = <strong>{shared.r_USD.toFixed(2)}%</strong> <span className="text-gray-400">(USD LP credit rate)</span></span>
                   {activeLayers.has('portfolioDiv') && activeLayers.has('carryOptim') && (
                     <span>Policy VAR limit = <strong className="text-violet-700">${policyVAR}M</strong></span>
                   )}
@@ -1119,7 +1112,7 @@ export function LayeredBufferAnalysis({
                     </thead>
                     <tbody>
                       {layerRows.map(r => (
-                        <tr key={r.ccy} className="border-b border-gray-100 hover:bg-blue-50/30">
+                        <tr key={r.ccy} className="border-b border-gray-100 hover:bg-blue-50">
                           <td className="px-2 py-1 font-bold text-gray-800">{r.ccy}</td>
                           <td className="px-2 py-1 text-right font-mono">{Math.abs(r.payout).toFixed(2)}</td>
                           <td className="px-2 py-1 text-right font-mono text-sky-700">{r.cash.toFixed(2)}</td>
@@ -1156,7 +1149,7 @@ export function LayeredBufferAnalysis({
                     {activeLayers.has('portfolioDiv') && activeLayers.has('carryOptim') ? (
                       <>
                         <strong className="text-amber-700">Path A — overlay-VAR budget fill:</strong>{' '}
-                        Policy VAR is charged on the carry OVERLAY (deviation from hold-the-book NP),
+                        Policy VAR is charged on the carry OVERLAY (deviation from hold-the-book LP),
                         not on existing holdings. One factor s scales the full carry leg of every
                         currency so Overlay_VAR = ${policyVAR}M. s = 1 ≡ the per-currency carry stack;
                         tight limit → s &lt; 1 (shrink toward hold), loose limit → s &gt; 1 (amplify carry),
@@ -1232,7 +1225,7 @@ export function LayeredBufferAnalysis({
                       </thead>
                       <tbody>
                         {layerRows.map(r => (
-                          <tr key={r.ccy} className={`border-b border-gray-100 hover:bg-amber-50/30 ${r.constrained ? 'bg-amber-50/40' : ''}`}>
+                          <tr key={r.ccy} className={`border-b border-gray-100 hover:bg-amber-50 ${r.constrained ? 'bg-amber-50' : ''}`}>
                             <td className="px-2 py-1 font-bold text-gray-800">{r.ccy}</td>
                             <td className={`px-2 py-1 text-right font-mono ${r.delta_r > 0.05 ? 'text-red-600' : r.delta_r < -0.05 ? 'text-green-600' : 'text-gray-400'}`}>
                               {r.delta_r > 0 ? '+' : ''}{r.delta_r.toFixed(2)}%
@@ -1304,7 +1297,7 @@ export function LayeredBufferAnalysis({
                           : 'text-gray-400';
                         const hColor = r.cash_threshold < -0.001 ? 'text-red-700' : 'text-gray-900';
                         return (
-                          <tr key={r.ccy} className="border-b border-gray-100 hover:bg-sky-50/30">
+                          <tr key={r.ccy} className="border-b border-gray-100 hover:bg-sky-50">
                             <td className="px-2 py-1 font-bold text-gray-800">{r.ccy}</td>
                             <td className="px-2 py-1 text-right font-mono text-emerald-700">{r.floor_contrib.toFixed(3)}</td>
                             <td className="px-2 py-1 text-right font-mono text-blue-700">
@@ -1413,7 +1406,7 @@ export function LayeredBufferAnalysis({
                           if (!p || !lr) return null;
                           const divSaving = c.standalone_VAR_USD - c.component_VAR_USD;
                           return (
-                            <tr key={c.ccy} className="border-b border-gray-100 hover:bg-violet-50/30">
+                            <tr key={c.ccy} className="border-b border-gray-100 hover:bg-violet-50">
                               <td className="px-2 py-1 font-bold text-gray-800">{c.ccy}</td>
                               <td className="px-2 py-1 text-right font-mono">{lr.cash_threshold.toFixed(3)}</td>
                               <td className="px-2 py-1 text-right font-mono">${(lr.cash_threshold * p.spot).toFixed(3)}M</td>

@@ -5,7 +5,7 @@ import { INITIAL_ROWS, INITIAL_USD_PARAMS } from './fx-buffer';
 const base = {
   rows: INITIAL_ROWS,
   usdCash: 303.9,
-  usdNonNpCash: 154.1,
+  usdNonLpCash: 154.1,
   usdParams: INITIAL_USD_PARAMS,
   shared: { r_USD: 3.50, σ_P: 0.10, days: 3 },
   activeLayers: new Set(['sigmaP', 'carryOptim', 'floorH', 'portfolioDiv'] as const),

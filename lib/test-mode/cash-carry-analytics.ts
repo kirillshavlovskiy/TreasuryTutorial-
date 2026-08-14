@@ -1,12 +1,16 @@
 /**
  * Analytics Cash Carry — two layers:
- * 1) Cash interest on interest-bearing cash + forecast revenue inflows
- *    (non-cash FX items excluded; path follows exposure forecast flat/custom)
+ * 1) Cash interest on interest-bearing cash + forecast revenue inflows.
+ *    Hedge settlement is the traded FCY delivery only. Receivables and debt
+ *    stay on the BS — a 100% target hedge leaves End = Debt − Receivables,
+ *    not zero.
  * 2) Hedge carry (prepared + booked bullet / strip) via EURUSD swap points
  */
 
 import {
   fcyToUsdM,
+  fxBookNetLocalM,
+  roundMoney,
   type RowState,
 } from '@/lib/fx-buffer';
 import {
@@ -191,7 +195,7 @@ function bookRowByCcy(
 
 /**
  * Opening cash that earns overnight interest (not receivables / debt).
- * Uses FX Risk → Cash FX (`spot`), not Liquidity → NP Cash (`cash`).
+ * Uses FX Risk → Cash FX (`spot`), not Liquidity → LP Cash (`cash`).
  * `Number.isFinite(cash)` is always true on RowState, so preferring cash
  * desynced Cash Carry from the Cash FX the user edits.
  */
@@ -199,6 +203,31 @@ export function interestBearingCashM(row: RowState): number {
   if (Number.isFinite(row.spot)) return row.spot;
   if (Number.isFinite(row.cash)) return row.cash;
   return 0;
+}
+
+/**
+ * FX book that is not Cash FX: receivables / NWC, debt, existing forwards,
+ * investments. A 100% target hedge includes these in the notional, but they
+ * stay on the BS. After the hedge delivers, End cash is therefore
+ * Debt − Receivables (EUR: 3.00 − 2.40 = 0.60), not zero.
+ */
+export function nonCashFxStockLocalM(row: RowState): number {
+  return roundMoney(fxBookNetLocalM(row) - interestBearingCashM(row));
+}
+
+/**
+ * Hedge settlement is cash delivery of the traded notional. Receivables and
+ * debt are not collected or repaid by the hedge, so they must not be written
+ * onto the cash path. Kept as the shared schedule hook so Liquidity and Cash
+ * Carry still settle the same dates; it no longer invents a Book→cash line.
+ */
+export function withNonCashFxConversion(
+  _row: RowState,
+  hedgeFlows: readonly number[],
+  _forecastMonths: number,
+  _forecastProfile?: ForecastProfileState | null,
+): number[] {
+  return hedgeFlows.map(x => x);
 }
 
 /**
@@ -448,6 +477,8 @@ export function buildCashForecastSchedule(input: {
     hedgeCashInM: number;
     hedgeCashOutM: number;
     hedgeCashFlowM: number;
+    /** Non-cash FX book (NWC / debt / fwd) converted with the hedge at Tf. */
+    bookConversionM: number;
     endCashM: number;
     endUsdCashM: number;
     interestUsdM: number;
@@ -488,6 +519,7 @@ export function buildCashForecastSchedule(input: {
         hedgeCashInM: 0,
         hedgeCashOutM: 0,
         hedgeCashFlowM: 0,
+        bookConversionM: 0,
         endCashM: openingCashM,
         endUsdCashM: 0,
         interestUsdM: 0,
@@ -519,6 +551,10 @@ export function buildCashForecastSchedule(input: {
           setup: input.setup,
         })
       : Array.from({ length: T }, () => 0);
+  const bookConversionM = roundMoney(
+    (withNonCashFxConversion(row, hedgeFlows, T, profile)[T - 1] ?? 0)
+      - (hedgeFlows[T - 1] ?? 0),
+  );
   const legs =
     input.setup != null
       ? collectHedgeLegs({
@@ -620,6 +656,10 @@ export function buildCashForecastSchedule(input: {
       fcy += hedgeCashFlowM;
       usd -= hedgeCashFlowM * usdPer;
     }
+    // Book→cash is no longer applied: hedging NWC / debt does not collect or
+    // repay those stocks. Leftover cash after a 100% hedge is −nonCash.
+    const conversionM = i === T - 1 ? bookConversionM : 0;
+    if (Math.abs(conversionM) >= 1e-15) fcy += conversionM;
 
     const endFcy = fcy;
     const endUsd = usd;
@@ -672,6 +712,7 @@ export function buildCashForecastSchedule(input: {
       hedgeCashInM,
       hedgeCashOutM,
       hedgeCashFlowM: hedgeCashInM - hedgeCashOutM,
+      bookConversionM,
       endCashM: fcy,
       endUsdCashM: usd,
       interestUsdM: residualEurInterestUsdM,
@@ -2762,7 +2803,7 @@ export function buildCashCarryAnalytics(input: {
   const horizon = Math.max(Tf, 1e-9);
 
   const cashInterest: CashInterestLayerRow[] = [];
-  let ratesSource = 'CURRENCY_PARAMS NP';
+  let ratesSource = 'CURRENCY_PARAMS LP';
 
   for (const row of input.risk) {
     const path = cashPathForCcy({

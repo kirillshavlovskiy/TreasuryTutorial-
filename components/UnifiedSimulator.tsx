@@ -1,13 +1,17 @@
 'use client';
 
 import {
+  Fragment,
   useState,
   useMemo,
   useCallback,
+  useEffect,
+  useRef,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { DeskProgressTrack, DeskStepper } from '@/components/DeskStepper';
 import {
   CURRENCY_PARAMS,
   INITIAL_ROWS,
@@ -22,7 +26,20 @@ import {
   type SharedGlobals,
   type LayerId,
 } from '@/lib/fx-buffer';
-import type { FcyComputedRow, UsdComputedRow, PortfolioSummary } from '@/lib/dashboard-model';
+import {
+  fundedPlanFor,
+  sizingFromPlan,
+  type FcyComputedRow,
+  type UsdComputedRow,
+  type PortfolioSummary,
+} from '@/lib/dashboard-model';
+import {
+  canEarnPositiveCarry,
+  carryBasisLabel,
+  projectCarryLifecycle,
+  targetForCarry,
+  type CarryPeriod,
+} from '@/lib/carry-accrual';
 import {
   resolveStrategyHedge,
   fwdHedgeCarryUsdYr,
@@ -76,9 +93,33 @@ import {
   type ForecastCashExtras,
   type ForecastFlowField,
   type ForecastFlowMode,
+  type ForecastFlowSide,
   type ForecastMonthFlow,
   type ForecastProfileState,
+  type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
+import {
+  buildLiquidityLadder,
+  dayOfMonthForFraction,
+  DEFAULT_LIQUIDITY_TIMING,
+  resolveLiquidityTiming,
+  HEDGE_SETTLE_LINE,
+  hedgeSettleSide,
+  LADDER_DAYS_PER_MONTH,
+  resolveFlowShape,
+  shapeCycleWindow,
+  type FlowCurve,
+  type FlowShape,
+  type HedgeSettleByCcy,
+  type LadderCycle,
+  type LiquidityGranularity,
+  type LiquidityLadderResult,
+  type LiquidityLineKey,
+  type LiquidityBookingMode,
+  type LiquidityTiming,
+  SIZING_BASIS_OPTIONS,
+  BOOKING_MODE_OPTIONS,
+} from '@/lib/liquidity-ladder';
 import { FORECAST_UNCERTAINTY_OPTIONS } from '@/lib/test-mode/var-setup';
 import {
   DEFAULT_VAR_SETUP,
@@ -110,12 +151,96 @@ function n(v: number): string {
   return String(roundMoney(v));
 }
 function clr(v: number) { return v < 0 ? 'text-red-600' : 'text-gray-900'; }
+/** Derived hedge cells stay quiet as a dash on currencies with no hedge. */
+function fmtHedgeCell(v: number): string {
+  return Math.abs(v) < 0.005 ? '—' : f2(v);
+}
+
+/** Trough Cash tooltip — which cycle the low came from, and how deep it sat. */
+function troughCellTitle(r: {
+  troughDay?: number;
+  troughCycleIndex?: number;
+  nearCycleTrough?: number;
+  daysBelowFloor?: number;
+  cash_floor: number;
+  cycleStartDay?: number;
+  cycleEndDay?: number;
+}): string {
+  if (r.troughDay === undefined) return 'Trough Cash';
+  const cycle = r.troughCycleIndex ?? 0;
+  const dayInCycle = r.troughDay - cycle * LADDER_DAYS_PER_MONTH + 1;
+  const parts = [
+    cycle === 0
+      ? `Trough Cash · nearest cycle operating low on D${dayInCycle}`
+      : `Trough Cash · worst cycle M${cycle + 1}, operating low on its D${dayInCycle} (no funding swap)`,
+    `cycle D${(r.cycleStartDay ?? 0) + 1}→D${(r.cycleEndDay ?? 0) + 1}`,
+  ];
+  if ((r.daysBelowFloor ?? 0) > 0) {
+    parts.push(`${r.daysBelowFloor}d below floor ${f2(r.cash_floor)}`);
+  }
+  if (cycle > 0 && r.nearCycleTrough !== undefined) {
+    parts.push(
+      `nearest cycle would trough at ${f2(r.nearCycleTrough)}`
+      + ' — sizing on the worst cycle in the horizon',
+    );
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * Swap Near tooltip — which cycle of the funded plan the row's leg is sized on.
+ * On the horizon basis that is not cycle 1, so the row and the expanded cycle
+ * rows carry different legs by design; say so instead of letting them look like
+ * a contradiction.
+ */
+function swapCellTitle(r: {
+  swapNear: number;
+  troughCycleIndex?: number;
+  sizingCycleIndex?: number;
+  liquidityPlan?: { cycleIndex: number; swap_needed: number }[];
+}): string {
+  const base = 'Swap near leg (model-optimised; override to force a value)';
+  const plan = r.liquidityPlan;
+  if (!plan?.length) return base;
+  const sized = r.sizingCycleIndex ?? r.troughCycleIndex ?? 0;
+  const own = plan[0]?.swap_needed ?? 0;
+  const parts = [`${base} · sized on the H* cycle M${sized + 1}`];
+  if (sized > 0 && Math.abs(own - r.swapNear) > 0.001) {
+    parts.push(`cycle M1 on its own would need ${f2(own)}`);
+  }
+  return parts.join(' · ');
+}
+
+/**
+ * Horizon flow totals behind a collapsed currency row. The cycle rows show one
+ * month each and count every line that settles in it, so the collapsed row sums
+ * the same cycles rather than reporting the single-cycle payout/payin input.
+ */
+function horizonFlows(cycles?: LadderCycle[]): {
+  outflow: number;
+  inflow: number;
+  months: number;
+} | null {
+  if (!cycles?.length) return null;
+  return {
+    outflow: cycles.reduce((s, c) => s + c.outflow, 0),
+    inflow: cycles.reduce((s, c) => s + c.inflow, 0),
+    months: cycles.length,
+  };
+}
+
 function dclr(v: number){ return v > 0 ? 'text-red-600' : 'text-green-600'; }
 /** Explicit "$M/yr" carry formatting so USD-denominated P&L cells never read
  *  as bare/ambiguous numbers (e.g. "16.58" vs "+$16.58"). */
 function usdCarry(v: number, dust = 0.005): string {
   if (isNaN(v) || Math.abs(v) < dust) return '—';
   return v < 0 ? `-$${Math.abs(v).toFixed(2)}` : `+$${v.toFixed(2)}`;
+}
+
+/** Period interest accrual is small next to $M notionals — quote it in $k. */
+function usdK(v: number, dust = 0.0005): string {
+  if (isNaN(v) || Math.abs(v) < dust) return '—';
+  return `${v < 0 ? '-' : '+'}$${Math.abs(v * 1000).toFixed(0)}k`;
 }
 
 function swapNearUsd(ccy: string, swapNear: number): number {
@@ -127,19 +252,19 @@ function fmtSwapUsd(v: number): string {
   return `${v >= 0 ? '+' : ''}${f2(v)}`;
 }
 
-/** Always show USD amount for Target NP Cash column (including zero). */
+/** Always show USD amount for Target LP Cash column (including zero). */
 function fmtThresholdUsd(v: number): string {
   if (isNaN(v)) return '—';
   return `${v >= 0 ? '+' : ''}${f2(v)}`;
 }
 
 function fmtZeroSumUsd(v: number): string {
-  if (Math.abs(v) < 0.005) return '✓ 0.00';
-  return `${v >= 0 ? '+' : ''}${f2(v)}`;
+  if (Math.abs(v) < 0.005) return '0.00 ✓';
+  return `${v >= 0 ? '+' : ''}${f2(v)} ✗`;
 }
 
 function zeroSumCls(v: number): string {
-  return Math.abs(v) < 0.01 ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700';
+  return Math.abs(v) < 0.005 ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700';
 }
 
 function CarryBadge({ dir }: { dir: 'earn' | 'pay' | 'neutral' }) {
@@ -150,24 +275,195 @@ function CarryBadge({ dir }: { dir: 'earn' | 'pay' | 'neutral' }) {
 
 // ─── Global param input ───────────────────────────────────────────────────────
 
-function GParam({ label, value, min, max, step, unit, onChange, title }: {
+/** Cluster caption in the desk toolbar / layers rail. */
+const toolCaption = 'font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-gray-500';
+
+/**
+ * Column groups of the book table. Each band owns a hue that runs from the
+ * In-view rail through its group header rule into the header of its first
+ * column, so a horizontally scrolled reader always knows where they are.
+ */
+type BandId = 'rates' | 'pos' | 'liq' | 'ir' | 'buf' | 'swap' | 'hedge' | 'risk' | 'pnl';
+
+const BAND_STYLE: Record<
+  BandId,
+  { label: string; short: string; rule: string; bg: string; bgOn: string; text: string; chipOn: string }
+> = {
+  rates: { label: 'RATES', short: 'RATES', rule: 'border-gray-300', bg: 'bg-gray-50',
+    bgOn: 'bg-gray-100', text: 'text-gray-600', chipOn: 'border-gray-400 bg-gray-100 text-gray-700' },
+  pos: { label: 'FX POSITION', short: 'FX', rule: 'border-gray-300', bg: 'bg-white',
+    bgOn: 'bg-gray-50', text: 'text-gray-600', chipOn: 'border-gray-400 bg-gray-100 text-gray-700' },
+  liq: { label: 'LIQUIDITY POOL BOOK', short: 'LP BOOK', rule: 'border-sky-300', bg: 'bg-sky-50',
+    bgOn: 'bg-sky-100', text: 'text-sky-700', chipOn: 'border-sky-300 bg-sky-100 text-sky-700' },
+  ir: { label: 'IR / FIXED-RATE BOOK', short: 'IR', rule: 'border-rose-300', bg: 'bg-rose-50',
+    bgOn: 'bg-rose-100', text: 'text-rose-700', chipOn: 'border-rose-300 bg-rose-100 text-rose-700' },
+  buf: { label: 'CARRY / BUFFER', short: 'BUFFER', rule: 'border-amber-300', bg: 'bg-amber-50',
+    bgOn: 'bg-amber-100', text: 'text-amber-700', chipOn: 'border-amber-300 bg-amber-100 text-amber-700' },
+  swap: { label: 'SWAP', short: 'SWAP', rule: 'border-emerald-300', bg: 'bg-emerald-50',
+    bgOn: 'bg-emerald-100', text: 'text-emerald-700', chipOn: 'border-emerald-300 bg-emerald-100 text-emerald-700' },
+  hedge: { label: 'FX HEDGE', short: 'HEDGE', rule: 'border-rose-400', bg: 'bg-rose-50',
+    bgOn: 'bg-rose-100', text: 'text-rose-700', chipOn: 'border-rose-400 bg-rose-100 text-rose-700' },
+  risk: { label: 'RISK METRICS', short: 'RISK', rule: 'border-violet-400', bg: 'bg-violet-50',
+    bgOn: 'bg-violet-100', text: 'text-violet-800', chipOn: 'border-violet-400 bg-violet-100 text-violet-800' },
+  pnl: { label: 'P&L', short: 'P&L', rule: 'border-purple-300', bg: 'bg-purple-50',
+    bgOn: 'bg-purple-100', text: 'text-purple-700', chipOn: 'border-purple-300 bg-purple-100 text-purple-700' },
+};
+
+const groupThBase = 'px-2 py-1 text-center text-xs font-semibold tracking-wide';
+
+/**
+ * Buffer layers are multi-select chips carrying the band they move, so the rail
+ * reads as "this control writes that column group". Hedging strategy stays a
+ * segmented track — the two families must never read alike.
+ */
+const BUFFER_LAYER_CHIPS: {
+  id: LayerId;
   label: string;
-  value: number; min: number; max: number; step: number; unit: string;
-  onChange: (v: number) => void;
-  title?: string;
+  band: string;
+  hue: 'amber' | 'emerald' | 'violet';
+  hint: string;
+  /** Gear tooltip — what the layer's own settings dialog controls. */
+  settingsLabel: string;
+}[] = [
+  { id: 'floorH', label: 'Min floor', band: '→ BUFFER', hue: 'amber',
+    hint: 'Hard minimum cash per currency',
+    settingsLabel: 'Minimum liquidity buffer per currency — hard cash floor (M FCY)' },
+  { id: 'sigmaP', label: 'Payout σ buffer', band: '→ BUFFER', hue: 'amber',
+    hint: 'Safety margin on uncovered payout deficit (prefunded payout → σ = 0)',
+    settingsLabel: 'Forecast uncertainty σ — default and per-currency payout overrides' },
+  { id: 'carryOptim', label: 'Carry target', band: '→ BUFFER · SWAP', hue: 'emerald',
+    hint: 'Rate-driven buffer shift (PAY sell / EARN buy)',
+    settingsLabel: 'Carry target inputs — overdraft rate r_OD and Δr per currency' },
+  { id: 'portfolioDiv', label: 'Portfolio VAR', band: '→ RISK', hue: 'violet',
+    hint: 'Cross-currency rebalance with VAR / USD budget limits',
+    settingsLabel: 'Portfolio VAR — notional sensitivity limit' },
+];
+
+const CHIP_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+  amber: 'border-amber-200 bg-amber-50',
+  emerald: 'border-emerald-200 bg-emerald-50',
+  violet: 'border-violet-200 bg-violet-50',
+};
+const CHIP_BOX_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+  amber: 'border-amber-500 bg-amber-500',
+  emerald: 'border-emerald-500 bg-emerald-500',
+  violet: 'border-violet-500 bg-violet-500',
+};
+const CHIP_TAG_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+  amber: 'border-amber-200 text-amber-700',
+  emerald: 'border-emerald-200 text-emerald-700',
+  violet: 'border-violet-200 text-violet-700',
+};
+const CHIP_GEAR_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+  amber: 'bg-amber-100 text-amber-700',
+  emerald: 'bg-emerald-100 text-emerald-700',
+  violet: 'bg-violet-100 text-violet-700',
+};
+const MODAL_HEAD_BG: Record<'amber' | 'emerald' | 'violet', string> = {
+  amber: 'bg-amber-50',
+  emerald: 'bg-emerald-50',
+  violet: 'bg-violet-50',
+};
+const MODAL_TITLE_FG: Record<'amber' | 'emerald' | 'violet', string> = {
+  amber: 'text-amber-700',
+  emerald: 'text-emerald-700',
+  violet: 'text-violet-700',
+};
+
+/** Settings dialog for one buffer layer, opened from that layer's gear. */
+function LayerModal({
+  hue,
+  title,
+  subtitle,
+  readout,
+  footnote,
+  simDark,
+  size = 'md',
+  onClose,
+  children,
+}: {
+  hue: 'amber' | 'emerald' | 'violet';
+  title: string;
+  subtitle: string;
+  readout?: string;
+  footnote: string;
+  simDark: boolean;
+  /** 'lg' widens to a table-width dialog and scrolls the body. */
+  size?: 'md' | 'lg';
+  onClose: () => void;
+  children: ReactNode;
 }) {
-  return (
-    <div className="flex flex-col gap-0.5 min-w-[96px]" title={title}>
-      <label className="text-xs font-medium text-gray-700">{label}</label>
-      <div className="flex items-center gap-1 mt-0.5">
-        <input
-          type="number" step={step} min={min} max={max} value={roundMoney(value)}
-          onChange={e => { const v = parseFloat(e.target.value); if (!isNaN(v)) onChange(roundMoney(v)); }}
-          className="w-20 rounded border border-gray-300 px-2 py-1 text-xs text-right font-mono"
-        />
-        <span className="text-xs text-gray-400 whitespace-nowrap">{unit}</span>
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  if (typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      className={`fixed inset-0 z-[200] flex items-start justify-center overflow-y-auto bg-black/60 p-4 pt-[12vh] backdrop-blur-sm${
+        simDark ? ' sim-dark' : ''
+      }`}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onClick={e => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className={`w-full overflow-hidden rounded-xl border border-gray-200 bg-white shadow-2xl ${
+          size === 'lg' ? 'max-w-5xl' : 'max-w-3xl'
+        }`}
+      >
+        <div
+          className={`flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-gray-100 px-4 py-3 ${MODAL_HEAD_BG[hue]}`}
+        >
+          <span className={`${toolCaption} ${MODAL_TITLE_FG[hue]}`}>{title}</span>
+          <span className="text-[10px] text-gray-500">{subtitle}</span>
+          {readout && (
+            <span className="ml-auto font-mono text-[10px] tabular-nums text-gray-500">
+              {readout}
+            </span>
+          )}
+        </div>
+        <div className={`px-4 py-3${size === 'lg' ? ' max-h-[68vh] overflow-y-auto' : ''}`}>
+          {children}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-gray-100 bg-gray-50 px-4 py-2.5">
+          <span className="font-mono text-[9px] leading-snug text-gray-500">{footnote}</span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="ml-auto rounded-md border border-gray-300 bg-white px-3 py-1.5 text-[11px] font-semibold text-gray-700 hover:bg-gray-50"
+          >
+            Done
+          </button>
+        </div>
       </div>
-    </div>
+    </div>,
+    document.body,
+  );
+}
+
+/**
+ * Book cell entry. On a locked view (the liquidity book is model-driven) the
+ * value is plain text — no field, no caret — so only formulas can change it.
+ */
+function CellInput({
+  locked,
+  className,
+  ...input
+}: React.InputHTMLAttributes<HTMLInputElement> & { locked?: boolean }) {
+  if (!locked) return <input {...input} className={className} />;
+  return (
+    <span className={`inline-block ${className ?? ''}`}>
+      {input.value === undefined || input.value === null ? '' : String(input.value)}
+    </span>
   );
 }
 
@@ -178,9 +474,59 @@ const POLICY_VAR_LIMITS = [
   { usd: 10, label: '$10M', who: 'Director' },
   { usd: 20, label: '$20M', who: 'CFO' },
 ] as const;
+function GearIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
+
 const thBase = 'px-1.5 py-1 text-[11px] leading-tight font-semibold text-gray-600 whitespace-nowrap align-bottom text-right';
 const tdBase = 'px-1.5 py-0.5 text-right text-[11px] whitespace-nowrap tabular-nums';
 const inBase = 'text-right text-xs border-0 bg-transparent focus:bg-white focus:ring-1 focus:ring-blue-400 rounded px-0.5 outline-none';
+/** Per-cycle breakout row under a currency — same columns, lighter weight. */
+const cycleTd = 'px-1.5 py-0.5 text-right font-mono text-[10px] whitespace-nowrap tabular-nums';
+
+// ─── Carry desk tokens (carryOptim modal) ────────────────────────────────────
+const carryTh = 'px-1.5 py-1 text-right text-[9px] font-semibold uppercase tracking-[0.06em] text-gray-500 whitespace-nowrap';
+const carryTd = 'px-1.5 py-1 text-right font-mono text-[10px] tabular-nums whitespace-nowrap';
+const carryIn = 'w-full rounded border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 text-right font-mono text-[10px] tabular-nums text-gray-800 outline-none focus:ring-1 focus:ring-emerald-400';
+const carryPnl = (v: number) => (v >= 0 ? 'text-emerald-700' : 'text-red-600');
+const carrySeg = (on: boolean) =>
+  `rounded px-2 py-0.5 font-mono text-[10px] font-semibold transition-colors ${
+    on ? 'bg-emerald-100 text-emerald-800' : 'text-gray-500 hover:text-gray-700'
+  }`;
+
+// ─── Desk segmented control ──────────────────────────────────────────────────
+// One track, one lit segment in the hue of the band the control moves: forecast
+// → LIQUIDITY sky, funding → SWAP emerald, strategy → FX HEDGE rose. Disabled
+// dims rather than greying, so a conditional control cannot read as broken.
+// The track recesses on the white toolbar card and lifts on the gray layers rail,
+// so it reads as a control on either surface instead of melting into it.
+const segTrack = (surface: 'card' | 'rail'): string =>
+  `inline-flex rounded-md border border-gray-200 p-0.5 ${
+    surface === 'rail' ? 'bg-white' : 'bg-gray-50'
+  }`;
+const SEG_ON: Record<'sky' | 'emerald' | 'rose', string> = {
+  sky: 'bg-sky-100 text-sky-800',
+  emerald: 'bg-emerald-100 text-emerald-800',
+  rose: 'bg-rose-100 text-rose-800',
+};
+const deskSeg = (on: boolean, hue: keyof typeof SEG_ON) =>
+  `rounded px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+    on ? SEG_ON[hue] : 'text-gray-500 hover:text-gray-700'
+  }`;
 function forecastProfileUi(dark: boolean) {
   if (!dark) {
     return {
@@ -327,6 +673,752 @@ function forecastProfileUi(dark: boolean) {
     netRow: 'border-t-2 border-slate-600',
   };
 }
+type ForecastUi = ReturnType<typeof forecastProfileUi>;
+
+const SHAPE_PRESETS: {
+  id: string;
+  label: string;
+  title: string;
+  shape: FlowShape;
+}[] = [
+  {
+    id: 'start',
+    label: 'Start',
+    title: 'Settles on the first day of the month',
+    shape: { from: 0, to: 0, curve: 'lump' },
+  },
+  {
+    id: 'even',
+    label: 'Even',
+    title: 'Spread evenly across the month',
+    shape: { from: 0, to: 1, curve: 'even' },
+  },
+  {
+    id: 'mid',
+    label: 'Mid',
+    title: 'Clustered around mid-month',
+    shape: { from: 0.4, to: 0.6, curve: 'even' },
+  },
+  {
+    id: 'end',
+    label: 'End',
+    title: 'Settles on the last day of the month',
+    shape: { from: 1, to: 1, curve: 'lump' },
+  },
+];
+
+const CURVE_OPTIONS: { id: FlowCurve; label: string }[] = [
+  { id: 'lump', label: 'Lump' },
+  { id: 'even', label: 'Even' },
+  { id: 'front', label: 'Front' },
+  { id: 'back', label: 'Back' },
+];
+
+const GRANULARITY_OPTIONS: { id: LiquidityGranularity; label: string }[] = [
+  { id: 'day', label: 'Daily' },
+  { id: 'week', label: 'Weekly' },
+  { id: 'month', label: 'Monthly' },
+];
+
+const sameShape = (a: FlowShape, b: FlowShape): boolean =>
+  a.curve === b.curve &&
+  Math.abs(a.from - b.from) < 1e-9 &&
+  Math.abs(a.to - b.to) < 1e-9;
+
+/** Shape window as 1-based day-of-month numbers for the editor. */
+const shapeDayFrom = (s: FlowShape): number => dayOfMonthForFraction(s.from) + 1;
+const shapeDayTo = (s: FlowShape): number =>
+  s.curve === 'lump' ? shapeDayFrom(s) : dayOfMonthForFraction(s.to) + 1;
+const dayToFraction = (d: number): number =>
+  Math.min(
+    LADDER_DAYS_PER_MONTH - 1,
+    Math.max(0, Math.round(Number.isFinite(d) ? d : 1) - 1),
+  ) / LADDER_DAYS_PER_MONTH;
+
+function shapeLandsLabel(s: FlowShape): string {
+  const from = shapeDayFrom(s);
+  const to = shapeDayTo(s);
+  return from === to ? `D${from}` : `D${from}–D${to}`;
+}
+
+/**
+ * Liquidity view of the Forecast profile modal — when inside the cycle each
+ * monthly line settles. Monthly amounts stay in the Flows view; here only the
+ * timing is edited, which is what turns the trough into a dated minimum.
+ */
+function LiquidityTimingPanel({
+  fpu,
+  simDark,
+  rows,
+  forecastMonths,
+  timing,
+  profile,
+  hedgeSettleByCcy,
+  shared,
+  activeLayers,
+  bookTargetByCcy,
+  onTimingChange,
+}: {
+  fpu: ForecastUi;
+  simDark: boolean;
+  rows: RowState[];
+  forecastMonths: number;
+  timing: LiquidityTiming;
+  profile: ForecastProfileState;
+  hedgeSettleByCcy?: HedgeSettleByCcy;
+  shared: SharedGlobals;
+  activeLayers: Set<LayerId>;
+  /** Target the book settled per currency — anchors the preview to the desk's grid. */
+  bookTargetByCcy?: Record<string, number>;
+  onTimingChange?: (patch: Partial<LiquidityTiming>) => void;
+}) {
+  const fcyRows = rows.filter(r => r.ccy !== 'USD');
+  const [scope, setScope] = useState<string>('all');
+  const scopeCcy = scope === 'all' ? '' : scope;
+  const previewRow =
+    fcyRows.find(r => r.ccy === scope) ?? fcyRows[0] ?? null;
+
+  const chip = (on: boolean): string =>
+    `rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
+      on
+        ? simDark
+          ? 'bg-sky-600/30 text-sky-100'
+          : 'bg-blue-100 text-blue-900'
+        : simDark
+          ? 'text-slate-400 hover:bg-slate-800'
+          : 'text-gray-500 hover:bg-gray-100'
+    }`;
+
+  const writeShape = (field: LiquidityLineKey, shape: FlowShape | null) => {
+    if (!onTimingChange) return;
+    if (scope === 'all') {
+      const byField = { ...(timing.byField ?? {}) };
+      if (shape) byField[field] = shape;
+      else delete byField[field];
+      onTimingChange({ byField });
+      return;
+    }
+    const byCcy = { ...(timing.byCcy ?? {}) };
+    const forCcy = { ...(byCcy[scope] ?? {}) };
+    if (shape) forCcy[field] = shape;
+    else delete forCcy[field];
+    if (Object.keys(forCcy).length > 0) byCcy[scope] = forCcy;
+    else delete byCcy[scope];
+    onTimingChange({ byCcy });
+  };
+
+  const hasOverride = (field: LiquidityLineKey): boolean =>
+    scope === 'all'
+      ? timing.byField?.[field] !== undefined
+      : timing.byCcy?.[scope]?.[field] !== undefined;
+
+  // Hedge settlement is not a forecast input — the amounts come from the hedge
+  // book, so this line exposes only its timing plus the schedule behind it.
+  const hedgeSettle = previewRow ? hedgeSettleByCcy?.[previewRow.ccy] : undefined;
+  const hedgeMonths = (hedgeSettle ?? [])
+    .map((amount, index) => ({ month: index + 1, amount }))
+    .filter(h => Math.abs(h.amount) > 1e-9);
+  const hedgeNet = hedgeMonths.reduce((s, h) => s + h.amount, 0);
+  const anyHedges = Object.values(hedgeSettleByCcy ?? {}).some(series =>
+    series.some(v => Math.abs(v) > 1e-9),
+  );
+
+  const timingLines: {
+    key: LiquidityLineKey;
+    label: string;
+    side: ForecastFlowSide;
+    note?: string;
+    noteTitle?: string;
+  }[] = [
+    ...forecastFlowLinesGrouped().map(l => ({
+      key: l.key as LiquidityLineKey,
+      label: l.label,
+      side: l.side,
+    })),
+    ...(anyHedges
+      ? [{
+          key: HEDGE_SETTLE_LINE as LiquidityLineKey,
+          label: 'Hedge settle',
+          side: hedgeSettleSide(hedgeNet),
+          note: hedgeMonths.length > 0
+            ? hedgeMonths.map(h => `M${h.month} ${f2(h.amount)}`).join(' · ')
+            : `none in ${previewRow?.ccy ?? 'this CCY'}`,
+          noteTitle:
+            'FCY leg of booked and prepared hedges. The amount comes from'
+            + ' Hedging Decision — only the settlement timing is editable here.',
+        }]
+      : []),
+  ];
+
+  const cycleWindow = shapeCycleWindow(timing, scopeCcy);
+  const livePlanProfile = { ...profile, liquidity: { ...timing, enabled: true } };
+  const ladder = previewRow
+    ? buildLiquidityLadder(previewRow, livePlanProfile, {
+        months: forecastMonths,
+        hedgeSettle,
+      })
+    : null;
+  // The funded plan, not the bare path: each cycle opens where its own near leg
+  // left it, which is what keeps a repeating drain from compounding into a swap
+  // the size of the whole horizon.
+  const plan = ladder && previewRow
+    ? fundedPlanFor(
+        previewRow, shared, activeLayers, ladder, livePlanProfile, hedgeSettle,
+        bookTargetByCcy?.[previewRow.ccy],
+      )
+    : [];
+  // Sizing reads the requirement chain — a leg per cycle — whichever way the cover
+  // is booked. Trough Cash is this path's operating low, including FX settlement.
+  const sizingPlan = ladder && previewRow && (timing.bookingMode ?? 'rolling') === 'term'
+    ? fundedPlanFor(
+        previewRow, shared, activeLayers, ladder, livePlanProfile, hedgeSettle,
+        bookTargetByCcy?.[previewRow.ccy], 'rolling',
+      )
+    : plan;
+  const sizing = sizingPlan.length > 0
+    ? sizingFromPlan(sizingPlan, timing.sizingBasis ?? 'horizon')
+    : null;
+  const bucketsPerCycle =
+    LADDER_DAYS_PER_MONTH /
+    (timing.granularity === 'day' ? 1 : timing.granularity === 'week' ? 7 : 30);
+
+  return (
+    <div className="min-h-0 flex-1 space-y-3 overflow-auto pt-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <label
+          className={fpu.growthLabel}
+          title="Off keeps the lump-sum trough — every payout before any payin, and NWC, debt, investing and hedge settlement out of it entirely"
+        >
+          <input
+            type="checkbox"
+            checked={timing.enabled}
+            onChange={e => onTimingChange?.({ enabled: e.target.checked })}
+            className="h-3 w-3 accent-sky-600"
+          />
+          <span className="whitespace-nowrap">Drive trough from timing</span>
+        </label>
+        <div className={fpu.modeWrap} role="group" aria-label="Ladder granularity">
+          {GRANULARITY_OPTIONS.map(o => (
+            <button
+              key={o.id}
+              type="button"
+              onClick={() => onTimingChange?.({ granularity: o.id })}
+              className={`transition-colors ${
+                timing.granularity === o.id ? fpu.modeOn : fpu.modeOff
+              }`}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+        <span className={`font-mono text-[11px] ${fpu.textSecondary}`}>
+          {Math.max(1, forecastMonths)}m ×{' '}
+          {GRANULARITY_OPTIONS.find(o => o.id === timing.granularity)?.label.toLowerCase()} ={' '}
+          {Math.round(Math.max(1, forecastMonths) * bucketsPerCycle)} buckets
+        </span>
+        <span className={`font-mono text-[11px] ${fpu.textSecondary}`}>
+          cycle window{' '}
+          <span className={fpu.textPrimary}>
+            D{cycleWindow.startDay + 1} → D{cycleWindow.endDay + 1}
+          </span>{' '}
+          ({cycleWindow.lengthDays}d)
+        </span>
+      </div>
+
+      {/* Basis and convention are set on the desk rail, where their effect on the
+          swap band is visible. Here they only read out against the preview CCY. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span className={`text-[10px] uppercase tracking-wide ${fpu.textMuted}`}>
+          Funding
+        </span>
+        <span
+          className={`font-mono text-[11px] ${fpu.textSecondary}`}
+          title="Set on the desk toolbar under Swap funding"
+        >
+          sized on{' '}
+          <span className={fpu.textPrimary}>
+            {SIZING_BASIS_OPTIONS.find(o => o.id === (timing.sizingBasis ?? 'horizon'))?.label}
+          </span>
+          {' · booked as '}
+          <span className={fpu.textPrimary}>
+            {BOOKING_MODE_OPTIONS.find(o => o.id === (timing.bookingMode ?? 'rolling'))?.label}
+          </span>
+        </span>
+        {sizing && plan.length > 1 && (
+          <span
+            className={`font-mono text-[11px] ${fpu.textSecondary}`}
+            title={`The cycle whose operating low sizes H* in ${previewRow?.ccy ?? 'this CCY'}, and`
+              + ' the cover it needs. Trough Cash is that cycle’s dated low with no'
+              + ' funding swap in it; the near leg is the separate Swap column.'}
+          >
+            binding{' '}
+            <span className={fpu.textPrimary}>
+              M{sizing.index + 1} @ {f2(ladder?.cycles[sizing.index]?.low ?? sizing.trough)}
+            </span>
+            {' · cover '}
+            <span className={fpu.textPrimary}>
+              {f2(sizingPlan[sizing.index]?.swap_needed ?? 0)}
+            </span>
+          </span>
+        )}
+        {plan.length > 0 && (
+          <span
+            className={`font-mono text-[11px] ${fpu.textSecondary}`}
+            title={(timing.bookingMode ?? 'rolling') === 'term'
+              ? `One leg today, held to M${plan.length}`
+              : `${f2(plan[0]?.swap_needed ?? 0)} today, then a leg every cycle — the legs roll, so the book adds up`}
+          >
+            {(timing.bookingMode ?? 'rolling') === 'term' ? 'term leg ' : 'book now '}
+            <span className={fpu.textPrimary}>{f2(plan[0]?.swap_needed ?? 0)}</span>
+            {' · outstanding M'}
+            {plan.length}{' '}
+            <span className={fpu.textPrimary}>
+              {f2(plan[plan.length - 1]?.standing_swap ?? 0)}
+            </span>
+          </span>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className={`text-[10px] uppercase tracking-wide ${fpu.textMuted}`}>
+          Applies to
+        </span>
+        <button type="button" onClick={() => setScope('all')} className={chip(scope === 'all')}>
+          All CCY
+        </button>
+        {fcyRows.map(r => (
+          <button
+            key={r.ccy}
+            type="button"
+            onClick={() => setScope(r.ccy)}
+            className={chip(scope === r.ccy)}
+          >
+            {r.ccy}
+            {timing.byCcy?.[r.ccy] && Object.keys(timing.byCcy[r.ccy]!).length > 0 ? ' •' : ''}
+          </button>
+        ))}
+      </div>
+
+      <div className={`overflow-x-auto rounded-lg border ${simDark ? 'border-slate-700' : 'border-gray-200'}`}>
+        <table className="w-full border-collapse font-mono text-[11px] tabular-nums">
+          <thead>
+            <tr>
+              <th className={`${fpu.th} border-l-0 text-left`}>Line</th>
+              <th className={fpu.th}>Preset</th>
+              <th className={fpu.th} title="First day of the settlement window">
+                From
+              </th>
+              <th className={fpu.th} title="Last day of the settlement window">
+                To
+              </th>
+              <th className={fpu.th}>Curve</th>
+              <th className={fpu.th}>Lands</th>
+              <th className={fpu.th} />
+            </tr>
+          </thead>
+          <tbody>
+            {timingLines.map(line => {
+              const shape = resolveFlowShape(timing, scopeCcy, line.key, line.side);
+              const out = line.side === 'out';
+              return (
+                <tr key={line.key}>
+                  <td className={`${fpu.td} border-l-0 text-left ${out ? fpu.signOut : fpu.signIn}`}>
+                    {line.label}
+                    <span className={out ? fpu.sideTagOut : fpu.sideTagIn}>
+                      {out ? 'out' : 'in'}
+                    </span>
+                    {line.note && (
+                      <span
+                        className={`ml-1.5 font-normal ${fpu.textMuted}`}
+                        title={line.noteTitle}
+                      >
+                        {line.note}
+                      </span>
+                    )}
+                  </td>
+                  <td className={fpu.td}>
+                    <div className="flex justify-end gap-1">
+                      {SHAPE_PRESETS.map(p => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          title={p.title}
+                          onClick={() => writeShape(line.key, p.shape)}
+                          className={chip(sameShape(shape, p.shape))}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                  <td className={fpu.td}>
+                    <input
+                      type="number"
+                      min={1}
+                      max={LADDER_DAYS_PER_MONTH}
+                      value={shapeDayFrom(shape)}
+                      onChange={e =>
+                        writeShape(line.key, {
+                          ...shape,
+                          from: dayToFraction(Number(e.target.value)),
+                        })
+                      }
+                      className={`${fpu.input} w-14`}
+                    />
+                  </td>
+                  <td className={fpu.td}>
+                    <input
+                      type="number"
+                      min={1}
+                      max={LADDER_DAYS_PER_MONTH}
+                      value={shapeDayTo(shape)}
+                      disabled={shape.curve === 'lump'}
+                      onChange={e =>
+                        writeShape(line.key, {
+                          ...shape,
+                          to: dayToFraction(Number(e.target.value)),
+                        })
+                      }
+                      className={`${fpu.input} w-14 disabled:opacity-40`}
+                    />
+                  </td>
+                  <td className={fpu.td}>
+                    <select
+                      value={shape.curve}
+                      onChange={e =>
+                        writeShape(line.key, {
+                          ...shape,
+                          curve: e.target.value as FlowCurve,
+                        })
+                      }
+                      className={`${fpu.input} w-20 text-left`}
+                    >
+                      {CURVE_OPTIONS.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className={`${fpu.td} ${fpu.textValue}`}>{shapeLandsLabel(shape)}</td>
+                  <td className={fpu.td}>
+                    {hasOverride(line.key) ? (
+                      <button
+                        type="button"
+                        onClick={() => writeShape(line.key, null)}
+                        className={chip(false)}
+                        title={
+                          scope === 'all'
+                            ? 'Drop this line override — inherit the side default'
+                            : `Drop the ${scope} override — inherit the all-CCY shape`
+                        }
+                      >
+                        reset
+                      </button>
+                    ) : (
+                      <span className={fpu.textMuted}>—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {ladder && previewRow && (
+        <LadderPreview
+          fpu={fpu}
+          simDark={simDark}
+          ccy={previewRow.ccy}
+          ladder={ladder}
+          plan={plan}
+          bindingCycle={sizing?.index ?? 0}
+          bookingMode={timing.bookingMode ?? 'rolling'}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Bucketed cash path for one currency, with the trough and floor marked. */
+function LadderPreview({
+  fpu,
+  simDark,
+  ccy,
+  ladder,
+  plan,
+  bindingCycle,
+  bookingMode,
+}: {
+  fpu: ForecastUi;
+  simDark: boolean;
+  ccy: string;
+  ladder: LiquidityLadderResult;
+  /** Funded per-cycle plan — same cycles as the ladder, each one funded. */
+  plan: readonly LiquidityCycleProjection[];
+  bindingCycle: number;
+  bookingMode: LiquidityBookingMode;
+}) {
+  const lows = ladder.buckets.map(b => b.low);
+  const min = Math.min(0, ladder.floor, ...lows);
+  const max = Math.max(0, ladder.opening, ...lows);
+  const span = max - min || 1;
+  const pos = (v: number): number => ((v - min) / span) * 100;
+
+  return (
+    <div className={`rounded-lg border p-3 ${simDark ? 'border-slate-700 bg-slate-950/40' : 'border-gray-200 bg-gray-50'}`}>
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 font-mono text-[11px]">
+        <span className={fpu.textPrimary}>{ccy}</span>
+        <span className={fpu.textSecondary}>
+          opening <span className={fpu.textValue}>{f2(ladder.opening)}</span>
+        </span>
+        <span
+          className={fpu.textSecondary}
+          title={
+            bindingCycle === 0
+              ? 'Low inside cycle 1 — this is what sizes H* and the swap'
+              : `Low inside cycle 1 — H* and the swap size against cycle M${bindingCycle + 1} instead`
+          }
+        >
+          cycle trough{' '}
+          <span className={ladder.cycleTrough < ladder.floor ? fpu.textNegative : fpu.textValue}>
+            {f2(ladder.cycleTrough)}
+          </span>{' '}
+          <span className={fpu.textMuted}>D{ladder.cycleTroughDay + 1}</span>
+        </span>
+        <span className={fpu.textSecondary} title="Cycle 1 closing — every month-1 line settled">
+          cycle end <span className={fpu.textValue}>{f2(ladder.cycleClosing)}</span>
+        </span>
+        {ladder.months > 1 && (
+          <span
+            className={fpu.textSecondary}
+            title="Lowest point of the unfunded path — a forecast signal, not a funding need: sizing runs on the funded cycles below"
+          >
+            horizon low{' '}
+            <span className={ladder.trough < ladder.floor ? fpu.textNegative : fpu.textValue}>
+              {f2(ladder.trough)}
+            </span>{' '}
+            <span className={fpu.textMuted}>D{ladder.troughDay + 1}</span>
+          </span>
+        )}
+        <span className={fpu.textSecondary}>
+          closing <span className={fpu.textValue}>{f2(ladder.closing)}</span>
+        </span>
+        <span className={fpu.textSecondary}>
+          floor <span className={fpu.textValue}>{f2(ladder.floor)}</span>
+        </span>
+        {ladder.daysBelowFloor > 0 && (
+          <span className={fpu.textNegative}>
+            {ladder.daysBelowFloor}d below floor
+            {ladder.months > 1 ? ` (${ladder.cycleDaysBelowFloor}d in cycle 1)` : ''}
+          </span>
+        )}
+      </div>
+      <div className="mt-2 overflow-x-auto">
+        <div className="flex min-w-max items-end gap-[3px]">
+          {ladder.buckets.map(b => {
+            const bottom = Math.min(b.low, 0);
+            const top = Math.max(b.low, 0);
+            const isTrough = b.index === ladder.troughBucket;
+            return (
+              <div key={b.index} className="flex w-[26px] shrink-0 flex-col items-center gap-1">
+                <div
+                  className={`relative h-16 w-full rounded-sm ${simDark ? 'bg-slate-900' : 'bg-white'}`}
+                  title={`${b.label} · low ${f2(b.low)} · in ${f2(b.inflow)} · out ${f2(b.outflow)} · close ${f2(b.closing)}`}
+                >
+                  <div
+                    className={`absolute inset-x-0 border-t border-dashed ${simDark ? 'border-slate-700' : 'border-gray-300'}`}
+                    style={{ bottom: `${pos(0)}%` }}
+                  />
+                  <div
+                    className={`absolute inset-x-0 border-t border-dashed ${simDark ? 'border-amber-500/50' : 'border-amber-400'}`}
+                    style={{ bottom: `${pos(ladder.floor)}%` }}
+                  />
+                  <div
+                    className={`absolute inset-x-[3px] rounded-sm ${
+                      b.belowFloor
+                        ? simDark ? 'bg-rose-500/70' : 'bg-rose-400'
+                        : simDark ? 'bg-sky-500/60' : 'bg-sky-400'
+                    } ${isTrough ? 'ring-1 ring-amber-400' : ''}`}
+                    style={{
+                      bottom: `${pos(bottom)}%`,
+                      height: `${Math.max(2, ((top - bottom) / span) * 100)}%`,
+                    }}
+                  />
+                </div>
+                <span className={`font-mono text-[9px] ${isTrough ? fpu.textPrimary : fpu.textMuted}`}>
+                  {b.label}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className={`mt-1.5 text-[10px] ${fpu.textMuted}`}>
+        Bar = worst balance inside the bucket (outflows settle before inflows) ·
+        amber dashes = cash floor · ringed bar holds the trough
+      </div>
+
+      <LiquidityCyclePlanTable
+        fpu={fpu}
+        simDark={simDark}
+        plan={plan}
+        cycles={ladder.cycles}
+        floor={ladder.floor}
+        bindingCycle={bindingCycle}
+        bookingMode={bookingMode}
+      />
+    </div>
+  );
+}
+
+/**
+ * Funded per-cycle plan: what each cycle drains, the low it reaches, and the
+ * near leg it needs. Shared by the Liquidity view of the forecast profile and
+ * the expandable liquidity row in the grid.
+ */
+function LiquidityCyclePlanTable({
+  fpu,
+  simDark,
+  plan,
+  cycles,
+  floor,
+  bindingCycle,
+  bookingMode,
+}: {
+  fpu: ForecastUi;
+  simDark: boolean;
+  plan: readonly LiquidityCycleProjection[];
+  /** Dated shape of the same cycles — gross out / in and the day the low lands. */
+  cycles: readonly LadderCycle[];
+  floor: number;
+  bindingCycle: number;
+  bookingMode: LiquidityBookingMode;
+}) {
+  const term = bookingMode === 'term';
+  return (
+    <>
+      <div className={`mt-3 overflow-x-auto rounded-md border ${simDark ? 'border-slate-700' : 'border-gray-200'}`}>
+        <table className="w-full border-collapse font-mono text-[11px] tabular-nums">
+          <thead>
+            <tr>
+              <th className={`${fpu.th} border-l-0 text-left`}>Cycle</th>
+              <th className={fpu.th} title="Opening balance on the funded path — the prior cycle's close, its near leg included">
+                Open Balance
+              </th>
+              <th className={fpu.th} title="Everything leaving in the cycle, including NWC, debt, investing and hedge settlement">
+                Out
+              </th>
+              <th className={fpu.th}>In</th>
+              <th className={fpu.th} title="In − out inside the cycle — a flow, not a balance">
+                Net Flow
+              </th>
+              <th className={fpu.th} title="Open balance − low: the cash this cycle drains at its deepest">
+                Drawdown
+              </th>
+              <th className={fpu.th} title="Operating low this cycle reaches — dated path, no funding swap in it. The near leg is the next column.">
+                Trough
+              </th>
+              <th className={fpu.th} title="Cushion this cycle has to hold at its trough">
+                H*
+              </th>
+              <th className={fpu.th} title="New leg to add for this cycle, sized on the funded path so earlier cover is not double-counted">
+                Near leg
+              </th>
+              <th className={fpu.th} title="Swap notional outstanding once this cycle's leg is on — every earlier leg is rolled, not run off, so the legs add up. Shown as Swap Book on the desk.">
+                Swap Book
+              </th>
+              {!term && (
+                <th className={fpu.th} title="How much of this cycle's leg exceeds the one booked today — bookable now as a forward-dated tranche. Term booking has nothing to pre-book: its single leg already covers the path.">
+                  Tranche
+                </th>
+              )}
+              <th className={fpu.th} title="Where the cycle closes with its own near leg on — the Cycle End column on the desk. The desk's Close Balance is the same cycle before the swap.">
+                Cycle End
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {plan.map(p => {
+              const shape = cycles[p.cycleIndex];
+              const binds = p.cycleIndex === bindingCycle;
+              return (
+                <tr
+                  key={p.cycleIndex}
+                  className={binds ? (simDark ? 'bg-sky-900/30' : 'bg-sky-50') : undefined}
+                >
+                  <td className={`${fpu.td} border-l-0 text-left`}>
+                    <span className={binds ? fpu.textPrimary : fpu.textSecondary}>
+                      M{p.cycleIndex + 1}
+                    </span>
+                    {binds && (
+                      <span
+                        className={`ml-1.5 text-[9px] ${fpu.textMuted}`}
+                        title="This is the low H* and the swap size against"
+                      >
+                        sizes H*
+                      </span>
+                    )}
+                  </td>
+                  <td className={fpu.td}>{f2(p.opening_cash)}</td>
+                  <td className={`${fpu.td} ${(shape?.outflow ?? 0) > 0 ? fpu.textNegative : fpu.textMuted}`}>
+                    {(shape?.outflow ?? 0) > 0 ? `−${f2(shape!.outflow)}` : '—'}
+                  </td>
+                  <td className={fpu.td}>
+                    {(shape?.inflow ?? 0) > 0 ? f2(shape!.inflow) : '—'}
+                  </td>
+                  <td className={`${fpu.td} ${
+                    !shape ? fpu.textMuted : shape.net < 0 ? fpu.textNegative : fpu.textValue
+                  }`}>
+                    {shape ? f2(shape.net) : '—'}
+                  </td>
+                  <td className={`${fpu.td} ${p.drawdown > 0 ? fpu.textNegative : fpu.textMuted}`}>
+                    {p.drawdown > 0 ? f2(p.drawdown) : '—'}
+                  </td>
+                  <td
+                    className={`${fpu.td} ${(shape?.low ?? p.forecasted_cash) < floor ? fpu.textNegative : fpu.textValue}`}
+                    title={shape ? `operating low on D${shape.lowDay - shape.startDay + 1} of the cycle — no funding swap in it` : undefined}
+                  >
+                    {f2(shape?.low ?? p.forecasted_cash)}
+                  </td>
+                  <td className={fpu.td}>{f2(p.cash_threshold)}</td>
+                  <td className={`${fpu.td} ${Math.abs(p.swap_needed) > 0.001 ? fpu.textPrimary : fpu.textMuted}`}>
+                    {Math.abs(p.swap_needed) > 0.001 ? f2(p.swap_needed) : '—'}
+                  </td>
+                  <td className={`${fpu.td} ${Math.abs(p.standing_swap) > 0.001 ? fpu.textNegative : fpu.textMuted}`}>
+                    {Math.abs(p.standing_swap) > 0.001 ? f2(p.standing_swap) : '—'}
+                  </td>
+                  {!term && (
+                    <td className={`${fpu.td} ${p.incremental_swap > 0.001 ? fpu.textValue : fpu.textMuted}`}>
+                      {p.incremental_swap > 0.001 ? f2(p.incremental_swap) : '—'}
+                    </td>
+                  )}
+                  <td className={`${fpu.td} ${p.cycle_end_cash < floor ? fpu.textNegative : fpu.textValue}`}>
+                    {f2(p.cycle_end_cash)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className={`mt-1.5 text-[10px] ${fpu.textMuted}`}>
+        {term
+          ? `One term swap funds the whole path: the leg lands at M1 and the cash
+             runs down cycle by cycle, so the Swap Book is flat while the closes
+             fall. Every cycle still clears its own H* — the cover above it is
+             what the term convention pays carry for.`
+          : `Every cycle here is funded: its near leg is in place, so the next
+             cycle opens where this one left it. Rolling a leg keeps its cash, it
+             does not repay the drain — so when the drawdown repeats, the near leg
+             stays flat while the Swap Book climbs by that leg every cycle. The
+             Swap Book at the last cycle is the funding the horizon needs.`}
+      </div>
+    </>
+  );
+}
+
 const FORECAST_FORMULA_SUGGESTIONS = [
   'prev',
   'k',
@@ -372,7 +1464,7 @@ export function UnifiedSimulator({
   shared, onSharedChange,
   rows, setRows,
   usdCash, setUsdCash,
-  usdNonNpCash, setUsdNonNpCash,
+  usdNonLpCash, setUsdNonLpCash,
   usdParams, setUsdParams,
   onResetTable,
   activeLayers,
@@ -399,6 +1491,11 @@ export function UnifiedSimulator({
    * Used when editing so write-back strips the overlay from the seed book.
    */
   bookedPositionByCcy = {},
+  /**
+   * FCY leg of booked and prepared hedges per currency and month — the dated
+   * hedge line on the liquidity path (see the Liquidity view of the profile).
+   */
+  hedgeSettleByCcy = {},
   /** Analytics regime — labels VaR columns (confidence · horizon · basis). */
   varSetup,
   /** Sync FX Risk forecast period into Analytics / answers. */
@@ -412,10 +1509,12 @@ export function UnifiedSimulator({
   formulas,
   onFormulaChange,
   onFormulaChanges,
-  /** Hide FX Hedge column group + hedging-strategy/Portfolio VAR toolbar (Liquidity view). */
+  /** Hide FX Hedge column group + hedging-strategy toolbar (Liquidity view). */
   hideFxHedge = false,
   /** 'carryOnly': P&L shows only Cash Carry + Swap Carry (drops Net Delta / Hedge Carry / Total Carry). */
   pnlColumns = 'full',
+  /** Read-only book: values come from the model and its formulas, not from typing. */
+  lockValues = false,
 }: {
   shared: SharedGlobals;
   onSharedChange: (key: keyof SharedGlobals, value: number) => void;
@@ -423,8 +1522,8 @@ export function UnifiedSimulator({
   setRows: React.Dispatch<React.SetStateAction<RowState[]>>;
   usdCash: number;
   setUsdCash: React.Dispatch<React.SetStateAction<number>>;
-  usdNonNpCash: number;
-  setUsdNonNpCash: React.Dispatch<React.SetStateAction<number>>;
+  usdNonLpCash: number;
+  setUsdNonLpCash: React.Dispatch<React.SetStateAction<number>>;
   usdParams: UsdParams;
   setUsdParams: React.Dispatch<React.SetStateAction<UsdParams>>;
   /** Restore the dashboard seed book (not the full workbench currency catalog). */
@@ -448,6 +1547,7 @@ export function UnifiedSimulator({
   showRiskMetrics?: boolean;
   riskMetricsByCcy?: Record<string, FxRiskMetricCell>;
   bookedPositionByCcy?: Record<string, BookedPositionOffset>;
+  hedgeSettleByCcy?: HedgeSettleByCcy;
   varSetup?: VarSetup;
   onVarSetupChange?: (setup: VarSetup) => void;
   /** Flat monthly×T or custom per-period Revenue/Expenses. */
@@ -465,6 +1565,7 @@ export function UnifiedSimulator({
   onFormulaChanges?: (updates: Record<string, string>) => void;
   hideFxHedge?: boolean;
   pnlColumns?: 'full' | 'carryOnly';
+  lockValues?: boolean;
 }) {
   // IR / fixed-rate book section: shown when any of its inputs are selected.
   const irCols = (showBonds ? 2 : 0) + (showInvestments ? 2 : 0) + (showLiabilities ? 2 : 0);
@@ -478,9 +1579,45 @@ export function UnifiedSimulator({
   const ratesOn = showAdvancedBook && showRates;
   /** Task Mode: Debt + Investments live in FX POSITION; every FX cell is editable. */
   const simplifiedFx = !showAdvancedBook;
-  const fxPosColSpan = simplifiedFx ? 16 : 12;
+  /** … plus Hedge (FCY) / Hedge $USD broken out of Cash FX and Fwd. */
+  const fxPosColSpan = (simplifiedFx ? 16 : 12) + 2;
   /** Exp · Booked H · Residual · VaR (after booked hedges; no Decision-% staging) */
   const riskMetricCols = 4;
+  /**
+   * The target each currency's layer stack settled on, carry requirement and
+   * portfolio VaR budget included. The forecast-profile preview prices its plan
+   * against it so the panel and this grid fund the same level.
+   */
+  const bookTargetByCcy = useMemo(
+    () => Object.fromEntries(
+      fcyComputed
+        .filter(r => r.ccy !== 'USD')
+        .map(r => [r.ccy, r.cash_threshold_pre_swap]),
+    ),
+    [fcyComputed],
+  );
+  /**
+   * Non-LP cash is a book input, not part of the cycle path: it stays on the
+   * editable book and off the read-only liquidity desk, which mirrors the
+   * per-cycle plan (open → out → in → net → drawdown → trough → close).
+   */
+  const showNonLp = !lockValues;
+  const liquidityCols = 9 + (showNonLp ? 1 : 0);
+  const swapCols = 7;
+  /** Width of the whole grid — full-width detail rows span it. Mirrors the band header. */
+  const gridCols =
+    1
+    + (ratesOn ? 3 : 0)
+    + (showFxPosition ? fxPosColSpan : 0)
+    + (showLiquidity ? liquidityCols : 0)
+    + (showIrBook ? irCols : 0)
+    + (showCarry ? 3 : 0)
+    + (showSwap ? swapCols : 0)
+    + (showFxHedge ? 5 : 0)
+    + (showRiskMetrics ? riskMetricCols : 0)
+    + (showPnl ? (pnlCarryOnly ? 2 : 5) : 0);
+  /** Currency whose funded per-cycle liquidity plan is expanded under its row. */
+  const [liqPlanCcy, setLiqPlanCcy] = useState<string | null>(null);
   const riskUsdTotals = useMemo(() => {
     let exp = 0;
     let fwd = 0;
@@ -507,6 +1644,14 @@ export function UnifiedSimulator({
   };
   /** Collapsed Formula help disclosure in Forecast profile chrome. */
   const [forecastFormulaHelpOpen, setForecastFormulaHelpOpen] = useState(false);
+  // The Liquidity desk (no FX hedge columns) opens the profile on timing;
+  // the FX Simulator opens it on the monthly amounts.
+  const [forecastView, setForecastView] = useState<'flows' | 'liquidity'>(
+    hideFxHedge ? 'liquidity' : 'flows',
+  );
+  useEffect(() => {
+    if (forecastProfileOpen) setForecastView(hideFxHedge ? 'liquidity' : 'flows');
+  }, [forecastProfileOpen, hideFxHedge]);
   /** Click line name → assign 1m projection uncertainty for that cash line. */
   const [lineUncertaintyEdit, setLineUncertaintyEdit] = useState<{
     ccy: string;
@@ -525,6 +1670,25 @@ export function UnifiedSimulator({
       : typeof varSetup?.forecastMonths === 'number' && varSetup.forecastMonths >= 0
         ? varSetup.forecastMonths
         : 1;
+
+  const liquidityTiming =
+    resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
+
+  const updateLiquidityTiming = useCallback(
+    (patch: Partial<LiquidityTiming>) => {
+      if (!onForecastProfileChange) return;
+      onForecastProfileChange({
+        ...forecastProfile,
+        liquidity: { ...liquidityTiming, ...patch },
+      });
+    },
+    [onForecastProfileChange, forecastProfile, liquidityTiming],
+  );
+
+  // Sizing basis and booking convention only reach the book through the dated
+  // path, so they are inert without a forecast period or an editable profile.
+  const liquidityFundingLive =
+    Boolean(onForecastProfileChange) && liquidityTiming.enabled && forecastMonths > 0;
 
   const setLineUncertainty = useCallback(
     (ccy: string, field: ForecastFlowField, u1m: number) => {
@@ -590,6 +1754,33 @@ export function UnifiedSimulator({
     (ccy: string): BookedPositionOffset =>
       bookedPositionByCcy[ccy] ?? { spotLocalM: 0, fwdLocalM: 0 },
     [bookedPositionByCcy],
+  );
+
+  /** Booked hedge sitting inside the FX book, broken out for its own column. */
+  const hedgeFcyFor = useCallback(
+    (ccy: string): number => {
+      const o = offsetFor(ccy);
+      return o.spotLocalM + o.fwdLocalM;
+    },
+    [offsetFor],
+  );
+
+  const hedgeCellTitle = useCallback(
+    (ccy: string): string | undefined => {
+      const o = offsetFor(ccy);
+      const settle = (hedgeSettleByCcy[ccy] ?? [])
+        .map((amount, i) => ({ month: i + 1, amount }))
+        .filter(s => Math.abs(s.amount) > 1e-9);
+      if (Math.abs(o.spotLocalM) < 1e-9 && Math.abs(o.fwdLocalM) < 1e-9
+        && settle.length === 0) return undefined;
+      const legs = `Booked: spot ${f2(o.spotLocalM)} + forward ${f2(o.fwdLocalM)} M FCY`
+        + ' — already inside Cash FX and Fwd, shown here so the overlay is visible.';
+      if (settle.length === 0) return legs;
+      return `${legs}\nSettles (booked + prepared): `
+        + settle.map(s => `M${s.month} ${f2(s.amount)}`).join(' · ')
+        + ' — dated on the liquidity path.';
+    },
+    [offsetFor, hedgeSettleByCcy],
   );
 
   const editRow = useCallback((
@@ -1379,6 +2570,214 @@ export function UnifiedSimulator({
   const [strategy, setStrategy] = useState<HedgeStrategy>('SWAP_ONLY');
   /** Option δ override per row (default 0.5). */
   const [hedgeDeltas, setHedgeDeltas] = useState<Record<string, number>>({});
+  /** Gear next to the Min floor layer: per-currency minimum cash thresholds. */
+  /** Which buffer layer's settings strip is open (one at a time). */
+  const [layerPanel, setLayerPanel] = useState<LayerId | null>(null);
+  const tableScrollRef = useRef<HTMLDivElement | null>(null);
+  const [activeBand, setActiveBand] = useState<BandId>('rates');
+  const [colCount, setColCount] = useState(0);
+  /** FCY rows only — the USD row carries no per-currency floor in the buffer model. */
+  const floorRows = useMemo(() => rows.filter(r => r.ccy !== 'USD'), [rows]);
+  const floorsSetCount = floorRows.filter(r => r.cash_floor > 0.0001).length;
+  const floorTotalUsd = floorRows.reduce(
+    (sum, r) => sum + fcyToUsdM(r.cash_floor, r.ccy),
+    0,
+  );
+
+  /** Per-currency payout σ lives on the forecast profile, not on the row. */
+  const [sigmaDrafts, setSigmaDrafts] = useState<Record<string, string>>({});
+  const sigmaOverrideCount = floorRows.filter(
+    r => lineUncertainty1m(forecastProfile, r.ccy, 'payout') > 0,
+  ).length;
+  const commitSigma = (ccy: string, raw: string) => {
+    setSigmaDrafts(d => {
+      const next = { ...d };
+      delete next[ccy];
+      return next;
+    });
+    if (raw.trim() === '') {
+      setLineUncertainty(ccy, 'payout', 0);
+      return;
+    }
+    const pct = parseFloat(raw);
+    if (!Number.isFinite(pct)) return;
+    setLineUncertainty(ccy, 'payout', Math.max(0, Math.min(1, pct / 100)));
+  };
+
+  // ── Carry desk (carryOptim gear) ───────────────────────────────────────────
+  /** Which column the desk steers on: the rate, the cash target, or the P&L target. */
+  const [carryDrive, setCarryDrive] = useState<'rate' | 'cash' | 'pnl'>('rate');
+  /** Months of forecast lifecycle to project the target and its accrual over. */
+  const [carryHorizon, setCarryHorizon] = useState(() =>
+    Math.min(12, Math.max(1, forecastMonths || 1)),
+  );
+  /** Currency whose per-period projection is expanded (one at a time). */
+  const [carryExpanded, setCarryExpanded] = useState<string | null>(null);
+  /** Per-row note when a typed carry ask has no reachable target, keyed by row id. */
+  const [carryNotes, setCarryNotes] = useState<Record<string, string>>({});
+
+  const carryRows = useMemo(
+    () => fcyComputed.filter(r => r.ccy !== 'USD'),
+    [fcyComputed],
+  );
+  const carryTargetCount = carryRows.filter(
+    r => typeof r.carry_target === 'number' && Number.isFinite(r.carry_target),
+  ).length;
+
+  const setCarryTarget = useCallback((id: string, value: number | undefined) => {
+    setRows(prev => prev.map(r => (
+      r.id === id
+        ? { ...r, carry_target: value === undefined ? undefined : roundMoney(value) }
+        : r
+    )));
+  }, [setRows]);
+
+  const clearCarryDrafts = useCallback((id: string) => {
+    setDrafts(prev => {
+      const next = { ...prev };
+      delete next[`${id}.carry_target`];
+      delete next[`${id}.carry_pnl`];
+      return next;
+    });
+  }, []);
+
+  /** Blank clears the override and hands the leg back to z_opt. */
+  const commitCarryCash = useCallback((id: string, raw: string) => {
+    clearCarryDrafts(id);
+    if (raw.trim() === '') return setCarryTarget(id, undefined);
+    const v = parseFloat(raw);
+    if (Number.isFinite(v)) setCarryTarget(id, v);
+  }, [clearCarryDrafts, setCarryTarget]);
+
+  /**
+   * Typed carry ($k for the near period) inverts into the cash target that earns
+   * it. Flows come from the projected near period, not the row, so a custom
+   * forecast profile inverts against the same numbers the projection shows.
+   */
+  const commitCarryPnl = useCallback((
+    row: FcyComputedRow,
+    near: CarryPeriod | undefined,
+    raw: string,
+  ) => {
+    setCarryNotes(prev => {
+      if (!prev[row.id]) return prev;
+      const next = { ...prev };
+      delete next[row.id];
+      return next;
+    });
+    if (raw.trim() === '') {
+      clearCarryDrafts(row.id);
+      return setCarryTarget(row.id, undefined);
+    }
+    const k = parseFloat(raw);
+    if (!Number.isFinite(k)) return clearCarryDrafts(row.id);
+    const solve = {
+      ccy: row.ccy,
+      r_FCY: row.r_FCY,
+      r_OD: row.r_OD,
+      r_USD: shared.r_USD,
+      payout: near?.payout ?? row.payout,
+      collections: near?.collections ?? row.collections,
+      invoiceFcast: row.fcastFX,
+      hedgeSettle: hedgeSettleByCcy[row.ccy]?.[0] ?? 0,
+      liquidity: liquidityTiming,
+    };
+    const target = targetForCarry(k / 1000, solve);
+    if (target === null) {
+      // Keep what was typed on screen — clearing it is what made the field look
+      // like it was ignoring the entry rather than unable to reach it.
+      setCarryNotes(prev => ({
+        ...prev,
+        [row.id]: k > 0 && !canEarnPositiveCarry(solve)
+          ? `${row.ccy} cannot earn against USD — ${f2(row.r_FCY)}% long, ${f2(row.r_OD)}% short, both losing vs ${f2(shared.r_USD)}%. Ask for a loss, or steer on cash.`
+          : `No target reaches ${usdK(k / 1000)} on ${row.ccy} — steer on cash instead.`,
+      }));
+      return;
+    }
+    clearCarryDrafts(row.id);
+    setCarryTarget(row.id, target);
+  }, [
+    clearCarryDrafts, setCarryTarget, shared.r_USD, liquidityTiming,
+    hedgeSettleByCcy,
+  ]);
+
+  /**
+   * Target cash and interest accrual per period over the forecast lifecycle.
+   * Each period reruns the same layer stack on that cycle's opening balance, so
+   * the path is the buffer model rolled forward rather than a parallel model.
+   */
+  const carryLive = activeLayers.has('carryOptim');
+  /**
+   * This panel is the layer's setup, so it always reads as if the layer were on.
+   * Otherwise every figure you dial in would show the plain trough back at you
+   * until the layer is switched on, and nothing here could be tuned.
+   */
+  const carryPreviewLayers = useMemo(() => {
+    if (carryLive) return activeLayers;
+    const next = new Set(activeLayers);
+    next.add('carryOptim');
+    return next;
+  }, [activeLayers, carryLive]);
+
+  const carryProjection = useMemo(() => {
+    if (layerPanel !== 'carryOptim') return [];
+    const from = new Date();
+    return carryRows.map(row => {
+      const periods = projectCarryLifecycle(
+        row, shared, carryPreviewLayers, carryHorizon, forecastProfile,
+        { from, hedgeSettle: hedgeSettleByCcy[row.ccy] },
+      );
+      const target = periods[0]?.targetCash ?? row.cash_threshold;
+      return {
+        row,
+        periods,
+        target,
+        nearCarry: periods[0]?.carryVsUsd ?? 0,
+        horizonCarry: periods.reduce((s, p) => s + p.carryVsUsd, 0),
+        // The projection runs the per-currency stack; once live, the book target can
+        // still be trimmed by the portfolio VAR cap or the USD stress rebalance.
+        offBook: carryLive && Math.abs(target - row.cash_threshold) > 0.01,
+      };
+    });
+  }, [
+    layerPanel, carryRows, shared, carryPreviewLayers, carryLive, carryHorizon,
+    forecastProfile, hedgeSettleByCcy,
+  ]);
+
+  /**
+   * Why a requested target did not land, in the desk's own words. Measured against
+   * what the setup itself can hold, so it reports real clamps rather than simply
+   * restating that the layer is off.
+   */
+  const carryBindReason = (r: FcyComputedRow, target: number): string | null => {
+    if (typeof r.carry_target !== 'number' || !Number.isFinite(r.carry_target)) return null;
+    if (Math.abs(r.carry_target - target) <= 0.01) return null;
+    if (carryLive && r.var_trim) return 'VAR cap';
+    if (carryLive && r.usd_stress_trim) return 'USD stress';
+    // r_OD above r_USD makes an overdraft dearer than holding USD, so the model
+    // refuses to run the balance negative however the target was arrived at.
+    if (r.debit_floor_binding || r.r_OD > shared.r_USD) return 'no overdraft';
+    if (r.cash_floor > 0.0001) return 'floor';
+    return 'clamped';
+  };
+
+  const carryTotals = useMemo(() => carryProjection.reduce(
+    (acc, c) => ({
+      targetUsd: acc.targetUsd + fcyToUsdM(c.target, c.row.ccy),
+      near: acc.near + c.nearCarry,
+      horizon: acc.horizon + c.horizonCarry,
+    }),
+    { targetUsd: 0, near: 0, horizon: 0 },
+  ), [carryProjection]);
+
+  /** Gear badge: how much of the layer is configured, at a glance. */
+  const layerBadge = (id: LayerId): string => {
+    if (id === 'floorH') return floorsSetCount > 0 ? String(floorsSetCount) : '';
+    if (id === 'sigmaP') return sigmaOverrideCount > 0 ? String(sigmaOverrideCount) : '';
+    if (id === 'carryOptim') return carryTargetCount > 0 ? String(carryTargetCount) : '';
+    if (id === 'portfolioDiv') return `$${n(policyVAR)}M`;
+    return '';
+  };
 
   const resetRows = useCallback(() => {
     if (onResetTable) {
@@ -1387,7 +2786,7 @@ export function UnifiedSimulator({
       setRows(INITIAL_ROWS.map(r => ({ ...r })));
       setUsdParams({ ...INITIAL_USD_PARAMS });
     setUsdCash(303.9);
-    setUsdNonNpCash(154.1);
+    setUsdNonLpCash(154.1);
     }
     setStrategy('SWAP_ONLY');
     setHedgeDeltas({});
@@ -1403,11 +2802,31 @@ export function UnifiedSimulator({
     setRows,
     setUsdParams,
     setUsdCash,
-    setUsdNonNpCash,
+    setUsdNonLpCash,
     onForecastProfileChange,
   ]);
 
   const computed = fcyComputed;
+
+  /**
+   * Cycles behind the collapsed rows. Only the read-only view totals the flows —
+   * where the cells are editable they have to keep showing the single-cycle
+   * input being edited.
+   */
+  const horizonMonths = lockValues
+    ? (computed.find(r => r.liquidityCycles?.length)?.liquidityCycles?.length ?? 0)
+    : 0;
+  const horizonSuffix = horizonMonths ? ` Σ${horizonMonths}m` : '';
+  const usdFlowTitle = horizonMonths
+    ? 'One cycle — the USD leg carries no dated forecast path, so it is not totalled over the horizon'
+    : undefined;
+  /**
+   * FX hedging and liquidity hedging are separate books. Forward settlement is
+   * operating cash, so it stays in the liquidity band and is what the funding
+   * decision is taken on; only the funding swap sits apart, in the SWAP band.
+   */
+  const liquidityBookNote = ' FX hedge settlement is counted in — it is cash the'
+    + ' account delivers or receives. The funding swap is not: that is the SWAP band.';
 
   const totals = useMemo(() => computed.reduce(
     (a, r) => ({
@@ -1427,8 +2846,12 @@ export function UnifiedSimulator({
     nonCash: totals.fxNonCashUSD + usdComputed.fxNonCashUSD,
     nonCashAsset: totals.fxNonCashAssetUSD + usdComputed.fxNonCashAssetUSD,
     netFx: totals.netFxUSD + usdComputed.netFxUSD,
-    cashPos: totals.cashPosUSD + usdComputed.cashPosUSD,
   }), [totals, usdComputed]);
+
+  const hedgeUsdTotal = useMemo(
+    () => computed.reduce((s, r) => s + fcyToUsdM(hedgeFcyFor(r.ccy), r.ccy), 0),
+    [computed, hedgeFcyFor],
+  );
 
   const usdComputedRow = usdComputed;
 
@@ -1437,7 +2860,24 @@ export function UnifiedSimulator({
     [computed, usdComputedRow.swapNear],
   );
 
-  const npCashUsdTotal = useMemo(
+  /**
+   * What the funding convention costs the book, in USD: the leg to trade today
+   * against the notional every rolled leg leaves outstanding at the horizon.
+   * Sits next to the toggles so switching basis or convention shows its price.
+   */
+  const liquidityBookUsd = useMemo(() => {
+    let bookNow = 0;
+    let outstanding = 0;
+    for (const r of computed) {
+      const plan = r.liquidityPlan;
+      if (!plan || plan.length === 0) continue;
+      bookNow += fcyToUsdM(plan[0]!.swap_needed, r.ccy);
+      outstanding += fcyToUsdM(plan[plan.length - 1]!.standing_swap, r.ccy);
+    }
+    return { bookNow, outstanding };
+  }, [computed]);
+
+  const lpCashUsdTotal = useMemo(
     () => computed.reduce((s, r) => s + swapNearUsd(r.ccy, r.cash), 0) + usdComputedRow.cash,
     [computed, usdComputedRow.cash],
   );
@@ -1522,12 +2962,18 @@ export function UnifiedSimulator({
     for (const r of computedWithHedge) {
       const spotRate = CURRENCY_PARAMS[r.ccy]?.spot ?? 1;
       const base: Scope = {
-        cash: r.cash, payout: r.payout, collections: r.collections, nonNpCash: r.nonNpCash,
+        cash: r.cash, payout: r.payout, collections: r.collections, nonLpCash: r.nonLpCash,
         fcastFX: r.fcastFX, spot: r.spot, fwd: r.fwd, nonCash: r.nonCash, nonCashAsset: r.nonCashAsset ?? 0,
         rFCY: r.r_FCY, rOD: r.r_OD, rUSD: shared.r_USD, spotRate,
         netFxFCY: r.netFxFCY, netFxForecast: r.netFxForecast,
         fwdNotional: r.fwdNotional, optNotional: r.optNotional, optDelta: r.optDelta,
         swapNear: r.swapNear,
+        modelTrough: r.lp_peak_cash,
+        modelCycleNet: r.cash_after_payins,
+        modelCycleEnd: r.cycleEndCash,
+        // Flow, not balance: the dated net of cycle 1 when the path is on, else
+        // the row's own payouts and payins.
+        modelCycleFlow: r.liquidityCycles?.[0]?.net ?? (r.payout + r.collections),
       };
       const overrides: Partial<Record<SimFieldKey, string>> = {};
       if (formulas) {
@@ -1557,73 +3003,155 @@ export function UnifiedSimulator({
   // Total annual USD carry = natural cash float + swap interest overlay + FX hedge carry.
   const totalCarryUsd = floatNimUsdTotal + swapCarryTotal + hedgeTotals.hedgeCarryUsdYr;
 
+  const forecastPeriodLabel =
+    FORECAST_PERIOD_OPTIONS.find(o => o.months === forecastMonths)?.label ?? `${forecastMonths}m`;
+
+  const visibleBands = (
+    [
+      ratesOn && 'rates',
+      showFxPosition && 'pos',
+      showLiquidity && 'liq',
+      showIrBook && 'ir',
+      showCarry && 'buf',
+      showSwap && 'swap',
+      showFxHedge && 'hedge',
+      showRiskMetrics && 'risk',
+      showPnl && 'pnl',
+    ] as (BandId | false)[]
+  ).filter((b): b is BandId => Boolean(b));
+  const visibleBandsKey = visibleBands.join(',');
+
+  /** Name the band the reader is scrolled into; the CCY column is ~108px wide. */
+  const syncActiveBand = useCallback(() => {
+    const el = tableScrollRef.current;
+    if (!el) return;
+    const heads = el.querySelectorAll<HTMLElement>('th[data-band]');
+    let next: BandId | null = null;
+    heads.forEach(h => {
+      if (h.offsetLeft - el.scrollLeft <= 130) next = h.dataset.band as BandId;
+    });
+    const first = heads[0]?.dataset.band as BandId | undefined;
+    const resolved = next ?? first;
+    if (resolved) setActiveBand(prev => (prev === resolved ? prev : resolved));
+  }, []);
+
+  const scrollToBand = (id: BandId) => {
+    const el = tableScrollRef.current;
+    if (!el) return;
+    const head = el.querySelector<HTMLElement>(`th[data-band="${id}"]`);
+    if (head) el.scrollLeft = Math.max(0, head.offsetLeft - 108);
+    setActiveBand(id);
+  };
+
+  useEffect(() => {
+    const el = tableScrollRef.current;
+    if (!el) return;
+    setColCount(el.querySelectorAll('thead tr:nth-child(2) th').length + 1);
+    syncActiveBand();
+  }, [visibleBandsKey, syncActiveBand]);
+
+  const bandHeadCls = (id: BandId) => {
+    const s = BAND_STYLE[id];
+    return `${groupThBase} border-l-2 border-t-2 ${s.rule} ${activeBand === id ? s.bgOn : s.bg} ${s.text}`;
+  };
+
   return (
     <div className="space-y-4">
 
-      {/* ── Global parameters ── */}
-      <div className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-3">
-        <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
-          <GParam
-            label="USD deposit rate r_USD"
-            value={shared.r_USD} min={0} max={10} step={0.05} unit="% p.a."
-            onChange={v => onSharedChange('r_USD', v)}
-          />
-          <GParam
-            label="Incremental forecast uncertainty"
-            value={shared.σ_P * 100} min={0} max={40} step={1} unit="%"
-            onChange={v => onSharedChange('σ_P', v / 100)}
-            title="σ used for forecast-uncertainty analysis (payout buffer / stress layers)"
-          />
-          <div className="flex flex-col gap-0.5 min-w-[140px]">
-            <label className="text-xs font-medium text-gray-700">Exposure period</label>
-            <div className="mt-0.5 flex flex-wrap items-center gap-1">
-              {FORECAST_PERIOD_OPTIONS.map(opt => {
-                const on = forecastPeriodIdForMonths(forecastMonths) === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    title={
-                      opt.months === 0
-                        ? 'No forecast — Net FX Forecast / Exp buildup = stock only (F×0).'
-                        : 'Risk Metrics Exp / Net FX Forecast buildup (F×T). Does not change VaR calculation horizon.'
-                    }
-                    onClick={() => setForecastMonths(opt.months)}
-                    className={`rounded border px-2 py-1 text-xs font-medium transition-colors ${
-                      on
-                        ? 'border-blue-500 bg-blue-50 text-blue-800'
-                        : 'border-gray-300 bg-white text-gray-600 hover:bg-gray-100'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                );
-              })}
+      {/* ── Desk toolbar: forecast · actions, layers rail as its footer ── */}
+      <div className="overflow-hidden rounded-lg border border-gray-200 bg-white">
+        <div className="flex flex-wrap items-stretch">
+          <div className="min-w-0 flex-1 border-r border-gray-100 px-3.5 py-2.5">
+            <div className="flex flex-wrap items-baseline gap-2">
+              <span className={toolCaption}>Forecast</span>
+              <span className="basis-full font-mono text-[9px] leading-snug text-gray-500">
+                exposure period = buildup F×T · not the VaR horizon
+              </span>
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              <div className={segTrack('card')}>
+                {FORECAST_PERIOD_OPTIONS.map(opt => {
+                  const on = forecastPeriodIdForMonths(forecastMonths) === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      title={
+                        opt.months === 0
+                          ? 'No forecast — Net FX Forecast / Exp buildup = stock only (F×0).'
+                          : 'Risk Metrics Exp / Net FX Forecast buildup (F×T). Does not change VaR calculation horizon.'
+                      }
+                      onClick={() => setForecastMonths(opt.months)}
+                      className={deskSeg(on, 'sky')}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <span className="font-mono text-[9px] leading-snug text-gray-500">
+                {forecastMonths === 0
+                  ? 'spot book only — no forecast buildup'
+                  : `F×T over ${forecastPeriodLabel} at u₁ₘ ${Math.round(shared.σ_P * 100)}%`}
+              </span>
             </div>
           </div>
-          <div className="flex items-end gap-2 ml-auto">
-            <button
-              type="button"
-              onClick={() => setForecastProfileOpen(true)}
-              disabled={forecastMonths === 0}
-              className="rounded border border-blue-300 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
-              title={
-                forecastMonths === 0
-                  ? 'No forecast period — pick 1 month+ to edit cash inflow / outflow profile'
-                  : 'Edit flat or custom per-period cash inflows / outflows'
-              }
-            >
-              Forecast profile…
-              {forecastProfile.mode === 'custom' && (
-                <span className="ml-1 text-[10px] font-semibold text-violet-600">custom</span>
-              )}
-            </button>
-            <button
-              onClick={resetRows}
-              className="rounded border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-100"
-            >
-              Reset table
-            </button>
+
+          <div className="ml-auto flex min-w-0 flex-col gap-1.5 px-3.5 py-2.5">
+            <div className={toolCaption}>Actions</div>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setForecastProfileOpen(true)}
+                disabled={forecastMonths === 0}
+                className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px] font-semibold transition-colors ${
+                  forecastMonths === 0
+                    ? 'cursor-not-allowed border-gray-200 bg-white text-gray-400'
+                    : forecastProfile.mode === 'custom'
+                      ? 'border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100'
+                      : 'border-gray-300 bg-white text-gray-700 hover:bg-gray-50'
+                }`}
+                title={
+                  forecastMonths === 0
+                    ? 'No forecast period — pick 1 month+ to edit cash inflow / outflow profile'
+                    : 'Edit flat or custom per-period cash inflows / outflows'
+                }
+              >
+                Forecast profile…
+                {forecastProfile.mode === 'custom' && (
+                  <span className="rounded border border-violet-300 bg-violet-100 px-1 py-px font-mono text-[8px] font-semibold tracking-wide text-violet-700">
+                    custom
+                  </span>
+                )}
+                {liquidityTiming.enabled && (
+                  <span
+                    className="rounded border border-sky-300 bg-sky-100 px-1 py-px font-mono text-[8px] font-semibold tracking-wide text-sky-700"
+                    title={
+                      (liquidityTiming.sizingBasis ?? 'horizon') === 'cycle'
+                        ? 'Trough is the min of the dated cash path, sized on the nearest cycle'
+                        : 'Trough is the min of the dated cash path, sized on the worst cycle of the horizon'
+                    }
+                  >
+                    timed
+                    {(liquidityTiming.sizingBasis ?? 'horizon') === 'horizon' && forecastMonths > 1
+                      ? ' · worst'
+                      : ''}
+                    {(liquidityTiming.bookingMode ?? 'rolling') === 'term' ? ' · term' : ''}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={resetRows}
+                className="rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-gray-600 hover:bg-gray-50"
+              >
+                Reset table
+              </button>
+            </div>
+            {forecastMonths === 0 && (
+              <span className="text-[10px] leading-snug text-gray-500">
+                Needs an exposure period — pick 1m or longer
+              </span>
+            )}
           </div>
         </div>
 
@@ -1645,7 +3173,10 @@ export function UnifiedSimulator({
                 <div className="flex shrink-0 items-start justify-between gap-3">
                   <div className="min-w-0">
                     <h4 id="forecast-profile-title" className={fpu.title}>
-                      Forecast profile — Balance-sheet cash
+                      Forecast profile —{' '}
+                      {forecastView === 'liquidity'
+                        ? 'Cycle timing'
+                        : 'Balance-sheet cash'}
                     </h4>
                     <p className={fpu.desc}>
                       {rows
@@ -1672,6 +3203,42 @@ export function UnifiedSimulator({
 
                 <div className="shrink-0 space-y-0">
                   <div className={fpu.chrome}>
+                    <div className={fpu.modeWrap} role="group" aria-label="Profile view">
+                      {(
+                        [
+                          {
+                            id: 'flows' as const,
+                            label: 'Flows',
+                            title: 'Monthly amounts per cash line',
+                          },
+                          {
+                            id: 'liquidity' as const,
+                            label: 'Liquidity',
+                            title:
+                              'When inside the cycle each line settles — drives the trough',
+                          },
+                        ] as const
+                      ).map(opt => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          title={opt.title}
+                          onClick={() => setForecastView(opt.id)}
+                          className={`transition-colors ${
+                            forecastView === opt.id ? fpu.modeOn : fpu.modeOff
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                    {forecastView === 'liquidity' ? (
+                      <span className={`text-[10px] ${fpu.textMuted}`}>
+                        Monthly amounts stay in Flows · timing only moves the
+                        liquidity trough, not FX exposure or CFaR
+                      </span>
+                    ) : (
+                    <>
                     <div className={fpu.modeWrap} role="group" aria-label="Edit mode">
                       {(
                         [
@@ -1790,8 +3357,10 @@ export function UnifiedSimulator({
                     >
                       Formula help
                     </button>
+                    </>
+                    )}
                   </div>
-                  {forecastFormulaHelpOpen && (
+                  {forecastView === 'flows' && forecastFormulaHelpOpen && (
                     <div
                       className={`rounded-md border px-2.5 py-2 ${
                         simDark
@@ -1820,6 +3389,23 @@ export function UnifiedSimulator({
                   )}
                 </div>
 
+                {forecastView === 'liquidity' ? (
+                  <LiquidityTimingPanel
+                    fpu={fpu}
+                    simDark={simDark}
+                    rows={rows}
+                    forecastMonths={forecastMonths}
+                    timing={liquidityTiming}
+                    profile={forecastProfile}
+                    hedgeSettleByCcy={hedgeSettleByCcy}
+                    shared={shared}
+                    activeLayers={activeLayers}
+                    bookTargetByCcy={bookTargetByCcy}
+                    onTimingChange={
+                      onForecastProfileChange ? updateLiquidityTiming : undefined
+                    }
+                  />
+                ) : (
                 <div className={fpu.tableWrap}>
                   {forecastProfile.mode === 'flat' ? (
                     <table className="w-full table-fixed border-collapse font-mono text-[11px] tabular-nums">
@@ -2729,8 +4315,20 @@ export function UnifiedSimulator({
                     </FormulaGridProvider>
                   )}
                 </div>
+                )}
                 <div className={fpu.footer}>
                   <div className={`space-y-1 text-[10px] ${fpu.textMuted}`}>
+                    {forecastView === 'liquidity' ? (
+                      <div>
+                        {liquidityTiming.enabled
+                          ? 'Trough = min of the dated path · every out-line counts, not just Revenue payout'
+                          : 'Timing off — trough stays at cash + payout (every payout before any payin)'}
+                        {' · '}
+                        Window days are days of the month · presets write the
+                        selected scope
+                      </div>
+                    ) : (
+                      <>
                     <div>
                       {forecastProfile.mode === 'flat'
                         ? 'Blank growth inherits Default · boxed Growth = override · 0 = flat path'
@@ -2755,6 +4353,8 @@ export function UnifiedSimulator({
                           );
                         })}
                     </div>
+                      </>
+                    )}
                   </div>
                   <button
                     type="button"
@@ -2919,148 +4519,766 @@ export function UnifiedSimulator({
           )}
 
         {showAdvancedBook && (
-        <div className="mt-3 flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-gray-100 bg-gray-50 px-4 py-2">
           {/* Formula layer toggles — same state as Layer Setup tab */}
-          <span className="text-xs font-medium text-gray-500">Layers:</span>
-          {[
-            { id: 'floorH' as LayerId, label: 'Min floor', hint: 'Hard minimum cash per currency' },
-            { id: 'sigmaP' as LayerId, label: 'Payout σ buffer', hint: 'Safety margin on uncovered payout deficit (prefunded payout → σ = 0)' },
-            { id: 'carryOptim' as LayerId, label: 'Carry target', hint: 'Rate-driven buffer shift (PAY sell / EARN buy)' },
-            ...(hideFxHedge ? [] : [{ id: 'portfolioDiv' as LayerId, label: 'Portfolio VAR', hint: 'Cross-currency rebalance with VAR / USD budget limits' }]),
-          ].map(l => {
-            const on = activeLayers.has(l.id);
-            return (
-              <button
-                key={l.id}
-                type="button"
-                onClick={() => onLayerToggle(l.id)}
-                title={l.hint}
-                className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
-                  on
-                    ? 'bg-blue-50 text-blue-800 border-blue-300 hover:bg-blue-100'
-                    : 'bg-gray-50 text-gray-400 border-gray-200 hover:border-gray-300 hover:text-gray-600'
-                }`}
-              >
-                <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${on ? 'bg-blue-600' : 'bg-gray-300'}`} />
-                {l.label}
-              </button>
-            );
-          })}
+          <span className={toolCaption}>Buffer layers</span>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {BUFFER_LAYER_CHIPS.map(l => {
+              const on = activeLayers.has(l.id);
+              const panelOpen = layerPanel === l.id;
+              const badge = layerBadge(l.id);
+              return (
+                <span
+                  key={l.id}
+                  className={`inline-flex items-stretch overflow-hidden rounded-md border transition-colors ${
+                    on ? CHIP_ON[l.hue] : 'border-gray-200 bg-white'
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onLayerToggle(l.id);
+                      // Switching a layer off takes its settings dialog with it.
+                      if (on && panelOpen) setLayerPanel(null);
+                    }}
+                    title={l.hint}
+                    aria-pressed={on}
+                    className="inline-flex items-center gap-1.5 px-2 py-1"
+                  >
+                    <span
+                      className={`flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] border text-[8px] font-bold leading-none text-white ${
+                        on ? CHIP_BOX_ON[l.hue] : 'border-gray-300 bg-white'
+                      }`}
+                    >
+                      {on ? '✓' : ''}
+                    </span>
+                    <span className={`text-[11px] font-semibold ${on ? 'text-gray-900' : 'text-gray-500'}`}>
+                      {l.label}
+                    </span>
+                    <span
+                      className={`border-l pl-1.5 font-mono text-[8px] tracking-wide ${
+                        on ? CHIP_TAG_ON[l.hue] : 'border-gray-200 text-gray-400'
+                      }`}
+                    >
+                      {l.band}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLayerPanel(p => (p === l.id ? null : l.id))}
+                    aria-pressed={panelOpen}
+                    aria-label={l.settingsLabel}
+                    title={l.settingsLabel}
+                    className={`inline-flex items-center gap-1 border-l px-1.5 transition-colors ${
+                      on ? CHIP_TAG_ON[l.hue].split(' ')[0] : 'border-gray-200'
+                    } ${
+                      panelOpen ? CHIP_GEAR_ON[l.hue] : 'text-gray-400 hover:text-gray-600'
+                    }`}
+                  >
+                    <GearIcon className="h-3.5 w-3.5" />
+                    {badge && (
+                      <span className="font-mono text-[9px] font-semibold tabular-nums">
+                        {badge}
+                      </span>
+                    )}
+                  </button>
+                </span>
+              );
+            })}
+          </div>
+
+          {/* The funding convention decides the whole liquidity band, so it belongs
+              on the desk next to the layers — not buried in the Forecast profile. */}
+          {showLiquidity && (
+            <>
+              <span className={`${toolCaption} border-l border-gray-200 pl-4`}>Swap funding</span>
+              <div className="inline-flex flex-wrap items-center gap-1.5">
+                <span className="font-mono text-[9px] tracking-wide text-gray-400">Size on</span>
+                <div className={segTrack('rail')} role="group" aria-label="Sizing basis">
+                  {SIZING_BASIS_OPTIONS.map(o => (
+                    <button
+                      key={o.id}
+                      type="button"
+                      title={o.hint}
+                      disabled={!liquidityFundingLive}
+                      onClick={() => updateLiquidityTiming({ sizingBasis: o.id })}
+                      className={deskSeg(
+                        (liquidityTiming.sizingBasis ?? 'horizon') === o.id,
+                        'emerald',
+                      )}
+                    >
+                      {o.label}
+                    </button>
+                  ))}
+                </div>
+                <span className="font-mono text-[9px] tracking-wide text-gray-400">Book as</span>
+                <div className={segTrack('rail')} role="group" aria-label="Swap booking mode">
+                  {BOOKING_MODE_OPTIONS.map(o => (
+                    <button
+                      key={o.id}
+                      type="button"
+                      title={o.hint}
+                      disabled={!liquidityFundingLive}
+                      onClick={() => updateLiquidityTiming({ bookingMode: o.id })}
+                      className={deskSeg(
+                        (liquidityTiming.bookingMode ?? 'rolling') === o.id,
+                        'emerald',
+                      )}
+                    >
+                      {o.label}
+                    </button>
+                  ))}
+                </div>
+                {liquidityFundingLive ? (
+                  <span
+                    className="font-mono text-[9px] tracking-wide text-gray-500"
+                    title={(liquidityTiming.bookingMode ?? 'rolling') === 'term'
+                      ? `One leg today, held to M${horizonMonths || forecastMonths}. Net across currencies at spot — a sweep of excess FCY nets against a currency being funded`
+                      : 'The leg to trade today, then one per cycle — each rolls, so the book adds up. Net across currencies at spot, so a sweep of excess FCY nets against a currency being funded'}
+                  >
+                    {(liquidityTiming.bookingMode ?? 'rolling') === 'term' ? 'term leg ' : 'book now '}
+                    <span className="text-gray-700">${f2(liquidityBookUsd.bookNow)}M</span>
+                    {' · outstanding M'}
+                    {horizonMonths || forecastMonths}{' '}
+                    <span className="text-gray-700">${f2(liquidityBookUsd.outstanding)}M</span>
+                  </span>
+                ) : (
+                  <span
+                    className="font-mono text-[9px] tracking-wide text-gray-400"
+                    title="These decide how the dated cash path is funded, so they only bite once the trough is driven from timing — turn that on in the Liquidity view of the Forecast profile"
+                  >
+                    dated path off
+                  </span>
+                )}
+                <span className="font-mono text-[8px] tracking-wide text-gray-400">→ SWAP</span>
+              </div>
+            </>
+          )}
 
           {!hideFxHedge && (
             <>
-              <span className="ml-4 text-xs font-medium text-gray-500">Hedging strategy:</span>
-              {HEDGE_STRATEGIES.map(s => (
-                <button
-                  key={s.id}
-                  type="button"
-                  onClick={() => setStrategy(s.id)}
-                  className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
-                    strategy === s.id
-                      ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
-                      : 'bg-gray-50 text-gray-400 border-gray-200 hover:border-gray-300 hover:text-gray-600'
-                  }`}
-                >
-                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${strategy === s.id ? 'bg-rose-600' : 'bg-gray-300'}`} />
-                  {s.label}
-                </button>
-              ))}
+              <span className={`${toolCaption} border-l border-gray-200 pl-4`}>Hedging strategy</span>
+              <div className="inline-flex items-center gap-1.5">
+                <div className={segTrack('rail')}>
+                  {HEDGE_STRATEGIES.map(s => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => setStrategy(s.id)}
+                      className={deskSeg(strategy === s.id, 'rose')}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+                <span className="font-mono text-[8px] tracking-wide text-gray-400">→ FX HEDGE</span>
+              </div>
             </>
+          )}
+
+          {/* The VAR limit lives in its dialog; its binding state has to stay on
+              the surface, or an active budget constraint goes unseen. */}
+          {activeLayers.has('portfolioDiv') && portfolioSummary && (
+            <span className="ml-auto flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[9px] text-gray-500">
+              <span
+                className={
+                  portfolioSummary.portfolio_VAR_USD > portfolioSummary.policyVAR
+                    ? 'font-semibold text-red-700'
+                    : ''
+                }
+              >
+                VAR ${f2(portfolioSummary.portfolio_VAR_USD)}M / ${f2(portfolioSummary.policyVAR)}M
+              </span>
+              <span
+                className={
+                  portfolioSummary.overlay_carry_USD >= 0 ? 'text-emerald-700' : 'text-red-700'
+                }
+              >
+                carry {portfolioSummary.overlay_carry_USD >= 0 ? '+' : ''}
+                ${f2(portfolioSummary.overlay_carry_USD)}M/yr
+              </span>
+              {portfolioSummary.budget_binding && (
+                <span className="font-semibold text-orange-700">⚠ budget binding</span>
+              )}
+              {portfolioSummary.stress_trim && (
+                <span className="font-semibold text-orange-700">⚠ stress trim</span>
+              )}
+              {portfolioSummary.var_trim && (
+                <span className="font-semibold text-amber-700">⚠ trimmed</span>
+              )}
+            </span>
           )}
         </div>
 
         )}
 
-        {showAdvancedBook && !hideFxHedge && activeLayers.has('portfolioDiv') && portfolioSummary && (
-          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2">
-            <span
-              className="text-xs font-semibold text-violet-800"
-              title="Notional sensitivity limit — caps the portfolio's position sensitivity (net notional × FX volatility σ, with cross-currency diversification). This is NOT a P&L limit: a true P&L limit would be a stochastic VAR on the mark-to-market FX exposure value, revalued daily."
-            >
-              Portfolio notional sensitivity limit
-            </span>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-violet-600">Sensitivity limit:</span>
-              {POLICY_VAR_LIMITS.map(pl => (
-                <button
-                  key={pl.usd}
-                  type="button"
-                  onClick={() => onPolicyVARChange(pl.usd)}
-                  className={`px-2 py-0.5 rounded text-xs font-medium border transition-colors ${
-                    policyVAR === pl.usd
-                      ? 'bg-violet-700 text-white border-violet-700'
-                      : 'bg-white text-violet-600 border-violet-300 hover:bg-violet-100'
-                  }`}
-                  title={`${pl.label} (${pl.who} approval)`}
+        {showAdvancedBook && layerPanel === 'floorH' && (
+          <LayerModal
+            hue="amber"
+            title="Minimum liquidity buffer"
+            subtitle={`hard cash floor per currency (M FCY)${
+              activeLayers.has('floorH') ? '' : ' — turn the Min floor layer on to apply these'
+            }`}
+            readout={`Σ ${f2(floorTotalUsd)} $USD`}
+            footnote="M FCY · $USD equivalent at spot · floors feed the H* target, not the swap sizing directly"
+            simDark={simDark}
+            onClose={() => setLayerPanel(null)}
+          >
+            <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
+              {floorRows.map(r => (
+                <label
+                  key={r.id}
+                  className="grid grid-cols-[34px_minmax(0,1fr)_76px] items-center gap-2 rounded-md border border-gray-200 bg-white px-2 py-1"
                 >
-                  {pl.label}
-                </button>
+                  <span className="font-mono text-[11px] font-semibold text-gray-700">{r.ccy}</span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={drafts[`${r.id}.cash_floor`] ?? n(r.cash_floor)}
+                    onChange={e => editRow(r.id, 'cash_floor', e.target.value)}
+                    onBlur={() => blurRow(r.id, 'cash_floor')}
+                    className={`w-full rounded border px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-amber-400 ${
+                      r.cash_floor ? 'border-amber-300 bg-amber-50' : 'border-gray-200 bg-gray-50'
+                    }`}
+                  />
+                  <span className="text-right font-mono text-[10px] tabular-nums text-gray-400">
+                    {r.cash_floor ? `${f2(fcyToUsdM(r.cash_floor, r.ccy))} $USD` : '—'}
+                  </span>
+                </label>
               ))}
-              <input
-                type="range"
-                min={0.5}
-                max={25}
-                step={0.5}
-                value={policyVAR}
-                onChange={e => onPolicyVARChange(Number(e.target.value))}
-                className="w-36 accent-violet-700"
-                title="Drag to set any intermediate notional sensitivity limit ($0.5M–$25M, $0.5M steps)"
-              />
-              <input
-                type="number"
-                min={0.5}
-                max={25}
-                step={0.5}
-                value={policyVAR}
-                onChange={e => {
-                  const v = Number(e.target.value);
-                  if (Number.isFinite(v) && v > 0) onPolicyVARChange(Math.min(25, Math.max(0.5, v)));
-                }}
-                className="w-16 rounded border border-violet-300 bg-white px-1.5 py-0.5 text-right text-xs font-mono text-violet-800 focus:ring-1 focus:ring-violet-400 outline-none"
-                title="Type an exact notional sensitivity limit in $M"
-              />
-              <span className="text-xs text-violet-600">$M</span>
             </div>
-            <span
-              className={`text-xs font-mono ${
-                portfolioSummary.portfolio_VAR_USD > portfolioSummary.policyVAR
-                  ? 'text-red-700 font-semibold'
-                  : 'text-green-700'
-              }`}
-              title="Notional sensitivity of the carry overlay (deviation from hold-the-book), measured as net notional × FX volatility σ with diversification — existing NP holdings are not charged against the sensitivity budget. Not a daily-revalued P&L VAR."
-            >
-              Overlay sensitivity ${f2(portfolioSummary.portfolio_VAR_USD)}M / ${f2(portfolioSummary.policyVAR)}M limit
-            </span>
-            <span
-              className={`text-xs font-mono font-semibold ${
-                portfolioSummary.overlay_carry_USD >= 0 ? 'text-emerald-700' : 'text-red-700'
-              }`}
-              title="Incremental annual USD carry from the discretionary overlay vs hold-the-book: Σ (target − base) × spot × (r_FCY − r_USD)/100. Already embedded in Cash Carry (post-swap economic P&L) — shown here as the VAR-budget attribution, not an add-on."
-            >
-              Overlay carry {portfolioSummary.overlay_carry_USD >= 0 ? '+' : ''}${f2(portfolioSummary.overlay_carry_USD)}M/yr
-            </span>
-            {portfolioSummary.var_binding && !portfolioSummary.budget_binding && (
-              <span className="text-xs font-medium text-green-700">✓ Carry maximized</span>
+          </LayerModal>
+        )}
+
+        {showAdvancedBook && layerPanel === 'sigmaP' && (
+          <LayerModal
+            hue="amber"
+            title="Forecast uncertainty σ"
+            subtitle={`δσ = σ × z₉₅ × |payout| — a prefunded payout carries no σ${
+              activeLayers.has('sigmaP')
+                ? ''
+                : ' — turn the Payout σ buffer layer on to apply these'
+            }`}
+            readout="z₉₅ 1.645"
+            footnote="% of the payout line · blank = default · overrides write the payout σ on the forecast profile"
+            simDark={simDark}
+            onClose={() => setLayerPanel(null)}
+          >
+            <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
+              <label className="grid grid-cols-[minmax(0,1fr)_60px_16px] items-center gap-2 rounded-md border border-amber-300 bg-white px-2 py-1">
+                <span className="text-[10px] font-semibold text-gray-700">Default · all CCY</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={40}
+                  step={1}
+                  value={roundMoney(shared.σ_P * 100)}
+                  onChange={e => {
+                    const v = parseFloat(e.target.value);
+                    if (Number.isFinite(v)) onSharedChange('σ_P', Math.max(0, v) / 100);
+                  }}
+                  className="w-full rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-amber-400"
+                />
+                <span className="font-mono text-[10px] text-gray-400">%</span>
+              </label>
+              {onForecastProfileChange &&
+                floorRows.map(r => {
+                  const override = lineUncertainty1m(forecastProfile, r.ccy, 'payout');
+                  const effective = override > 0 ? override : shared.σ_P;
+                  return (
+                    <label
+                      key={r.id}
+                      className="grid grid-cols-[34px_minmax(0,1fr)_76px] items-center gap-2 rounded-md border border-gray-200 bg-white px-2 py-1"
+                    >
+                      <span className="font-mono text-[11px] font-semibold text-gray-700">
+                        {r.ccy}
+                      </span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="default"
+                        value={
+                          sigmaDrafts[r.ccy] ??
+                          (override > 0 ? n(roundMoney(override * 100)) : '')
+                        }
+                        onChange={e =>
+                          setSigmaDrafts(d => ({ ...d, [r.ccy]: e.target.value }))
+                        }
+                        onBlur={e => commitSigma(r.ccy, e.target.value)}
+                        className={`w-full rounded border px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-amber-400 ${
+                          override > 0 ? 'border-amber-300 bg-amber-50' : 'border-gray-200 bg-gray-50'
+                        }`}
+                      />
+                      <span className="text-right font-mono text-[10px] tabular-nums text-gray-400">
+                        eff {Math.round(effective * 100)}%
+                      </span>
+                    </label>
+                  );
+                })}
+            </div>
+          </LayerModal>
+        )}
+
+        {showAdvancedBook && layerPanel === 'carryOptim' && (
+          <LayerModal
+            hue="emerald"
+            title="Carry target inputs"
+            subtitle="steer the carry leg on the rate, the cash target, or the P&L target"
+            readout={`r_USD ${f2(shared.r_USD)}% · ${carryHorizon}m ${usdK(carryTotals.horizon)}`}
+            footnote="Setup for the carry layer — figures show what this layer holds, which reaches the book once the layer is on · accrual on the time-weighted post-swap balance with flows mid-cycle · ACT/360 or ACT/365 per currency · carry vs USD = (r_FCY − r_USD), the leg the VAR budget is charged on · targets still clamp to floors and the portfolio VAR cap"
+            simDark={simDark}
+            size="lg"
+            onClose={() => setLayerPanel(null)}
+          >
+            <div className="flex flex-col gap-2.5">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                <span className={toolCaption}>Steer on</span>
+                <div className="inline-flex rounded-md border border-emerald-300 bg-white p-0.5">
+                  {([
+                    ['rate', 'Rate r_OD', 'Size the leg from z_opt = Φ⁻¹(1 − Δr / r_OD)'],
+                    ['cash', 'Cash target', 'Type the Target LP Cash you want to hold (M FCY)'],
+                    ['pnl', 'Carry P&L', 'Type the near-period carry you want to earn ($k) — solves back to the cash target'],
+                  ] as const).map(([id, label, hint]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => setCarryDrive(id)}
+                      title={hint}
+                      className={carrySeg(carryDrive === id)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <span className={toolCaption}>Lifecycle</span>
+                <div className="inline-flex rounded-md border border-gray-200 bg-gray-50 p-0.5">
+                  {[1, 3, 6, 12].map(m => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => setCarryHorizon(m)}
+                      title={`Project targets and accrual ${m} month${m > 1 ? 's' : ''} out`}
+                      className={carrySeg(carryHorizon === m)}
+                    >
+                      {m}m
+                    </button>
+                  ))}
+                </div>
+                {carryTargetCount > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => carryRows.forEach(r => setCarryTarget(r.id, undefined))}
+                    className="ml-auto rounded border border-gray-300 bg-white px-2 py-0.5 font-mono text-[10px] font-semibold text-gray-600 hover:bg-gray-50"
+                  >
+                    Clear {carryTargetCount} manual
+                  </button>
+                )}
+              </div>
+
+              <table className="w-full border-collapse">
+                <thead>
+                  <tr className="border-b border-gray-200">
+                    <th className={`${carryTh} text-left`}>CCY</th>
+                    <th className={carryTh} title="LP debit / overdraft rate — the cost of running the cushion too thin">r_OD %</th>
+                    <th className={carryTh} title="Δr = r_USD − r_FCY">Δr</th>
+                    <th className={`${carryTh} text-center`}>Dir</th>
+                    <th className={carryTh} title="Money-market day count used for the accrual">Basis</th>
+                    <th className={carryTh} title="Target LP Cash = opening LP + swap (M FCY) — the cash exposure the carry leg holds">Target M FCY</th>
+                    <th className={carryTh}>Target $USD</th>
+                    <th className={carryTh} title="Carry vs USD accrued over the near period">M1 carry</th>
+                    <th className={carryTh} title={`Cumulative carry vs USD over ${carryHorizon} month${carryHorizon > 1 ? 's' : ''}`}>{carryHorizon}m carry</th>
+                    <th className={carryTh} aria-label="Expand" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {carryProjection.map(c => {
+                    const r = c.row;
+                    const manual =
+                      typeof r.carry_target === 'number' && Number.isFinite(r.carry_target);
+                    const reason = carryBindReason(r, c.target);
+                    const note = carryNotes[r.id];
+                    const reqVsHeld = manual
+                      ? `Requested ${f2(r.carry_target!)} M ${r.ccy} — holds ${f2(c.target)}`
+                      : undefined;
+                    const open = carryExpanded === r.ccy;
+                    const peakTarget = Math.max(
+                      ...c.periods.map(p => Math.abs(p.targetCash)),
+                      0.001,
+                    );
+                    return (
+                      <Fragment key={r.id}>
+                        <tr className={`border-b border-gray-100 ${open ? 'bg-emerald-50' : ''}`}>
+                          <td className="px-1.5 py-1 text-left font-mono text-[11px] font-semibold text-gray-700">
+                            {r.ccy}
+                          </td>
+                          <td className={carryTd}>
+                            {carryDrive === 'rate' ? (
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={drafts[`${r.id}.r_OD`] ?? n(r.r_OD)}
+                                onChange={e => editRow(r.id, 'r_OD', e.target.value)}
+                                onBlur={() => blurRow(r.id, 'r_OD')}
+                                className={carryIn}
+                              />
+                            ) : (
+                              <span className="text-gray-500">{f2(r.r_OD)}</span>
+                            )}
+                          </td>
+                          <td className={`${carryTd} ${dclr(r.delta_r)}`}>
+                            {r.delta_r > 0 ? '+' : ''}
+                            {f2(r.delta_r)}%
+                          </td>
+                          <td className="px-1.5 py-1 text-center">
+                            <CarryBadge dir={r.carryDir} />
+                          </td>
+                          <td className={`${carryTd} text-gray-400`}>{carryBasisLabel(r.ccy)}</td>
+                          <td className={carryTd}>
+                            {carryDrive === 'cash' ? (
+                              <div className="flex flex-col items-stretch gap-0.5">
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  placeholder={n(c.target)}
+                                  value={
+                                    drafts[`${r.id}.carry_target`] ??
+                                    (manual ? n(r.carry_target!) : '')
+                                  }
+                                  onChange={e =>
+                                    setDrafts(d => ({
+                                      ...d,
+                                      [`${r.id}.carry_target`]: e.target.value,
+                                    }))
+                                  }
+                                  onBlur={e => commitCarryCash(r.id, e.target.value)}
+                                  title="Target LP Cash to hold (M FCY) — blank hands the leg back to z_opt"
+                                  className={carryIn}
+                                />
+                                {reason && (
+                                  <span className="text-[9px] text-amber-700" title={reqVsHeld}>
+                                    holds {f2(c.target)}
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <span className={manual ? 'font-semibold text-emerald-700' : clr(c.target)}>
+                                {f2(c.target)}
+                              </span>
+                            )}
+                          </td>
+                          <td className={`${carryTd} ${clr(fcyToUsdM(c.target, r.ccy))}`}>
+                            {f2(fcyToUsdM(c.target, r.ccy))}
+                            {reason && (
+                              <span
+                                className="ml-1 rounded bg-amber-100 px-1 text-[9px] font-semibold text-amber-800"
+                                title={reqVsHeld}
+                              >
+                                {reason}
+                              </span>
+                            )}
+                          </td>
+                          <td className={carryTd}>
+                            {carryDrive === 'pnl' ? (
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                placeholder={(c.nearCarry * 1000).toFixed(0)}
+                                value={
+                                  drafts[`${r.id}.carry_pnl`] ??
+                                  (manual ? (c.nearCarry * 1000).toFixed(0) : '')
+                                }
+                                onChange={e =>
+                                  setDrafts(d => ({
+                                    ...d,
+                                    [`${r.id}.carry_pnl`]: e.target.value,
+                                  }))
+                                }
+                                onBlur={e => commitCarryPnl(r, c.periods[0], e.target.value)}
+                                title="Carry vs USD to earn over the near period ($k) — solves back to the cash target"
+                                className={`${carryIn} ${note ? 'border-amber-400 bg-amber-50' : ''}`}
+                              />
+                            ) : (
+                              <span className={carryPnl(c.nearCarry)}>{usdK(c.nearCarry)}</span>
+                            )}
+                          </td>
+                          <td className={`${carryTd} font-semibold ${carryPnl(c.horizonCarry)}`}>
+                            {usdK(c.horizonCarry)}
+                          </td>
+                          <td className="px-1 py-1 text-right">
+                            <button
+                              type="button"
+                              onClick={() => setCarryExpanded(open ? null : r.ccy)}
+                              title={`${open ? 'Hide' : 'Show'} the ${carryHorizon}-month projection`}
+                              className="rounded px-1 font-mono text-[10px] text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                            >
+                              {open ? '▾' : '▸'}
+                            </button>
+                          </td>
+                        </tr>
+                        {note && (
+                          <tr>
+                            <td colSpan={10} className="px-1.5 pb-1 pt-0 text-left">
+                              <span className="font-mono text-[9px] leading-snug text-amber-700">
+                                {note}
+                              </span>
+                            </td>
+                          </tr>
+                        )}
+                        {open && (
+                          <tr>
+                            <td colSpan={10} className="px-0 pb-2 pt-1">
+                              <div className="rounded-md border border-emerald-200 bg-emerald-50 p-2">
+                                <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                                  <span className={toolCaption}>
+                                    {r.ccy} lifecycle · {carryBasisLabel(r.ccy)}
+                                  </span>
+                                  {c.offBook && (
+                                    <span className="font-mono text-[9px] text-amber-700">
+                                      book target differs — portfolio VAR cap / USD stress trim applies
+                                    </span>
+                                  )}
+                                </div>
+                                <table className="w-full border-collapse">
+                                  <thead>
+                                    <tr className="border-b border-emerald-200">
+                                      <th className={`${carryTh} text-left`}>Period</th>
+                                      <th className={carryTh}>Days</th>
+                                      <th className={carryTh}>Opening</th>
+                                      <th className={carryTh}>Payout</th>
+                                      <th className={carryTh}>Collect</th>
+                                      <th className={carryTh}>Swap</th>
+                                      <th className={carryTh} title="Target LP Cash for this cycle (M FCY)">Target</th>
+                                      <th className={carryTh} title="Time-weighted balance the interest accrues on">TWA bal</th>
+                                      <th className={carryTh} title="LP credit rate when long, debit rate when overdrawn">Rate</th>
+                                      <th className={carryTh} title="Interest earned on the balance at the applied rate">Accrual</th>
+                                      <th className={carryTh} title="Accrual net of the USD opportunity cost">vs USD</th>
+                                      <th className={carryTh}>Cum</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {c.periods.map(p => (
+                                      <tr
+                                        key={p.monthIndex}
+                                        className="border-b border-emerald-100 last:border-0"
+                                      >
+                                        <td className="px-1.5 py-0.5 text-left font-mono text-[10px] font-semibold text-gray-600">
+                                          {p.label}
+                                        </td>
+                                        <td className={`${carryTd} text-gray-400`}>{p.days}</td>
+                                        <td className={`${carryTd} ${clr(p.openingCash)}`}>{f2(p.openingCash)}</td>
+                                        <td className={`${carryTd} ${clr(p.payout)}`}>{f2(p.payout)}</td>
+                                        <td className={carryTd}>{f2(p.collections)}</td>
+                                        <td className={`${carryTd} ${clr(p.swap)}`}>{fmtSwapUsd(p.swap)}</td>
+                                        <td className="px-1.5 py-0.5">
+                                          <div className="flex items-center justify-end gap-1.5">
+                                            <DeskProgressTrack
+                                              pct={Math.min(100, (Math.abs(p.targetCash) / peakTarget) * 100)}
+                                              className="w-8"
+                                            />
+                                            <span className={`font-mono text-[10px] tabular-nums ${clr(p.targetCash)}`}>
+                                              {f2(p.targetCash)}
+                                            </span>
+                                          </div>
+                                        </td>
+                                        <td className={`${carryTd} ${clr(p.twaCash)}`}>{f2(p.twaCash)}</td>
+                                        <td
+                                          className={`${carryTd} text-gray-500`}
+                                          title={p.debitDays === undefined
+                                            ? undefined
+                                            : `${p.creditDays}d credit at ${f2(r.r_FCY)}%`
+                                              + ` · ${p.debitDays}d overdrawn at ${f2(r.r_OD)}%`
+                                              + ' — shown as the effective rate on the TWA balance'}
+                                        >
+                                          {f2(p.rateApplied)}%
+                                          {(p.debitDays ?? 0) > 0 && (p.creditDays ?? 0) > 0 && (
+                                            <span className="ml-0.5 text-[9px] text-amber-600">⇅</span>
+                                          )}
+                                        </td>
+                                        <td className={carryTd}>{usdK(p.grossAccrualUsd)}</td>
+                                        <td className={`${carryTd} ${carryPnl(p.carryVsUsd)}`}>
+                                          {usdK(p.carryVsUsd)}
+                                        </td>
+                                        <td className={`${carryTd} font-semibold ${carryPnl(p.cumCarryVsUsd)}`}>
+                                          {usdK(p.cumCarryVsUsd)}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-gray-300 bg-gray-50">
+                    <td className="px-1.5 py-1 text-left font-mono text-[10px] font-semibold uppercase tracking-[0.06em] text-gray-500">
+                      Total
+                    </td>
+                    <td colSpan={4} />
+                    {/* M FCY columns never sum across currencies — only $USD does. */}
+                    <td className={`${carryTd} text-gray-400`}>—</td>
+                    <td className={`${carryTd} font-semibold ${clr(carryTotals.targetUsd)}`}>
+                      {f2(carryTotals.targetUsd)}
+                    </td>
+                    <td className={`${carryTd} font-semibold ${carryPnl(carryTotals.near)}`}>
+                      {usdK(carryTotals.near)}
+                    </td>
+                    <td className={`${carryTd} font-semibold ${carryPnl(carryTotals.horizon)}`}>
+                      {usdK(carryTotals.horizon)}
+                    </td>
+                    <td />
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </LayerModal>
+        )}
+
+        {showAdvancedBook && layerPanel === 'portfolioDiv' && (
+          <LayerModal
+            hue="violet"
+            title="Portfolio VAR · sensitivity limit"
+            subtitle={`caps net notional × FX σ with cross-currency diversification — not a daily-revalued P&L VAR${
+              activeLayers.has('portfolioDiv')
+                ? ''
+                : ' — turn the Portfolio VAR layer on to apply this limit'
+            }`}
+            footnote="existing LP holdings are not charged against the budget · the overlay is the deviation from hold-the-book"
+            simDark={simDark}
+            onClose={() => setLayerPanel(null)}
+          >
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="inline-flex rounded-md border border-violet-300 bg-white p-0.5">
+                {POLICY_VAR_LIMITS.map(pl => (
+                  <button
+                    key={pl.usd}
+                    type="button"
+                    onClick={() => onPolicyVARChange(pl.usd)}
+                    className={`rounded px-2 py-0.5 font-mono text-[11px] font-semibold transition-colors ${
+                      policyVAR === pl.usd
+                        ? 'bg-violet-100 text-violet-800'
+                        : 'text-violet-600 hover:text-violet-800'
+                    }`}
+                    title={`${pl.label} (${pl.who} approval)`}
+                  >
+                    {pl.label}
+                  </button>
+                ))}
+              </div>
+              <DeskStepper
+                label="Policy VAR"
+                value={policyVAR}
+                min={0.5}
+                max={25}
+                step={0.5}
+                onChange={onPolicyVARChange}
+                formatValue={v => `$${v.toFixed(1)}M`}
+                editable
+                accent="violet"
+                tickValues={[0.5, 5, 10, 20, 25]}
+                className="min-w-[220px] flex-1"
+                editClassName="w-14"
+                title="Drag or type any intermediate notional sensitivity limit ($0.5M–$25M, $0.5M steps)"
+                ariaLabel="Policy VAR notional sensitivity limit"
+              />
+            </div>
+
+            {portfolioSummary && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px]">
+              <span
+                className={
+                  portfolioSummary.portfolio_VAR_USD > portfolioSummary.policyVAR
+                    ? 'font-semibold text-red-700'
+                    : 'text-gray-500'
+                }
+                title="Notional sensitivity of the carry overlay (deviation from hold-the-book), measured as net notional × FX volatility σ with diversification — existing LP holdings are not charged against the sensitivity budget. Not a daily-revalued P&L VAR."
+              >
+                overlay sens{' '}
+                <span className="font-semibold text-gray-900">
+                  ${f2(portfolioSummary.portfolio_VAR_USD)}M
+                </span>{' '}
+                / ${f2(portfolioSummary.policyVAR)}M
+              </span>
+              <span
+                className="text-gray-500"
+                title="Incremental annual USD carry from the discretionary overlay vs hold-the-book: Σ (target − base) × spot × (r_FCY − r_USD)/100. Already embedded in Cash Carry (post-swap economic P&L) — shown here as the VAR-budget attribution, not an add-on."
+              >
+                overlay carry{' '}
+                <span
+                  className={`font-semibold ${
+                    portfolioSummary.overlay_carry_USD >= 0 ? 'text-emerald-700' : 'text-red-700'
+                  }`}
+                >
+                  {portfolioSummary.overlay_carry_USD >= 0 ? '+' : ''}
+                  ${f2(portfolioSummary.overlay_carry_USD)}M/yr
+                </span>
+              </span>
+              {portfolioSummary.var_binding && !portfolioSummary.budget_binding && (
+                <span className="font-semibold text-green-700">✓ carry maximized</span>
+              )}
+              {portfolioSummary.budget_binding && (
+                <span className="font-semibold text-orange-700">⚠ USD budget binding</span>
+              )}
+              {portfolioSummary.stress_trim && (
+                <span className="font-semibold text-orange-700">⚠ USD stress trim</span>
+              )}
+              {portfolioSummary.var_trim && (
+                <span className="font-semibold text-amber-700">⚠ overlay trimmed</span>
+              )}
+              {!portfolioSummary.var_binding && !portfolioSummary.budget_binding && !portfolioSummary.stress_trim
+                && portfolioSummary.portfolio_VAR_USD <= portfolioSummary.policyVAR && (
+                <span className="text-green-700">✓ within limit</span>
+              )}
+            </div>
             )}
-            {portfolioSummary.budget_binding && (
-              <span className="text-xs font-medium text-orange-700">⚠ USD budget binding</span>
-            )}
-            {portfolioSummary.stress_trim && (
-              <span className="text-xs font-medium text-orange-700">⚠ USD stress trim</span>
-            )}
-            {portfolioSummary.var_trim && (
-              <span className="text-xs font-medium text-amber-700">⚠ Overlay trimmed</span>
-            )}
-            {!portfolioSummary.var_binding && !portfolioSummary.budget_binding && !portfolioSummary.stress_trim
-              && portfolioSummary.portfolio_VAR_USD <= portfolioSummary.policyVAR && (
-              <span className="text-xs text-green-700">✓ Within limit</span>
-            )}
-          </div>
+            </div>
+          </LayerModal>
         )}
       </div>
 
+      {/* ── Band orientation rail: names the band in view, doubles as jump control ── */}
+      {visibleBands.length > 1 && (
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-0.5">
+          <span className={toolCaption}>In view</span>
+          <span
+            className={`rounded border px-2 py-0.5 font-mono text-[10px] font-semibold tracking-wide ${BAND_STYLE[activeBand].chipOn}`}
+          >
+            {BAND_STYLE[activeBand].label}
+          </span>
+          <div className="flex flex-wrap gap-1">
+            {visibleBands.map(id => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => scrollToBand(id)}
+                className={`rounded border px-1.5 py-0.5 font-mono text-[9px] font-semibold tracking-wide transition-colors ${
+                  activeBand === id
+                    ? BAND_STYLE[id].chipOn
+                    : 'border-gray-200 bg-white text-gray-500 hover:border-gray-300 hover:text-gray-700'
+                }`}
+              >
+                {BAND_STYLE[id].short}
+              </button>
+            ))}
+          </div>
+          <span className="ml-auto font-mono text-[9px] text-gray-400">
+            {colCount > 0 ? `${colCount} columns · ` : ''}
+            {visibleBands.length} bands
+          </span>
+        </div>
+      )}
+
       {/* ── Main table ── */}
-      <div className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-10rem)] rounded-lg border border-gray-200">
+      <div
+        ref={tableScrollRef}
+        onScroll={syncActiveBand}
+        className="overflow-x-auto overflow-y-auto max-h-[calc(100vh-10rem)] rounded-lg border border-gray-200"
+      >
         <FormulaGridProvider
           rowOrder={computedWithHedge.map(r => r.ccy)}
           onFill={(columnKey, rowKeys, formulaText, _sourceRowKey) => {
@@ -3090,43 +5308,43 @@ export function UnifiedSimulator({
               </th>
 
               {ratesOn && (
-              <th className="border-l border-gray-300 bg-gray-50 px-2 py-1 text-center text-xs font-semibold text-gray-600 tracking-wide" colSpan={3}>
+              <th className={bandHeadCls('rates')} data-band="rates" colSpan={3}>
                 RATES
               </th>
               )}
 
               {showFxPosition && (
-                <th className="border-l border-gray-300 bg-white px-2 py-1 text-center text-xs font-semibold text-gray-600 tracking-wide" colSpan={fxPosColSpan}>
+                <th className={bandHeadCls('pos')} data-band="pos" colSpan={fxPosColSpan}>
                 FX POSITION
               </th>
               )}
 
               {showLiquidity && (
-              <th className="border-l border-gray-300 bg-sky-50 px-2 py-1 text-center text-xs font-semibold text-sky-700 tracking-wide" colSpan={9}>
-                LIQUIDITY BOOK
+              <th className={bandHeadCls('liq')} data-band="liq" colSpan={liquidityCols}>
+                LIQUIDITY POOL BOOK
               </th>
               )}
 
               {showIrBook && (
-                <th className="border-l border-gray-300 bg-rose-50 px-2 py-1 text-center text-xs font-semibold text-rose-700 tracking-wide" colSpan={irCols}>
+                <th className={bandHeadCls('ir')} data-band="ir" colSpan={irCols}>
                   IR / FIXED-RATE BOOK
                 </th>
               )}
 
               {showCarry && (
-              <th className="border-l border-gray-300 bg-amber-50 px-2 py-1 text-center text-xs font-semibold text-amber-700 tracking-wide" colSpan={3}>
+              <th className={bandHeadCls('buf')} data-band="buf" colSpan={3}>
                 CARRY / BUFFER
               </th>
               )}
 
               {showSwap && (
-              <th className="border-l border-gray-300 bg-emerald-50 px-2 py-1 text-center text-xs font-semibold text-emerald-700 tracking-wide" colSpan={6}>
+              <th className={bandHeadCls('swap')} data-band="swap" colSpan={swapCols}>
                 SWAP
               </th>
               )}
 
               {showFxHedge && (
-              <th className="border-l-2 border-rose-400 bg-rose-50 px-2 py-1 text-center text-xs font-semibold text-rose-700 tracking-wide" colSpan={5}>
+              <th className={bandHeadCls('hedge')} data-band="hedge" colSpan={5}>
                 FX HEDGE
 
                 {strategy === 'SWAP_ONLY' && (
@@ -3139,7 +5357,8 @@ export function UnifiedSimulator({
 
               {showRiskMetrics && (
                 <th
-                  className="border-l border-violet-400 bg-violet-50 px-2 py-1 text-center text-xs font-semibold text-violet-800 tracking-wide"
+                  className={bandHeadCls('risk')}
+                  data-band="risk"
                   colSpan={riskMetricCols}
                   title="Per-CCY Analytics: Exp, booked hedges, residual, and VaR after booked hedges (Decision-% staging excluded)."
                 >
@@ -3195,7 +5414,7 @@ export function UnifiedSimulator({
               )}
 
               {showPnl && (
-              <th className="border-l border-gray-300 bg-purple-50 px-2 py-1 text-center text-xs font-semibold text-purple-700 tracking-wide" colSpan={pnlCarryOnly ? 2 : 5}>
+              <th className={bandHeadCls('pnl')} data-band="pnl" colSpan={pnlCarryOnly ? 2 : 5}>
                 P&L
               </th>
               )}
@@ -3206,7 +5425,7 @@ export function UnifiedSimulator({
 
               {/* RATES ×3 */}
               {ratesOn && (<>
-              <th className={`${thBase} bg-gray-50 border-l border-gray-300 min-w-[64px]`}>Credit Rate</th>
+              <th className={`${thBase} bg-gray-50 border-l-2 border-gray-300 min-w-[64px]`}>Credit Rate</th>
               <th className={`${thBase} bg-gray-50 min-w-[64px]`}>Debit Rate</th>
               <th className={`${thBase} bg-gray-50 min-w-[68px]`}>Rate Spread</th>
               </>)}
@@ -3214,7 +5433,7 @@ export function UnifiedSimulator({
               {/* FX POSITION */}
               {showFxPosition && (<>
               <th
-                className={`${thBase} bg-white border-l border-gray-300 min-w-[68px]`}
+                className={`${thBase} bg-white border-l-2 border-gray-300 min-w-[68px]`}
                 title="Cash FX book (M FCY), including booked Decision-layer spot hedges"
               >
                 Cash FX
@@ -3231,6 +5450,18 @@ export function UnifiedSimulator({
                 title="Outstanding forward settlement (M USD), including booked Decision-layer forward hedges"
               >
                 Fwd $USD
+              </th>
+              <th
+                className={`${thBase} bg-white min-w-[68px]`}
+                title="Booked Decision-layer hedge (M FCY) — spot + forward legs. Already inside Cash FX and Fwd; broken out here so the overlay is visible."
+              >
+                Hedge (FCY)
+              </th>
+              <th
+                className={`${thBase} bg-white min-w-[68px]`}
+                title="Booked Decision-layer hedge (M USD) at spot"
+              >
+                Hedge $USD
               </th>
               <th className={`${thBase} bg-white min-w-[76px]`} title="Receivables — accruals/receivables/NDF assets (M FCY, positive increases exposure)">Receivables</th>
               <th className={`${thBase} bg-white min-w-[80px]`}>Receivables $USD</th>
@@ -3255,15 +5486,68 @@ export function UnifiedSimulator({
 
               {/* LIQUIDITY ×9 */}
               {showLiquidity && (<>
-              <th className={`${thBase} bg-sky-50 border-l border-sky-200 min-w-[64px]`}>NP Cash</th>
-              <th className={`${thBase} bg-sky-100 min-w-[68px]`}>NP Cash $USD</th>
-              <th className={`${thBase} bg-sky-50 min-w-[68px]`}>Gross Payouts</th>
-              <th className={`${thBase} bg-sky-50 min-w-[64px]`}>Gross Payins</th>
-              <th className={`${thBase} bg-sky-50 min-w-[72px]`}>Non-NP Cash</th>
-              <th className={`${thBase} bg-sky-100 min-w-[76px]`}>Trough Cash</th>
-              <th className={`${thBase} bg-sky-100 min-w-[80px]`}>Cycle Net Flow</th>
-              <th className={`${thBase} bg-sky-50 min-w-[72px]`}>Total Cash</th>
-              <th className={`${thBase} bg-sky-100 min-w-[68px]`}>Total Cash $USD</th>
+              <th
+                className={`${thBase} bg-sky-50 border-l-2 border-sky-300 min-w-[72px]`}
+                title="Opening LP cash today — a balance, so the currency row and cycle M1 carry the same number"
+              >
+                Open Balance
+              </th>
+              <th className={`${thBase} bg-sky-100 min-w-[76px]`}>Open Balance $USD</th>
+              <th
+                className={`${thBase} bg-sky-50 min-w-[68px]`}
+                title={horizonMonths
+                  ? `Σ outflow over the ${horizonMonths}-cycle forecast on the currency row;`
+                    + " each cycle's own outflow when expanded. Counts every operating"
+                    + ' outflow line — payout, NWC, debt, investing.' + liquidityBookNote
+                  : 'Payout leaving the cycle (M FCY)'}
+              >
+                Gross Payouts{horizonSuffix}
+              </th>
+              <th
+                className={`${thBase} bg-sky-50 min-w-[64px]`}
+                title={horizonMonths
+                  ? `Σ inflow over the ${horizonMonths}-cycle forecast on the currency row;`
+                    + " each cycle's own inflow when expanded. Counts every operating"
+                    + ' inflow line — collections, NWC, debt draw, investing.' + liquidityBookNote
+                  : 'Collections landing in the cycle (M FCY)'}
+              >
+                Gross Payins{horizonSuffix}
+              </th>
+              <th
+                className={`${thBase} bg-sky-100 min-w-[80px]`}
+                title={horizonMonths
+                  ? `Payins − payouts inside the cycles: Σ over the ${horizonMonths}-cycle`
+                    + " forecast on the currency row, each cycle's own net when expanded."
+                    + ' A flow, not a balance.' + liquidityBookNote
+                  : 'Payins − payouts inside one cycle — a flow, not a balance'}
+              >
+                Cycle Net Flow{horizonSuffix}
+              </th>
+              <th
+                className={`${thBase} bg-sky-50 min-w-[80px]`}
+                title={'Cash the cycle drains at its deepest: its opening balance − the cycle'
+                  + ' low. Counts every line that settles inside the cycle, NWC, debt and'
+                  + ' investing included.' + liquidityBookNote}
+              >
+                Cycle Drawdown
+              </th>
+              <th
+                className={`${thBase} bg-sky-100 min-w-[76px]`}
+                title={"Lowest point of the dated operating path — no funding swap in it."
+                  + ' A buffer layer cannot move this number; the swap is the Swap Near column.'
+                  + liquidityBookNote}
+              >
+                Trough Cash
+              </th>
+              {showNonLp && <th className={`${thBase} bg-sky-50 min-w-[72px]`}>Non-LP Cash</th>}
+              <th
+                className={`${thBase} bg-sky-50 min-w-[80px]`}
+                title={'Where cycle 1 closes across every dated line, before the swap — the'
+                  + ' same number M1 carries when the row is expanded.' + liquidityBookNote}
+              >
+                Close Balance
+              </th>
+              <th className={`${thBase} bg-sky-100 min-w-[76px]`}>Close Balance $USD</th>
               </>)}
 
               {/* IR / FIXED-RATE BOOK — gated per input */}
@@ -3282,18 +5566,29 @@ export function UnifiedSimulator({
 
               {showCarry && (<>
               {/* CARRY / BUFFER ×3 */}
-              <th className={`${thBase} bg-amber-50 border-l border-gray-300 min-w-[52px] text-center`}>Carry</th>
-              <th className={`${thBase} bg-amber-50 min-w-[72px]`}>Target NP Cash</th>
-              <th className={`${thBase} bg-amber-100 min-w-[72px]`}>Target NP Cash $USD</th>
+              <th className={`${thBase} bg-amber-50 border-l-2 border-amber-300 min-w-[52px] text-center`}>Carry</th>
+              <th className={`${thBase} bg-amber-50 min-w-[72px]`}>Target LP Cash</th>
+              <th className={`${thBase} bg-amber-100 min-w-[72px]`}>Target LP Cash $USD</th>
               </>)}
 
               {showSwap && (<>
-              {/* SWAP ×6 */}
-              <th className={`${thBase} bg-emerald-50 border-l border-gray-300 min-w-[64px]`}>Swap Near</th>
+              {/* SWAP — the liquidity hedge: the leg that funds the trough */}
+              <th className={`${thBase} bg-emerald-50 border-l-2 border-emerald-300 min-w-[64px]`}>Swap Near</th>
               <th className={`${thBase} bg-emerald-100 min-w-[64px]`}>Swap $USD</th>
-              <th className={`${thBase} bg-emerald-50 min-w-[68px]`}>NP+Swap</th>
-              <th className={`${thBase} bg-emerald-100 min-w-[68px]`}>NP+Swap $USD</th>
-              <th className={`${thBase} bg-emerald-50 min-w-[72px]`}>Cycle End</th>
+              <th
+                className={`${thBase} bg-emerald-50 min-w-[76px]`}
+                title={horizonMonths
+                  ? `Swap outstanding at the end of the ${horizonMonths}-cycle forecast — every near leg on the funded path, since the legs roll rather than run off. The column beside Swap Near is one cycle's leg; this is the book it builds.`
+                  : 'Swap outstanding at the end of the forecast — the whole booked book, not one cycle'}
+              >
+                Swap Book{horizonSuffix}
+              </th>
+              <th className={`${thBase} bg-emerald-50 min-w-[68px]`}>LP+Swap</th>
+              <th className={`${thBase} bg-emerald-100 min-w-[68px]`}>LP+Swap $USD</th>
+              <th className={`${thBase} bg-emerald-50 min-w-[72px]`}
+                title="Last close on the dated path: hedge settlement in, term cover repaid on the last date. Without a dated plan this is the near cycle (LP+Swap + flows + Non-LP sweep).">
+                Cycle End
+              </th>
               <th className={`${thBase} bg-emerald-100 min-w-[72px]`}>Cycle End $USD</th>
               </>)}
 
@@ -3308,7 +5603,7 @@ export function UnifiedSimulator({
 
               {showRiskMetrics && (<>
               <th
-                className={`${thBase} bg-violet-50 border-l border-violet-300 min-w-[72px]`}
+                className={`${thBase} bg-violet-50 border-l-2 border-violet-400 min-w-[72px]`}
                 title={`Per-CCY Analytics position Exp $USD M = Net FX Forecast (${analyticsSetupSummary.forecastLabel}). Hedge-target exposure from open book + forecast — not Decision % staging.`}
               >
                 Exp
@@ -3336,9 +5631,9 @@ export function UnifiedSimulator({
               {showPnl && (<>
               {/* P&L — all USD-denominated, $M/yr for carry columns */}
               {!pnlCarryOnly && (
-              <th className={`${thBase} bg-purple-50 border-l border-gray-300 min-w-[76px]`}>Net Delta $USD</th>
+              <th className={`${thBase} bg-purple-50 border-l-2 border-purple-300 min-w-[76px]`}>Net Delta $USD</th>
               )}
-              <th className={`${thBase} bg-purple-50 min-w-[76px] ${pnlCarryOnly ? 'border-l border-gray-300' : ''}`}>Cash Carry $USD</th>
+              <th className={`${thBase} bg-purple-50 min-w-[76px] ${pnlCarryOnly ? 'border-l-2 border-purple-300' : ''}`}>Cash Carry $USD</th>
               <th className={`${thBase} bg-purple-50 min-w-[76px]`}>Swap Carry $USD</th>
               {!pnlCarryOnly && (<>
               <th className={`${thBase} bg-purple-50 min-w-[76px]`}>Hedge Carry $USD</th>
@@ -3362,31 +5657,51 @@ export function UnifiedSimulator({
               };
               const hedgeCarry = R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr;
               const residual = R?.residualFx ?? r.residualFx;
+              const planOpen = liqPlanCcy === r.ccy;
+              const liqCycles = r.liquidityCycles;
+              const flows = horizonMonths ? horizonFlows(liqCycles) : null;
+              /** Swap outstanding once every leg on the funded path is on. */
+              const plan = r.liquidityPlan;
+              const swapBook = plan?.length ? plan[plan.length - 1]!.standing_swap : null;
               return (
-              <tr key={r.id} className="border-b border-gray-100 hover:bg-gray-50/50">
+              <Fragment key={r.id}>
+              <tr className="border-b border-gray-100 hover:bg-gray-50">
 
                 {/* CCY */}
                 <td className="sticky left-0 z-20 bg-white hover:bg-gray-50 px-1.5 py-0.5 shadow-[2px_0_4px_-2px_rgba(0,0,0,0.08)]">
-                  <input
-                    type="text" value={r.ccy} maxLength={6}
-                    onChange={e => editCcy(r.id, e.target.value)}
-                    className="w-[52px] text-left text-xs font-bold text-gray-900 border-0 bg-transparent focus:bg-white focus:ring-1 focus:ring-blue-400 rounded px-0.5 outline-none uppercase"
-                  />
+                  <div className="flex items-center gap-0.5">
+                    {showLiquidity && (
+                      <button
+                        type="button"
+                        onClick={() => setLiqPlanCcy(planOpen ? null : r.ccy)}
+                        title={`${planOpen ? 'Hide' : 'Show'} the ${r.ccy} cash path cycle by cycle over the forecast`}
+                        className="rounded px-0.5 font-mono text-[10px] text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                      >
+                        {planOpen ? '▾' : '▸'}
+                      </button>
+                    )}
+                    <CellInput
+                      type="text" value={r.ccy} maxLength={6}
+                      onChange={e => editCcy(r.id, e.target.value)}
+                      locked={lockValues}
+                      className="w-[46px] text-left text-xs font-bold text-gray-900 border-0 bg-transparent focus:bg-white focus:ring-1 focus:ring-blue-400 rounded px-0.5 outline-none uppercase"
+                    />
+                  </div>
                 </td>
 
                 {/* RATES */}
                 {ratesOn && (<>
-                <td className={`${tdBase} bg-gray-50 border-l border-gray-300`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.r_FCY`] ?? n(r.r_FCY)}
+                <td className={`${tdBase} bg-gray-50 border-l-2 border-gray-300`}>
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.r_FCY`] ?? n(r.r_FCY)}
                     onChange={e => editRow(r.id, 'r_FCY', e.target.value)}
                     onBlur={() => blurRow(r.id, 'r_FCY')}
-                    className={`${inBase} w-[52px]`} />
+                    locked={lockValues} className={`${inBase} w-[52px]`} />
                 </td>
                 <td className={`${tdBase} bg-gray-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.r_OD`] ?? n(r.r_OD)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.r_OD`] ?? n(r.r_OD)}
                     onChange={e => editRow(r.id, 'r_OD', e.target.value)}
                     onBlur={() => blurRow(r.id, 'r_OD')}
-                    className={`${inBase} w-[52px]`} />
+                    locked={lockValues} className={`${inBase} w-[52px]`} />
                 </td>
                 <td className={`${tdBase} bg-gray-50 font-medium ${dclr(r.delta_r)}`}>
                   {r.delta_r > 0 ? '+' : ''}{f2(r.delta_r)}%
@@ -3395,8 +5710,8 @@ export function UnifiedSimulator({
 
                 {/* FX POSITION — spot/fwd/non-cash in FCY + USD */}
                 {showFxPosition && (<>
-                <td className={`${tdBase} bg-white border-l border-gray-300`}>
-                  <input
+                <td className={`${tdBase} bg-white border-l-2 border-gray-300`}>
+                  <CellInput
                     type="text"
                     inputMode="decimal"
                     value={drafts[`${r.id}.spot`] ?? n(r.spot)}
@@ -3407,21 +5722,21 @@ export function UnifiedSimulator({
                         ? `Includes booked spot hedge ${offsetFor(r.ccy).spotLocalM.toFixed(2)} M`
                         : undefined
                     }
-                    className={`${inBase} w-[62px] ${r.spot < 0 ? 'text-red-600' : ''}`}
+                    locked={lockValues} className={`${inBase} w-[62px] ${r.spot < 0 ? 'text-red-600' : ''}`}
                   />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.spotUsd`] ?? n(r.fxSpotUSD)}
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.spotUsd`] ?? n(r.fxSpotUSD)}
                       onChange={e => editFcyViaUsd(r.id, r.ccy, 'spot', 'spotUsd', e.target.value)}
                       onBlur={() => blurRow(r.id, 'spotUsd')}
-                      className={`${inBase} w-[62px] font-medium ${r.fxSpotUSD < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.fxSpotUSD < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${clr(r.fxSpotUSD)}`}>{f2(r.fxSpotUSD)}</span>
                   )}
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input
+                  <CellInput
                     type="text"
                     inputMode="decimal"
                     value={drafts[`${r.id}.fwdFcy`] ?? n(r.fxFwdFCY)}
@@ -3432,11 +5747,11 @@ export function UnifiedSimulator({
                         ? `Includes booked forward ${offsetFor(r.ccy).fwdLocalM.toFixed(2)} M FCY`
                         : undefined
                     }
-                    className={`${inBase} w-[62px] font-medium ${r.fxFwdFCY < 0 ? 'text-red-600' : ''}`}
+                    locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.fxFwdFCY < 0 ? 'text-red-600' : ''}`}
                   />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input
+                  <CellInput
                     type="text"
                     inputMode="decimal"
                     value={drafts[`${r.id}.fwd`] ?? n(r.fwd)}
@@ -3447,67 +5762,77 @@ export function UnifiedSimulator({
                         ? `Includes booked forward ${fcyToUsdM(offsetFor(r.ccy).fwdLocalM, r.ccy).toFixed(2)} M USD`
                         : undefined
                     }
-                    className={`${inBase} w-[62px] ${r.fwd < 0 ? 'text-red-600' : ''}`}
+                    locked={lockValues} className={`${inBase} w-[62px] ${r.fwd < 0 ? 'text-red-600' : ''}`}
                   />
                 </td>
+                <td className={`${tdBase} bg-white`} title={hedgeCellTitle(r.ccy)}>
+                  <span className={`font-medium ${clr(hedgeFcyFor(r.ccy))}`}>
+                    {fmtHedgeCell(hedgeFcyFor(r.ccy))}
+                  </span>
+                </td>
+                <td className={`${tdBase} bg-white`} title={hedgeCellTitle(r.ccy)}>
+                  <span className={`font-medium ${clr(fcyToUsdM(hedgeFcyFor(r.ccy), r.ccy))}`}>
+                    {fmtHedgeCell(fcyToUsdM(hedgeFcyFor(r.ccy), r.ccy))}
+                  </span>
+                </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAsset`] ?? n((r.nonCashAsset ?? 0))}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAsset`] ?? n((r.nonCashAsset ?? 0))}
                     onChange={e => editRow(r.id, 'nonCashAsset', e.target.value)}
                     onBlur={() => blurRow(r.id, 'nonCashAsset')}
-                    className={`${inBase} w-[58px] ${(r.nonCashAsset ?? 0) < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[58px] ${(r.nonCashAsset ?? 0) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAssetUsd`] ?? n(r.fxNonCashAssetUSD)}
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashAssetUsd`] ?? n(r.fxNonCashAssetUSD)}
                       onChange={e => editFcyViaUsd(r.id, r.ccy, 'nonCashAsset', 'nonCashAssetUsd', e.target.value)}
                       onBlur={() => blurRow(r.id, 'nonCashAssetUsd')}
-                      className={`${inBase} w-[62px] font-medium ${r.fxNonCashAssetUSD < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.fxNonCashAssetUSD < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${clr(r.fxNonCashAssetUSD)}`}>{f2(r.fxNonCashAssetUSD)}</span>
                   )}
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCash`] ?? n(r.nonCash)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.nonCash`] ?? n(r.nonCash)}
                     onChange={e => editRow(r.id, 'nonCash', e.target.value)}
                     onBlur={() => blurRow(r.id, 'nonCash')}
-                    className={`${inBase} w-[58px] ${r.nonCash < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[58px] ${r.nonCash < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashUsd`] ?? n(r.fxNonCashUSD)}
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.nonCashUsd`] ?? n(r.fxNonCashUSD)}
                       onChange={e => editFcyViaUsd(r.id, r.ccy, 'nonCash', 'nonCashUsd', e.target.value)}
                       onBlur={() => blurRow(r.id, 'nonCashUsd')}
-                      className={`${inBase} w-[62px] font-medium ${r.fxNonCashUSD < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.fxNonCashUSD < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${clr(r.fxNonCashUSD)}`}>{f2(r.fxNonCashUSD)}</span>
                   )}
                 </td>
                 {simplifiedFx && (<>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? n(r.ir_liab_notional)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? n(r.ir_liab_notional)}
                     onChange={e => editRow(r.id, 'ir_liab_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_liab_notional')}
-                    className={`${inBase} w-[58px] ${r.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[58px] ${r.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal"
+                  <CellInput type="text" inputMode="decimal"
                     value={drafts[`${r.id}.debtUsd`] ?? n(fcyToUsdM(r.ir_liab_notional, r.ccy))}
                     onChange={e => editFcyViaUsd(r.id, r.ccy, 'ir_liab_notional', 'debtUsd', e.target.value)}
                     onBlur={() => blurRow(r.id, 'debtUsd')}
-                    className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.ir_liab_notional, r.ccy) < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.ir_liab_notional, r.ccy) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? n((r.ir_invest_notional ?? 0))}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? n((r.ir_invest_notional ?? 0))}
                     onChange={e => editRow(r.id, 'ir_invest_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_invest_notional')}
-                    className={`${inBase} w-[58px] ${(r.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[58px] ${(r.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-white`}>
-                  <input type="text" inputMode="decimal"
+                  <CellInput type="text" inputMode="decimal"
                     value={drafts[`${r.id}.investUsd`] ?? n(fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy))}
                     onChange={e => editFcyViaUsd(r.id, r.ccy, 'ir_invest_notional', 'investUsd', e.target.value)}
                     onBlur={() => blurRow(r.id, 'investUsd')}
-                    className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy) < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.ir_invest_notional ?? 0, r.ccy) < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 </>)}
                 <td
@@ -3527,20 +5852,20 @@ export function UnifiedSimulator({
                   ].filter(Boolean).join(' ')}
                 >
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxFCY`] ?? n(r.netFxFCY)}
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.netFxFCY`] ?? n(r.netFxFCY)}
                       onChange={e => editNetFxFcy(r.id, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxFCY')}
-                      className={`${inBase} w-[62px] font-medium ${r.netFxFCY < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.netFxFCY < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${clr(r.netFxFCY)}`}>{f2(r.netFxFCY)}</span>
                   )}
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxUSD`] ?? n(r.netFxUSD)}
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.netFxUSD`] ?? n(r.netFxUSD)}
                       onChange={e => editNetFxUsd(r.id, r.ccy, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxUSD')}
-                      className={`${inBase} w-[62px] font-medium ${r.netFxUSD < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.netFxUSD < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${clr(r.netFxUSD)}`}>{f2(r.netFxUSD)}</span>
                   )}
@@ -3552,10 +5877,10 @@ export function UnifiedSimulator({
                       : `Net FX (${f2(r.netFxFCY)}) + (Rev ${f2(r.collections)} + Exp ${f2(r.payout)} + Fcast ${f2(r.fcastFX)}) × ${forecastMonths} = ${f2(r.netFxForecast)} M FCY`
                   }>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal" value={drafts[`${r.id}.netFxForecast`] ?? n(r.netFxForecast)}
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.netFxForecast`] ?? n(r.netFxForecast)}
                       onChange={e => editNetFxForecast(r.id, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxForecast')}
-                      className={`${inBase} w-[62px] font-medium ${r.netFxForecast < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${r.netFxForecast < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${Math.abs(r.netFxForecast) < 0.005 ? 'text-gray-300' : clr(r.netFxForecast)}`}>
                   {Math.abs(r.netFxForecast) < 0.005 ? '—' : f2(r.netFxForecast)}
@@ -3564,11 +5889,11 @@ export function UnifiedSimulator({
                 </td>
                 <td className={`${tdBase} bg-white`}>
                   {simplifiedFx ? (
-                    <input type="text" inputMode="decimal"
+                    <CellInput type="text" inputMode="decimal"
                       value={drafts[`${r.id}.netFxForecastUSD`] ?? n(fcyToUsdM(r.netFxForecast, r.ccy))}
                       onChange={e => editNetFxForecastUsd(r.id, r.ccy, e.target.value)}
                       onBlur={() => blurRow(r.id, 'netFxForecastUSD')}
-                      className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.netFxForecast, r.ccy) < 0 ? 'text-red-600' : ''}`} />
+                      locked={lockValues} className={`${inBase} w-[62px] font-medium ${fcyToUsdM(r.netFxForecast, r.ccy) < 0 ? 'text-red-600' : ''}`} />
                   ) : (
                     <span className={`font-medium ${clr(fcyToUsdM(r.netFxForecast, r.ccy))}`}>
                       {f2(fcyToUsdM(r.netFxForecast, r.ccy))}
@@ -3579,132 +5904,205 @@ export function UnifiedSimulator({
 
                 {/* LIQUIDITY */}
                 {showLiquidity && (<>
-                <td className={`${tdBase} bg-sky-50 border-l border-sky-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.cash`] ?? n(r.cash)}
+                <td className={`${tdBase} bg-sky-50 border-l-2 border-sky-300`}>
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.cash`] ?? n(r.cash)}
                     onChange={e => editRow(r.id, 'cash', e.target.value)}
                     onBlur={() => blurRow(r.id, 'cash')}
-                    className={`${inBase} w-[58px] ${r.cash < 0 ? 'text-red-600' : ''}`} />
+                    locked={lockValues} className={`${inBase} w-[58px] ${r.cash < 0 ? 'text-red-600' : ''}`} />
                 </td>
                 <td className={`${tdBase} bg-sky-100 font-medium ${clr(swapNearUsd(r.ccy, r.cash))}`}
                   title={`${f2(r.cash)} M FCY × spot ${(CURRENCY_PARAMS[r.ccy]?.spot ?? 1).toFixed(4)}`}>
                   {f2(swapNearUsd(r.ccy, r.cash))}
                 </td>
-                <td className={`${tdBase} bg-sky-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.payout`] ?? n(r.payout)}
-                    onChange={e => editRow(r.id, 'payout', e.target.value)}
-                    onBlur={() => blurRow(r.id, 'payout')}
-                    className={`${inBase} w-[62px] ${r.payout < 0 ? 'text-red-600' : ''}`} />
+                <td className={`${tdBase} bg-sky-50 ${
+                  !flows ? '' : flows.outflow > 0.001 ? 'text-red-600' : 'text-gray-300'
+                }`}
+                  title={flows
+                    ? `Σ ${flows.months} cycles · payout ${f2(r.payout)} a cycle plus every other`
+                      + ' outflow line that settles inside the cycles'
+                    : undefined}>
+                  {flows ? (flows.outflow > 0.001 ? f2(-flows.outflow) : '—') : (
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.payout`] ?? n(r.payout)}
+                      onChange={e => editRow(r.id, 'payout', e.target.value)}
+                      onBlur={() => blurRow(r.id, 'payout')}
+                      locked={lockValues} className={`${inBase} w-[62px] ${r.payout < 0 ? 'text-red-600' : ''}`} />
+                  )}
                 </td>
-                <td className={`${tdBase} bg-sky-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.collections`] ?? n(r.collections)}
-                    onChange={e => editRow(r.id, 'collections', e.target.value)}
-                    onBlur={() => blurRow(r.id, 'collections')}
-                    className={`${inBase} w-[58px]`} />
+                <td className={`${tdBase} bg-sky-50 ${
+                  !flows ? '' : flows.inflow > 0.001 ? 'text-green-700' : 'text-gray-300'
+                }`}
+                  title={flows
+                    ? `Σ ${flows.months} cycles · collections ${f2(r.collections)} a cycle plus every other`
+                      + ' inflow line that settles inside the cycles'
+                    : undefined}>
+                  {flows ? (flows.inflow > 0.001 ? f2(flows.inflow) : '—') : (
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.collections`] ?? n(r.collections)}
+                      onChange={e => editRow(r.id, 'collections', e.target.value)}
+                      onBlur={() => blurRow(r.id, 'collections')}
+                      locked={lockValues} className={`${inBase} w-[58px]`} />
+                  )}
                 </td>
-                <td className={`${tdBase} bg-sky-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.nonNpCash`] ?? n(r.nonNpCash)}
-                    onChange={e => editRow(r.id, 'nonNpCash', e.target.value)}
-                    onBlur={() => blurRow(r.id, 'nonNpCash')}
-                    className={`${inBase} w-[58px] ${r.nonNpCash < 0 ? 'text-red-600' : ''}`} />
-                </td>
-                <FormulaCell
-                  tdClass={`${tdBase} bg-sky-100 font-semibold ${
-                    fv('troughCash') >= fv('targetNpCash') ? 'text-green-700'
-                    : fv('troughCash') >= 0 ? 'text-amber-700' : 'text-red-600'}`}
-                  display={f2(fv('troughCash'))}
-                  formula={fFormula('troughCash')} defaultFormula={SIM_FIELD_BY_KEY.troughCash.defaultFormula}
-                  onCommit={fCommit('troughCash')} error={fErr('troughCash')} title="Trough Cash"
-                  columnKey="troughCash" rowKey={r.ccy} />
-                <FormulaCell
-                  tdClass={`${tdBase} bg-sky-100 font-medium ${fv('cycleNetFlow') >= 0 ? 'text-green-700' : 'text-red-600'}`}
-                  display={f2(fv('cycleNetFlow'))}
-                  formula={fFormula('cycleNetFlow')} defaultFormula={SIM_FIELD_BY_KEY.cycleNetFlow.defaultFormula}
-                  onCommit={fCommit('cycleNetFlow')} error={fErr('cycleNetFlow')} title="Cycle Net Flow"
-                  columnKey="cycleNetFlow" rowKey={r.ccy} />
+                {flows ? (
+                  <td className={`${tdBase} bg-sky-100 font-medium ${clr(flows.inflow - flows.outflow)}`}
+                    title={`Σ ${flows.months} cycles · payins ${f2(flows.inflow)} − payouts ${f2(flows.outflow)}`
+                      + ' — what the book earns or drains over the horizon, before any funding'}>
+                    {f2(flows.inflow - flows.outflow)}
+                  </td>
+                ) : (
+                  <FormulaCell
+                    tdClass={`${tdBase} bg-sky-100 font-medium ${fv('cycleNetFlow') >= 0 ? 'text-green-700' : 'text-red-600'}`}
+                    display={f2(fv('cycleNetFlow'))}
+                    formula={fFormula('cycleNetFlow')} defaultFormula={SIM_FIELD_BY_KEY.cycleNetFlow.defaultFormula}
+                    onCommit={fCommit('cycleNetFlow')} error={fErr('cycleNetFlow')}
+                    title="Cycle Net Flow — payins − payouts inside the cycle"
+                    columnKey="cycleNetFlow" rowKey={r.ccy} />
+                )}
+                {(() => {
+                  const drawdown = r.cycleDrawdown;
+                  const cycle = r.troughCycleIndex ?? 0;
+                  const low = r.lp_peak_cash;
+                  return (
+                    <td
+                      className={`${tdBase} bg-sky-50 font-medium ${
+                        (drawdown ?? 0) > 0 ? 'text-red-600' : 'text-gray-400'
+                      }`}
+                      title={
+                        drawdown === undefined
+                          ? undefined
+                          : cycle === 0
+                            ? `${f2(r.cash)} opening − ${f2(low)} low`
+                              + ` = ${f2(drawdown)} drained inside the cycle`
+                            : `Cycle M${cycle + 1} drains ${f2(drawdown)} from its own opening`
+                              + ' — the deepest cycle in the horizon'
+                      }
+                    >
+                      {drawdown === undefined ? '—' : f2(drawdown)}
+                    </td>
+                  );
+                })()}
+                {(() => {
+                  const troughDay = r.troughDay;
+                  const below = r.daysBelowFloor ?? 0;
+                  return (
+                    <FormulaCell
+                      tdClass={`${tdBase} bg-sky-100 font-semibold ${
+                        fv('troughCash') >= fv('targetLpCash') ? 'text-green-700'
+                        : fv('troughCash') >= 0 ? 'text-amber-700' : 'text-red-600'}`}
+                      display={
+                        troughDay === undefined ? f2(fv('troughCash')) : (
+                          <span className="inline-flex items-baseline gap-1">
+                            {f2(fv('troughCash'))}
+                            <span className={`font-mono text-[9px] font-medium ${
+                              below > 0 ? 'text-red-600' : 'text-gray-400'
+                            }`}>
+                              D{troughDay + 1}
+                              {below > 0 ? '⚠' : ''}
+                            </span>
+                          </span>
+                        )
+                      }
+                      formula={fFormula('troughCash')} defaultFormula={SIM_FIELD_BY_KEY.troughCash.defaultFormula}
+                      onCommit={fCommit('troughCash')} error={fErr('troughCash')}
+                      title={troughCellTitle(r) + liquidityBookNote}
+                      columnKey="troughCash" rowKey={r.ccy} />
+                  );
+                })()}
+                {showNonLp && (
+                  <td className={`${tdBase} bg-sky-50`}>
+                    <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.nonLpCash`] ?? n(r.nonLpCash)}
+                      onChange={e => editRow(r.id, 'nonLpCash', e.target.value)}
+                      onBlur={() => blurRow(r.id, 'nonLpCash')}
+                      locked={lockValues} className={`${inBase} w-[58px] ${r.nonLpCash < 0 ? 'text-red-600' : ''}`} />
+                  </td>
+                )}
                 <FormulaCell
                   tdClass={`${tdBase} bg-sky-50 font-medium ${clr(fv('totalCash'))}`}
                   display={f2(fv('totalCash'))}
                   formula={fFormula('totalCash')} defaultFormula={SIM_FIELD_BY_KEY.totalCash.defaultFormula}
-                  onCommit={fCommit('totalCash')} error={fErr('totalCash')} title="Total Cash"
+                  onCommit={fCommit('totalCash')} error={fErr('totalCash')}
+                  title={`Close Balance — where cycle 1 lands before its swap: ${f2(r.cash)} opening`
+                    + ` ${r.cash_after_payins - r.cash >= 0 ? '+' : '−'}`
+                    + ` ${f2(Math.abs(r.cash_after_payins - r.cash))}`
+                    + ' of dated flow' + liquidityBookNote}
                   columnKey="totalCash" rowKey={r.ccy} />
                 <FormulaCell
                   tdClass={`${tdBase} bg-sky-100 font-medium ${clr(fv('totalCashUSD'))}`}
                   display={f2(fv('totalCashUSD'))}
                   formula={fFormula('totalCashUSD')} defaultFormula={SIM_FIELD_BY_KEY.totalCashUSD.defaultFormula}
-                  onCommit={fCommit('totalCashUSD')} error={fErr('totalCashUSD')} title="Total Cash $USD"
+                  onCommit={fCommit('totalCashUSD')} error={fErr('totalCashUSD')} title="Close Balance $USD"
                   columnKey="totalCashUSD" rowKey={r.ccy} />
                 </>)}
 
                 {/* IR / FIXED-RATE BOOK */}
                 {showBonds && (<>
                 <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_notional`] ?? n(r.ir_asset_notional)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_notional`] ?? n(r.ir_asset_notional)}
                     onChange={e => editRow(r.id, 'ir_asset_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_asset_notional')}
-                    className={`${inBase} w-[58px]`} />
+                    locked={lockValues} className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-rose-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_rate`] ?? n(r.ir_asset_rate)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_asset_rate`] ?? n(r.ir_asset_rate)}
                     onChange={e => editRow(r.id, 'ir_asset_rate', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_asset_rate')}
-                    className={`${inBase} w-[46px]`} />
+                    locked={lockValues} className={`${inBase} w-[46px]`} />
                 </td>
                 </>)}
                 {showInvestments && (<>
                 <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? n((r.ir_invest_notional ?? 0))}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_notional`] ?? n((r.ir_invest_notional ?? 0))}
                     onChange={e => editRow(r.id, 'ir_invest_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_invest_notional')}
-                    className={`${inBase} w-[58px]`} />
+                    locked={lockValues} className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-rose-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_rate`] ?? n((r.ir_invest_rate ?? 0))}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_invest_rate`] ?? n((r.ir_invest_rate ?? 0))}
                     onChange={e => editRow(r.id, 'ir_invest_rate', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_invest_rate')}
-                    className={`${inBase} w-[46px]`} />
+                    locked={lockValues} className={`${inBase} w-[46px]`} />
                 </td>
                 </>)}
                 {showLiabilities && (<>
                 <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? n(r.ir_liab_notional)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_notional`] ?? n(r.ir_liab_notional)}
                     onChange={e => editRow(r.id, 'ir_liab_notional', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_liab_notional')}
-                    className={`${inBase} w-[58px]`} />
+                    locked={lockValues} className={`${inBase} w-[58px]`} />
                 </td>
                 <td className={`${tdBase} bg-rose-50`}>
-                  <input type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_rate`] ?? n(r.ir_liab_rate)}
+                  <CellInput type="text" inputMode="decimal" value={drafts[`${r.id}.ir_liab_rate`] ?? n(r.ir_liab_rate)}
                     onChange={e => editRow(r.id, 'ir_liab_rate', e.target.value)}
                     onBlur={() => blurRow(r.id, 'ir_liab_rate')}
-                    className={`${inBase} w-[46px]`} />
+                    locked={lockValues} className={`${inBase} w-[46px]`} />
                 </td>
                 </>)}
 
 {showCarry && (<>
                 {/* CARRY / BUFFER */}
-                <td className={`${tdBase} bg-amber-50 border-l border-gray-300 text-center`}>
+                <td className={`${tdBase} bg-amber-50 border-l-2 border-amber-300 text-center`}>
                   <CarryBadge dir={r.carryDir} />
                 </td>
                 <FormulaCell
                   tdClass={`${tdBase} bg-amber-50 font-semibold text-amber-900`}
-                  display={<>{f2(fv('targetNpCash'))}{r.funding_binding && <span className="ml-0.5 text-xs text-red-600" title="USD funding bind — target trimmed">⛓</span>}</>}
-                  formula={fFormula('targetNpCash')} defaultFormula={SIM_FIELD_BY_KEY.targetNpCash.defaultFormula}
-                  onCommit={fCommit('targetNpCash')} error={fErr('targetNpCash')} title="Target NP Cash = Opening NP + Swap"
-                  columnKey="targetNpCash" rowKey={r.ccy} />
+                  display={<>{f2(fv('targetLpCash'))}{r.funding_binding && <span className="ml-0.5 text-xs text-red-600" title="USD funding bind — target trimmed">⛓</span>}</>}
+                  formula={fFormula('targetLpCash')} defaultFormula={SIM_FIELD_BY_KEY.targetLpCash.defaultFormula}
+                  onCommit={fCommit('targetLpCash')} error={fErr('targetLpCash')} title="Target LP Cash = Opening LP + Swap"
+                  columnKey="targetLpCash" rowKey={r.ccy} />
                 <FormulaCell
-                  tdClass={`${tdBase} bg-amber-100 font-semibold ${clr(fv('targetNpCashUSD'))}`}
-                  display={<>{fmtThresholdUsd(fv('targetNpCashUSD'))}{r.debit_floor_binding && <span className="ml-0.5 text-xs text-amber-600" title="Expensive OD floor">⌊</span>}</>}
-                  formula={fFormula('targetNpCashUSD')} defaultFormula={SIM_FIELD_BY_KEY.targetNpCashUSD.defaultFormula}
-                  onCommit={fCommit('targetNpCashUSD')} error={fErr('targetNpCashUSD')} title="Target NP Cash $USD"
-                  columnKey="targetNpCashUSD" rowKey={r.ccy} />
+                  tdClass={`${tdBase} bg-amber-100 font-semibold ${clr(fv('targetLpCashUSD'))}`}
+                  display={<>{fmtThresholdUsd(fv('targetLpCashUSD'))}{r.debit_floor_binding && <span className="ml-0.5 text-xs text-amber-600" title="Expensive OD floor">⌊</span>}</>}
+                  formula={fFormula('targetLpCashUSD')} defaultFormula={SIM_FIELD_BY_KEY.targetLpCashUSD.defaultFormula}
+                  onCommit={fCommit('targetLpCashUSD')} error={fErr('targetLpCashUSD')} title="Target LP Cash $USD"
+                  columnKey="targetLpCashUSD" rowKey={r.ccy} />
 </>)}
 
                 {showSwap && (<>
                 {/* SWAP */}
                 <FormulaCell
-                  tdClass={`${tdBase} bg-emerald-50 border-l border-gray-300 font-semibold ${clr(fv('swapNear'))}`}
+                  tdClass={`${tdBase} bg-emerald-50 border-l-2 border-emerald-300 font-semibold ${clr(fv('swapNear'))}`}
                   display={f2(fv('swapNear'))}
                   formula={fFormula('swapNear')} defaultFormula={SIM_FIELD_BY_KEY.swapNear.defaultFormula}
-                  onCommit={fCommit('swapNear')} error={fErr('swapNear')} title="Swap near leg (model-optimised; override to force a value)"
+                  onCommit={fCommit('swapNear')} error={fErr('swapNear')} title={swapCellTitle(r)}
                   columnKey="swapNear" rowKey={r.ccy} />
                 <FormulaCell
                   tdClass={`${tdBase} bg-emerald-100 font-semibold ${clr(fv('swapUSD'))}`}
@@ -3712,23 +6110,34 @@ export function UnifiedSimulator({
                   formula={fFormula('swapUSD')} defaultFormula={SIM_FIELD_BY_KEY.swapUSD.defaultFormula}
                   onCommit={fCommit('swapUSD')} error={fErr('swapUSD')} title="Swap $USD"
                   columnKey="swapUSD" rowKey={r.ccy} />
+                <td className={`${tdBase} bg-emerald-50 font-semibold ${
+                  swapBook === null ? 'text-gray-300' : clr(swapBook)
+                }`}
+                  title={swapBook === null
+                    ? 'No dated path — turn on the liquidity forecast to see the swap book the cycles build'
+                    : `${f2(swapBook)} outstanding after ${r.liquidityPlan!.length} cycles`
+                      + ` · this cycle's leg ${f2(r.swapNear)}`}>
+                  {swapBook === null ? '—'
+                    : Math.abs(swapBook) > 0.001 ? f2(swapBook) : '—'}
+                </td>
                 <FormulaCell
-                  tdClass={`${tdBase} bg-emerald-50 font-medium ${clr(fv('npSwap'))}`}
-                  display={f2(fv('npSwap'))}
-                  formula={fFormula('npSwap')} defaultFormula={SIM_FIELD_BY_KEY.npSwap.defaultFormula}
-                  onCommit={fCommit('npSwap')} error={fErr('npSwap')} title="NP+Swap = Opening NP + Swap"
-                  columnKey="npSwap" rowKey={r.ccy} />
+                  tdClass={`${tdBase} bg-emerald-50 font-medium ${clr(fv('lpSwap'))}`}
+                  display={f2(fv('lpSwap'))}
+                  formula={fFormula('lpSwap')} defaultFormula={SIM_FIELD_BY_KEY.lpSwap.defaultFormula}
+                  onCommit={fCommit('lpSwap')} error={fErr('lpSwap')} title="LP+Swap = Opening LP + Swap"
+                  columnKey="lpSwap" rowKey={r.ccy} />
                 <FormulaCell
-                  tdClass={`${tdBase} bg-emerald-100 font-medium ${clr(fv('npSwapUSD'))}`}
-                  display={fmtSwapUsd(fv('npSwapUSD'))}
-                  formula={fFormula('npSwapUSD')} defaultFormula={SIM_FIELD_BY_KEY.npSwapUSD.defaultFormula}
-                  onCommit={fCommit('npSwapUSD')} error={fErr('npSwapUSD')} title="NP+Swap $USD"
-                  columnKey="npSwapUSD" rowKey={r.ccy} />
+                  tdClass={`${tdBase} bg-emerald-100 font-medium ${clr(fv('lpSwapUSD'))}`}
+                  display={fmtSwapUsd(fv('lpSwapUSD'))}
+                  formula={fFormula('lpSwapUSD')} defaultFormula={SIM_FIELD_BY_KEY.lpSwapUSD.defaultFormula}
+                  onCommit={fCommit('lpSwapUSD')} error={fErr('lpSwapUSD')} title="LP+Swap $USD"
+                  columnKey="lpSwapUSD" rowKey={r.ccy} />
                 <FormulaCell
                   tdClass={`${tdBase} bg-emerald-50 font-medium ${clr(fv('cycleEnd'))}`}
                   display={f2(fv('cycleEnd'))}
                   formula={fFormula('cycleEnd')} defaultFormula={SIM_FIELD_BY_KEY.cycleEnd.defaultFormula}
-                  onCommit={fCommit('cycleEnd')} error={fErr('cycleEnd')} title="Cycle End cash"
+                  onCommit={fCommit('cycleEnd')} error={fErr('cycleEnd')}
+                  title="Cycle End — last close after hedge settlement and the term far-leg repayment"
                   columnKey="cycleEnd" rowKey={r.ccy} />
                 <FormulaCell
                   tdClass={`${tdBase} bg-emerald-100 font-medium ${clr(fv('cycleEndUSD'))}`}
@@ -3769,7 +6178,7 @@ export function UnifiedSimulator({
                   title={strategy !== 'SWAP_FWD_OPT'
                     ? 'Option delta — select "Swap + Fwd + Option" strategy above to activate the written option'
                     : 'Option delta (ATM ≈ 0.5) — editable regardless of current forward size; takes effect once this row has a non-zero forecast to hedge'}>
-                    <input
+                    <CellInput
                       type="text" inputMode="decimal"
                     disabled={strategy !== 'SWAP_FWD_OPT'}
                     value={drafts[`${r.id}.hedgeDelta`] ?? n((hedgeDeltas[r.id] ?? 0.5))}
@@ -3779,7 +6188,7 @@ export function UnifiedSimulator({
                         if (!isNaN(v) && v >= 0 && v <= 1) setHedgeDeltas(prev => ({ ...prev, [r.id]: v }));
                       }}
                       onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next[`${r.id}.hedgeDelta`]; return next; })}
-                    className={`${inBase} w-[36px] font-medium ${
+                    locked={lockValues} className={`${inBase} w-[36px] font-medium ${
                       strategy !== 'SWAP_FWD_OPT' ? 'text-gray-300 cursor-not-allowed' : 'text-rose-700'
                     }`}
                     />
@@ -3809,7 +6218,7 @@ export function UnifiedSimulator({
                   return (
                     <>
                       <td
-                        className={`${tdBase} bg-violet-50 border-l border-violet-300 font-mono ${
+                        className={`${tdBase} bg-violet-50 border-l-2 border-violet-400 font-mono ${
                           expUsd >= 0 ? 'text-emerald-700' : 'text-rose-600'
                         }`}
                         title={`Analytics position Exp $USD M · ${analyticsSetupSummary.forecastLabel} · ${analyticsSetupSummary.profile}`}
@@ -3853,13 +6262,13 @@ export function UnifiedSimulator({
                 {showPnl && (<>
                 {/* P&L — USD-denominated ($M/yr) */}
                 {!pnlCarryOnly && (
-                <td className={`${tdBase} bg-purple-50 border-l border-gray-300 font-semibold ${clr(swapNearUsd(r.ccy, r.netDelta))}`}
+                <td className={`${tdBase} bg-purple-50 border-l-2 border-purple-300 font-semibold ${clr(swapNearUsd(r.ccy, r.netDelta))}`}
                   title={`Net FX delta ${f2(r.netDelta)} M ${r.ccy} × spot ${(CURRENCY_PARAMS[r.ccy]?.spot ?? 1).toFixed(4)} = $${f2(swapNearUsd(r.ccy, r.netDelta))} USD M`}>
                   ${f2(swapNearUsd(r.ccy, r.netDelta))}
                 </td>
                 )}
-                <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l border-gray-300' : ''} ${r.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`}
-                  title={`Post-swap economic cash carry (USD): NP+Swap ${f2(r.postSwapCash)}M ${r.ccy} × spot × (${r.postSwapCash >= 0 ? `credit ${r.r_FCY.toFixed(2)}%` : `debit ${r.r_OD.toFixed(2)}%`} − r_USD ${shared.r_USD.toFixed(2)}%) / 100 = $${f2(r.floatNim)}M/yr. Opening cash swapped away is not counted — CIP cancels that differential through the swap points.`}>
+                <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l-2 border-purple-300' : ''} ${r.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`}
+                  title={`Post-swap economic cash carry (USD): LP+Swap ${f2(r.postSwapCash)}M ${r.ccy} × spot × (${r.postSwapCash >= 0 ? `credit ${r.r_FCY.toFixed(2)}%` : `debit ${r.r_OD.toFixed(2)}%`} − r_USD ${shared.r_USD.toFixed(2)}%) / 100 = $${f2(r.floatNim)}M/yr. Opening cash swapped away is not counted — CIP cancels that differential through the swap points.`}>
                   {usdCarry(r.floatNim, 0)}
                 </td>
                 <td className={`${tdBase} bg-purple-50 font-medium ${
@@ -3886,28 +6295,195 @@ export function UnifiedSimulator({
                 </>)}
                 </>)}
               </tr>
+              {planOpen && !r.liquidityPlan && (
+                <tr className="border-b border-gray-100">
+                  <td colSpan={gridCols} className="px-2 py-1 text-left font-mono text-[10px] text-amber-700">
+                    No dated path for {r.ccy} — turn on “Drive trough from timing”
+                    in the Liquidity view of the Forecast profile.
+                  </td>
+                </tr>
+              )}
+              {planOpen && r.liquidityPlan?.map(p => {
+                const shape = liqCycles?.[p.cycleIndex];
+                const binds = p.cycleIndex === (r.sizingCycleIndex ?? r.troughCycleIndex ?? 0);
+                return (
+                  <tr key={`${r.id}·M${p.cycleIndex + 1}`} className="border-b border-gray-100">
+                    <td className="sticky left-0 z-20 bg-white px-1.5 py-0.5 shadow-[2px_0_4px_-2px_rgba(0,0,0,0.08)]">
+                      <span className="pl-3 font-mono text-[10px] text-gray-500">
+                        M{p.cycleIndex + 1}
+                      </span>
+                      {binds && (
+                        <span
+                          className="ml-1 font-mono text-[9px] text-sky-700"
+                          title="The cycle H* and the swap size against"
+                        >
+                          H*
+                        </span>
+                      )}
+                    </td>
+
+                    {ratesOn && <td colSpan={3} className="bg-gray-50 border-l-2 border-gray-300" />}
+                    {showFxPosition && (
+                      <td colSpan={fxPosColSpan} className="bg-white border-l-2 border-gray-300" />
+                    )}
+
+                    {showLiquidity && (<>
+                    <td className={`${cycleTd} bg-sky-50 border-l-2 border-sky-300`}
+                      title={(p.cycleIndex === 0
+                        ? "Cash on hand today — the currency row's own opening balance"
+                        : `Where M${p.cycleIndex} closed, this cycle's own swap included`)
+                        + liquidityBookNote}>
+                      {f2(p.opening_cash)}
+                    </td>
+                    <td className={`${cycleTd} bg-sky-100`}>
+                      {f2(swapNearUsd(r.ccy, p.opening_cash))}
+                    </td>
+                    <td className={`${cycleTd} bg-sky-50 ${(shape?.outflow ?? 0) > 0 ? 'text-red-600' : 'text-gray-300'}`}>
+                      {(shape?.outflow ?? 0) > 0 ? `−${f2(shape!.outflow)}` : '—'}
+                    </td>
+                    <td className={`${cycleTd} bg-sky-50 ${(shape?.inflow ?? 0) > 0 ? 'text-green-700' : 'text-gray-300'}`}>
+                      {(shape?.inflow ?? 0) > 0 ? f2(shape!.inflow) : '—'}
+                    </td>
+                    <td className={`${cycleTd} bg-sky-100 ${clr(shape?.net ?? 0)}`}
+                      title={shape
+                        ? `${f2(shape.inflow)} in − ${f2(shape.outflow)} out inside M${p.cycleIndex + 1}`
+                        : undefined}>
+                      {shape ? f2(shape.net) : '—'}
+                    </td>
+                    <td className={`${cycleTd} bg-sky-50 ${p.drawdown > 0 ? 'text-red-600' : 'text-gray-300'}`}>
+                      {p.drawdown > 0 ? f2(p.drawdown) : '—'}
+                    </td>
+                    <td
+                      className={`${cycleTd} bg-sky-100 font-semibold ${
+                        (shape?.low ?? p.forecasted_cash) < r.cash_floor ? 'text-red-600' : 'text-gray-700'
+                      }`}
+                      title={(shape ? `operating low on D${shape.lowDay - shape.startDay + 1} of the cycle — no funding swap in it.` : '')
+                        + (Math.abs(p.hedgeSettle) > 0.005
+                          ? ` ${f2(p.hedgeSettle)} FCY of FX hedge`
+                            + ` ${p.hedgeSettle < 0 ? 'delivered' : 'received'} in this cycle is in it.`
+                          : '')
+                        + liquidityBookNote}
+                    >
+                      {f2(shape?.low ?? p.forecasted_cash)}
+                    </td>
+                    {showNonLp && <td className={`${cycleTd} bg-sky-50`} />}
+                    <td
+                      className={`${cycleTd} bg-sky-50 font-semibold ${
+                        p.cycle_end_cash - p.swap_needed >= 0 ? 'text-green-700' : 'text-red-600'
+                      }`}
+                      title={`Where M${p.cycleIndex + 1} closes before its swap: ${f2(p.opening_cash)} opening ${
+                        (shape?.net ?? 0) >= 0 ? '+' : '−'
+                      } ${f2(Math.abs(shape?.net ?? 0))} net flow.` + liquidityBookNote}
+                    >
+                      {f2(p.cycle_end_cash - p.swap_needed)}
+                    </td>
+                    <td className={`${cycleTd} bg-sky-100 ${
+                      p.cycle_end_cash - p.swap_needed < 0 ? 'text-red-600' : 'text-gray-700'
+                    }`}>
+                      {f2(swapNearUsd(r.ccy, p.cycle_end_cash - p.swap_needed))}
+                    </td>
+                    </>)}
+
+                    {showIrBook && <td colSpan={irCols} className="bg-rose-50 border-l border-rose-200" />}
+                    {showCarry && (<>
+                    <td className={`${cycleTd} bg-amber-50 border-l-2 border-amber-300 text-center`}>
+                      <CarryBadge dir={p.layered.carry_dir} />
+                    </td>
+                    <td className={`${cycleTd} bg-amber-50 font-semibold text-amber-900`}
+                      title={`Target LP cash entering M${p.cycleIndex + 1}:`
+                        + ` ${f2(p.opening_cash)} opening + ${f2(p.swap_needed)} near leg,`
+                        + ` funding this cycle's requirement of ${f2(p.cash_threshold)}`
+                        + (p.layered.carry_target_applied
+                          ? ` — the carry target drives it${p.layered.carry_target_binding
+                            ? ', trimmed by a floor clamp' : ''}.`
+                          : `. Carry shift ${f2(p.layered.delta_carry)} at`
+                            + ` Δr ${p.layered.delta_r.toFixed(2)}%,`
+                            + ` σ cushion ${f2(p.layered.delta_sigma)},`
+                            + ` floor ${f2(p.layered.floor_contrib)}.`)
+                        + (r.var_trim || r.usd_stress_trim
+                          ? ` The book pass trimmed this currency's target to ${f2(r.cash_threshold_pre_swap)}`
+                            + ` on ${r.var_trim ? 'the portfolio VaR budget' : 'USD funding stress'} —`
+                            + ' that verdict is priced on the near cycle only, so later cycles here'
+                            + ' still show their own layer requirement.'
+                          : '')}>
+                      {f2(p.post_swap_cash)}
+                    </td>
+                    <td className={`${cycleTd} bg-amber-100 font-semibold ${clr(swapNearUsd(r.ccy, p.post_swap_cash))}`}>
+                      {f2(swapNearUsd(r.ccy, p.post_swap_cash))}
+                    </td>
+                    </>)}
+
+                    {showSwap && (<>
+                    <td
+                      className={`${cycleTd} bg-emerald-50 border-l-2 border-emerald-300 ${
+                        Math.abs(p.swap_needed) > 0.001 ? 'font-semibold text-gray-700' : 'text-gray-300'
+                      }`}
+                      title={
+                        `This cycle's own leg ${f2(p.swap_needed)} · swap outstanding after it`
+                        + ` ${f2(p.standing_swap)} (legs roll, they do not run off).`
+                        + (binds ? '' : ` The row above books ${f2(r.swapNear)} — the leg the H* cycle needs.`)
+                      }
+                    >
+                      {Math.abs(p.swap_needed) > 0.001 ? f2(p.swap_needed) : '—'}
+                    </td>
+                    <td className={`${cycleTd} bg-emerald-100`} />
+                    <td className={`${cycleTd} bg-emerald-50 font-semibold ${clr(p.standing_swap)}`}
+                      title={`Swap outstanding once M${p.cycleIndex + 1}'s leg is on`
+                        + (Math.abs(p.far_leg) > 0.001
+                          ? `, repaid in full at this cycle's close — the far leg`
+                            + ` delivers ${f2(p.far_leg)} back on the last date.`
+                          : '')}>
+                      {Math.abs(p.standing_swap) > 0.001 ? f2(p.standing_swap) : '—'}
+                    </td>
+                    <td className={`${cycleTd} bg-emerald-50 text-gray-700`}>
+                      {f2(p.post_swap_cash)}
+                    </td>
+                    <td className={`${cycleTd} bg-emerald-100`} />
+                    <td className={`${cycleTd} bg-emerald-50 ${
+                      p.cycle_end_cash < r.cash_floor ? 'text-red-600' : 'text-gray-700'
+                    }`}
+                      title={Math.abs(p.far_leg) > 0.001
+                        ? `After the far leg repays ${f2(p.far_leg)} at maturity —`
+                          + ` ${f2(p.cycle_end_cash - p.far_leg)} before it`
+                        : undefined}>
+                      {f2(p.cycle_end_cash)}
+                    </td>
+                    <td className={`${cycleTd} bg-emerald-100`} />
+                    </>)}
+
+                    {showFxHedge && <td colSpan={5} className="bg-rose-50 border-l-2 border-rose-400" />}
+                    {showRiskMetrics && (
+                      <td colSpan={riskMetricCols} className="bg-violet-50 border-l-2 border-violet-400" />
+                    )}
+                    {showPnl && (
+                      <td colSpan={pnlCarryOnly ? 2 : 5} className="bg-purple-50 border-l-2 border-purple-300" />
+                    )}
+                  </tr>
+                );
+              })}
+              </Fragment>
               );
             })}
 
             {/* ── USD row ── */}
-            <tr className="border-t-2 border-blue-400 bg-blue-50/40 font-medium">
+            <tr className="border-t-2 border-blue-400 bg-blue-50 font-medium">
               <td className="sticky left-0 z-20 bg-blue-100 px-1.5 py-0.5 shadow-[2px_0_4px_-2px_rgba(0,0,0,0.08)]">
                 <span className="text-xs font-bold text-blue-800 px-0.5">USD</span>
               </td>
 
               {/* RATES */}
               {ratesOn && (<>
-              <td className={`${tdBase} bg-gray-50 border-l border-gray-300`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.r_FCY'] ?? n(usdParams.r_FCY)}
+              <td className={`${tdBase} bg-gray-50 border-l-2 border-gray-300`}>
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.r_FCY'] ?? n(usdParams.r_FCY)}
                   onChange={e => editUsd('r_FCY', e.target.value)}
                   onBlur={() => blurUsd('r_FCY')}
-                  className={`${inBase} w-[52px]`} />
+                  locked={lockValues} className={`${inBase} w-[52px]`} />
               </td>
               <td className={`${tdBase} bg-gray-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.r_OD'] ?? n(usdParams.r_OD)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.r_OD'] ?? n(usdParams.r_OD)}
                   onChange={e => editUsd('r_OD', e.target.value)}
                   onBlur={() => blurUsd('r_OD')}
-                  className={`${inBase} w-[52px]`} />
+                  locked={lockValues} className={`${inBase} w-[52px]`} />
               </td>
               <td className={`${tdBase} bg-gray-50 font-medium ${dclr(usdComputed.delta_r)}`}>
                 {usdComputed.delta_r > 0 ? '+' : ''}{f2(usdComputed.delta_r)}%
@@ -3916,10 +6492,13 @@ export function UnifiedSimulator({
 
               {/* FX POSITION — USD balancing leg */}
               {showFxPosition && (<>
-              <td className={`${tdBase} bg-white border-l border-gray-300 text-gray-400`}>—</td>
+              <td className={`${tdBase} bg-white border-l-2 border-gray-300 text-gray-400`}>—</td>
               <td className={`${tdBase} bg-white font-medium ${clr(usdComputed.fxSpotUSD)}`}>{f2(usdComputed.fxSpotUSD)}</td>
               <td className={`${tdBase} bg-white text-gray-400`}>—</td>
               <td className={`${tdBase} bg-white font-medium ${clr(usdComputed.fxFwdUSD)}`}>{f2(usdComputed.fxFwdUSD)}</td>
+              {/* Hedge — the FCY legs sit on their own rows, USD is the balancing leg. */}
+              <td className={`${tdBase} bg-white text-gray-400`}>—</td>
+              <td className={`${tdBase} bg-white text-gray-400`}>—</td>
               <td className={`${tdBase} bg-white text-gray-400`}>—</td>
               <td className={`${tdBase} bg-white font-medium ${clr(usdComputed.fxNonCashAssetUSD)}`}
                 title="USD is the balancing leg — nets the Σ non-cash asset FX across all FCY rows">{f2(usdComputed.fxNonCashAssetUSD)}</td>
@@ -3927,28 +6506,28 @@ export function UnifiedSimulator({
               <td className={`${tdBase} bg-white font-medium ${clr(usdComputed.fxNonCashUSD)}`}>{f2(usdComputed.fxNonCashUSD)}</td>
               {simplifiedFx && (<>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
                   onChange={e => editUsd('ir_liab_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_notional')}
-                  className={`${inBase} w-[58px] ${usdParams.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
+                  locked={lockValues} className={`${inBase} w-[58px] ${usdParams.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
                   onChange={e => editUsd('ir_liab_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_notional')}
-                  className={`${inBase} w-[62px] font-medium ${usdParams.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
+                  locked={lockValues} className={`${inBase} w-[62px] font-medium ${usdParams.ir_liab_notional < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
                   onChange={e => editUsd('ir_invest_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_notional')}
-                  className={`${inBase} w-[58px] ${(usdParams.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
+                  locked={lockValues} className={`${inBase} w-[58px] ${(usdParams.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-white`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
                   onChange={e => editUsd('ir_invest_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_notional')}
-                  className={`${inBase} w-[62px] font-medium ${(usdParams.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
+                  locked={lockValues} className={`${inBase} w-[62px] font-medium ${(usdParams.ir_invest_notional ?? 0) < 0 ? 'text-red-600' : ''}`} />
               </td>
               </>)}
               <td className={`${tdBase} bg-white text-gray-400`}>—</td>
@@ -3964,112 +6543,128 @@ export function UnifiedSimulator({
 
               {/* LIQUIDITY */}
               {showLiquidity && (<>
-              <td className={`${tdBase} bg-sky-50 border-l border-sky-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.cash'] ?? n(usdCash)}
+              <td className={`${tdBase} bg-sky-50 border-l-2 border-sky-300`}>
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.cash'] ?? n(usdCash)}
                   onChange={e => {
                     setDrafts(prev => ({ ...prev, 'usd.cash': e.target.value }));
                     const v = roundMoney(parseFloat(e.target.value));
                     if (!isNaN(v)) setUsdCash(v);
                   }}
                   onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next['usd.cash']; return next; })}
-                  className={`${inBase} w-[58px] ${usdCash < 0 ? 'text-red-600' : ''}`} />
+                  locked={lockValues} className={`${inBase} w-[58px] ${usdCash < 0 ? 'text-red-600' : ''}`} />
               </td>
               <td className={`${tdBase} bg-sky-100 font-medium ${clr(usdComputed.cash)}`}>{f2(usdComputed.cash)}</td>
-              <td className={`${tdBase} bg-sky-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.payout'] ?? n(usdParams.payout)}
+              <td className={`${tdBase} bg-sky-50`} title={usdFlowTitle}>
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.payout'] ?? n(usdParams.payout)}
                   onChange={e => editUsd('payout', e.target.value)}
                   onBlur={() => blurUsd('payout')}
-                  className={`${inBase} w-[62px] ${usdParams.payout < 0 ? 'text-red-600' : ''}`} />
+                  locked={lockValues} className={`${inBase} w-[62px] ${usdParams.payout < 0 ? 'text-red-600' : ''}`} />
               </td>
-              <td className={`${tdBase} bg-sky-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.collections'] ?? n(usdParams.collections)}
+              <td className={`${tdBase} bg-sky-50`} title={usdFlowTitle}>
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.collections'] ?? n(usdParams.collections)}
                   onChange={e => editUsd('collections', e.target.value)}
                   onBlur={() => blurUsd('collections')}
-                  className={`${inBase} w-[58px]`} />
+                  locked={lockValues} className={`${inBase} w-[58px]`} />
               </td>
-              <td className={`${tdBase} bg-sky-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.nonNpCash'] ?? n(usdNonNpCash)}
-                  onChange={e => {
-                    setDrafts(prev => ({ ...prev, 'usd.nonNpCash': e.target.value }));
-                    const v = roundMoney(parseFloat(e.target.value));
-                    if (!isNaN(v)) setUsdNonNpCash(v);
-                  }}
-                  onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next['usd.nonNpCash']; return next; })}
-                  className={`${inBase} w-[58px] ${usdNonNpCash < 0 ? 'text-red-600' : ''}`} />
+              <td className={`${tdBase} bg-sky-100 font-medium ${
+                clr(usdComputed.payout + usdComputed.collections)
+              }`}
+                title={`Payins (${f2(usdComputed.collections)}) + Payouts (${f2(usdComputed.payout)}) inside the cycle`}>
+                {f2(usdComputed.payout + usdComputed.collections)}
+              </td>
+              <td className={`${tdBase} bg-sky-50 font-medium ${
+                Math.max(0, -usdComputed.payout) > 0 ? 'text-red-600' : 'text-gray-400'
+              }`}
+                title="Cash the USD cycle drains at its deepest — the USD leg carries no dated forecast path, so this is the payout"
+              >
+                {f2(Math.max(0, -usdComputed.payout))}
               </td>
               <td className={`${tdBase} bg-sky-100 font-semibold ${
-                usdComputed.np_peak_cash >= usdComputed.cash_threshold ? 'text-green-700'
-                : usdComputed.np_peak_cash >= 0               ? 'text-amber-700'
+                usdComputed.lp_peak_cash >= usdComputed.cash_threshold ? 'text-green-700'
+                : usdComputed.lp_peak_cash >= 0               ? 'text-amber-700'
                 : 'text-red-600'
-              }`}>{f2(usdComputed.np_peak_cash)}</td>
-              <td className={`${tdBase} bg-sky-100 font-medium ${
+              }`}>{f2(usdComputed.lp_peak_cash)}</td>
+              {showNonLp && (
+                <td className={`${tdBase} bg-sky-50`}>
+                  <CellInput type="text" inputMode="decimal" value={drafts['usd.nonLpCash'] ?? n(usdNonLpCash)}
+                    onChange={e => {
+                      setDrafts(prev => ({ ...prev, 'usd.nonLpCash': e.target.value }));
+                      const v = roundMoney(parseFloat(e.target.value));
+                      if (!isNaN(v)) setUsdNonLpCash(v);
+                    }}
+                    onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next['usd.nonLpCash']; return next; })}
+                    locked={lockValues} className={`${inBase} w-[58px] ${usdNonLpCash < 0 ? 'text-red-600' : ''}`} />
+                </td>
+              )}
+              <td className={`${tdBase} bg-sky-50 font-medium ${
                 usdComputed.cash_after_payins >= 0 ? 'text-green-700' : 'text-red-600'
               }`}
-                title={`NP (${f2(usdComputed.cash)}) + Non-NP (${f2(usdComputed.nonNpCash)}) + Payouts (${f2(usdComputed.payout)}) + Payins (${f2(usdComputed.collections)}) = ${f2(usdComputed.cash_after_payins)} M USD — before swap`}>
+                title={`LP (${f2(usdComputed.cash)}) + Non-LP (${f2(usdComputed.nonLpCash)}) + Payouts (${f2(usdComputed.payout)}) + Payins (${f2(usdComputed.collections)}) = ${f2(usdComputed.cash_after_payins)} M USD — before swap`}>
                 {f2(usdComputed.cash_after_payins)}
               </td>
-              <td className={`${tdBase} bg-sky-50 font-medium ${clr(usdComputed.cashPos)}`}>{f2(usdComputed.cashPos)}</td>
-              <td className={`${tdBase} bg-sky-100 font-medium ${clr(usdComputed.cashPosUSD)}`}>{f2(usdComputed.cashPosUSD)}</td>
+              <td className={`${tdBase} bg-sky-100 font-medium ${clr(usdComputed.cash_after_payins)}`}>
+                {f2(usdComputed.cash_after_payins)}
+              </td>
               </>)}
 
               {/* IR / FIXED-RATE BOOK — USD */}
               {showBonds && (<>
               <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_asset_notional'] ?? n(usdParams.ir_asset_notional)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_asset_notional'] ?? n(usdParams.ir_asset_notional)}
                   onChange={e => editUsd('ir_asset_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_asset_notional')}
-                  className={`${inBase} w-[58px]`} />
+                  locked={lockValues} className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-rose-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_asset_rate'] ?? n(usdParams.ir_asset_rate)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_asset_rate'] ?? n(usdParams.ir_asset_rate)}
                   onChange={e => editUsd('ir_asset_rate', e.target.value)}
                   onBlur={() => blurUsd('ir_asset_rate')}
-                  className={`${inBase} w-[46px]`} />
+                  locked={lockValues} className={`${inBase} w-[46px]`} />
               </td>
               </>)}
               {showInvestments && (<>
               <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_invest_notional'] ?? n((usdParams.ir_invest_notional ?? 0))}
                   onChange={e => editUsd('ir_invest_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_notional')}
-                  className={`${inBase} w-[58px]`} />
+                  locked={lockValues} className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-rose-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_invest_rate'] ?? n((usdParams.ir_invest_rate ?? 0))}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_invest_rate'] ?? n((usdParams.ir_invest_rate ?? 0))}
                   onChange={e => editUsd('ir_invest_rate', e.target.value)}
                   onBlur={() => blurUsd('ir_invest_rate')}
-                  className={`${inBase} w-[46px]`} />
+                  locked={lockValues} className={`${inBase} w-[46px]`} />
               </td>
               </>)}
               {showLiabilities && (<>
               <td className={`${tdBase} bg-rose-50 border-l border-rose-200`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_liab_notional'] ?? n(usdParams.ir_liab_notional)}
                   onChange={e => editUsd('ir_liab_notional', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_notional')}
-                  className={`${inBase} w-[58px]`} />
+                  locked={lockValues} className={`${inBase} w-[58px]`} />
               </td>
               <td className={`${tdBase} bg-rose-50`}>
-                <input type="text" inputMode="decimal" value={drafts['usd.ir_liab_rate'] ?? n(usdParams.ir_liab_rate)}
+                <CellInput type="text" inputMode="decimal" value={drafts['usd.ir_liab_rate'] ?? n(usdParams.ir_liab_rate)}
                   onChange={e => editUsd('ir_liab_rate', e.target.value)}
                   onBlur={() => blurUsd('ir_liab_rate')}
-                  className={`${inBase} w-[46px]`} />
+                  locked={lockValues} className={`${inBase} w-[46px]`} />
               </td>
               </>)}
 
               {/* CARRY / BUFFER */}
 {showCarry && (<>
-              <td className={`${tdBase} bg-amber-50 border-l border-gray-300 text-center`}>
+              <td className={`${tdBase} bg-amber-50 border-l-2 border-amber-300 text-center`}>
                 <CarryBadge dir={usdComputed.carryDir} />
               </td>
               <td className={`${tdBase} bg-amber-50 font-semibold text-amber-900`}
-                title={`Opening NP ($${f2(usdComputed.cash)}) + Swap ($${f2(usdComputed.swapNear)}) = $${f2(usdComputed.cash_threshold)}M · payout reserve H* $${f2(usdComputed.cash_threshold_pre_swap)}M${usdComputed.funding_binding ? ' — USD funding bind' : ''}`}>
+                title={`Opening LP ($${f2(usdComputed.cash)}) + Swap ($${f2(usdComputed.swapNear)}) = $${f2(usdComputed.cash_threshold)}M · payout reserve H* $${f2(usdComputed.cash_threshold_pre_swap)}M${usdComputed.funding_binding ? ' — USD funding bind' : ''}`}>
                 {f2(usdComputed.cash_threshold)}
                 {usdComputed.funding_binding && (
                   <span className="ml-0.5 text-xs text-red-600" title="USD funding bind">⛓</span>
                 )}
               </td>
               <td className={`${tdBase} bg-amber-100 font-semibold text-amber-900`}
-                title={`USD Target = opening NP + swap = ${fmtThresholdUsd(usdComputed.cashThresholdUSD)}`}>
+                title={`USD Target = opening LP + swap = ${fmtThresholdUsd(usdComputed.cashThresholdUSD)}`}>
                 {fmtThresholdUsd(usdComputed.cashThresholdUSD)}
                 {usdComputed.funding_binding && (
                   <span className="ml-0.5 text-xs text-red-600" title="USD funding bind">⛓</span>
@@ -4079,7 +6674,7 @@ export function UnifiedSimulator({
 
               {showSwap && (<>
               {/* SWAP */}
-              <td className={`${tdBase} bg-emerald-50 border-l border-gray-300 font-semibold ${clr(usdComputed.swapNear)}`}
+              <td className={`${tdBase} bg-emerald-50 border-l-2 border-emerald-300 font-semibold ${clr(usdComputed.swapNear)}`}
                 title="USD funding leg (already in $M)">
                 {f2(usdComputed.swapNear)}
               </td>
@@ -4087,16 +6682,18 @@ export function UnifiedSimulator({
                 title="USD funding leg — offsets Σ(FCY swap × spot)">
                 {fmtSwapUsd(usdComputed.swapNear)}
               </td>
+              <td className={`${tdBase} bg-emerald-50 text-gray-300`}
+                title="The USD leg carries no dated path, so it rolls no swap book of its own">—</td>
               <td className={`${tdBase} bg-emerald-50 font-medium ${clr(usdComputed.postSwapCash)}`}
-                title={`Opening NP ($${f2(usdComputed.cash)}) + Swap ($${f2(usdComputed.swapNear)}) = $${f2(usdComputed.postSwapCash)}M — funded position before payout`}>
+                title={`Opening LP ($${f2(usdComputed.cash)}) + Swap ($${f2(usdComputed.swapNear)}) = $${f2(usdComputed.postSwapCash)}M — funded position before payout`}>
                 {f2(usdComputed.postSwapCash)}
               </td>
               <td className={`${tdBase} bg-emerald-100 font-medium ${clr(usdComputed.postSwapUSD)}`}
-                title="Opening NP $USD + Swap $USD at near leg">
+                title="Opening LP $USD + Swap $USD at near leg">
                 {fmtSwapUsd(usdComputed.postSwapUSD)}
               </td>
               <td className={`${tdBase} bg-emerald-50 font-medium ${clr(usdComputed.cycleEndCash)}`}
-                title={`NP+Swap ($${f2(usdComputed.postSwapCash)}) + Payout ($${f2(usdComputed.payout)}) + Payins ($${f2(usdComputed.collections)}) + Non-NP sweep ($${f2(usdComputed.nonNpCash)}) = $${f2(usdComputed.cycleEndCash)}M`}>
+                title={`LP+Swap ($${f2(usdComputed.postSwapCash)}) + Payout ($${f2(usdComputed.payout)}) + Payins ($${f2(usdComputed.collections)}) + Non-LP sweep ($${f2(usdComputed.nonLpCash)}) = $${f2(usdComputed.cycleEndCash)}M`}>
                 {f2(usdComputed.cycleEndCash)}
               </td>
               <td className={`${tdBase} bg-emerald-100 font-medium ${clr(usdComputed.cycleEndCash)}`}
@@ -4127,7 +6724,7 @@ export function UnifiedSimulator({
 
               {showRiskMetrics && (
                 <>
-                  <td className={`${tdBase} bg-violet-50 border-l border-violet-300 text-gray-400 text-xs`}>—</td>
+                  <td className={`${tdBase} bg-violet-50 border-l-2 border-violet-400 text-gray-400 text-xs`}>—</td>
                   <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`}>—</td>
                   <td className={`${tdBase} bg-violet-50 text-gray-400 text-xs`}>—</td>
                   <td className={`${tdBase} bg-violet-100 text-gray-400 text-xs`} title="Reporting CCY — no FX mismatch VaR">—</td>
@@ -4137,9 +6734,9 @@ export function UnifiedSimulator({
               {showPnl && (<>
               {/* P&L */}
               {!pnlCarryOnly && (
-              <td className={`${tdBase} bg-purple-50 border-l border-gray-300 font-semibold ${clr(usdComputed.netDelta)}`}>${f2(usdComputed.netDelta)}</td>
+              <td className={`${tdBase} bg-purple-50 border-l-2 border-purple-300 font-semibold ${clr(usdComputed.netDelta)}`}>${f2(usdComputed.netDelta)}</td>
               )}
-              <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l border-gray-300' : ''} ${usdComputed.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`} title="USD is the base currency — Δr = 0, no carry vs itself">{usdCarry(usdComputed.floatNim, 0)}</td>
+              <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l-2 border-purple-300' : ''} ${usdComputed.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`} title="USD is the base currency — Δr = 0, no carry vs itself">{usdCarry(usdComputed.floatNim, 0)}</td>
               <td className={`${tdBase} bg-purple-50 text-gray-400 text-xs`} title="USD is the funding leg — its interest effect is inside each FCY swap carry">—</td>
               {!pnlCarryOnly && (<>
               <td className={`${tdBase} bg-purple-50 text-gray-400 text-xs`}>—</td>
@@ -4154,12 +6751,12 @@ export function UnifiedSimulator({
 
               {/* RATES — blank */}
               {ratesOn && (
-              <td className="bg-gray-50 border-l border-gray-300" colSpan={3} />
+              <td className="bg-gray-50 border-l-2 border-gray-300" colSpan={3} />
               )}
 
               {/* FX POSITION — FCY not additive; validate $USD columns */}
               {showFxPosition && (<>
-              <td className={`${tdBase} bg-white border-l border-gray-300 text-gray-400 text-xs`}>—</td>
+              <td className={`${tdBase} bg-white border-l-2 border-gray-300 text-gray-400 text-xs`}>—</td>
               <td className={`${tdBase} font-bold border border-gray-300 ${zeroSumCls(fxUsdTotals.spot)}`}
                 title="Σ Spot $USD across all CCY + USD — must equal 0">
                 {fmtZeroSumUsd(fxUsdTotals.spot)}
@@ -4168,6 +6765,11 @@ export function UnifiedSimulator({
               <td className={`${tdBase} font-bold border border-gray-300 ${zeroSumCls(fxUsdTotals.fwd)}`}
                 title="Σ Fwd $USD across all CCY + USD — must equal 0">
                 {fmtZeroSumUsd(fxUsdTotals.fwd)}
+              </td>
+              <td className={`${tdBase} bg-white text-gray-400 text-xs`}>—</td>
+              <td className={`${tdBase} bg-white font-bold ${clr(hedgeUsdTotal)}`}
+                title="Σ booked hedge $USD across all CCY — an overlay on the book, so it need not net to 0">
+                {fmtHedgeCell(hedgeUsdTotal)}
               </td>
               <td className={`${tdBase} bg-white text-gray-400 text-xs`}>—</td>
               <td className={`${tdBase} font-bold border border-gray-300 ${zeroSumCls(fxUsdTotals.nonCashAsset)}`}
@@ -4196,20 +6798,21 @@ export function UnifiedSimulator({
 
               {/* LIQUIDITY — M FCY not additive; $USD columns summed */}
               {showLiquidity && (<>
-              <td className={`${tdBase} bg-sky-50 border-l border-sky-200 text-gray-400 text-xs`} title="M FCY balances are not additive across currencies">—</td>
-              <td className={`${tdBase} bg-sky-100 font-bold ${clr(npCashUsdTotal)}`}
-                title="Σ NP Cash $USD across all CCY + USD">
-                {f2(npCashUsdTotal)}
+              <td className={`${tdBase} bg-sky-50 border-l-2 border-sky-300 text-gray-400 text-xs`} title="M FCY balances are not additive across currencies">—</td>
+              <td className={`${tdBase} bg-sky-100 font-bold ${clr(lpCashUsdTotal)}`}
+                title="Σ LP Cash $USD across all CCY + USD">
+                {f2(lpCashUsdTotal)}
               </td>
               <td className={`${tdBase} bg-sky-50 text-gray-400 text-xs`}>—</td>
               <td className={`${tdBase} bg-sky-50 text-gray-400 text-xs`}>—</td>
-              <td className={`${tdBase} bg-sky-50 text-gray-400 text-xs`}>—</td>
-              <td className={`${tdBase} bg-sky-100 text-gray-400 text-xs`}>—</td>
               <td className={`${tdBase} bg-sky-100 text-gray-400 text-xs`}>—</td>
               <td className={`${tdBase} bg-sky-50 text-gray-400 text-xs`}>—</td>
-              <td className={`${tdBase} bg-sky-100 font-bold border border-sky-300 ${zeroSumCls(fxUsdTotals.cashPos)}`}
-                title="Σ Total Cash $USD (NP + Non-NP) across all CCY + USD">
-                {fmtZeroSumUsd(fxUsdTotals.cashPos)}
+              <td className={`${tdBase} bg-sky-100 text-gray-400 text-xs`}>—</td>
+              {showNonLp && <td className={`${tdBase} bg-sky-50 text-gray-400 text-xs`}>—</td>}
+              <td className={`${tdBase} bg-sky-50 text-gray-400 text-xs`}>—</td>
+              <td className={`${tdBase} bg-sky-100 font-bold border border-sky-300 ${clr(cycleNetFlowUsdTotal)}`}
+                title="Σ Close Balance $USD across all CCY + USD — where the book closes cycle 1 before any swap">
+                {f2(cycleNetFlowUsdTotal)}
               </td>
               </>)}
 
@@ -4220,14 +6823,14 @@ export function UnifiedSimulator({
 
 {showCarry && (<>
               {/* CARRY / BUFFER */}
-              <td className="bg-amber-50 border-l border-gray-300" />
+              <td className="bg-amber-50 border-l-2 border-amber-300" />
               <td className={`${tdBase} bg-amber-50 text-gray-400 text-xs`} title="M FCY thresholds are not additive across currencies">—</td>
               <td className={`${tdBase} bg-amber-100 font-bold ${clr(thresholdUsdTotal)}`}>{fmtThresholdUsd(thresholdUsdTotal)}</td>
               </>)}
 
               {showSwap && (<>
               {/* SWAP — FCY units not additive; validate in $USD column */}
-              <td className={`${tdBase} bg-emerald-50 border-l border-gray-300 text-gray-400 text-xs`} title="M FCY swap legs are not additive across currencies">—</td>
+              <td className={`${tdBase} bg-emerald-50 border-l-2 border-emerald-300 text-gray-400 text-xs`} title="M FCY swap legs are not additive across currencies">—</td>
               <td className={`${tdBase} font-bold border border-emerald-300 ${
                 Math.abs(swapNearUsdTotal) < 0.01 ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'
               }`}
@@ -4236,14 +6839,15 @@ export function UnifiedSimulator({
                   ? <><span className="mr-1">✓</span>{f2(0)}<span className="ml-1 text-xs font-normal">zero-sum</span></>
                   : <><span className="mr-1">⚠</span>{fmtSwapUsd(swapNearUsdTotal)}</>}
               </td>
-              <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`} title="M FCY NP after swap is not additive across currencies">—</td>
+              <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`} title="M FCY swap books are not additive across currencies">—</td>
+              <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`} title="M FCY LP after swap is not additive across currencies">—</td>
               <td className={`${tdBase} bg-emerald-100 font-bold border border-emerald-200 ${clr(postSwapUsdTotal)}`}
-                title={`Σ (Opening NP + Swap) $USD — swap zero-sum, so = Σ opening NP $USD`}>
+                title={`Σ (Opening LP + Swap) $USD — swap zero-sum, so = Σ opening LP $USD`}>
                 {fmtSwapUsd(postSwapUsdTotal)}
               </td>
               <td className={`${tdBase} bg-emerald-50 text-gray-400 text-xs`} title="M FCY cycle end is not additive across currencies">—</td>
               <td className={`${tdBase} bg-emerald-100 font-bold border border-emerald-200 ${clr(cycleEndUsdTotal)}`}
-                title={`Σ Cycle End $USD (NP+Swap − payout + payins + Non-NP sweep) — before far leg`}>
+                title={`Σ Cycle End $USD — last close on each currency's path after hedge settlement and the term far-leg repayment`}>
                 {fmtSwapUsd(cycleEndUsdTotal)}
               </td>
               </>)}
@@ -4275,7 +6879,7 @@ export function UnifiedSimulator({
               {showRiskMetrics && (
                 <>
                   <td
-                    className={`${tdBase} bg-violet-50 border-l border-violet-300 font-bold ${
+                    className={`${tdBase} bg-violet-50 border-l-2 border-violet-400 font-bold ${
                       riskUsdTotals.exp >= 0 ? 'text-emerald-800' : 'text-rose-700'
                     }`}
                     title="Σ Exp $USD M across FCY"
@@ -4316,13 +6920,13 @@ export function UnifiedSimulator({
               {showPnl && (<>
               {/* P&L totals — USD-denominated ($M/yr); Net Delta $USD is additive across currencies */}
               {!pnlCarryOnly && (
-              <td className={`${tdBase} bg-purple-50 border-l border-gray-300 font-bold ${clr(netDeltaUsdTotal)}`}
+              <td className={`${tdBase} bg-purple-50 border-l-2 border-purple-300 font-bold ${clr(netDeltaUsdTotal)}`}
                 title="Σ net FX delta across all rows, converted to $USD at spot">
                 ${f2(netDeltaUsdTotal)}
               </td>
               )}
-              <td className={`${tdBase} bg-purple-50 font-bold ${pnlCarryOnly ? 'border-l border-gray-300' : ''} ${floatNimUsdTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
-                title="Σ post-swap economic cash carry across all rows, $M/yr USD — O/N earn/pay on the funded NP balance after CIP-neutral swaps">
+              <td className={`${tdBase} bg-purple-50 font-bold ${pnlCarryOnly ? 'border-l-2 border-purple-300' : ''} ${floatNimUsdTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
+                title="Σ post-swap economic cash carry across all rows, $M/yr USD — O/N earn/pay on the funded LP balance after CIP-neutral swaps">
                 {usdCarry(floatNimUsdTotal, 0)}
               </td>
               <td className={`${tdBase} bg-purple-50 font-bold ${swapCarryTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
@@ -4348,6 +6952,22 @@ export function UnifiedSimulator({
           </tbody>
         </table>
         </FormulaGridProvider>
+      </div>
+
+      {/* How to read the TOTAL row */}
+      <div className="flex flex-wrap gap-x-4 gap-y-1 px-0.5 font-mono text-[9px] leading-snug text-gray-400">
+        <span>
+          <span className="font-semibold text-gray-700">1,234</span> real sum ($USD)
+        </span>
+        <span>
+          <span className="text-gray-400">—</span> not additive (M FCY · per-CCY only)
+        </span>
+        <span>
+          <span className="font-semibold text-green-700">0.00 ✓</span> zero-sum invariant holds
+        </span>
+        <span>
+          <span className="font-semibold text-red-700">0.04 ✗</span> invariant broken — model out of balance
+        </span>
       </div>
     </div>
   );

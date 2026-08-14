@@ -2,31 +2,31 @@ import { describe, it, expect } from 'vitest';
 import { INITIAL_ROWS, INITIAL_USD_PARAMS, Z_NEUTRAL } from './fx-buffer';
 import { computeDashboardModel } from './dashboard-model';
 
-describe('Target NP Cash with payout (sigma + floor only)', () => {
+describe('Target LP Cash with payout (sigma + floor only)', () => {
   const base = {
     rows: INITIAL_ROWS.map(r => r.ccy === 'CAD' ? { ...r, payout: -100 } : r),
     usdCash: 303.9,
-    usdNonNpCash: 154.1,
+    usdNonLpCash: 154.1,
     usdParams: INITIAL_USD_PARAMS,
     shared: { r_USD: 3.50, σ_P: 0.10, days: 3 },
     activeLayers: new Set(['sigmaP', 'floorH'] as const),
     policyVAR: 5.0,
   };
 
-  it('CAD −100M: Target = NP Cash + Swap; swap sized to the σ cushion', () => {
+  it('CAD −100M: Target = LP Cash + Swap; swap sized to the σ cushion', () => {
     const model = computeDashboardModel(base);
     const cad = model.fcyComputed.find(r => r.ccy === 'CAD')!;
     const sigma = 100 * base.shared.σ_P * Z_NEUTRAL; // 16.45
     // Internal cushion H* that sizes the swap = σ buffer
     expect(cad.cash_threshold_pre_swap).toBeCloseTo(sigma, 1);
-    // Target = NP+Swap = opening NP + swap (funds the payout plus the cushion)
+    // Target = LP+Swap = opening LP + swap (funds the payout plus the cushion)
     expect(cad.cash_threshold).toBeCloseTo(cad.cash + cad.swapNear, 4);
     expect(cad.postSwapCash).toBeCloseTo(cad.cash + cad.swapNear, 4);
     expect(cad.cash_threshold).toBeCloseTo(cad.postSwapCash, 4);
     expect(cad.cash_threshold).toBeCloseTo(100 + sigma, 1);
   });
 
-  it('Target = NP+Swap moves 1:1+σ with payout estimate', () => {
+  it('Target = LP+Swap moves 1:1+σ with payout estimate', () => {
     const m100 = computeDashboardModel(base);
     const m200 = computeDashboardModel({
       ...base,

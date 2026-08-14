@@ -6,7 +6,7 @@ import {
   cashInterestModeOf,
   clearStoredMarketRates,
   DEFAULT_EURUSD_MARKET_RATES,
-  defaultOvernightCashFromNp,
+  defaultOvernightCashFromLp,
   effectiveOvernightCash,
   getActiveMarketRates,
   normalizeMarketRatesBundle,
@@ -272,20 +272,20 @@ export function DataUploadPanel({
     setDirty(false);
   };
 
-  /** One-click: FCY NP for this CCY + shared USD NP for all pairs. */
-  const applyNpOvernight = () => {
-    const np = defaultOvernightCashFromNp(previewCcy);
-    setOnDraft(np);
+  /** One-click: FCY LP for this CCY + shared USD LP for all pairs. */
+  const applyLpOvernight = () => {
+    const lp = defaultOvernightCashFromLp(previewCcy);
+    setOnDraft(lp);
     commitBundle(
       {
         ...rates,
         overnightCash: {
-          base: { ...np.base },
-          usd: { ...np.usd },
+          base: { ...lp.base },
+          usd: { ...lp.usd },
         },
       },
       previewCcy,
-      { stampUsd: np.usd },
+      { stampUsd: lp.usd },
     );
     setDirty(false);
   };
@@ -504,15 +504,15 @@ export function DataUploadPanel({
             </button>
             <button
               type="button"
-              onClick={applyNpOvernight}
+              onClick={applyLpOvernight}
               className="rounded border border-amber-700/50 bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-100 hover:bg-amber-500/20"
               title={
                 previewCcy === 'EUR'
-                  ? 'Apply NP: EUR 1.78% / 2.21% here · USD 3.50% / 3.89% on all pairs'
-                  : `Apply NP: ${previewCcy} here · USD NP on all pairs`
+                  ? 'Apply LP: EUR 1.78% / 2.21% here · USD 3.50% / 3.89% on all pairs'
+                  : `Apply LP: ${previewCcy} here · USD LP on all pairs`
               }
             >
-              Apply NP O/N
+              Apply LP O/N
             </button>
             <button
               type="button"
@@ -606,7 +606,7 @@ export function DataUploadPanel({
               Cash interest in analytics
             </div>
             <p className="text-[10px] text-slate-600">
-              Current = flat O/N (e.g. NP {fmtPct2(appliedOn.base.creditPct)}
+              Current = flat O/N (e.g. LP {fmtPct2(appliedOn.base.creditPct)}
               ). Forward = rate ladder SW→1Y by month.
             </p>
           </div>

@@ -34,7 +34,7 @@ export interface OvernightCashRates {
 
 /**
  * How cash interest months pick a rate in Cash Carry / forecast paths.
- * - `current` — flat applied O/N for every month (e.g. NP EUR 1.78%)
+ * - `current` — flat applied O/N for every month (e.g. LP EUR 1.78%)
  * - `forward` — O/N near 0; SW→1Y deposit ladder for later months
  */
 export type CashInterestMode = 'current' | 'forward';
@@ -73,7 +73,7 @@ export interface FxMarketRatesBundle {
 }
 
 /** Default overnight cash from JPM NP credit/debit (CURRENCY_PARAMS). */
-export function defaultOvernightCashFromNp(
+export function defaultOvernightCashFromLp(
   baseCcy = 'EUR',
 ): OvernightCashRates {
   const base = CURRENCY_PARAMS[baseCcy];
@@ -90,13 +90,13 @@ export function defaultOvernightCashFromNp(
   };
 }
 
-/** Ensure overnight cash exists (seed NP if missing). */
+/** Ensure overnight cash exists (seed LP if missing). */
 export function normalizeMarketRatesBundle(
   bundle: FxMarketRatesBundle,
 ): FxMarketRatesBundle {
   const overnightCash =
     bundle.overnightCash ??
-    defaultOvernightCashFromNp(bundle.baseCcy || 'EUR');
+    defaultOvernightCashFromLp(bundle.baseCcy || 'EUR');
   return {
     ...bundle,
     overnightCash,
@@ -156,13 +156,13 @@ export function marketRatesStorageKey(scopeId?: string | null): string {
   return STORAGE_KEY;
 }
 
-/** Bundled seed from FXOCalculator EURUSD.xlsx (+ NP overnight cash). */
+/** Bundled seed from FXOCalculator EURUSD.xlsx (+ LP overnight cash). */
 export const DEFAULT_EURUSD_MARKET_RATES: FxMarketRatesBundle =
   normalizeMarketRatesBundle({
     ...(defaultEurUsd as FxMarketRatesBundle),
     overnightCash:
       (defaultEurUsd as FxMarketRatesBundle).overnightCash ??
-      defaultOvernightCashFromNp('EUR'),
+      defaultOvernightCashFromLp('EUR'),
   });
 
 export function selectCreditDebitRate(
@@ -344,7 +344,7 @@ export function overnightCashFromDeposits(
     return { base, usd: { ...swRow.usd } };
   }
 
-  return defaultOvernightCashFromNp(baseCcy);
+  return defaultOvernightCashFromLp(baseCcy);
 }
 
 const SHORT_END_TENORS = ['ON', 'TN', 'SN', 'SW', '1W'] as const;
@@ -361,7 +361,7 @@ export function shortEndDepositTenor(
 /**
  * Effective overnight for a bundle.
  * Applied `overnightCash` wins (set via UI Apply or ON row in file).
- * Else ON/TN/SN deposit row; else NP — SW is term-only until user Applies O/N.
+ * Else ON/TN/SN deposit row; else LP — SW is term-only until user Applies O/N.
  */
 export function effectiveOvernightCash(
   bundle: FxMarketRatesBundle | null | undefined,
@@ -382,7 +382,7 @@ export function effectiveOvernightCash(
   if (onRow) {
     return { base: { ...onRow.eur }, usd: { ...onRow.usd } };
   }
-  return defaultOvernightCashFromNp(ccy);
+  return defaultOvernightCashFromLp(ccy);
 }
 
 /** Suggested O/N from SW (EUR desk 2.15/2.35; else copy SW deposits). */
@@ -396,15 +396,15 @@ export function suggestOvernightFromSw(
   );
 }
 
-/** Empty per-CCY shell — NP overnight, no term curve (until upload). */
+/** Empty per-CCY shell — LP overnight, no term curve (until upload). */
 export function emptyMarketRatesForCcy(ccy: string): FxMarketRatesBundle {
   const base = (ccy || 'EUR').toUpperCase();
   return normalizeMarketRatesBundle({
     pair: `${base}USD`,
     baseCcy: base,
     quoteCcy: 'USD',
-    sourceFile: 'NP defaults (no upload)',
-    overnightCash: defaultOvernightCashFromNp(base),
+    sourceFile: 'LP defaults (no upload)',
+    overnightCash: defaultOvernightCashFromLp(base),
     deposits: [],
   });
 }
@@ -426,7 +426,7 @@ export function pickSharedUsdOvernight(
       return { creditPct: usd.creditPct, debitPct: usd.debitPct };
     }
   }
-  return { ...defaultOvernightCashFromNp('EUR').usd };
+  return { ...defaultOvernightCashFromLp('EUR').usd };
 }
 
 /** Stamp the same USD O/N onto every currency bundle in the book. */
@@ -439,7 +439,7 @@ export function stampSharedUsdOvernight(
   for (const ccy of Object.keys(map)) {
     const bundle = map[ccy]!;
     const on =
-      bundle.overnightCash ?? defaultOvernightCashFromNp(bundle.baseCcy || ccy);
+      bundle.overnightCash ?? defaultOvernightCashFromLp(bundle.baseCcy || ccy);
     map[ccy] = normalizeMarketRatesBundle({
       ...bundle,
       overnightCash: {
@@ -467,8 +467,8 @@ export function resolveOvernightCashRates(
   source: string;
 } {
   const normalized = bundle ? normalizeMarketRatesBundle(bundle) : null;
-  const usdNp = CURRENCY_PARAMS.USD;
-  const fcyNp = CURRENCY_PARAMS[ccy];
+  const usdLp = CURRENCY_PARAMS.USD;
+  const fcyLp = CURRENCY_PARAMS[ccy];
   const hasShortEnd = Boolean(
     normalized && shortEndDepositTenor(normalized.deposits),
   );
@@ -490,14 +490,14 @@ export function resolveOvernightCashRates(
     }
     return {
       fcy: {
-        creditPct: usdNp?.carry ?? 3.5,
-        debitPct: usdNp?.r_OD ?? 3.89,
+        creditPct: usdLp?.carry ?? 3.5,
+        debitPct: usdLp?.r_OD ?? 3.89,
       },
       usd: {
-        creditPct: usdNp?.carry ?? 3.5,
-        debitPct: usdNp?.r_OD ?? 3.89,
+        creditPct: usdLp?.carry ?? 3.5,
+        debitPct: usdLp?.r_OD ?? 3.89,
       },
-      source: 'CURRENCY_PARAMS NP · USD overnight',
+      source: 'CURRENCY_PARAMS LP · USD overnight',
     };
   }
 
@@ -523,20 +523,20 @@ export function resolveOvernightCashRates(
   }
   return {
     fcy: {
-      creditPct: fcyNp?.carry ?? 0,
-      debitPct: fcyNp?.r_OD ?? fcyNp?.carry ?? 0,
+      creditPct: fcyLp?.carry ?? 0,
+      debitPct: fcyLp?.r_OD ?? fcyLp?.carry ?? 0,
     },
     usd: {
-      creditPct: usdNp?.carry ?? 3.5,
-      debitPct: usdNp?.r_OD ?? 3.89,
+      creditPct: usdLp?.carry ?? 3.5,
+      debitPct: usdLp?.r_OD ?? 3.89,
     },
-    source: 'CURRENCY_PARAMS NP · overnight',
+    source: 'CURRENCY_PARAMS LP · overnight',
   };
 }
 
 /**
  * Term deposit credit/debit at tenor — for forward CIP / points pricing only.
- * Uses the uploaded curve when the bundle belongs to `ccy`; else NP.
+ * Uses the uploaded curve when the bundle belongs to `ccy`; else LP.
  * USD uses the USD deposit column of a peer FCY×USD file.
  */
 export function resolveForwardDepositRates(
@@ -548,18 +548,18 @@ export function resolveForwardDepositRates(
   usd: DepositSideRates;
   source: string;
 } {
-  const usdNp = CURRENCY_PARAMS.USD;
-  const fcyNp = CURRENCY_PARAMS[ccy];
+  const usdLp = CURRENCY_PARAMS.USD;
+  const fcyLp = CURRENCY_PARAMS[ccy];
   const fallback = {
     fcy: {
-      creditPct: fcyNp?.carry ?? 0,
-      debitPct: fcyNp?.r_OD ?? fcyNp?.carry ?? 0,
+      creditPct: fcyLp?.carry ?? 0,
+      debitPct: fcyLp?.r_OD ?? fcyLp?.carry ?? 0,
     },
     usd: {
-      creditPct: usdNp?.carry ?? 3.5,
-      debitPct: usdNp?.r_OD ?? 3.89,
+      creditPct: usdLp?.carry ?? 3.5,
+      debitPct: usdLp?.r_OD ?? 3.89,
     },
-    source: 'CURRENCY_PARAMS NP · term',
+    source: 'CURRENCY_PARAMS LP · term',
   };
 
   if (ccy === 'USD' && bundle?.deposits && bundle.deposits.length > 0) {
@@ -589,7 +589,7 @@ export function resolveForwardDepositRates(
 
 /**
  * Cash interest rates for a holding horizon.
- * Mode `current`: flat applied O/N for every tenor (e.g. NP 1.78%).
+ * Mode `current`: flat applied O/N for every tenor (e.g. LP 1.78%).
  * Mode `forward` (default):
  * - Near 0 / below SW → O/N
  * - SW…1Y → interpolate deposit term structure (capped at 12m)
@@ -632,7 +632,7 @@ export function resolveCashRatesForHorizon(
     };
   }
 
-  // NP fallback still tenor-flat; prefer overnight if no curve.
+  // LP fallback still tenor-flat; prefer overnight if no curve.
   return {
     fcy: on.fcy,
     usd: on.usd,
@@ -876,7 +876,7 @@ export function pickPeerMarketRatesForUsd(
 /**
  * Per-CCY market rates bundle: DB-persisted book map → legacy scoped
  * localStorage (pre-per-CCY books, matching ccy) → EURUSD seed (EUR only)
- * → NP empty shell for other currencies.
+ * → LP empty shell for other currencies.
  *
  * USD: no dedicated upload — borrow a peer FCY×USD file (USD columns).
  */

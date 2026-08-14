@@ -4,7 +4,7 @@ import type { Entity } from '@/lib/workspace-store';
 export interface EntitySimSeed {
   rows: RowState[];
   usdCash: number;
-  usdNonNpCash: number;
+  usdNonLpCash: number;
   usdParams: UsdParams;
   /** Currencies to show in the FX table for this entity. */
   currencyFilter: string[];
@@ -58,7 +58,7 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
     return {
       rows: [pln],
       usdCash: 0,
-      usdNonNpCash: 0,
+      usdNonLpCash: 0,
       usdParams: { ...INITIAL_USD_PARAMS },
       currencyFilter: ['PLN'],
       profileCurrencies: ['PLN'],
@@ -83,7 +83,7 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
     return {
       rows: [eur, gbp],
       usdCash: 0,
-      usdNonNpCash: 0,
+      usdNonLpCash: 0,
       usdParams: { ...INITIAL_USD_PARAMS },
       currencyFilter: ['EUR', 'GBP'],
       profileCurrencies: ['EUR', 'GBP'],
@@ -94,7 +94,7 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
   return {
     rows: [],
     usdCash: 6.0,
-    usdNonNpCash: 0,
+    usdNonLpCash: 0,
     usdParams: { ...INITIAL_USD_PARAMS, payout: -0.8, collections: 0 },
     currencyFilter: [], // USD-only book (no FCY rows)
     profileCurrencies: ['USD'],

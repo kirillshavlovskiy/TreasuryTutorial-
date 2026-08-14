@@ -1,14 +1,13 @@
 'use client';
 
 import {
-  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
-  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from 'react';
+import { DeskStepper } from '@/components/DeskStepper';
 import { createPortal } from 'react-dom';
 import {
   ExposureHedgePathChart,
@@ -16,11 +15,18 @@ import {
   type HedgePathSummaryMetrics,
 } from '@/components/test-mode/ExposureHedgePathChart';
 import {
+  chipsFromPathSummary,
+  HedgeStagingHeader,
+} from '@/components/test-mode/HedgeStagingHeader';
+import {
   DEFAULT_FORECAST_PROFILE,
   monthlyFlowSeriesLocalM,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
 import type { RowState } from '@/lib/fx-buffer';
+import type { FcyComputedRow } from '@/lib/dashboard-model';
+import type { LiquidityBookingMode, LiquiditySizingBasis } from '@/lib/liquidity-ladder';
+import { LiquiditySwapDecision } from '@/components/LiquiditySwapDecision';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   hedgeBasisNotionalLocalM,
@@ -75,6 +81,7 @@ import {
   computeAnalyticsVarUsdM,
   computeParametricVarUsdM,
   horizonMonths,
+  monthlyVolForSetup,
   VAR_EXPOSURE_OPTIONS,
   VAR_HORIZON_OPTIONS,
   type VarExposureBasis,
@@ -259,6 +266,14 @@ interface HedgingDecisionLayerProps {
   onBookHedge?: (ticket: HedgeTicket) => void;
   bookRows?: RowState[];
   forecastProfile?: ForecastProfileState;
+  /** Desk-computed funded plan — the funding strip this module books first. */
+  fcyComputed?: FcyComputedRow[];
+  r_USD?: number;
+  sizingBasis?: LiquiditySizingBasis;
+  bookingMode?: LiquidityBookingMode;
+  forecastMonths?: number;
+  onSizingBasisChange?: (v: LiquiditySizingBasis) => void;
+  onBookingModeChange?: (v: LiquidityBookingMode) => void;
 }
 
 /**
@@ -283,6 +298,13 @@ export function HedgingDecisionLayer({
   onBookHedge,
   bookRows,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
+  fcyComputed,
+  r_USD,
+  sizingBasis,
+  bookingMode,
+  forecastMonths,
+  onSizingBasisChange,
+  onBookingModeChange,
 }: HedgingDecisionLayerProps) {
   const risk = useMemo(
     () =>
@@ -393,7 +415,9 @@ export function HedgingDecisionLayer({
     varSetup.confidencePct,
     varSetup.forecastUncertainty1m,
     JSON.stringify(forecastProfile.uncertainty1mByCcy ?? {}),
-    varSetup.volSource,
+    // Effective σ₁ₘ, not just the source id — an edited override changes the
+    // vol without changing which source is selected.
+    monthlyVolForSetup(varSetup),
     hedgeSizingSetup.horizon,
     hedgeSizingSetup.exposureBasis,
   ].join('|');
@@ -1213,6 +1237,17 @@ export function HedgingDecisionLayer({
         </div>
       </div>
 
+      <LiquiditySwapDecision
+        rows={fcyComputed ?? []}
+        r_USD={r_USD ?? 0}
+        sizingBasis={sizingBasis ?? 'horizon'}
+        bookingMode={bookingMode ?? 'rolling'}
+        forecastMonths={forecastMonths ?? varSetup.forecastMonths ?? 1}
+        onSizingBasisChange={onSizingBasisChange}
+        onBookingModeChange={onBookingModeChange}
+        embedded={embedded}
+      />
+
       <>
       <div className="grid gap-3 sm:grid-cols-3">
         <Stat
@@ -1601,18 +1636,27 @@ export function HedgingDecisionLayer({
                             {fmtLocal(totalM, r.ccy)}
                           </span>
                         </div>
-                        <div className="flex min-w-[280px] flex-col gap-1">
-                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
-                            Hedge ratio
-                          </span>
-                          <HedgeRatioControl
-                            pct={Math.round(r.hedgeRatio * 100)}
-                            notional={fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}
-                            mutedClass={muted}
-                            disabled={flat}
-                            onChange={pct => setStructRatio(r.ccy, pct)}
-                          />
-                        </div>
+                        <DeskStepper
+                          label="Hedge"
+                          value={Math.round(r.hedgeRatio * 100)}
+                          min={0}
+                          max={MAX_HEDGE_PCT}
+                          step={1}
+                          nudgeStep={HEDGE_STEP_PCT}
+                          onChange={pct => setStructRatio(r.ccy, pct)}
+                          formatValue={v => `${v}%`}
+                          suffix={`→ ${fmtLocal(-r.hedgeNotionalLocalM, r.ccy)}`}
+                          editable
+                          disabled={flat}
+                          tickValues={[0, 25, 50, 75, 100]}
+                          className="min-w-[280px] w-[280px]"
+                          title={
+                            flat
+                              ? 'No net exposure to hedge'
+                              : `Scale hedge % of Target / Total expected (0–${MAX_HEDGE_PCT}%)`
+                          }
+                          ariaLabel="Hedge percent"
+                        />
                         <div className="flex flex-col gap-1">
                           <span className="text-[9px] uppercase tracking-wide text-slate-500">
                             Target (total)
@@ -2051,15 +2095,11 @@ export function HedgingDecisionLayer({
           >
             <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
               <div className="sticky top-0 z-30 shrink-0 border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <h4
-                      id="decision-path-title"
-                      className="text-sm font-semibold text-white"
-                    >
-                      {chartCcy} — exposure path vs hedge
-                    </h4>
-                    <p className="mt-0.5 text-[11px] text-slate-400">
+                <HedgeStagingHeader
+                  titleId="decision-path-title"
+                  title={`${chartCcy} — exposure path vs hedge`}
+                  subtitle={
+                    <>
                       Selected regime:{' '}
                       <span className="font-semibold text-violet-200">
                         {pathBasis === 'cash'
@@ -2068,91 +2108,17 @@ export function HedgingDecisionLayer({
                             ? 'VaR-neutral'
                             : 'Target (Total)'}
                       </span>
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
-                    {chartCcy && preparedByCcy[chartCcy] && (
-                      <span
-                        className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[10px] font-semibold text-emerald-200"
-                        title="Staged in Hedging Decision — Send under this CCY to book"
-                      >
-                        ✓ Prebooked
-                      </span>
-                    )}
-                    {pathPrepareAction && (
-                      <button
-                        type="button"
-                        disabled={pathPrepareAction.disabled}
-                        onClick={() => pathPrepareAction.run()}
-                        title={pathPrepareAction.title}
-                        className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        {pathPrepareAction.label}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={closePathChart}
-                      className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
-                    >
-                      Close
-                    </button>
-                  </div>
-                </div>
-                {pathSummaryMetrics && (
-                  <div className="mt-2 flex flex-wrap items-center gap-1">
-                    {(
-                      [
-                        [
-                          'Cover',
-                          pathSummaryMetrics.coverValue,
-                          pathSummaryMetrics.coverPct,
-                          pathSummaryMetrics.coverSub,
-                          'text-emerald-200',
-                        ],
-                        [
-                          'Legs',
-                          pathSummaryMetrics.legsValue,
-                          null,
-                          pathSummaryMetrics.legsSub,
-                          'text-sky-200',
-                        ],
-                        [
-                          'Resid',
-                          pathSummaryMetrics.residVarValue,
-                          pathSummaryMetrics.residVarPct,
-                          pathSummaryMetrics.residVarSub,
-                          'text-rose-300',
-                        ],
-                        [
-                          'BE',
-                          pathSummaryMetrics.breakevenValue,
-                          null,
-                          pathSummaryMetrics.breakevenSub,
-                          'text-amber-200/90',
-                        ],
-                      ] as const
-                    ).map(([label, value, pct, title, tone]) => (
-                      <span
-                        key={label}
-                        title={title ?? undefined}
-                        className="inline-flex items-center gap-1 rounded border border-slate-700/80 bg-slate-950/90 px-1.5 py-0.5 text-[10px] text-slate-500"
-                      >
-                        {label}{' '}
-                        <span
-                          className={`font-mono font-semibold tabular-nums ${tone}`}
-                        >
-                          {value}
-                        </span>
-                        {pct != null && (
-                          <span className="font-mono font-semibold tabular-nums text-slate-400">
-                            {pct}
-                          </span>
-                        )}
-                      </span>
-                    ))}
-                  </div>
-                )}
+                    </>
+                  }
+                  chips={
+                    pathSummaryMetrics
+                      ? chipsFromPathSummary(pathSummaryMetrics)
+                      : undefined
+                  }
+                  isPrebooked={Boolean(chartCcy && preparedByCcy[chartCcy])}
+                  prepareAction={pathPrepareAction}
+                  onClose={closePathChart}
+                />
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
               <ExposureHedgePathChart
@@ -2404,187 +2370,6 @@ function Row({ term, detail }: { term: string; detail: ReactNode }) {
     <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-2">
       <dt className="text-[11px] text-slate-500">{term}</dt>
       <dd className="text-right text-xs text-slate-200">{detail}</dd>
-    </div>
-  );
-}
-
-function HedgeRatioControl({
-  pct,
-  notional,
-  mutedClass,
-  onChange,
-  disabled = false,
-}: {
-  pct: number;
-  notional: string;
-  mutedClass: string;
-  onChange: (pct: number) => void;
-  disabled?: boolean;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(String(pct));
-  const dragRef = useRef<{ startX: number; startPct: number; moved: boolean } | null>(null);
-  const pctRef = useRef(pct);
-  pctRef.current = pct;
-
-  useEffect(() => {
-    if (!editing) setDraft(String(pct));
-  }, [pct, editing]);
-
-  const commitDraft = () => {
-    if (disabled) return;
-    const n = Number(draft.replace('%', '').trim());
-    if (Number.isFinite(n)) onChange(Math.round(clampPct(n)));
-    setEditing(false);
-  };
-
-  const startEdit = () => {
-    if (disabled) return;
-    setDraft(String(pctRef.current));
-    setEditing(true);
-  };
-
-  const onPointerDown = useCallback(
-    (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (editing || disabled) return;
-      e.preventDefault();
-      e.currentTarget.setPointerCapture(e.pointerId);
-      dragRef.current = { startX: e.clientX, startPct: pctRef.current, moved: false };
-    },
-    [editing, disabled],
-  );
-
-  const onPointerMove = useCallback(
-    (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (disabled) return;
-      const drag = dragRef.current;
-      if (!drag) return;
-      const dx = e.clientX - drag.startX;
-      if (Math.abs(dx) >= 3) drag.moved = true;
-      if (!drag.moved) return;
-      const delta = Math.round(dx / 2);
-      onChange(clampPct(drag.startPct + delta));
-    },
-    [onChange, disabled],
-  );
-
-  const onPointerUp = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current;
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      /* already released */
-    }
-    dragRef.current = null;
-    if (drag && !drag.moved) startEdit();
-  }, []);
-
-  return (
-    <div className={`flex flex-col gap-1${disabled ? ' opacity-40 grayscale' : ''}`}>
-      <div className="flex items-center gap-1">
-        <button
-          type="button"
-          title={disabled ? 'No net exposure to hedge' : `−${HEDGE_STEP_PCT}%`}
-          aria-label={`Decrease hedge by ${HEDGE_STEP_PCT} percent`}
-          disabled={disabled || pct <= 0}
-          onClick={() =>
-            onChange(
-              pct > MAX_HEDGE_PCT
-                ? MAX_HEDGE_PCT
-                : Math.max(0, pct - HEDGE_STEP_PCT),
-            )
-          }
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-slate-600 text-slate-300 hover:bg-slate-800 disabled:opacity-30"
-        >
-          −
-        </button>
-
-        {editing ? (
-          <input
-            autoFocus
-            type="text"
-            inputMode="numeric"
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            onBlur={commitDraft}
-            onKeyDown={e => {
-              if (e.key === 'Enter') commitDraft();
-              if (e.key === 'Escape') setEditing(false);
-            }}
-            className="w-14 rounded border border-emerald-600/50 bg-slate-950 px-1 py-0.5 text-center font-mono text-[11px] text-emerald-200 outline-none"
-          />
-        ) : (
-          <div
-            role="slider"
-            tabIndex={0}
-            aria-valuemin={0}
-            aria-valuemax={MAX_HEDGE_PCT}
-            aria-valuenow={pct}
-            aria-label="Hedge percent — drag for custom, click to type, buttons ±10%"
-            title="Drag for custom % · click to type · ± steps by 10%"
-            onPointerDown={onPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-            onPointerCancel={onPointerUp}
-            onKeyDown={e => {
-              if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
-                e.preventDefault();
-                onChange(
-                  pct > MAX_HEDGE_PCT
-                    ? MAX_HEDGE_PCT
-                    : Math.max(0, pct - HEDGE_STEP_PCT),
-                );
-              } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
-                e.preventDefault();
-                onChange(clampPct(pct + HEDGE_STEP_PCT));
-              } else if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                startEdit();
-              } else if (e.key === 'Home') {
-                e.preventDefault();
-                onChange(0);
-              } else if (e.key === 'End') {
-                e.preventDefault();
-                onChange(MAX_HEDGE_PCT);
-              }
-            }}
-            className="flex min-w-[3.25rem] cursor-ew-resize select-none items-center justify-center rounded border border-slate-600 bg-slate-950/80 px-2 py-1 font-mono text-[11px] text-emerald-300 hover:border-emerald-500/50"
-          >
-            {pct}%
-          </div>
-        )}
-
-        <button
-          type="button"
-          title={disabled ? 'No net exposure to hedge' : `+${HEDGE_STEP_PCT}%`}
-          aria-label={`Increase hedge by ${HEDGE_STEP_PCT} percent`}
-          disabled={disabled || pct >= MAX_HEDGE_PCT}
-          onClick={() => onChange(clampPct(pct + HEDGE_STEP_PCT))}
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-slate-600 text-slate-300 hover:bg-slate-800 disabled:opacity-30"
-        >
-          +
-        </button>
-
-        <input
-          type="range"
-          min={0}
-          max={MAX_HEDGE_PCT}
-          step={1}
-          value={Math.min(MAX_HEDGE_PCT, pct)}
-          disabled={disabled}
-          onChange={e => onChange(Number(e.target.value))}
-          className="ml-1 w-20 accent-emerald-500 disabled:cursor-not-allowed"
-          title={
-            disabled
-              ? 'No net exposure to hedge'
-              : `Drag for custom hedge % (0–${MAX_HEDGE_PCT}% of Target / Total expected)`
-          }
-          aria-label="Hedge percent slider"
-        />
-      </div>
-      <div className={`font-mono text-[11px] ${mutedClass}`}>
-        {disabled ? 'flat · 0' : notional}
-      </div>
     </div>
   );
 }

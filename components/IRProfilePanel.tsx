@@ -104,7 +104,7 @@ export function IRProfilePanel({
     σ_daily: 0, r_FCY: shared.r_USD, r_OD: usdParams.r_OD, β_IR: 0,
     spot: 0, fwd: 0, nonCash: 0,
     cash: usdCash, payout: usdParams.payout,
-    collections: usdParams.collections, fcastFX: 0, nonNpCash: 0, cash_floor: 0,
+    collections: usdParams.collections, fcastFX: 0, nonLpCash: 0, cash_floor: 0,
     ir_asset_notional: usdParams.ir_asset_notional,
     ir_asset_rate:     usdParams.ir_asset_rate,
     ir_liab_notional:  usdParams.ir_liab_notional,
@@ -151,7 +151,7 @@ export function IRProfilePanel({
       {/* Summary strip */}
       <div className="grid grid-cols-6 gap-3">
         {[
-          { label: 'Float NIM (FCY)',   v: totals.float_nim, sub: 'NP cash carry vs USD' },
+          { label: 'Float NIM (FCY)',   v: totals.float_nim, sub: 'LP cash carry vs USD' },
           { label: 'Fixed NIM (FCY)',   v: totals.fixed_nim, sub: '(A×rA − L×rL)×spot'  },
           { label: 'Total NIM',         v: totals.total_nim, sub: 'Float + Fixed'         },
           { label: 'Net DV01',          v: totals.net_dv01,  sub: '$M per 1bp shift'     },
@@ -381,7 +381,7 @@ export function IRProfilePanel({
 
       {/* Legend */}
       <div className="text-xs text-gray-400 space-y-0.5 border-t border-gray-100 pt-2">
-        <p><strong className="text-gray-500">Float NIM</strong> = NP cash × (r_FCY − r_USD) / 100 × spot · annualised net interest margin on floating NP cash position</p>
+        <p><strong className="text-gray-500">Float NIM</strong> = LP cash × (r_FCY − r_USD) / 100 × spot · annualised net interest margin on floating LP cash position</p>
         <p><strong className="text-gray-500">Fixed NIM</strong> = (fixed_assets × asset_rate − fixed_liabs × liab_rate) / 100 × spot · net income from fixed-rate book</p>
         <p><strong className="text-gray-500">Net DV01</strong> = (fixed_assets − fixed_liabs) × net_duration × spot × 0.0001 · P&L per 1bp parallel rate shift</p>
         <p><strong className="text-gray-500">MTM 100bp</strong> = Net DV01 × 100 · mark-to-market P&L impact of 100bp parallel shock across fixed-rate book</p>

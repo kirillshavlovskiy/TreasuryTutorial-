@@ -29,7 +29,7 @@ import {
   netPayoutDeficit,
   computeUsdBuffer,
   computeFcySwapNear,
-  applyNoNegativeNpFloor,
+  applyNoNegativeLpFloor,
   isExpensiveOverdraft,
   deriveUsdLiquidity,
   deriveUsdFromFcySwaps,
@@ -39,7 +39,7 @@ import {
   assessUsdLiquidityPriority,
   usdStressTrimFloor,
   payoutLiquidityMinimum,
-  allowsNegativeNp,
+  allowsNegativeLp,
   computePortfolioVAR,
   optimizePortfolioCarry,
   computeEffectiveUsdBudget,
@@ -312,12 +312,12 @@ describe('calcDynamicH', () => {
 
   it('JPM NP TRY multiplier is 1.009, NOT 1.368 (nominal rates)', () => {
     // Confirms the decision to use JPM NP rates — multiplier is much smaller
-    const mult_np = combinedMultiplier(CURRENCY_PARAMS.TRY.carry, CURRENCY_PARAMS.TRY.β_IR);
+    const mult_lp = combinedMultiplier(CURRENCY_PARAMS.TRY.carry, CURRENCY_PARAMS.TRY.β_IR);
     const mult_nominal = combinedMultiplier(46.0, CURRENCY_PARAMS.TRY.β_IR);
-    expect(mult_np).toBeCloseTo(1.009, 2);
+    expect(mult_lp).toBeCloseTo(1.009, 2);
     expect(mult_nominal).toBeCloseTo(1.368, 2);
     // JPM NP H is 26% smaller than if nominal rates were used
-    expect(mult_nominal / mult_np).toBeGreaterThan(1.3);
+    expect(mult_nominal / mult_lp).toBeGreaterThan(1.3);
   });
 
   it('floor binding: small position on volatile currency still respects cash_floor', () => {
@@ -430,12 +430,12 @@ describe('calcOptimalBuffer', () => {
 //    P_contrib = P when sigmaP layer is active, else 0 (PRE-PAYOUT base)
 // ─────────────────────────────────────────────────────────────────────────────
 describe('netPayoutDeficit', () => {
-  it('returns 0 when opening NP covers outflow', () => {
+  it('returns 0 when opening LP covers outflow', () => {
     expect(netPayoutDeficit(-100, 95.1)).toBeCloseTo(4.9);
     expect(netPayoutDeficit(-50, 95.1)).toBe(0);
   });
 
-  it('returns full |payout| when NP cannot prefund', () => {
+  it('returns full |payout| when LP cannot prefund', () => {
     expect(netPayoutDeficit(-100, 0)).toBe(100);
   });
 });
@@ -595,7 +595,7 @@ describe('computeLayeredBuffer', () => {
         layers as Set<'sigmaP' | 'carryOptim' | 'floorH' | 'portfolioDiv'>);
       const layerSum = r.floor_contrib + r.delta_sigma + r.delta_carry;
       expect(r.raw_sum).toBeCloseTo(layerSum, 10);
-      const expected = allowsNegativeNp(EUR.r_OD, r_USD) ? r.raw_sum : Math.max(0, r.raw_sum);
+      const expected = allowsNegativeLp(EUR.r_OD, r_USD) ? r.raw_sum : Math.max(0, r.raw_sum);
       expect(r.cash_threshold).toBe(expected);
     }
   });
@@ -739,19 +739,19 @@ describe('assessUsdLiquidityPriority', () => {
   });
 });
 
-describe('isExpensiveOverdraft / allowsNegativeNp', () => {
+describe('isExpensiveOverdraft / allowsNegativeLp', () => {
   const r_USD = 4.5;
 
-  it('AED: r_OD > r_USD → no negative NP', () => {
+  it('AED: r_OD > r_USD → no negative LP', () => {
     const { r_OD } = CURRENCY_PARAMS.AED!;
     expect(isExpensiveOverdraft(r_OD, r_USD)).toBe(true);
-    expect(allowsNegativeNp(r_OD, r_USD)).toBe(false);
+    expect(allowsNegativeLp(r_OD, r_USD)).toBe(false);
   });
 
-  it('CAD: r_OD < r_USD → negative NP allowed', () => {
+  it('CAD: r_OD < r_USD → negative LP allowed', () => {
     const { r_OD } = CURRENCY_PARAMS.CAD!;
     expect(isExpensiveOverdraft(r_OD, r_USD)).toBe(false);
-    expect(allowsNegativeNp(r_OD, r_USD)).toBe(true);
+    expect(allowsNegativeLp(r_OD, r_USD)).toBe(true);
   });
 
   it('AED expensive overdraft: swap clamped to clear negative cash', () => {
@@ -771,6 +771,7 @@ describe('enforceUsdLiquidityStress', () => {
     cash: number,
     cash_threshold: number,
     total_cash = cash,
+    trough_lp = cash,
   ) {
     const p = CURRENCY_PARAMS[ccy]!;
     const layered = computeLayeredBuffer(0, cash, σ_P, r_USD, p.carry, p.r_OD, 0, allLayers);
@@ -780,6 +781,7 @@ describe('enforceUsdLiquidityStress', () => {
       total_cash,
       cash,
       payout: 0,
+      trough_lp,
       P_contrib: layered.P_contrib,
       floor_contrib: layered.floor_contrib,
       delta_sigma: layered.delta_sigma,
@@ -790,8 +792,8 @@ describe('enforceUsdLiquidityStress', () => {
 
   it('no-op when USD covers FCY funding need and no excess buys', () => {
     const opt = optimizePortfolioCarry([
-      { ccy: 'CAD', P: 0, np_cash: 95.1, P_contrib: 0, forecasted_cash: 95.1, floor_contrib: 0, delta_sigma: 0, r_FCY: CURRENCY_PARAMS.CAD!.carry, r_OD: CURRENCY_PARAMS.CAD!.r_OD },
-      { ccy: 'MXN', P: 0, np_cash: 238, P_contrib: 0, forecasted_cash: 238, floor_contrib: 0, delta_sigma: 0, r_FCY: CURRENCY_PARAMS.MXN!.carry, r_OD: CURRENCY_PARAMS.MXN!.r_OD },
+      { ccy: 'CAD', P: 0, lp_cash: 95.1, P_contrib: 0, forecasted_cash: 95.1, floor_contrib: 0, delta_sigma: 0, r_FCY: CURRENCY_PARAMS.CAD!.carry, r_OD: CURRENCY_PARAMS.CAD!.r_OD },
+      { ccy: 'MXN', P: 0, lp_cash: 238, P_contrib: 0, forecasted_cash: 238, floor_contrib: 0, delta_sigma: 0, r_FCY: CURRENCY_PARAMS.MXN!.carry, r_OD: CURRENCY_PARAMS.MXN!.r_OD },
     ], σ_P, r_USD, 500, 500);
     const rows = opt.map(r => stressRow(r.ccy, r.ccy === 'CAD' ? 95.1 : 238, r.cash_threshold));
     const res = enforceUsdLiquidityStress(rows, 500, 0, r_USD, true);
@@ -811,13 +813,25 @@ describe('enforceUsdLiquidityStress', () => {
     expect(res.stress_binding).toBe(true);
   });
 
+  it('sizes the swap on the trough it was handed, not on cash + payout', () => {
+    // The dated path troughs 60 below the opening cash: a stress pass that
+    // re-derived the low from cash + payout would size the leg 60 short.
+    const dated = enforceUsdLiquidityStress(
+      [stressRow('MXN', 238, 350, 238, 178)], 500, 0, r_USD, true,
+    );
+    const lump = enforceUsdLiquidityStress(
+      [stressRow('MXN', 238, 350, 238, 238)], 500, 0, r_USD, true,
+    );
+    expect(dated.rows[0]!.swap_needed - lump.rows[0]!.swap_needed).toBeCloseTo(60, 6);
+  });
+
   it('keeps PAY sell target when r_OD ≤ r_USD', () => {
     const floor = usdStressTrimFloor(
       { P_contrib: 0, floor_contrib: 0, delta_sigma: 0, r_FCY: 1.49, r_OD: 2.39 },
       80,
       4.5,
     );
-    expect(allowsNegativeNp(2.39, 4.5)).toBe(true);
+    expect(allowsNegativeLp(2.39, 4.5)).toBe(true);
     expect(floor).toBe(80);
   });
 
@@ -990,7 +1004,7 @@ describe('CURRENCY_PARAMS integrity', () => {
     expect(CURRENCY_PARAMS.HKD.β_IR).toBe(0);
   });
 
-  it('NP debit rate (r_OD) > NP credit rate (carry) for all currencies', () => {
+  it('LP debit rate (r_OD) > LP credit rate (carry) for all currencies', () => {
     // Bank always charges more to borrow than it pays to deposit
     for (const [ccy, p] of Object.entries(CURRENCY_PARAMS)) {
       expect(p.r_OD, `${ccy}: r_OD must exceed carry`).toBeGreaterThan(p.carry);
@@ -1228,13 +1242,13 @@ describe('optimizePortfolioCarry', () => {
   const σ_P = 0.10;
 
   function makeInput(
-    ccy: string, np_cash: number, payout = 0,
+    ccy: string, lp_cash: number, payout = 0,
     overrides: Partial<PortfolioCarryInput> = {},
   ): PortfolioCarryInput {
     const p = CURRENCY_PARAMS[ccy]!;
     return {
-      ccy, P: payout, np_cash, P_contrib: payout > 0 ? payout : 0,
-      forecasted_cash: np_cash, floor_contrib: 0, delta_sigma: 0,
+      ccy, P: payout, lp_cash, P_contrib: payout > 0 ? payout : 0,
+      forecasted_cash: lp_cash, floor_contrib: 0, delta_sigma: 0,
       r_FCY: p.carry, r_OD: p.r_OD, ...overrides,
     };
   }
@@ -1247,7 +1261,7 @@ describe('optimizePortfolioCarry', () => {
     ], σ_P, r_USD, 500);
     const cad = res.find(r => r.ccy === 'CAD')!;
     const mxn = res.find(r => r.ccy === 'MXN')!;
-    // PAY → sell overlay (δ<0) on top of the hold-the-book base (own NP stock).
+    // PAY → sell overlay (δ<0) on top of the hold-the-book base (own LP stock).
     expect(cad.delta_portfolio).toBeLessThan(0);
     expect(cad.cash_threshold).toBeCloseTo(95.1 + cad.delta_portfolio, 1);
     expect(cad.cash_threshold).toBeLessThan(95.1);
@@ -1273,7 +1287,7 @@ describe('optimizePortfolioCarry', () => {
     expect(mxnHi.delta_portfolio).toBeGreaterThan(mxnLo.delta_portfolio);
   });
 
-  it('JPY negative NP stock: large negative delta_portfolio (not zero)', () => {
+  it('JPY negative LP stock: large negative delta_portfolio (not zero)', () => {
     const res = optimizePortfolioCarry([
       makeInput('JPY', -869.1),
       makeInput('CAD', 95.1),
@@ -1329,7 +1343,7 @@ describe('optimizePortfolioCarry', () => {
       const trough = 95.1 - grossPayout;
       const l = computeLayeredBuffer(grossPayout, trough, σ_P, r_USD, p.carry, p.r_OD, 0, allLayers, 95.1);
       return {
-        ccy: 'CAD', P: grossPayout, np_cash: 95.1, forecasted_cash: trough,
+        ccy: 'CAD', P: grossPayout, lp_cash: 95.1, forecasted_cash: trough,
         P_contrib: l.P_contrib, floor_contrib: l.floor_contrib, delta_sigma: l.delta_sigma,
         r_FCY: p.carry, r_OD: p.r_OD,
       };

@@ -1,7 +1,7 @@
 // Safe arithmetic formula evaluator with named variable references.
 //
 // Supports Excel-like expressions over named fields (no cell coordinates):
-//   = cash * 1.1 + nonNpCash - payout
+//   = cash * 1.1 + nonLpCash - payout
 //   = max(troughCash, 0) * spotRate
 // Grammar (recursive descent, no eval / Function):
 //   expr    := term (('+' | '-') term)*

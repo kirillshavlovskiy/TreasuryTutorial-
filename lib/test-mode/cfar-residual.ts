@@ -20,6 +20,7 @@ import {
   type StripHedgedVarLeg,
 } from '@/lib/test-mode/hedge-var';
 import {
+  clampRateVolBpYr,
   forecastErrorStdForSetupM,
   horizonMonths,
   monthlyVolForSetup,
@@ -301,13 +302,36 @@ export const RATE_DIFF_VOL_BP_YR: Record<string, number> = {
   TRY: 450,
 };
 /** Fallback for currencies not in the table above. */
-const DEFAULT_RATE_DIFF_VOL_BP_YR = 80;
+export const DEFAULT_RATE_DIFF_VOL_BP_YR = 80;
+
+/** Desk-table rate-differential vol for a currency, before any override. */
+export function presetRateVolBpYr(ccy: string): number {
+  return RATE_DIFF_VOL_BP_YR[ccy] ?? DEFAULT_RATE_DIFF_VOL_BP_YR;
+}
+
+/**
+ * Rate-differential vol in bp/year for a currency — the setup's override when
+ * one is set, otherwise the desk table. The override deliberately replaces the
+ * table for every currency rather than shifting it, so a single field cannot
+ * leave USD at 0 and TRY at 450 while claiming to have set the rate vol.
+ */
+export function rateVolBpYrFor(
+  ccy: string,
+  setup?: Pick<VarSetup, 'rateVolOverrideBpYr'> | null,
+): number {
+  const override = setup?.rateVolOverrideBpYr;
+  return typeof override === 'number' && Number.isFinite(override)
+    ? clampRateVolBpYr(override)
+    : presetRateVolBpYr(ccy);
+}
 
 /** Rate-differential vol converted to the same monthly-decimal convention as
  * monthlyVolForSetup, so it drops into the identical z·S·σ·√t formula. */
-function rateDiffVolMonthly(ccy: string): number {
-  const bpYr = RATE_DIFF_VOL_BP_YR[ccy] ?? DEFAULT_RATE_DIFF_VOL_BP_YR;
-  return bpYr / 10000 / Math.sqrt(12);
+function rateDiffVolMonthly(
+  ccy: string,
+  setup?: Pick<VarSetup, 'rateVolOverrideBpYr'> | null,
+): number {
+  return rateVolBpYrFor(ccy, setup) / 10000 / Math.sqrt(12);
 }
 
 /**
@@ -524,7 +548,7 @@ export function computeHedgeCfarBands(input: {
   const swapBands = computeCfarBands({
     knots: swapKnots,
     spotUsd,
-    sigmaMonthly: rateDiffVolMonthly(ccy),
+    sigmaMonthly: rateDiffVolMonthly(ccy, setup),
     confidencePct: setup.confidencePct,
     steps,
   });

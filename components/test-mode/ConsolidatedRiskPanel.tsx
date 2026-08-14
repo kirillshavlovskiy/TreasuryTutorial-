@@ -32,7 +32,7 @@ export function ConsolidatedRiskPanel({
     <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5">
       <h3 className="text-sm font-semibold text-white">Risk layer — VaR per currency</h3>
       <p className="mt-0.5 text-xs text-slate-500">
-        1-month 95% VaR on stock exposure (group net). Not the NP carry-overlay portfolio VAR.
+        1-month 95% VaR on stock exposure (group net). Not the LP carry-overlay portfolio VAR.
       </p>
 
       <div className="mt-4 overflow-x-auto">

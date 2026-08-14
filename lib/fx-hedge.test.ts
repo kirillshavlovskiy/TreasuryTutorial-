@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  suggestCarryHedge, excessLongNpCash, spotCarryBenefitUsdYr,
+  suggestCarryHedge, excessLongLpCash, spotCarryBenefitUsdYr,
   fwdHedgeCarryUsdYr, optionGammaCarryUsdYr, shortOptionCarryUsdYr,
   resolveStrategyHedge,
 } from './fx-hedge';
@@ -190,8 +190,8 @@ describe('suggestCarryHedge', () => {
   it('CAD PAY with excess above target → SPOT sell', () => {
     const s = suggestCarryHedge({
       ccy: 'CAD',
-      npNetFX: 50,
-      npCash: 95.1,
+      lpNetFX: 50,
+      lpCash: 95.1,
       cashThreshold: 69.96,
       postSwapCash: 95.1,
       fcastFX: 0,
@@ -210,8 +210,8 @@ describe('suggestCarryHedge', () => {
   it('CAD PAY with invoice pipeline → OPTION spot + retain', () => {
     const s = suggestCarryHedge({
       ccy: 'CAD',
-      npNetFX: 50,
-      npCash: 95.1,
+      lpNetFX: 50,
+      lpCash: 95.1,
       cashThreshold: 69.96,
       postSwapCash: 95.1,
       fcastFX: -10,
@@ -230,8 +230,8 @@ describe('suggestCarryHedge', () => {
   it('EARN carry → no hedge', () => {
     const s = suggestCarryHedge({
       ccy: 'MXN',
-      npNetFX: 100,
-      npCash: 100,
+      lpNetFX: 100,
+      lpCash: 100,
       cashThreshold: 50,
       postSwapCash: 100,
       fcastFX: 0,
@@ -244,9 +244,9 @@ describe('suggestCarryHedge', () => {
     expect(s.mode).toBe('NONE');
   });
 
-  it('excessLongNpCash uses max of stock vs trough', () => {
-    expect(excessLongNpCash(95.1, 80, 70)).toBeCloseTo(25.1, 1);
-    expect(excessLongNpCash(50, 90, 70)).toBeCloseTo(20, 1);
+  it('excessLongLpCash uses max of stock vs trough', () => {
+    expect(excessLongLpCash(95.1, 80, 70)).toBeCloseTo(25.1, 1);
+    expect(excessLongLpCash(50, 90, 70)).toBeCloseTo(20, 1);
   });
 
   it('spotCarryBenefitUsdYr positive for PAY spot sell', () => {

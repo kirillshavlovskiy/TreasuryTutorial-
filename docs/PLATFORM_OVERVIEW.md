@@ -18,13 +18,13 @@ The product tagline on the landing page frames its purpose directly: *"Size FX b
 
 Treasury's FX Team (division mission: *"Manage FX exposure across 150+ currencies, implement hedging strategies, and build tooling to automate FX risk management"*) must continuously answer, per currency:
 
-1. **How much FCY cash should we hold** in the Notional Pool (NP) vs. sweep to USD? (liquidity sufficiency vs. opportunity cost)
+1. **How much FCY cash should we hold** in the Liquidity Pool (LP) vs. sweep to USD? (liquidity sufficiency vs. opportunity cost)
 2. **How large should the restructuring FX swap be** to fund that target without changing net FX exposure?
-3. **Is the currency EARN CARRY or PAY CARRY** relative to the USD NP rate, and how should that bias the buffer up or down?
+3. **Is the currency EARN CARRY or PAY CARRY** relative to the USD LP rate, and how should that bias the buffer up or down?
 4. **What is the aggregate portfolio Value-at-Risk (VaR)** across all currencies, and does it stay inside Treasury policy limits ($5M / $10M / $20M approval thresholds)?
 5. **What hedge (spot / forward / option) should be executed** given the carry direction and pipeline needs?
 
-Previously this lived in Excel models (Time Structuring, NP Liquidity Analysis, Std Deviation Model Daily, Loss Fraction VAR) with hardcoded, uniform assumptions (e.g. a fixed minimum cash threshold `H = 100,000` for every currency regardless of size or volatility). Simple Sigma implements the corrected, dynamic version of that model as executable, tested TypeScript, and wraps it in a UI so traders can manipulate assumptions and immediately see the effect on every downstream number.
+Previously this lived in Excel models (Time Structuring, LP Liquidity Analysis, Std Deviation Model Daily, Loss Fraction VAR) with hardcoded, uniform assumptions (e.g. a fixed minimum cash threshold `H = 100,000` for every currency regardless of size or volatility). Simple Sigma implements the corrected, dynamic version of that model as executable, tested TypeScript, and wraps it in a UI so traders can manipulate assumptions and immediately see the effect on every downstream number.
 
 ---
 
@@ -44,7 +44,7 @@ H = MAX(H_min, |C + D| × σ_daily × √21 × z₉₅ × (1 + carry_rate × β_
 - `σ_daily × √21 × z₉₅` — the 1‑month, 95%-confidence VaR factor
 - `(1 + carry_rate × β_IR)` — an IR-carry uplift multiplier, material for EM currencies (TRY: +37%) and negligible for DM currencies (<2%)
 
-This subsumed three original design options (pure VaR-FCY proxy, combined VaR+carry, and NP-buffer parity) into a single formula, with a calibrated 25-currency parameter table (σ, carry, β_IR).
+This subsumed three original design options (pure VaR-FCY proxy, combined VaR+carry, and LP-buffer parity) into a single formula, with a calibrated 25-currency parameter table (σ, carry, β_IR).
 
 **This was later superseded.** The team determined that FX volatility (σ) should *not* drive the liquidity threshold at all:
 
@@ -84,7 +84,7 @@ Swap legs always net to zero balance-sheet impact (`I + J = 0`) — the swap res
 
 ### 3.5 Rate sourcing philosophy
 
-- **Carry / overdraft rates**: sourced from **JPM Notional Pool credit/debit rates** (Jan 2026, LU_661 report), *not* nominal central-bank policy rates — because the NP account earns/pays the JPM rate, not the nominal one (e.g. TRY NP credit is 1.16%, vastly different from its ~46% nominal policy rate).
+- **Carry / overdraft rates**: sourced from **JPM Notional Pool credit/debit rates** (Jan 2026, LU_661 report), *not* nominal central-bank policy rates — because the LP account earns/pays the JPM rate, not the nominal one (e.g. TRY LP credit is 1.16%, vastly different from its ~46% nominal policy rate).
 - **Target end-state**: Covered Interest Rate Parity (CIP) — implied rates derived from live FX forward points (`r_implied = r_USD + (F−S)/S × 365/tenor_days`), sourced from the FX Rate Mesh, replacing the hardcoded table. This is a pending backlog item (see §7).
 
 ---
@@ -131,7 +131,7 @@ Each FX risk profile lets a user opt into specific **FX Inputs** (Liquidity, FX 
 
 ### 4.2 The five simulator tabs
 
-1. **FX Simulator** — the primary spreadsheet-style table (`UnifiedSimulator.tsx`) showing, per currency: cash position, TMS FX exposure (spot/forward/non-cash), net FX book, VaR buffer, target NP cash, swap near/far legs, post-swap cash, cycle-end cash, carry P&L, and net Delta. Every cell can carry a **custom user-entered formula** (Excel-style `= cash * 1.1 + nonNpCash` syntax, evaluated by a safe recursive-descent parser with named-field references and a small function library: `abs`, `min`, `max`, `round`, `sqrt`, `pow`, `floor`, `ceil`) with fill-handle drag-to-copy behavior across rows.
+1. **FX Simulator** — the primary spreadsheet-style table (`UnifiedSimulator.tsx`) showing, per currency: cash position, TMS FX exposure (spot/forward/non-cash), net FX book, VaR buffer, target LP cash, swap near/far legs, post-swap cash, cycle-end cash, carry P&L, and net Delta. Every cell can carry a **custom user-entered formula** (Excel-style `= cash * 1.1 + nonLpCash` syntax, evaluated by a safe recursive-descent parser with named-field references and a small function library: `abs`, `min`, `max`, `round`, `sqrt`, `pow`, `floor`, `ceil`) with fill-handle drag-to-copy behavior across rows.
 2. **Sensitivity Analysis** (`BufferOptimizer.tsx`) — computes the optimal buffer `H*` and renders sensitivity curves against carry differential (Δr), forecast uncertainty (σ_P), and overdraft rate (r_OD), plus a multi-currency EARN/PAY carry comparison table.
 3. **Layer Setup** (`LayeredBufferAnalysis.tsx`) — toggle the four buffer layers on/off, see each layer's dollar contribution per currency, set the Portfolio VaR policy limit, and view the diversified cross-currency VaR with per-currency component VaR, standalone VaR and beta.
 4. **IR Profile** (`IRProfilePanel.tsx`) — net interest margin (floating + fixed), DV01, and 100bp mark-to-market sensitivity per currency, tying the FX buffer decision to its interest-rate P&L consequence.
@@ -145,7 +145,7 @@ The model natively covers **25 currencies** with individually calibrated paramet
 
 ### 4.4 Consistency invariants
 
-A dedicated Cursor rule (`.cursor/rules/fx-simulator-consistency.mdc`) and a `fx-simulator-invariants.test.ts` suite encode ten "must hold simultaneously" invariants for the simulator — e.g. total swap USD nets to zero across the book, `Target NP Cash = Opening NP + Swap` by construction, the σ layer scales on gross `|payout|` not net deficit, and targets are never liquidated to zero purely to satisfy the VaR limit. This exists precisely because several of the historical bugs recorded in `decisions.md` were column-by-column fixes that broke a different invariant — the rule instructs future changes to be validated against the whole system, not one column.
+A dedicated Cursor rule (`.cursor/rules/fx-simulator-consistency.mdc`) and a `fx-simulator-invariants.test.ts` suite encode ten "must hold simultaneously" invariants for the simulator — e.g. total swap USD nets to zero across the book, `Target LP Cash = Opening LP + Swap` by construction, the σ layer scales on gross `|payout|` not net deficit, and targets are never liquidated to zero purely to satisfy the VaR limit. This exists precisely because several of the historical bugs recorded in `decisions.md` were column-by-column fixes that broke a different invariant — the rule instructs future changes to be validated against the whole system, not one column.
 
 ---
 
@@ -155,11 +155,11 @@ The platform is explicitly built to reflect (not replace) Treasury's written FX 
 
 ### 5.1 From the FX Hedging Policy (`fx-hedging-policy.md`)
 - **Approval thresholds** are hard limits the tool must respect: FX position size >$50M/$100M/$250M requires Director of Finance/CFO/CEO approval; stressed P&L VaR >$5M/$10M/$20M requires the same escalation chain. The Portfolio VaR layer's policy-limit control in the Layer Setup tab is a direct implementation of this.
-- **Notional Pool (NP)** mechanics — cash concentration, credit lines collateralized across currencies, and the rule that a negative FCY balance is only allowed without Director-of-Finance approval when `USD credit rate > FCY debit rate` — underpin the EARN/PAY carry classification throughout the model.
+- **Liquidity Pool (LP)** mechanics — cash concentration, credit lines collateralized across currencies, and the rule that a negative FCY balance is only allowed without Director-of-Finance approval when `USD credit rate > FCY debit rate` — underpin the EARN/PAY carry classification throughout the model.
 - **Restricted currencies (Model 3)** are tracked in exposure but excluded from trading P&L KPIs — a distinction the division doc reiterates and the codebase respects conceptually (buffers are computed for all currencies; P&L attribution is a separate concern).
 
 ### 5.2 From the 2026 FX Hedging & Risk Management Strategy (`fx-hedging-strategy.md`)
-- **Automation targets** this platform advances: FX swap netting to decrease P&L fluctuation, NP-liquidity-driven automatic swap sizing, and a multi-instrument decision algorithm (Swap vs. Spot vs. Option) based on current position, NP cash, and market signals — the Hedging Decision panel is a first implementation of that decision layer.
+- **Automation targets** this platform advances: FX swap netting to decrease P&L fluctuation, LP-liquidity-driven automatic swap sizing, and a multi-instrument decision algorithm (Swap vs. Spot vs. Option) based on current position, LP cash, and market signals — the Hedging Decision panel is a first implementation of that decision layer.
 - The EUR/USD decision matrix (market structure × momentum × mood → hedge type/instrument/delta) is documented as the target risk layer to embed once validated with banks; it is not yet wired into the hedge engine, which currently uses a simpler carry-direction rule.
 
 ### 5.3 From division/department engineering & compliance standards
@@ -218,7 +218,7 @@ Open items still tracked:
 
 - [ ] **Live CIP-implied rates** from the FX Rate Mesh API client, replacing hardcoded `CURRENCY_PARAMS.carry`
 - [ ] **Automated NWC maximization**: for EARN-carry currencies, automatically size buffers to the pre-positioning maximum; for PAY-carry currencies, minimize to reduce opportunity cost
-- [ ] **Swap balance-sheet netting confirmation**: verify `I + J = 0` treatment against actual NP accounting
+- [ ] **Swap balance-sheet netting confirmation**: verify `I + J = 0` treatment against actual LP accounting
 
 ---
 

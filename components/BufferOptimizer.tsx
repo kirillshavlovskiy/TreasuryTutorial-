@@ -2,6 +2,7 @@
 
 import { useState, useMemo } from 'react';
 import { LineChart } from '@/components/LineChart';
+import { DeskProgressTrack, DeskStepper } from '@/components/DeskStepper';
 import {
   CURRENCY_PARAMS,
   calcOptimalBuffer,
@@ -58,18 +59,20 @@ function Slider({
   step: number; unit: string; onChange: (v: number) => void;
 }) {
   return (
-    <div className="space-y-1">
-      <div className="flex justify-between text-xs">
-        <span className="font-medium text-gray-700">{label}</span>
-        <span className="font-mono text-blue-700">{unit === '%' ? value.toFixed(2) + '%' : value.toFixed(2)}</span>
-      </div>
-      {sublabel && <div className="text-xs text-gray-400">{sublabel}</div>}
-      <input
-        type="range" min={min} max={max} step={step} value={value}
-        onChange={e => onChange(parseFloat(e.target.value))}
-        className="w-full accent-blue-600"
-      />
-    </div>
+    <DeskStepper
+      label={label}
+      value={value}
+      min={min}
+      max={max}
+      step={step}
+      onChange={onChange}
+      formatValue={v => (unit === '%' ? `${v.toFixed(2)}%` : v.toFixed(2))}
+      suffix={unit && unit !== '%' ? unit : undefined}
+      editable
+      title={sublabel}
+      className="w-full"
+      editClassName="w-14"
+    />
   );
 }
 
@@ -190,22 +193,22 @@ export function BufferOptimizer({ shared, onSharedChange }: {
           <div className="rounded bg-white/70 px-2 py-1.5 text-xs">
             <div className="text-gray-500 mb-1">Cost breakdown (daily)</div>
             {result.TC_daily > 0 ? (
-              <div className="h-3 rounded overflow-hidden bg-gray-200 flex">
+              <div className="flex h-1.5 overflow-hidden rounded-full bg-slate-800 ring-1 ring-slate-700/80">
                 <div
-                  className="bg-blue-500"
+                  className="h-full bg-emerald-500/70"
                   style={{ width: `${(result.C_hold_daily / result.TC_daily * 100)}%` }}
                   title="Hold cost"
                 />
                 <div
-                  className="bg-orange-400"
+                  className="h-full bg-amber-500/70"
                   style={{ width: `${(result.C_OD_daily / result.TC_daily * 100)}%` }}
                   title="OD cost"
                 />
               </div>
             ) : <div className="text-gray-400">n/a</div>}
             <div className="flex gap-3 mt-1 text-gray-500">
-              <span><span className="inline-block w-2 h-2 bg-blue-500 rounded-full mr-1"/>Hold</span>
-              <span><span className="inline-block w-2 h-2 bg-orange-400 rounded-full mr-1"/>Overdraft</span>
+              <span><span className="inline-block w-2 h-2 rounded-full bg-emerald-500/70 mr-1"/>Hold</span>
+              <span><span className="inline-block w-2 h-2 rounded-full bg-amber-500/70 mr-1"/>Overdraft</span>
             </div>
           </div>
 
@@ -293,12 +296,10 @@ export function BufferOptimizer({ shared, onSharedChange }: {
                   </td>
                   <td className="py-1 text-right">
                     <div className="flex items-center justify-end gap-1">
-                      <div className="w-20 h-2 rounded bg-gray-200 overflow-hidden">
-                        <div
-                          className={`h-full rounded ${row.H_pct > 100 ? 'bg-blue-500' : 'bg-gray-400'}`}
-                          style={{ width: `${Math.min(100, row.H_pct / 1.6)}%` }}
-                        />
-                      </div>
+                      <DeskProgressTrack
+                        pct={Math.min(100, row.H_pct / 1.6)}
+                        className="w-20"
+                      />
                       <span className="font-semibold text-gray-900 w-12 text-right">{fmt1(row.H_pct)}%</span>
                     </div>
                   </td>

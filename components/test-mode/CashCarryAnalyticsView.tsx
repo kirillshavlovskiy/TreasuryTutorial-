@@ -6,13 +6,18 @@ import {
   useMemo,
   useRef,
   useState,
-  type PointerEvent as ReactPointerEvent,
 } from 'react';
+import { DeskStepper } from '@/components/DeskStepper';
 import { createPortal } from 'react-dom';
 import {
   ExposureHedgePathChart,
   type HedgePathSummaryMetrics,
 } from '@/components/test-mode/ExposureHedgePathChart';
+import {
+  chipsFromPathSummary,
+  HedgeStagingHeader,
+  type HedgeStagingChip,
+} from '@/components/test-mode/HedgeStagingHeader';
 import {
   assignImpliedCarryFromSwapPoints,
   buildCarryEvolutionBars,
@@ -62,12 +67,12 @@ import {
 } from '@/lib/test-mode/remodel-prepared-hedge';
 import {
   VAR_HORIZON_OPTIONS,
-  VAR_VOL_SOURCE_OPTIONS,
   horizonMonths,
   monthlyVolForSetup,
   type VarHorizonId,
   type VarSetup,
 } from '@/lib/test-mode/var-setup';
+import { VolSourceControl } from '@/components/test-mode/VolSourceControl';
 import {
   VAR_CONFIDENCE_OPTIONS,
   zForConfidence,
@@ -134,245 +139,6 @@ function InfoIcon({ className }: { className?: string }) {
   );
 }
 
-/** Snap to nearest step within [min, max]. */
-function snapStepperValue(
-  raw: number,
-  min: number,
-  max: number,
-  step: number,
-): number {
-  if (!(step > 0)) return Math.min(max, Math.max(min, raw));
-  const n = Math.round((raw - min) / step);
-  const snapped = min + n * step;
-  const rounded = Math.round(snapped * 1e6) / 1e6;
-  return Math.min(max, Math.max(min, rounded));
-}
-
-/**
- * Desk-style parameter stepper: track + fill + major/minor ticks + thumb,
- * optional −/+ nudge. Used for shape-search Legs / CoM / Kurtosis.
- */
-function TickBarStepper({
-  label,
-  value,
-  min,
-  max,
-  step,
-  onChange,
-  disabled = false,
-  formatValue,
-  tickValues,
-  tickLabels,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  onChange: (v: number) => void;
-  disabled?: boolean;
-  formatValue: (v: number) => string;
-  /** Major tick positions (also get labels when tickLabels provided). */
-  tickValues: readonly number[];
-  tickLabels?: readonly string[];
-}) {
-  const trackRef = useRef<HTMLDivElement>(null);
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-  const span = max - min;
-  const pct =
-    span > 1e-12 ? ((Math.min(max, Math.max(min, value)) - min) / span) * 100 : 0;
-
-  const valueFromClientX = (clientX: number) => {
-    const el = trackRef.current;
-    if (!el) return value;
-    const rect = el.getBoundingClientRect();
-    if (rect.width < 1e-6) return value;
-    const t = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-    return snapStepperValue(min + t * span, min, max, step);
-  };
-
-  const nudge = (dir: -1 | 1) => {
-    if (disabled) return;
-    onChange(snapStepperValue(value + dir * step, min, max, step));
-  };
-
-  const beginDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (disabled) return;
-    e.preventDefault();
-    const target = e.currentTarget;
-    target.setPointerCapture(e.pointerId);
-    onChangeRef.current(valueFromClientX(e.clientX));
-    const onMove = (ev: PointerEvent) => {
-      onChangeRef.current(valueFromClientX(ev.clientX));
-    };
-    const onUp = (ev: PointerEvent) => {
-      target.releasePointerCapture(ev.pointerId);
-      target.removeEventListener('pointermove', onMove);
-      target.removeEventListener('pointerup', onUp);
-      target.removeEventListener('pointercancel', onUp);
-    };
-    target.addEventListener('pointermove', onMove);
-    target.addEventListener('pointerup', onUp);
-    target.addEventListener('pointercancel', onUp);
-  };
-
-  const stepBtn =
-    'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border border-slate-600 bg-slate-950 text-[11px] font-semibold text-slate-300 hover:border-slate-500 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40';
-
-  // Minor ticks at every step (cap density for continuous ranges).
-  const minorTicks: number[] = [];
-  const maxMinors = 24;
-  const stepCount = Math.round(span / step);
-  if (stepCount > 0 && stepCount <= maxMinors) {
-    for (let i = 0; i <= stepCount; i++) {
-      minorTicks.push(min + i * step);
-    }
-  }
-
-  return (
-    <div
-      className={`rounded-md border border-slate-700 bg-slate-900/80 px-2.5 py-2${
-        disabled ? ' opacity-50' : ''
-      }`}
-    >
-      <div className="mb-1.5 flex items-center justify-between gap-2">
-        <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-          {label}
-        </span>
-        <span className="font-mono text-[11px] font-semibold tabular-nums text-slate-100">
-          {formatValue(value)}
-        </span>
-      </div>
-
-      {/* − / bar / + share one 24px row so buttons sit on the track centerline */}
-      <div className="flex h-6 items-center gap-1.5">
-        <button
-          type="button"
-          className={stepBtn}
-          disabled={disabled || value <= min + 1e-12}
-          aria-label={`Decrease ${label}`}
-          onClick={() => nudge(-1)}
-        >
-          −
-        </button>
-
-        <div
-          ref={trackRef}
-          role="slider"
-          tabIndex={disabled ? -1 : 0}
-          aria-label={label}
-          aria-valuemin={min}
-          aria-valuemax={max}
-          aria-valuenow={value}
-          aria-valuetext={formatValue(value)}
-          aria-disabled={disabled}
-          onKeyDown={e => {
-            if (disabled) return;
-            if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
-              e.preventDefault();
-              nudge(-1);
-            } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
-              e.preventDefault();
-              nudge(1);
-            } else if (e.key === 'Home') {
-              e.preventDefault();
-              onChange(min);
-            } else if (e.key === 'End') {
-              e.preventDefault();
-              onChange(max);
-            }
-          }}
-          onPointerDown={beginDrag}
-          className={`relative h-6 min-w-0 flex-1 select-none touch-none ${
-            disabled ? 'cursor-not-allowed' : 'cursor-pointer'
-          }`}
-        >
-          <div className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-slate-800 ring-1 ring-slate-700/80">
-            <div
-              className="h-full rounded-full bg-slate-400"
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-
-          {minorTicks.map(t => {
-            const p = span > 1e-12 ? ((t - min) / span) * 100 : 0;
-            const isMajor = tickValues.some(
-              m => Math.abs(m - t) < step * 0.25 + 1e-9,
-            );
-            if (isMajor) return null;
-            return (
-              <span
-                key={`m-${t}`}
-                className="pointer-events-none absolute top-1/2 h-2 w-px -translate-x-1/2 -translate-y-1/2 bg-slate-600"
-                style={{ left: `${p}%` }}
-              />
-            );
-          })}
-
-          {tickValues.map(t => {
-            const p = span > 1e-12 ? ((t - min) / span) * 100 : 0;
-            return (
-              <span
-                key={`M-${t}`}
-                className="pointer-events-none absolute top-1/2 h-3 w-px -translate-x-1/2 -translate-y-1/2 bg-slate-400"
-                style={{ left: `${p}%` }}
-              />
-            );
-          })}
-
-          <span
-            className="pointer-events-none absolute top-1/2 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-slate-300 bg-slate-950 shadow-md"
-            style={{ left: `${pct}%` }}
-          />
-        </div>
-
-        <button
-          type="button"
-          className={stepBtn}
-          disabled={disabled || value >= max - 1e-12}
-          aria-label={`Increase ${label}`}
-          onClick={() => nudge(1)}
-        >
-          +
-        </button>
-      </div>
-
-      {tickLabels != null && tickLabels.length > 0 && (
-        <div className="mt-1 flex gap-1.5">
-          <div className="h-3 w-6 shrink-0" aria-hidden />
-          <div className="relative h-3 min-w-0 flex-1">
-            {tickValues.map((t, i) => {
-              const lab = tickLabels[i];
-              if (lab == null) return null;
-              const p = span > 1e-12 ? ((t - min) / span) * 100 : 0;
-              return (
-                <span
-                  key={`L-${t}`}
-                  className={`absolute top-0 whitespace-nowrap font-mono text-[8px] leading-none text-slate-500 ${
-                    i === 0
-                      ? 'left-0'
-                      : i === tickValues.length - 1
-                        ? 'right-0'
-                        : '-translate-x-1/2'
-                  }`}
-                  style={
-                    i === 0 || i === tickValues.length - 1
-                      ? undefined
-                      : { left: `${p}%` }
-                  }
-                >
-                  {lab}
-                </span>
-              );
-            })}
-          </div>
-          <div className="h-3 w-6 shrink-0" aria-hidden />
-        </div>
-      )}
-    </div>
-  );
-}
 
 function fmtK(usdM: number): string {
   const k = usdM * 1000;
@@ -3074,7 +2840,7 @@ export function CashCarryAnalyticsView({
     useState<StripShapeScore | null>(null);
   /**
    * Modal hedge package. Apply shape / rank row / path Prepare all update
-   * this local draft only; Assign/Prebook is the sole explicit action that
+   * this local draft only; Prebook is the sole explicit action that
    * promotes it to Analytics prepared + Neon / Decision.
    */
   const [profileDraft, setProfileDraft] = useState<PreparedHedgeProfile | null>(
@@ -4218,7 +3984,7 @@ export function CashCarryAnalyticsView({
 
   // Knob / strip-leg edits only update the local preview (shapePreview /
   // shapePreviewScore below) — the desk must click Apply shape to lock it
-  // into the modal draft, and Assign/Prebook to stage it to platform.
+  // into the modal draft, and Prebook to stage it to platform.
 
   const pathRiskBar = risk.find(r => r.bar.ccy === chartCcy)?.bar;
   const pathBookRow = bookRows?.find(r => r.ccy === chartCcy);
@@ -4264,7 +4030,7 @@ export function CashCarryAnalyticsView({
     prepared?.coverLocalM ??
     (Math.abs(pathEqualVarLocalM) > 1e-12 ? pathEqualVarLocalM : 0);
 
-  /** Path chart → modal draft only (Stage to Analytics promotes to platform). */
+  /** Path chart → modal draft only (Prebook promotes to platform). */
   const bookPathHedgeProfile = (args: {
     structure: ForecastHedgeStructure;
     basis: HedgePathBasisId;
@@ -4346,7 +4112,7 @@ export function CashCarryAnalyticsView({
       );
       // Local draft only — do NOT echo settleEnds/weights into parent
       // path state here (setPathScheduleEnds → chart sync setCustomEndMonths
-      // was an infinite update loop). Assign/Prebook stages to platform.
+      // was an infinite update loop). Prebook stages to platform.
       // Also: do NOT persistProfileSession on every auto-stage paint — that
       // rewrote hedges → Neon PUT → re-render → Maximum update depth.
       const nextWeights =
@@ -4431,34 +4197,7 @@ export function CashCarryAnalyticsView({
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
               Volatility σ₁ₘ
             </div>
-            <div
-              className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-              role="group"
-              aria-label="Volatility source"
-            >
-              {VAR_VOL_SOURCE_OPTIONS.map(opt => {
-                const on = setup.volSource === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    title={opt.description}
-                    disabled={!onSetupChange}
-                    onClick={() => patch({ volSource: opt.id })}
-                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
-                      on
-                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                        : 'text-slate-500 hover:text-slate-300'
-                    } ${onSetupChange ? '' : 'cursor-default opacity-80'}`}
-                  >
-                    {opt.label}
-                    <span className="ml-1 font-mono text-[10px] font-normal opacity-80">
-                      {(opt.monthlyVol * 100).toFixed(1)}%
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
+            <VolSourceControl setup={setup} onSetupChange={onSetupChange} />
           </div>
           <div>
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-blue-300">
@@ -4491,8 +4230,10 @@ export function CashCarryAnalyticsView({
             </div>
           </div>
           <p className="font-mono text-[10px] text-slate-500">
-            Shared VaR setup · drives FX Risk &amp; CFaR (carry is deterministic) ·
-            σ₁ₘ={(sigmaMonthly * 100).toFixed(2)}% · z={zConf.toFixed(2)}
+            Shared VaR setup · drives FX Risk &amp; CFaR · σ₁ₘ=
+            {(sigmaMonthly * 100).toFixed(2)}% · z={zConf.toFixed(2)} · σ_r=
+            {setup.rateVolOverrideBpYr ?? '—'}
+            {setup.rateVolOverrideBpYr == null ? ' (desk table)' : 'bp/yr'}
           </p>
         </div>
       </section>
@@ -4995,7 +4736,19 @@ export function CashCarryAnalyticsView({
                   {fmtM(-cashForecast.totals.hedgeCashOutM)}
                 </span>
               </div>
-              <div>
+              {Math.abs(cashForecast.totals.bookConversionM) > 1e-9 && (
+                <div
+                  title="Leftover from a prior Book→cash conversion — hedging NWC / debt no longer writes those stocks into cash."
+                >
+                  <span className="text-slate-500">Book → cash </span>
+                  <span className="text-violet-300/90">
+                    {fmtM(cashForecast.totals.bookConversionM)}
+                  </span>
+                </div>
+              )}
+              <div
+                title="Cash FX + Revenue − Expenses + Hedge CF. Hedging receivables and debt does not collect or repay them, so a 100% target leaves End = Debt − Receivables."
+              >
                 <span className="text-slate-500">End {chartCcy} </span>
                 <span className="text-slate-100">
                   {fmtM(cashForecast.totals.endCashM)}
@@ -5517,34 +5270,14 @@ export function CashCarryAnalyticsView({
             }}
           >
             <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-t-xl rounded-b-none border border-slate-700 bg-slate-900 shadow-2xl">
-              {/* Fixed header — stays pinned while modal body scrolls. */}
+              {/* Same staging chrome as Hedging Decision / FX Risk path modals. */}
               <div className="sticky top-0 z-30 shrink-0 rounded-t-xl border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <h4
-                    id="cash-carry-profile-title"
-                    className="text-sm font-semibold text-white"
-                  >
-                    {chartCcy} — hedge carry profile
-                  </h4>
-                  <button
-                    type="button"
-                    onClick={closeCcyProfile}
-                    className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
-                  >
-                    Close
-                  </button>
-                </div>
-
                 {(() => {
-                  const chip =
-                    'inline-flex items-center gap-1 rounded border border-slate-700/80 bg-slate-950/90 px-1.5 py-0.5 text-[10px] text-slate-500';
-                  const val = 'font-mono font-semibold tabular-nums';
                   const optScore =
                     appliedShapeScore ??
                     shapePreviewScore ??
                     stripShapeOpt?.best ??
                     null;
-                  const locked = appliedShapeScore != null;
                   const optStruct =
                     optScore == null
                       ? pathStructure === 'strip'
@@ -5576,230 +5309,110 @@ export function CashCarryAnalyticsView({
                       : null) ??
                     currentWamRow?.settleScheduleLabel ??
                     null;
-                  const residZero =
-                    pathSummaryMetrics != null &&
-                    (pathSummaryMetrics.residVarValue === '$0K' ||
-                      pathSummaryMetrics.residVarValue === '0' ||
-                      /\$0/.test(pathSummaryMetrics.residVarValue));
-                  const canApply =
-                    shapePreviewScore != null &&
-                    Math.abs(shapePreviewScore.hedgeDeltaLocalM) > 1e-12;
-
+                  const wamLabel = optScore
+                    ? `M${Math.round(optScore.wamMonths)}`
+                    : currentWamRow?.label ?? null;
+                  const chips: HedgeStagingChip[] = pathSummaryMetrics
+                    ? chipsFromPathSummary(pathSummaryMetrics, {
+                        legsValue:
+                          optScore && optScore.legCount > 1
+                            ? String(optScore.legCount)
+                            : undefined,
+                      })
+                    : [];
+                  if (optScore) {
+                    const totalCarry =
+                      optScore.newCarryUsdM + optScore.fwdCarryUsdM;
+                    chips.push(
+                      {
+                        label: 'Carry',
+                        value: fmtK(totalCarry),
+                        title:
+                          'Total carry = New (FCY+USD int) + FWD pts — same as table',
+                        tone:
+                          totalCarry >= 0
+                            ? 'text-emerald-200'
+                            : 'text-rose-300',
+                      },
+                      {
+                        label: 'Enh',
+                        value: fmtK(optScore.enhancementUsdM),
+                        tone:
+                          optScore.enhancementUsdM >= 0
+                            ? 'text-emerald-200'
+                            : 'text-rose-300',
+                      },
+                      {
+                        label: 'vs bullet',
+                        value: fmtK(optScore.vsBulletUsdM),
+                        tone:
+                          optScore.vsBulletUsdM >= 0
+                            ? 'text-sky-200'
+                            : 'text-rose-300',
+                      },
+                    );
+                  }
+                  const staged = Boolean(chartCcy && preparedByCcy[chartCcy]);
                   return (
-                    <div
-                      className={`mt-2 rounded-md border px-2.5 py-2 ${
-                        locked
-                          ? 'border-emerald-600/50 bg-emerald-950/40'
-                          : 'border-slate-700 bg-slate-950/80'
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-start justify-between gap-2">
-                        <div className="min-w-0 flex-1 space-y-1.5">
-                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                            <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                              {locked ? 'Applied' : 'Opt. preview'}
-                            </span>
-                            <span className="font-mono text-[10px] font-semibold text-violet-200">
-                              {optStruct}
-                              {optScore != null && optScore.legCount > 1 && (
-                                <>
-                                  {' '}
-                                  · CoM{' '}
-                                  {(optScore.centerOfMass * 100).toFixed(0)}% ·
-                                  kurt {optScore.kurtosis.toFixed(1)}
-                                </>
-                              )}
-                              {optSched && (
-                                <span className="ml-1 text-amber-200/90">
-                                  {optSched}
-                                </span>
-                              )}
-                            </span>
-                            {optScore != null && optScore.legCount > 1 && (
-                              <span className={`${chip} text-amber-200/90`}>
+                    <HedgeStagingHeader
+                      titleId="cash-carry-profile-title"
+                      title={`${chartCcy} — hedge carry profile`}
+                      subtitle={
+                        <>
+                          Structure:{' '}
+                          <span className="font-semibold text-violet-200">
+                            {optStruct}
+                          </span>
+                          {optSched ? (
+                            <>
+                              {' · '}Schedule:{' '}
+                              <span className="font-semibold text-violet-200">
+                                {optSched}
+                              </span>
+                            </>
+                          ) : null}
+                          {optScore != null && optScore.legCount > 1 ? (
+                            <>
+                              {' · '}Skew:{' '}
+                              <span className="font-semibold text-violet-200">
                                 {optSkew === 'front'
                                   ? 'Front'
                                   : optSkew === 'back'
                                     ? 'Back'
                                     : 'Neutral'}
                               </span>
-                            )}
-                            {(currentWamRow || optScore) && (
-                              <span className={chip}>
-                                WAM{' '}
-                                <span className={`${val} text-emerald-200`}>
-                                  {optScore
-                                    ? `M${Math.round(optScore.wamMonths)}`
-                                    : currentWamRow!.label}
-                                </span>
+                            </>
+                          ) : null}
+                          {wamLabel ? (
+                            <>
+                              {' · '}WAM:{' '}
+                              <span className="font-semibold text-violet-200">
+                                {wamLabel}
                               </span>
-                            )}
-                            {profileDraftDirty && (
-                              <span className="rounded border border-amber-700/40 bg-amber-950/30 px-1 py-px text-[9px] font-medium text-amber-300/90">
-                                Draft
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="flex flex-wrap items-baseline gap-x-4 gap-y-0.5">
-                            <div className="inline-flex items-baseline gap-1.5">
-                              <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                                Carry
-                              </span>
-                              <span
-                                className={`font-mono text-base font-semibold tabular-nums ${
-                                  ((optScore?.newCarryUsdM ?? 0) +
-                                    (optScore?.fwdCarryUsdM ?? 0)) >=
-                                  0
-                                    ? 'text-emerald-100'
-                                    : 'text-rose-300'
-                                }`}
-                                title="Total carry = New (FCY+USD int) + FWD pts — same as table"
-                              >
-                                {optScore
-                                  ? fmtK(
-                                      optScore.newCarryUsdM +
-                                        optScore.fwdCarryUsdM,
-                                    )
-                                  : '—'}
-                              </span>
-                            </div>
-                            <div className="inline-flex items-baseline gap-1.5">
-                              <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                                Enh
-                              </span>
-                              <span
-                                className={`font-mono text-base font-semibold tabular-nums ${
-                                  (optScore?.enhancementUsdM ?? 0) >= 0
-                                    ? 'text-emerald-100'
-                                    : 'text-rose-300'
-                                }`}
-                              >
-                                {optScore
-                                  ? fmtK(optScore.enhancementUsdM)
-                                  : '—'}
-                              </span>
-                            </div>
-                            <div className="inline-flex items-baseline gap-1.5">
-                              <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                                vs bullet
-                              </span>
-                              <span
-                                className={`font-mono text-sm font-semibold tabular-nums ${
-                                  (optScore?.vsBulletUsdM ?? 0) >= 0
-                                    ? 'text-sky-200'
-                                    : 'text-rose-300'
-                                }`}
-                              >
-                                {optScore ? fmtK(optScore.vsBulletUsdM) : '—'}
-                              </span>
-                              {optScore && (
-                                <span className="font-mono text-[9px] text-slate-500">
-                                  Σ {fmtM(optScore.hedgeDeltaLocalM)} · M
-                                  {Math.round(optScore.wamMonths)}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-
-                          <div className="flex flex-wrap items-center gap-1">
-                            {pathSummaryMetrics ? (
-                              <>
-                                <span
-                                  className={chip}
-                                  title={pathSummaryMetrics.coverSub}
-                                >
-                                  Cover{' '}
-                                  <span className={`${val} text-slate-100`}>
-                                    {pathSummaryMetrics.coverValue}
-                                  </span>
-                                  {pathSummaryMetrics.coverPct != null && (
-                                    <span className={`${val} text-slate-400`}>
-                                      {pathSummaryMetrics.coverPct}
-                                    </span>
-                                  )}
-                                </span>
-                                <span
-                                  className={chip}
-                                  title={pathSummaryMetrics.legsSub}
-                                >
-                                  Legs{' '}
-                                  <span className={`${val} text-sky-200`}>
-                                    {optScore && optScore.legCount > 1
-                                      ? String(optScore.legCount)
-                                      : pathSummaryMetrics.legsValue}
-                                  </span>
-                                </span>
-                                <span
-                                  className={chip}
-                                  title={pathSummaryMetrics.residVarSub}
-                                >
-                                  Resid{' '}
-                                  <span
-                                    className={`${val} ${
-                                      residZero
-                                        ? 'text-slate-300'
-                                        : 'text-rose-300'
-                                    }`}
-                                  >
-                                    {pathSummaryMetrics.residVarValue}
-                                  </span>
-                                </span>
-                                <span
-                                  className={chip}
-                                  title={
-                                    pathSummaryMetrics.breakevenSub ??
-                                    'Breakeven'
-                                  }
-                                >
-                                  BE{' '}
-                                  <span
-                                    className={`${val} text-amber-200/90`}
-                                  >
-                                    {pathSummaryMetrics.breakevenValue}
-                                  </span>
-                                </span>
-                              </>
-                            ) : (
-                              <span className="text-[9px] text-slate-600">
-                                Cover / Legs / Resid / BE load with hedge path…
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex shrink-0 flex-col items-stretch gap-1 sm:items-end">
-                          <div className="flex flex-row flex-wrap items-center justify-end gap-1">
-                            <button
-                              type="button"
-                              disabled={!canApply}
-                              onClick={() => {
-                                if (shapePreviewScore)
-                                  applyStripShapeAroundWam(shapePreviewScore);
-                              }}
-                              className="rounded border border-emerald-700/50 bg-emerald-950/50 px-2.5 py-1.5 text-[10px] font-semibold text-emerald-100 hover:bg-emerald-900/50 disabled:cursor-not-allowed disabled:opacity-40"
-                              title="Lock optimal strip into modal draft (local — Assign/Prebook to stage to Analytics)"
-                            >
-                              {locked ? 'Re-apply' : 'Apply shape'}
-                            </button>
-                            {profileDraft && onPreparedByCcyChange && (
-                              <button
-                                type="button"
-                                onClick={() => stageProfileDraft()}
-                                disabled={!profileDraftDirty}
-                                className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30 disabled:cursor-not-allowed disabled:opacity-40"
-                                title="Prebook package for Hedging Decision — Send under this CCY to book"
-                              >
-                                {profileDraftDirty ? 'Prebook' : 'Prebooked'}
-                              </button>
-                            )}
-                          </div>
-                          <span className="text-right text-[8px] text-slate-600">
-                            Prebook → Decision · Send to book
-                          </span>
-                        </div>
-                      </div>
-                    </div>
+                            </>
+                          ) : null}
+                          {profileDraftDirty ? (
+                            <span className="ml-1.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-px text-[9px] font-medium text-amber-300/90">
+                              Draft
+                            </span>
+                          ) : null}
+                        </>
+                      }
+                      chips={chips.length > 0 ? chips : undefined}
+                      isPrebooked={staged}
+                      prepareAction={
+                        profileDraft && onPreparedByCcyChange
+                          ? {
+                              label: `Prebook ${optStruct}`,
+                              title:
+                                'Prebook package for Hedging Decision — Send under this CCY to book',
+                              disabled: false,
+                              run: () => stageProfileDraft(),
+                            }
+                          : null
+                      }
+                      onClose={closeCcyProfile}
+                    />
                   );
                 })()}
               </div>
@@ -5892,8 +5505,7 @@ export function CashCarryAnalyticsView({
                   {!hasStrategyHedge || settleScenarios.length === 0 ? (
                     <p className="py-6 text-center text-xs text-slate-500">
                       No model hedge for {chartCcy} yet — set cover / structure
-                      in Hedge path below (stays in this modal until Stage to
-                      Analytics).
+                      in Hedge path below (stays in this modal until Prebook).
                     </p>
                   ) : (
                     <>
@@ -6229,7 +5841,7 @@ export function CashCarryAnalyticsView({
                             applyStripShapeAroundWam(shapePreviewScore)
                           }
                           className="rounded-md border border-emerald-700/50 bg-emerald-950/40 px-2.5 py-1 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-900/50"
-                          title="Lock optimal strip into Analytics prepared package (Hedging Summary + reopen)"
+                          title="Lock this strip into the modal draft — Prebook in the header to stage to Hedging Decision"
                         >
                           {appliedShape ? 'Re-apply shape' : 'Apply shape'}
                         </button>
@@ -6386,7 +5998,7 @@ export function CashCarryAnalyticsView({
                           );
                           return (
                             <>
-                              <TickBarStepper
+                              <DeskStepper
                                 label="Strip legs"
                                 value={legs}
                                 min={1}
@@ -6401,7 +6013,7 @@ export function CashCarryAnalyticsView({
                                   n === 1 ? '•' : String(n),
                                 )}
                               />
-                              <TickBarStepper
+                              <DeskStepper
                                 label="Skew · CoM"
                                 value={com}
                                 min={0}
@@ -6423,7 +6035,7 @@ export function CashCarryAnalyticsView({
                                   'back',
                                 ]}
                               />
-                              <TickBarStepper
+                              <DeskStepper
                                 label="Kurtosis"
                                 value={kurt}
                                 min={-1}
@@ -6595,7 +6207,7 @@ export function CashCarryAnalyticsView({
                                         : ''
                                   }`}
                                   onClick={() => applyStripShapeAroundWam(c)}
-                                  title="Apply this strip locally · Assign/Prebook to stage to Analytics + Neon"
+                                  title="Apply this strip locally · Prebook in the header to stage to Hedging Decision"
                                 >
                                   <td className="py-1.5 pr-2 text-slate-500">
                                     {i + 1}
@@ -6653,7 +6265,7 @@ export function CashCarryAnalyticsView({
                       </div>
                       <p className="text-[10px] text-slate-500">
                         Click a rank row to Apply the shape locally. Use
-                        Assign/Prebook above to stage it to Analytics / Neon.
+                        Prebook in the header to stage it to Hedging Decision.
                       </p>
                     </>
                   )}

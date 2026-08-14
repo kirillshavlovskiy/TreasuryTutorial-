@@ -44,6 +44,9 @@ export function emptyAnswers(): TaskAnswers {
     varForecastMonths: '',
     varForecastUncertainty: '',
     varVolSource: '',
+    varVolHistorical: '',
+    varVolImplied: '',
+    varRateVol: '',
     varAveragingConvention: 'midMonth',
     eurVarUsdK: '',
   };

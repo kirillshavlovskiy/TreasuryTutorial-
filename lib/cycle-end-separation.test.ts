@@ -1,9 +1,9 @@
 /**
  * Column semantics:
- *   Target  = opening NP + swap   (cash target the swap funds to; = NP+Swap)
+ *   Target  = opening LP + swap   (cash target the swap funds to; = LP+Swap)
  *   Swap    = cushion H* − trough
- *   NP+Swap = opening NP + swap   (funded NP position after swap, before payout)
- *   Cycle End = NP+Swap − payout + payins + fcast + Non-NP sweep back
+ *   LP+Swap = opening LP + swap   (funded LP position after swap, before payout)
+ *   Cycle End = LP+Swap − payout + payins + fcast + Non-LP sweep back
  */
 import { describe, it, expect } from 'vitest';
 import { INITIAL_ROWS, INITIAL_USD_PARAMS } from './fx-buffer';
@@ -25,7 +25,7 @@ function model(overrides: {
       fcastFX: overrides.fcast?.[r.ccy] ?? r.fcastFX,
     })),
     usdCash: 303.9,
-    usdNonNpCash: 154.1,
+    usdNonLpCash: 154.1,
     usdParams: INITIAL_USD_PARAMS,
     shared: SHARED,
     activeLayers: ACTIVE,
@@ -33,15 +33,15 @@ function model(overrides: {
   });
 }
 
-describe('column separation: Target / Swap / NP+Swap / Cycle End', () => {
-  it('Target = NP+Swap = opening + swap; cushion = Target − |payout|', () => {
+describe('column separation: Target / Swap / LP+Swap / Cycle End', () => {
+  it('Target = LP+Swap = opening + swap; cushion = Target − |payout|', () => {
     const m = model({ payout: { CAD: -100 } });
     const cad = m.fcyComputed.find(r => r.ccy === 'CAD')!;
     expect(cad.cash_threshold).toBeCloseTo(cad.cash + cad.swapNear, 6);
     expect(cad.postSwapCash).toBeCloseTo(cad.cash + cad.swapNear, 6);
     expect(cad.cash_threshold).toBeCloseTo(cad.postSwapCash, 6);
     // Post-payout cushion = Target + payout (payout leaves after the swap funds the target)
-    expect(cad.np_after_swap_trough).toBeCloseTo(cad.cash_threshold + cad.payout, 4);
+    expect(cad.lp_after_swap_trough).toBeCloseTo(cad.cash_threshold + cad.payout, 4);
   });
 
   it('fcast does not move near swap or Target; moves Cycle End 1:1', () => {
@@ -54,7 +54,7 @@ describe('column separation: Target / Swap / NP+Swap / Cycle End', () => {
     expect(cF.cycleEndCash - c0.cycleEndCash).toBeCloseTo(-15, 4);
   });
 
-  it('payins move Cycle End 1:1, not Target or NP+Swap', () => {
+  it('payins move Cycle End 1:1, not Target or LP+Swap', () => {
     const m0 = model({ collections: { CAD: 0 } });
     const mPayin = model({ collections: { CAD: 50 } });
     const c0 = m0.fcyComputed.find(r => r.ccy === 'CAD')!;
@@ -63,10 +63,10 @@ describe('column separation: Target / Swap / NP+Swap / Cycle End', () => {
     expect(c1.postSwapCash).toBeCloseTo(c0.postSwapCash, 4);
     expect(c1.cycleEndCash - c0.cycleEndCash).toBeCloseTo(50, 4);
     expect(c1.cycleEndCash).toBeCloseTo(
-      c1.postSwapCash + c1.payout + 50 + c1.fcastFX + c1.nonNpCash, 4);
+      c1.postSwapCash + c1.payout + 50 + c1.fcastFX + c1.nonLpCash, 4);
   });
 
-  it('payout raises Target = NP+Swap by the trough gap + σ; Cycle End near-stable', () => {
+  it('payout raises Target = LP+Swap by the trough gap + σ; Cycle End near-stable', () => {
     const m0 = model({ payout: { CAD: 0 } });
     const m150 = model({ payout: { CAD: -150 } });
     const c0 = m0.fcyComputed.find(r => r.ccy === 'CAD')!;
@@ -81,12 +81,12 @@ describe('column separation: Target / Swap / NP+Swap / Cycle End', () => {
       .toBeCloseTo(c150.cash_threshold_pre_swap!, 1);
   });
 
-  it('with payout + payin + fcast, Cycle End is distinct from Target/NP+Swap', () => {
+  it('with payout + payin + fcast, Cycle End is distinct from Target/LP+Swap', () => {
     const m = model({ payout: { CAD: -150 }, collections: { CAD: 40 }, fcast: { CAD: -10 } });
     const cad = m.fcyComputed.find(r => r.ccy === 'CAD')!;
     expect(cad.cycleEndCash).toBeCloseTo(
-      cad.postSwapCash + cad.payout + 40 - 10 + cad.nonNpCash, 4);
-    // Target = NP+Swap (both funded to opening + swap)
+      cad.postSwapCash + cad.payout + 40 - 10 + cad.nonLpCash, 4);
+    // Target = LP+Swap (both funded to opening + swap)
     expect(cad.cash_threshold).toBeCloseTo(cad.postSwapCash, 4);
     // Cycle End differs from the funded target (payout has left, payins/fcast/sweep applied)
     expect(cad.cycleEndCash).not.toBeCloseTo(cad.cash_threshold, 0);

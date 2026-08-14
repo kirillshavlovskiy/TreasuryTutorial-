@@ -13,8 +13,8 @@ export type ActiveHedgeMode = Exclude<HedgeMode, 'AUTO'>;
 
 export interface HedgeSuggestionInput {
   ccy: string;
-  npNetFX: number;
-  npCash: number;
+  lpNetFX: number;
+  lpCash: number;
   cashThreshold: number;
   postSwapCash: number;
   fcastFX: number;
@@ -42,14 +42,14 @@ export interface HedgeSuggestion {
 const DERIV_CORRIDORS = new Set(['CAD', 'GBP', 'EUR', 'AUD', 'CHF']);
 const PEGGED_CCY = new Set(['AED', 'HKD']);
 
-/** FCY stock above target NP cash available to sell for USD carry. */
-export function excessLongNpCash(
-  npCash: number,
+/** FCY stock above target LP cash available to sell for USD carry. */
+export function excessLongLpCash(
+  lpCash: number,
   postSwapCash: number,
   cashThreshold: number,
 ): number {
   const troughExcess = Math.max(0, postSwapCash - cashThreshold);
-  const stockExcess = Math.max(0, npCash - cashThreshold);
+  const stockExcess = Math.max(0, lpCash - cashThreshold);
   return Math.max(troughExcess, stockExcess);
 }
 
@@ -80,13 +80,13 @@ export function suggestCarryHedge(inp: HedgeSuggestionInput): HedgeSuggestion {
     return none('Pegged — FX risk negligible');
   }
 
-  const excessLong = excessLongNpCash(inp.npCash, inp.postSwapCash, inp.cashThreshold);
-  const longNpFx = inp.npNetFX > 0.001 ? inp.npNetFX : 0;
+  const excessLong = excessLongLpCash(inp.lpCash, inp.postSwapCash, inp.cashThreshold);
+  const longLpFx = inp.lpNetFX > 0.001 ? inp.lpNetFX : 0;
   const σ_ann = inp.σ_daily * Math.sqrt(252);
   const fcastNeed = inp.fcastFX < -0.001 ? Math.abs(inp.fcastFX) : 0;
 
   if (inp.carryDir === 'earn') {
-    if (Math.abs(inp.npNetFX) < inp.cashFloor + 0.001) {
+    if (Math.abs(inp.lpNetFX) < inp.cashFloor + 0.001) {
       return none('EARN carry — hold FCY; exposure within floor');
     }
     return none('EARN carry — hold FCY position for income');
@@ -122,17 +122,17 @@ export function suggestCarryHedge(inp: HedgeSuggestionInput): HedgeSuggestion {
     };
   }
 
-  // ── Long NP FX residual (book exposure) — forward square if no excess cash ─
-  if (longNpFx > inp.cashFloor + 0.001) {
-    const sz = -longNpFx;
+  // ── Long LP FX residual (book exposure) — forward square if no excess cash ─
+  if (longLpFx > inp.cashFloor + 0.001) {
+    const sz = -longLpFx;
     if (DERIV_CORRIDORS.has(inp.ccy) && σ_ann > 0.08 && fcastNeed > 0.001) {
       return {
         mode: 'OPTION',
         size: sz,
         spotSell: 0,
-        optionRetain: Math.min(fcastNeed, longNpFx),
+        optionRetain: Math.min(fcastNeed, longLpFx),
         optionDelta: 0.35,
-        reason: `Long NP FX — fwd hedge + option retain for pipeline (σ=${(σ_ann * 100).toFixed(0)}%)`,
+        reason: `Long LP FX — fwd hedge + option retain for pipeline (σ=${(σ_ann * 100).toFixed(0)}%)`,
         carryBenefitUsdYr: 0,
       };
     }
@@ -142,25 +142,25 @@ export function suggestCarryHedge(inp: HedgeSuggestionInput): HedgeSuggestion {
       spotSell: 0,
       optionRetain: 0,
       optionDelta: 1,
-      reason: 'Long NP FX — EOM outright fwd square-off',
+      reason: 'Long LP FX — EOM outright fwd square-off',
       carryBenefitUsdYr: 0,
     };
   }
 
-  // ── Short NP FX — buy FCY via forward ─────────────────────────────────────
-  if (inp.npNetFX < -inp.cashFloor - 0.001) {
+  // ── Short LP FX — buy FCY via forward ─────────────────────────────────────
+  if (inp.lpNetFX < -inp.cashFloor - 0.001) {
     return {
       mode: 'FWD',
-      size: -inp.npNetFX,
+      size: -inp.lpNetFX,
       spotSell: 0,
       optionRetain: 0,
       optionDelta: 1,
-      reason: 'Short NP FX — buy FCY via forward',
+      reason: 'Short LP FX — buy FCY via forward',
       carryBenefitUsdYr: 0,
     };
   }
 
-  return none('Net NP FX within floor — no hedge needed');
+  return none('Net LP FX within floor — no hedge needed');
 }
 
 // ─── Hedge overlay carry measures (on top of the swap book) ─────────────────

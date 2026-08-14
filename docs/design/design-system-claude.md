@@ -7,6 +7,8 @@ Briefs should say “same kit as `docs/design/design-system-claude.md`” instea
 
 **Code anchors:** `components/test-mode/*` · `RiskPerspectiveSelector` · `CashCarryAnalyticsView` · `CfarAnalysisView` · `ExposureHedgePathChart`
 
+**Exception:** the simulator desk (`UnifiedSimulator` · `LayeredBufferAnalysis` · `Simulator` tabs) is authored in *light* utilities and remapped to dark by `.sim-dark` in `app/globals.css`. Use the remap-safe tokens listed in `docs/design/fx-simulator-desk-claude-design.md`, not the `slate-*` classes below.
+
 ---
 
 ## Surfaces
@@ -168,6 +170,7 @@ CCY violet · CP orange · refinement only · no marketing UI
 
 | Brief | Path |
 |-------|------|
+| FX Simulator desk (main component) | `docs/design/fx-simulator-desk-claude-design.md` |
 | Entity onboarding | `docs/design/entity-onboarding-claude-design.md` |
 | CFaR analysis | `docs/design/cfar-analysis-claude-design.md` |
 | Cash Carry · All CCY | `docs/design/cash-carry-all-currencies-claude-design.md` |

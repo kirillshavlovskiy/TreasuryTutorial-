@@ -5,10 +5,10 @@ import {
   useMemo,
   useRef,
   useState,
-  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { DeskStepper } from '@/components/DeskStepper';
 import { stripHedgeLegCarryUsdM } from '@/lib/fx-hedge';
 import {
   fwdCarryFromSwapPointsUsdM,
@@ -70,207 +70,6 @@ function GearIcon({ className }: { className?: string }) {
       <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
       <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z" />
     </svg>
-  );
-}
-
-function snapCoverPct(v: number, min: number, max: number, step: number): number {
-  const snapped = Math.round((v - min) / step) * step + min;
-  return Math.min(max, Math.max(min, Math.round(snapped)));
-}
-
-/** Compact cover-% stepper (inline or inside Cover modal). */
-function CoverOfTargetStepper({
-  value,
-  onChange,
-  scaledLabel,
-  disabled = false,
-  className = 'w-[220px]',
-}: {
-  value: number;
-  onChange: (v: number) => void;
-  scaledLabel: string;
-  disabled?: boolean;
-  className?: string;
-}) {
-  const trackRef = useRef<HTMLDivElement>(null);
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-  const [draft, setDraft] = useState<string | null>(null);
-  const min = 0;
-  const max = 100;
-  const step = 5;
-  const pct = ((Math.min(max, Math.max(min, value)) - min) / (max - min)) * 100;
-
-  const valueFromClientX = (clientX: number) => {
-    const el = trackRef.current;
-    if (!el) return value;
-    const rect = el.getBoundingClientRect();
-    if (rect.width < 1e-6) return value;
-    const t = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-    return snapCoverPct(min + t * (max - min), min, max, step);
-  };
-
-  const nudge = (dir: -1 | 1) => {
-    if (disabled) return;
-    onChange(snapCoverPct(value + dir * step, min, max, step));
-  };
-
-  const commitDraft = () => {
-    if (draft == null) return;
-    const n = Number(draft.replace(/%/g, '').trim());
-    if (Number.isFinite(n)) {
-      onChange(Math.min(max, Math.max(min, Math.round(n))));
-    }
-    setDraft(null);
-  };
-
-  const beginDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (disabled) return;
-    e.preventDefault();
-    const target = e.currentTarget;
-    target.setPointerCapture(e.pointerId);
-    onChangeRef.current(valueFromClientX(e.clientX));
-    const onMove = (ev: PointerEvent) => {
-      onChangeRef.current(valueFromClientX(ev.clientX));
-    };
-    const onUp = (ev: PointerEvent) => {
-      target.releasePointerCapture(ev.pointerId);
-      target.removeEventListener('pointermove', onMove);
-      target.removeEventListener('pointerup', onUp);
-      target.removeEventListener('pointercancel', onUp);
-    };
-    target.addEventListener('pointermove', onMove);
-    target.addEventListener('pointerup', onUp);
-    target.addEventListener('pointercancel', onUp);
-  };
-
-  const stepBtn =
-    'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border border-slate-600 bg-slate-950 text-[11px] font-semibold text-slate-300 hover:border-slate-500 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40';
-
-  const majorTicks = [0, 25, 50, 75, 100] as const;
-
-  return (
-    <div
-      className={`shrink-0 rounded-md border border-slate-700 bg-slate-900/80 px-2 py-1.5${
-        disabled ? ' opacity-50' : ''
-      } ${className}`}
-      title="Scale hedge cover as % of the selected regime target"
-    >
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-          Cover
-        </span>
-        <div className="flex items-baseline gap-1.5 font-mono tabular-nums">
-          {draft != null ? (
-            <input
-              autoFocus
-              type="text"
-              inputMode="numeric"
-              value={draft}
-              disabled={disabled}
-              onChange={e => setDraft(e.target.value)}
-              onBlur={commitDraft}
-              onKeyDown={e => {
-                if (e.key === 'Enter') commitDraft();
-                if (e.key === 'Escape') setDraft(null);
-              }}
-              className="w-10 rounded border border-emerald-600/50 bg-slate-950 px-1 py-0.5 text-right text-[11px] font-semibold text-emerald-100 outline-none"
-              aria-label="Cover percent"
-            />
-          ) : (
-            <button
-              type="button"
-              disabled={disabled}
-              onClick={() => setDraft(String(value))}
-              className="text-[11px] font-semibold text-slate-100 hover:text-emerald-100 disabled:cursor-not-allowed"
-              title="Click to type %"
-            >
-              {value}%
-            </button>
-          )}
-          <span
-            className={`text-[10px] ${
-              disabled ? 'text-slate-600' : 'text-slate-400'
-            }`}
-            title="Scaled cover notional"
-          >
-            → {scaledLabel}
-          </span>
-        </div>
-      </div>
-
-      <div className="flex h-6 items-center gap-1.5">
-        <button
-          type="button"
-          className={stepBtn}
-          disabled={disabled || value <= min}
-          aria-label="Decrease cover"
-          onClick={() => nudge(-1)}
-        >
-          −
-        </button>
-
-        <div
-          ref={trackRef}
-          role="slider"
-          tabIndex={disabled ? -1 : 0}
-          aria-label="Cover percent of target hedge"
-          aria-valuemin={min}
-          aria-valuemax={max}
-          aria-valuenow={value}
-          aria-valuetext={`${value}% → ${scaledLabel}`}
-          aria-disabled={disabled}
-          onKeyDown={e => {
-            if (disabled) return;
-            if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
-              e.preventDefault();
-              nudge(-1);
-            } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
-              e.preventDefault();
-              nudge(1);
-            } else if (e.key === 'Home') {
-              e.preventDefault();
-              onChange(min);
-            } else if (e.key === 'End') {
-              e.preventDefault();
-              onChange(max);
-            }
-          }}
-          onPointerDown={beginDrag}
-          className={`relative h-6 min-w-0 flex-1 select-none touch-none ${
-            disabled ? 'cursor-not-allowed' : 'cursor-pointer'
-          }`}
-        >
-          <div className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-slate-800 ring-1 ring-slate-700/80">
-            <div
-              className="h-full rounded-full bg-emerald-500/70"
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-          {majorTicks.map(t => (
-            <span
-              key={t}
-              className="pointer-events-none absolute top-1/2 h-2.5 w-px -translate-x-1/2 -translate-y-1/2 bg-slate-500"
-              style={{ left: `${t}%` }}
-            />
-          ))}
-          <span
-            className="pointer-events-none absolute top-1/2 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-emerald-300/80 bg-slate-950 shadow-md"
-            style={{ left: `${pct}%` }}
-          />
-        </div>
-
-        <button
-          type="button"
-          className={stepBtn}
-          disabled={disabled || value >= max}
-          aria-label="Increase cover"
-          onClick={() => nudge(1)}
-        >
-          +
-        </button>
-      </div>
-    </div>
   );
 }
 
@@ -3005,12 +2804,21 @@ export function ExposureHedgePathChart({
               Close
             </button>
           </div>
-          <CoverOfTargetStepper
+          <DeskStepper
+            label="Cover"
             value={targetCoverPct}
+            min={0}
+            max={100}
+            step={5}
             onChange={setTargetCoverPct}
-            scaledLabel={fmtM(scaled)}
+            formatValue={v => `${v}%`}
+            suffix={`→ ${fmtM(scaled)}`}
+            editable
             disabled={coverControlDisabled}
+            tickValues={[0, 25, 50, 75, 100]}
             className="w-full"
+            title="Scale hedge cover as % of the selected regime target"
+            ariaLabel="Cover percent of target hedge"
           />
           <div className="mt-3 flex justify-end">
             <button

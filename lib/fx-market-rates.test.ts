@@ -126,7 +126,7 @@ describe('fx-market-rates', () => {
     expect(cash.fcy.creditPct).toBeCloseTo(3.41, 2);
     expect(fwd.fcy.creditPct).toBeCloseTo(2.26, 2);
     const gbpCash = resolveOvernightCashRates(plnBundle, 'GBP');
-    expect(gbpCash.source).toContain('NP');
+    expect(gbpCash.source).toContain('LP');
   });
 
   it('suggests EUR SW→O/N 2.15/2.35 without overwriting SW deposits', () => {

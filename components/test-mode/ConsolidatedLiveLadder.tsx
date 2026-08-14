@@ -267,9 +267,9 @@ export function ConsolidatedLiveLadder({
           sources = carry.filter(s => Math.abs(s.value) > 1e-12);
           hedge = toUnit(hedgeSigned * m);
           net = sources.reduce((s, seg) => s + seg.value, 0) + hedge;
-        } else if (perspective === 'cfar') {
-          // CFaR is a path/liquidity metric — analysed in the Analytics tab,
-          // not a per-CCY stacked ladder. Render empty here.
+        } else if (perspective === 'cfar' || perspective === 'liquidity') {
+          // Both are path metrics — analysed in the Analytics tab, not as a
+          // per-CCY stacked ladder of the FX book. Render empty here.
           sources = [];
           hedge = 0;
           net = 0;
@@ -433,6 +433,11 @@ export function ConsolidatedLiveLadder({
       {perspective === 'cfar' ? (
         <p className="py-8 text-center text-xs text-slate-500">
           CFaR (critical cash absorption) is analysed in the Analytics → CFaR tab.
+        </p>
+      ) : perspective === 'liquidity' ? (
+        <p className="py-8 text-center text-xs text-slate-500">
+          Liquidity funding runs on the dated cash path, not the FX book ladder —
+          the swap strategy comparison is in the Analytics → Liquidity tab.
         </p>
       ) : bars.length === 0 ? (
         <p className="py-8 text-center text-xs text-slate-500">No FCY rows to ladder.</p>

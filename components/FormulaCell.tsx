@@ -2,26 +2,19 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import {
-  cycleAbsRefToken,
-  findLockableRefSpan,
-  lexFormula,
-} from '@/lib/formula';
+import { cycleAbsRefToken, findLockableRefSpan } from '@/lib/formula';
 import { AVAILABLE_REFS } from '@/lib/sim-formulas';
 import {
   formulaEditKey,
   parseFormulaEditKey,
   useFormulaGrid,
 } from '@/components/FormulaGrid';
-import { colorForName } from '@/lib/token-colors';
 
 const DEFAULT_SUGGESTIONS = [
   ...AVAILABLE_REFS.map(r => r.name),
   'abs', 'min', 'max', 'round', 'sqrt', 'pow', 'floor', 'ceil', 'exp', 'ln', 'log',
 ];
-const OPS = new Set(['+', '-', '*', '/', '%', '^', '(', ')', ',']);
 const isIdent = (t: string) => /^\$?[A-Za-z_][A-Za-z0-9_]*$/.test(t);
-const isNumber = (t: string) => /^[0-9]*\.?[0-9]+$/.test(t);
 
 /** Above portaled modals (z-200) and their backdrops. */
 const PORTAL_Z = 'z-[300]';
@@ -135,10 +128,6 @@ export function FormulaCell({
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(
     null,
   );
-  const [previewCoords, setPreviewCoords] = useState<{
-    top: number;
-    left: number;
-  } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const cellRef = useRef<HTMLTableCellElement>(null);
@@ -251,16 +240,6 @@ export function FormulaCell({
     },
     [editKey, grid, openEditor, resolvePickToken],
   );
-
-  const sourceText = hasOverride ? storedFormulaText : defaultFormula;
-  const previewTokens = (() => {
-    if (!sourceText) return [];
-    try {
-      return lexFormula(sourceText);
-    } catch {
-      return null;
-    }
-  })();
 
   useEffect(() => {
     if (!editing) return;
@@ -706,9 +685,6 @@ export function FormulaCell({
       ? `= ${storedFormulaText}  ·  click / double-click to edit${canFill ? ' · drag corner to fill (relative refs shift)' : ''}`
       : `${title ? title + ' · ' : ''}= ${defaultFormula || '(model value)'}  ·  click / double-click to edit${canFill ? ' · drag corner to fill (relative refs shift)' : ''}`;
 
-  const showPreview =
-    !!previewCoords && !grid?.dragging && !!previewTokens && previewTokens.length > 0;
-
   const dragHighlight = dark
     ? 'outline outline-2 outline-sky-400 outline-offset-[-1px] bg-sky-950/50'
     : 'outline outline-2 outline-blue-400 outline-offset-[-1px] bg-blue-50/60';
@@ -736,17 +712,11 @@ export function FormulaCell({
       }}
       onClick={handleCellClick}
       onDoubleClick={handleCellDoubleClick}
-      onMouseEnter={e => {
+      onMouseEnter={() => {
         // Fill range is driven by window pointermove (axis-locked); mouseEnter
         // remains a lightweight fallback when still over the same column.
         if (canFill) grid!.hoverDrag(columnKey!, rowKey!);
-        // Avoid stacking formula previews while another cell is being edited.
-        if (grid?.activeEditKey) return;
-        if (grid?.dragging) return;
-        const rect = e.currentTarget.getBoundingClientRect();
-        setPreviewCoords({ top: rect.bottom + 2, left: rect.left });
       }}
-      onMouseLeave={() => setPreviewCoords(null)}
     >
       <div className="flex min-h-[20px] flex-col items-end gap-0.5 py-0.5">
         <span className="inline-flex items-center gap-0.5 font-mono tabular-nums">
@@ -783,55 +753,6 @@ export function FormulaCell({
           aria-hidden
         />
       )}
-      {showPreview &&
-        typeof document !== 'undefined' &&
-        createPortal(
-          <div
-            className={`fixed ${PORTAL_Z} flex max-w-[320px] flex-wrap items-center gap-1 rounded-lg border p-1.5 shadow-lg pointer-events-none ${
-              dark
-                ? 'sim-dark border-slate-600 bg-slate-900 ring-1 ring-slate-700/80'
-                : 'border-gray-200 bg-white'
-            }`}
-            style={{ top: previewCoords!.top, left: previewCoords!.left }}
-          >
-            <span
-              className={`font-mono text-xs font-bold ${dark ? 'text-slate-500' : 'text-gray-400'}`}
-            >
-              =
-            </span>
-            {previewTokens!.map((t, i) =>
-              OPS.has(t) ? (
-                <span
-                  key={i}
-                  className={`px-0.5 font-mono text-xs ${dark ? 'text-slate-400' : 'text-gray-500'}`}
-                >
-                  {t}
-                </span>
-              ) : (
-                <span
-                  key={i}
-                  className={`rounded px-1 py-0.5 text-[11px] font-medium ${
-                    isNumber(t)
-                      ? dark
-                        ? 'bg-amber-950/70 text-amber-200'
-                        : 'bg-amber-100 text-amber-800'
-                      : `${colorForName(t).bg} ${colorForName(t).text}`
-                  }`}
-                >
-                  {t}
-                </span>
-              ),
-            )}
-            {!hasOverride && (
-              <span
-                className={`ml-1 text-[9px] ${dark ? 'text-slate-500' : 'text-gray-400'}`}
-              >
-                (default)
-              </span>
-            )}
-          </div>,
-          document.body,
-        )}
     </td>
   );
 }

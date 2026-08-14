@@ -47,6 +47,24 @@ export interface VarSetup {
   /** Historical (realized) vs option-implied FX vol for σ₁ₘ. */
   volSource: VarVolSource;
   /**
+   * User-entered σ₁ₘ replacing the desk preset in VAR_VOL_SOURCE_OPTIONS.
+   * Held per source so switching Historical ↔ Implied keeps each edited value
+   * rather than clobbering one with the other. Missing entry = use the preset.
+   */
+  volOverrides?: Partial<Record<VarVolSource, number>>;
+  /**
+   * User-entered rate-differential vol in bp/year, replacing the per-currency
+   * desk table for EVERY currency. One number rather than a map: the control
+   * that sets it is a single field, and silently applying it to one currency
+   * while leaving the rest on the table would make cross-currency totals
+   * incomparable. Undefined = every currency keeps its own table value.
+   *
+   * Not held per vol source. Historical and implied are FX quotes; there is no
+   * second rate-vol curve behind them, so pinning this to the active source
+   * would invent a distinction the data does not have.
+   */
+  rateVolOverrideBpYr?: number;
+  /**
    * @deprecated Ignored by the engine — profile id selects the average method.
    * Retained so older saved answers still parse.
    */
@@ -239,15 +257,87 @@ export function parseVarVolSource(
   return null;
 }
 
-/** Resolve σ₁ₘ from setup (defaults to historical curriculum vol). */
-export function monthlyVolForSetup(
-  setup?: Partial<Pick<VarSetup, 'volSource'>> | null,
-): number {
-  const id = setup?.volSource ?? 'historical';
+/** Widest σ₁ₘ an override may set: 0 (vol off) up to 50% per month. */
+export const MONTHLY_VOL_MIN = 0;
+export const MONTHLY_VOL_MAX = 0.5;
+
+/** Clamp a σ₁ₘ fraction into the accepted range. */
+export function clampMonthlyVol(v: number): number {
+  if (!Number.isFinite(v)) return NORDTECH_VAR.monthlyVol;
+  return Math.min(MONTHLY_VOL_MAX, Math.max(MONTHLY_VOL_MIN, v));
+}
+
+/**
+ * Parse a persisted σ₁ₘ override, stored as a fraction string ("0.032").
+ * Returns null for blank/unparseable/out-of-range input so the caller falls
+ * back to the desk preset.
+ */
+export function parseMonthlyVol(
+  raw: string | number | undefined | null,
+): number | null {
+  if (raw == null || raw === '') return null;
+  const v = typeof raw === 'number' ? raw : Number(String(raw).replace(/%/g, '').trim());
+  if (!Number.isFinite(v)) return null;
+  if (v < MONTHLY_VOL_MIN || v > MONTHLY_VOL_MAX) return null;
+  return v;
+}
+
+/** Desk preset σ₁ₘ for a source, ignoring any user override. */
+export function presetVolForSource(id: VarVolSource): number {
   return (
     VAR_VOL_SOURCE_OPTIONS.find(o => o.id === id)?.monthlyVol ??
     NORDTECH_VAR.monthlyVol
   );
+}
+
+/** Effective σ₁ₘ for one source — the user's override if set, else the preset. */
+export function volForSource(
+  setup: Partial<Pick<VarSetup, 'volOverrides'>> | null | undefined,
+  id: VarVolSource,
+): number {
+  const override = setup?.volOverrides?.[id];
+  return typeof override === 'number' && Number.isFinite(override)
+    ? clampMonthlyVol(override)
+    : presetVolForSource(id);
+}
+
+/** Resolve σ₁ₘ from setup (defaults to historical curriculum vol). */
+export function monthlyVolForSetup(
+  setup?: Partial<Pick<VarSetup, 'volSource' | 'volOverrides'>> | null,
+): number {
+  return volForSource(setup, setup?.volSource ?? 'historical');
+}
+
+/** Widest rate-differential vol an override may set, bp/year. 0 turns the
+ * rate random walk off entirely; 1000 is well past the widest desk table
+ * entry (TRY at 450). */
+export const RATE_VOL_BP_MIN = 0;
+export const RATE_VOL_BP_MAX = 1000;
+
+export function clampRateVolBpYr(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.min(RATE_VOL_BP_MAX, Math.max(RATE_VOL_BP_MIN, v));
+}
+
+/**
+ * Parse a persisted rate-vol override in bp/year. Blank, unparseable or
+ * out-of-range falls back to null, which means the per-currency desk table.
+ */
+export function parseRateVolBpYr(
+  raw: string | number | undefined | null,
+): number | null {
+  if (raw == null || raw === '') return null;
+  const v = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (!Number.isFinite(v)) return null;
+  if (v < RATE_VOL_BP_MIN || v > RATE_VOL_BP_MAX) return null;
+  return v;
+}
+
+export function serializeRateVolOverride(
+  setup: Pick<VarSetup, 'rateVolOverrideBpYr'>,
+): string {
+  const v = setup.rateVolOverrideBpYr;
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : '';
 }
 
 /** Curriculum EUR stock / monthly flow for reference scoring (Net FX = S − debt). */
@@ -433,6 +523,9 @@ export function parseVarSetup(partial: {
   varForecastMonths?: string;
   varForecastUncertainty?: string;
   varVolSource?: string;
+  varVolHistorical?: string;
+  varVolImplied?: string;
+  varRateVol?: string;
   varAveragingConvention?: string;
 }): VarSetup | null {
   const confidencePct = (() => {
@@ -448,6 +541,8 @@ export function parseVarSetup(partial: {
     parseForecastUncertainty1m(partial.varForecastUncertainty) ?? 0;
   const volSource =
     parseVarVolSource(partial.varVolSource) ?? DEFAULT_VAR_SETUP.volSource;
+  const volOverrides = parseVolOverrides(partial);
+  const rateVolOverrideBpYr = parseRateVolBpYr(partial.varRateVol);
   const basis = exposureBasis === 'stock' ? 'simpleAvg' : exposureBasis;
   const averagingConvention =
     parseVarAveragingConvention(partial.varAveragingConvention) ??
@@ -459,8 +554,37 @@ export function parseVarSetup(partial: {
     forecastMonths,
     forecastUncertainty1m,
     volSource,
+    ...(volOverrides ? { volOverrides } : {}),
+    ...(rateVolOverrideBpYr == null ? {} : { rateVolOverrideBpYr }),
     averagingConvention,
   };
+}
+
+/**
+ * Read per-source σ₁ₘ overrides out of persisted answers. Returns undefined
+ * when neither source is overridden, so an untouched setup stays free of an
+ * empty object.
+ */
+export function parseVolOverrides(partial: {
+  varVolHistorical?: string;
+  varVolImplied?: string;
+}): Partial<Record<VarVolSource, number>> | undefined {
+  const historical = parseMonthlyVol(partial.varVolHistorical);
+  const implied = parseMonthlyVol(partial.varVolImplied);
+  if (historical == null && implied == null) return undefined;
+  return {
+    ...(historical == null ? {} : { historical }),
+    ...(implied == null ? {} : { implied }),
+  };
+}
+
+/** Serialize one source's override for persisted answers ('' = use preset). */
+export function serializeVolOverride(
+  setup: Pick<VarSetup, 'volOverrides'>,
+  id: VarVolSource,
+): string {
+  const v = setup.volOverrides?.[id];
+  return typeof v === 'number' && Number.isFinite(v) ? String(v) : '';
 }
 
 /**

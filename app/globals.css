@@ -33,6 +33,16 @@
 .sim-dark .hover\:bg-gray-100:hover { background-color: #334155; }
 .sim-dark .hover\:bg-gray-200:hover { background-color: #475569; }
 
+/* Semantic tints used as row / chip hovers. The base-tint rules further down do
+   not cover the hover variant (different class token), so without these the
+   highlight paints the light tint on dark. A notch stronger than the base tint. */
+.sim-dark .hover\:bg-sky-50:hover     { background-color: rgba(14,165,233,0.16); }
+.sim-dark .hover\:bg-blue-50:hover    { background-color: rgba(59,130,246,0.16); }
+.sim-dark .hover\:bg-blue-100:hover   { background-color: rgba(59,130,246,0.26); }
+.sim-dark .hover\:bg-violet-50:hover  { background-color: rgba(139,92,246,0.16); }
+.sim-dark .hover\:bg-violet-100:hover { background-color: rgba(139,92,246,0.26); }
+.sim-dark .hover\:bg-amber-50:hover   { background-color: rgba(245,158,11,0.16); }
+
 /* ── Neutral text (inverted scale: dark-on-light → light-on-dark) ────────── */
 .sim-dark .text-black    { color: #f8fafc; }
 .sim-dark .text-gray-900 { color: #f8fafc; }
@@ -41,7 +51,9 @@
 .sim-dark .text-gray-600 { color: #cbd5e1; }
 .sim-dark .text-gray-500 { color: #a3b2c7; }
 .sim-dark .text-gray-400 { color: #94a3b8; }
-.sim-dark .text-gray-300 { color: #cbd5e1; }
+/* The desk uses gray-300 for the muted role — em-dashes, zeros, inactive layers.
+   Inverting it would put those ABOVE body text in contrast, so it dims instead. */
+.sim-dark .text-gray-300 { color: #64748b; }
 .sim-dark .text-gray-200 { color: #e2e8f0; }
 .sim-dark .text-gray-100 { color: #f1f5f9; }
 

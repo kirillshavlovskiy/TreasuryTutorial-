@@ -17,14 +17,14 @@ describe('computeDashboardModel', () => {
   const input = {
     rows: INITIAL_ROWS,
     usdCash: 303.9,
-    usdNonNpCash: 154.1,
+    usdNonLpCash: 154.1,
     usdParams: INITIAL_USD_PARAMS,
     shared: SHARED,
     activeLayers: ACTIVE_LAYERS,
     policyVAR: 5.0,
   };
 
-  function openingNpUsdTotal(m: ReturnType<typeof computeDashboardModel>) {
+  function openingLpUsdTotal(m: ReturnType<typeof computeDashboardModel>) {
     return m.fcyComputed.reduce((s, r) => s + fcyToUsdM(r.cash, r.ccy), 0) + m.usdComputed.cash;
   }
 
@@ -49,18 +49,18 @@ describe('computeDashboardModel', () => {
     }
   });
 
-  it('Target = NP+Swap = opening + swap; TOTAL Target $USD = opening NP $USD', () => {
+  it('Target = LP+Swap = opening + swap; TOTAL Target $USD = opening LP $USD', () => {
     const model = computeDashboardModel(input);
-    const opening = openingNpUsdTotal(model);
+    const opening = openingLpUsdTotal(model);
     for (const fc of model.fcyComputed) {
       expect(fc.cash_threshold).toBeCloseTo(fc.cash + fc.swapNear, 4);
       expect(fc.postSwapCash).toBeCloseTo(fc.cash + fc.swapNear, 4);
       expect(fc.cash_threshold).toBeCloseTo(fc.postSwapCash, 4);
       expect(fc.postSwapUSD).toBeCloseTo(fcyToUsdM(fc.postSwapCash, fc.ccy), 4);
       expect(fc.cashThresholdUSD).toBeCloseTo(fcyToUsdM(fc.cash_threshold, fc.ccy), 4);
-      expect(fc.np_after_swap_trough).toBeCloseTo(fc.np_peak_cash + fc.swapNear, 4);
+      expect(fc.lp_after_swap_trough).toBeCloseTo(fc.lp_peak_cash + fc.swapNear, 4);
       expect(fc.cycleEndCash).toBeCloseTo(
-        fc.postSwapCash + fc.payout + fc.collections + fc.fcastFX + fc.nonNpCash, 4);
+        fc.postSwapCash + fc.payout + fc.collections + fc.fcastFX + fc.nonLpCash, 4);
     }
     const usd = model.usdComputed;
     expect(usd.cash_threshold).toBeCloseTo(usd.cash + usd.swapNear, 4);
@@ -100,7 +100,7 @@ describe('computeDashboardModel', () => {
     expect(Math.abs(fcySwapUsd)).toBeGreaterThan(50);
   });
 
-  it('zero payouts + tight 5M limit: targets stay near opening NP, never all zero', () => {
+  it('zero payouts + tight 5M limit: targets stay near opening LP, never all zero', () => {
     // Regression: base holdings must NOT be liquidated to fund the VAR limit —
     // the P&L budget applies to the carry OVERLAY (deviation from hold-the-book).
     const m = computeDashboardModel({
@@ -112,10 +112,10 @@ describe('computeDashboardModel', () => {
     const s = m.portfolioSummary!;
     // Overlay VAR fills the 5M budget exactly
     expect(s.portfolio_VAR_USD).toBeCloseTo(5, 1);
-    // Positive-NP rows keep meaningful targets (not trimmed to zero)
+    // Positive-LP rows keep meaningful targets (not trimmed to zero)
     const nonZero = m.fcyComputed.filter(r => r.cash > 10 && r.cash_threshold > 1);
     expect(nonZero.length).toBeGreaterThan(10);
-    // EARN rows tilt ABOVE opening NP (buy overlay), PAY rows below (sell overlay)
+    // EARN rows tilt ABOVE opening LP (buy overlay), PAY rows below (sell overlay)
     const mxn = m.fcyComputed.find(r => r.ccy === 'MXN')!;
     expect(mxn.cash_threshold).toBeGreaterThan(mxn.cash);
     const cad = m.fcyComputed.find(r => r.ccy === 'CAD')!;
@@ -155,7 +155,7 @@ describe('computeDashboardModel', () => {
   });
 
   it('P&L does not book opening-cash carry after the position is swapped away', () => {
-    // Regression: PAY sells (e.g. EUR/CAD) swap nearly all opening NP to the
+    // Regression: PAY sells (e.g. EUR/CAD) swap nearly all opening LP to the
     // overlay target — Cash Carry must reflect the residual post-swap balance,
     // not the opening stock. Overlay banner carry is incremental attribution
     // only and must not be added again into floatNim.
@@ -213,7 +213,7 @@ describe('computeDashboardModel', () => {
     expect(cad.cash_threshold).toBeLessThan(cad.cash);
   });
 
-  it('CAD payout: NP+Swap rises with payout; zero-sum $USD legs hold', () => {
+  it('CAD payout: LP+Swap rises with payout; zero-sum $USD legs hold', () => {
     for (const payout of [-50, -100]) {
       const model = computeDashboardModel({
         ...input,
@@ -231,10 +231,10 @@ describe('computeDashboardModel', () => {
   it('Post-payout cushion = Target + payout (funded target minus the payout that leaves)', () => {
     const model = computeDashboardModel(input);
     for (const fc of model.fcyComputed) {
-      expect(fc.np_after_swap_trough).toBeCloseTo(fc.cash_threshold + fc.payout, 4);
+      expect(fc.lp_after_swap_trough).toBeCloseTo(fc.cash_threshold + fc.payout, 4);
       expect(fc.postSwapCash).toBeCloseTo(fc.cash_threshold, 4);
     }
-    expect(model.usdComputed.np_after_swap_trough).toBeCloseTo(
+    expect(model.usdComputed.lp_after_swap_trough).toBeCloseTo(
       model.usdComputed.cash_threshold + model.usdComputed.payout, 4,
     );
   });

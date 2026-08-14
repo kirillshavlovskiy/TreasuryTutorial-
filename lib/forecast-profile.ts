@@ -1,8 +1,18 @@
 // Multi-period FX forecast profile — flat monthly×T (workspace formula) or
 // custom cash inflow / outflow lines per month within the forecasting period.
 
-import { roundMoney, type RowState } from '@/lib/fx-buffer';
+import {
+  roundMoney,
+  computeLayeredBuffer,
+  computeFcySwapNear,
+  type RowState,
+  type SharedGlobals,
+  type LayerId,
+  type LayeredBufferResult,
+} from '@/lib/fx-buffer';
 import { safeEval, type Scope } from '@/lib/formula';
+// Type-only: the ladder engine imports this module at runtime, not the reverse.
+import type { LiquidityBookingMode, LiquidityTiming } from '@/lib/liquidity-ladder';
 
 export type ForecastFlowMode = 'flat' | 'custom';
 
@@ -224,6 +234,14 @@ export interface ForecastProfileState {
   calcRowsByCcy?: Record<string, ForecastCalcRow[]>;
   /** Values for calc rows: calcByCcy[ccy][calcId][monthIndex]. */
   calcByCcy?: Record<string, Record<string, number[]>>;
+  /**
+   * Intra-cycle settlement timing for the liquidity book — when inside its
+   * month each line lands. Monthly amounts above are unchanged, so FX exposure
+   * and CFaR are unaffected; only the liquidity trough becomes dated.
+   * Undefined takes the default (dated, worst-case shapes); `enabled: false`
+   * keeps the lump-sum trough (cash + payout).
+   */
+  liquidity?: LiquidityTiming;
 }
 
 export const DEFAULT_FORECAST_PROFILE: ForecastProfileState = {
@@ -1058,4 +1076,389 @@ export function copyMonth1ToAll(
   if (months.length === 0) return months;
   const m0 = normalizeMonthFlow(months[0]);
   return months.map(() => ({ ...m0 }));
+}
+
+// ── Multi-cycle liquidity projection ────────────────────────────────────────
+//
+// computeLayeredBuffer / computeFcySwapNear (fx-buffer.ts) size the buffer and
+// near-leg swap for ONE cycle only, from the row's live cash/payout. They have
+// no visibility into the MoM growth already configured on the Forecast profile
+// (growthRateMoM / flatGrowthByCcy), so a currency whose payout run-rate is
+// growing shows its true buffer need only after the fact, one cycle late.
+//
+// projectLiquidityCycles chains the same per-cycle formula forward: cycle k's
+// closing cash becomes cycle k+1's opening cash, and payout/collections/invoice
+// fcast are read from the grown (or custom) month series instead of the flat
+// row value. This mirrors the rolling-hedge.ts pattern (successive forward
+// edges when Tf > Th) but applied to the liquidity buffer instead of the VaR
+// hedge notional.
+
+function cycleFlowAt(
+  row: RowState,
+  forecastProfile: ForecastProfileState | null | undefined,
+  monthIndex: number,
+): { payout: number; collections: number; invoiceFcast: number } {
+  if (forecastProfile?.mode === 'custom') {
+    const months = resizeMonthSeries(
+      forecastProfile.byCcy[row.ccy],
+      monthIndex + 1,
+      row,
+      forecastProfile.extrasByCcy?.[row.ccy],
+    );
+    const m = normalizeMonthFlow(months[monthIndex]);
+    return { payout: m.payout, collections: m.collections, invoiceFcast: m.invoiceFcast };
+  }
+  const extras = normalizeExtras(forecastProfile?.extrasByCcy?.[row.ccy]);
+  const m = flatMonthFlowAt(row, extras, forecastProfile, monthIndex);
+  return { payout: m.payout, collections: m.collections, invoiceFcast: m.invoiceFcast };
+}
+
+export interface LiquidityCycleProjection {
+  /** 0-based cycle index; 0 = the current/near cycle. */
+  cycleIndex: number;
+  /** Opening LP cash entering this cycle (M FCY) — chained from the prior cycle's close. */
+  opening_cash: number;
+  /** This cycle's net payout (M FCY, ≤0 = outflow), grown per the Forecast profile. */
+  payout: number;
+  collections: number;
+  invoiceFcast: number;
+  /**
+   * FCY leg of hedges settling in this cycle (signed, + = received). Only the
+   * delivery side enters `forecasted_cash`, matching the outflows-before-inflows
+   * convention the undated trough encodes.
+   */
+  hedgeSettle: number;
+  /**
+   * Trough this cycle protects against: the dated path's low when a cycle shape
+   * is supplied, otherwise opening_cash + payout + hedge delivery.
+   */
+  forecasted_cash: number;
+  /** opening_cash − forecasted_cash: the cash this cycle drains at its deepest. */
+  drawdown: number;
+  /** H* for this cycle, from the same active layers run on this cycle's numbers. */
+  cash_threshold: number;
+  layered: LayeredBufferResult;
+  /** Near-leg swap required THIS cycle to bring opening_cash to cash_threshold. */
+  swap_needed: number;
+  /**
+   * Funding beyond what cycle 0 already commits (0 for cycle 0 itself) — the
+   * tranche that can be pre-booked today, value-dated at this cycle, instead of
+   * waiting for the shortfall to show up when the cycle arrives. Read off the
+   * near-leg need on the dated path, off threshold growth otherwise.
+   */
+  incremental_swap: number;
+  /**
+   * Swap notional outstanding once this cycle's leg is on: the running sum of
+   * every leg booked so far.
+   *
+   * The near leg's cash stays in the account — the far leg is rolled, not let
+   * run off — so a drain that repeats does NOT settle at one cycle's leg size.
+   * Each cycle adds another leg on top, and the outstanding book grows to the
+   * whole horizon's burn. This is the funding position; `swap_needed` is only
+   * the trade to add this cycle.
+   */
+  standing_swap: number;
+  post_swap_cash: number;
+  /**
+   * Far leg settling at the end of this cycle (≤ 0: the cover is repaid). Term
+   * cover matures with the horizon, so its far leg lands on the last date and
+   * `cycle_end_cash` states the balance after repayment. Rolling legs are rolled
+   * rather than let run off, so this is 0 on every cycle of that convention.
+   */
+  far_leg: number;
+  /** Becomes next cycle's opening_cash. Net of `far_leg` where one settles. */
+  cycle_end_cash: number;
+}
+
+/**
+ * Per-cycle shape of the dated liquidity path, handed in by a caller that owns
+ * the ladder (this module cannot import it without a cycle).
+ *
+ * Both fields are invariant to funding: a near leg landing at the start of the
+ * cycle lifts the whole path, leaving the drain from the cycle's own opening and
+ * the cycle's net change untouched. That is what lets the projection chain a
+ * funded path out of an unfunded one.
+ */
+export interface DatedCycleShape {
+  /** opening − low: the cash the cycle drains at its deepest. */
+  drawdown: number;
+  /** Inflow − outflow across the cycle, counting every dated line. */
+  net: number;
+}
+
+/**
+ * The near leg a cycle gets, given the cycle's own numbers. Rolling booking
+ * answers "whatever this cycle is short"; term booking answers "the whole
+ * horizon's cover, at cycle 0, nothing after".
+ */
+type NearLegPolicy = (
+  k: number,
+  ctx: { opening: number; forecasted_cash: number; cash_threshold: number },
+) => number;
+
+function runLiquidityCycles(
+  row: RowState,
+  shared: SharedGlobals,
+  activeLayers: Set<LayerId>,
+  T: number,
+  forecastProfile: ForecastProfileState | null | undefined,
+  hedgeSettle: readonly number[] | undefined,
+  datedCycles: readonly DatedCycleShape[] | undefined,
+  nearLeg: NearLegPolicy,
+  /** Term booking has nothing left to pre-book: the one leg is already on. */
+  preBookable: boolean,
+  targetShift: number,
+): LiquidityCycleProjection[] {
+  const out: LiquidityCycleProjection[] = [];
+  let opening = row.cash;
+  let cycle0Threshold = 0;
+  let cycle0Swap = 0;
+  let standing = 0;
+
+  for (let k = 0; k < T; k++) {
+    const flow = cycleFlowAt(row, forecastProfile, k);
+    const hedge = hedgeSettle?.[k] ?? 0;
+    const dated = datedCycles?.[k];
+    // With the dated path on, the trough is the low the shape actually reaches —
+    // every line at its own settlement day, not every payout before every payin.
+    const forecasted_cash = dated
+      ? roundMoney(opening - dated.drawdown)
+      : roundMoney(opening + flow.payout + Math.min(0, hedge));
+    const grossPayout = Math.abs(flow.payout);
+
+    const layered = computeLayeredBuffer(
+      grossPayout,
+      forecasted_cash,
+      shared.σ_P,
+      shared.r_USD,
+      row.r_FCY,
+      row.r_OD,
+      row.cash_floor,
+      activeLayers,
+      opening,
+      row.carry_target,
+    );
+    // A budget verdict can take away the carry overlay and the stock hold; the
+    // floor and the forecast-uncertainty cushion are not discretionary, so the
+    // shift never funds a cycle below them.
+    const cash_threshold = targetShift === 0
+      ? layered.cash_threshold
+      : roundMoney(Math.max(
+        layered.cash_threshold + targetShift,
+        layered.floor_contrib + layered.delta_sigma,
+      ));
+
+    const swap_needed = nearLeg(k, { opening, forecasted_cash, cash_threshold });
+    if (k === 0) {
+      cycle0Threshold = cash_threshold;
+      cycle0Swap = swap_needed;
+    }
+    // Growth in the REQUIRED buffer level vs. what cycle 0 already established —
+    // not the raw swap_needed delta, which also moves with cycle 0's one-off
+    // "get from today's actual cash to target" transient (cycle 1+ instead funds
+    // the steady-state "replace what left"), a swing that has nothing to do with
+    // the structural gap actually growing.
+    // On the dated funded path the openings are already chained, so the honest
+    // statement is how much larger this cycle's near leg has to be than the one
+    // booked today — the undated path keeps the threshold-growth reading, which
+    // strips cycle 0's "get from today's cash to target" transient.
+    const incremental_swap = k === 0 || !preBookable
+      ? 0
+      : roundMoney(Math.max(0, dated
+        ? swap_needed - cycle0Swap
+        : cash_threshold - cycle0Threshold));
+
+    const post_swap_cash = roundMoney(opening + swap_needed);
+    // The leg's cash is chained into the next opening, so it is still funded when
+    // the next leg goes on: the book adds up rather than resetting each cycle.
+    standing = roundMoney(standing + swap_needed);
+    // nonLpCash is a static one-time balance swept into LP (see RowState doc), not a
+    // recurring monthly flow — only sweep it in at cycle 0, or it compounds every cycle.
+    const nonLpSweep = k === 0 ? row.nonLpCash : 0;
+    // The dated net already carries NWC, debt, investing and hedge settlement, so
+    // taking it whole keeps the projection's close equal to the ladder's.
+    const cycle_end_cash = roundMoney(
+      dated
+        ? post_swap_cash + dated.net + nonLpSweep
+        : post_swap_cash + flow.payout + flow.collections + flow.invoiceFcast
+          + hedge + nonLpSweep,
+    );
+
+    out.push({
+      cycleIndex: k,
+      opening_cash: opening,
+      payout: flow.payout,
+      collections: flow.collections,
+      invoiceFcast: flow.invoiceFcast,
+      hedgeSettle: hedge,
+      forecasted_cash,
+      drawdown: roundMoney(Math.max(0, opening - forecasted_cash)),
+      cash_threshold,
+      layered,
+      swap_needed,
+      incremental_swap,
+      standing_swap: standing,
+      post_swap_cash,
+      far_leg: 0,
+      cycle_end_cash,
+    });
+
+    opening = cycle_end_cash;
+  }
+
+  return out;
+}
+
+export function projectLiquidityCycles(
+  row: RowState,
+  shared: SharedGlobals,
+  activeLayers: Set<LayerId>,
+  cycles: number,
+  forecastProfile?: ForecastProfileState | null,
+  hedgeSettle?: readonly number[],
+  datedCycles?: readonly DatedCycleShape[],
+  bookingMode: LiquidityBookingMode = 'rolling',
+  /**
+   * Level shift (M FCY) on every cycle's target, floored at cash_floor while the
+   * floor layer is on. The book's layer pass settles the carry requirement and the
+   * portfolio VaR / USD budget across all currencies at once, on one cycle's
+   * numbers; this carries that verdict onto the whole horizon so each period's
+   * starting target is the policy the book reached, not the raw layer sum.
+   */
+  targetShift = 0,
+): LiquidityCycleProjection[] {
+  const T = Math.max(1, Math.floor(cycles));
+  const formulaLayersActive =
+    activeLayers.has('floorH') ||
+    activeLayers.has('sigmaP') ||
+    activeLayers.has('carryOptim') ||
+    activeLayers.has('portfolioDiv');
+
+  const run = (nearLeg: NearLegPolicy, preBookable: boolean) => runLiquidityCycles(
+    row, shared, activeLayers, T, forecastProfile, hedgeSettle, datedCycles,
+    nearLeg, preBookable, targetShift,
+  );
+
+  const rolling = run((_k, ctx) => computeFcySwapNear(
+    ctx.cash_threshold,
+    ctx.opening,
+    row.fcastFX,
+    row.r_OD,
+    shared.r_USD,
+    formulaLayersActive,
+    ctx.forecasted_cash,
+  ), true);
+  // No layer selected is no funding policy: the desk is reading the book as it
+  // stands, so neither convention may book a leg. The term solve answers a
+  // shortfall against H*, which without a layer would still fund the path to
+  // zero — so it has to be gated here, not inside the solve.
+  if (bookingMode === 'rolling' || !formulaLayersActive) return rolling;
+
+  // Term booking: one leg today, big enough that every cycle on the path still
+  // clears its own H*. The rolling pass already prices that — its outstanding
+  // book at cycle k is exactly what cycle k needs funded by then — so its peak
+  // is the opening size. H* moves a little once the cover is on (the layer
+  // formula reads opening cash), so re-solve against any residual shortfall.
+  let leg = rolling.reduce((m, p) => Math.max(m, p.standing_swap), 0);
+  let projection = rolling;
+  for (let pass = 0; pass < 4; pass++) {
+    const booked = leg;
+    projection = run(k => (k === 0 ? booked : 0), false);
+    // `forecasted_cash` is the low BEFORE this cycle's own leg lands, so cycle 0
+    // clears H* on trough + leg. Later cycles open on the chained close, which
+    // already carries the leg's cash, and clear H* on the trough as reported.
+    const shortfall = projection.reduce(
+      (worst, p) => Math.min(
+        worst,
+        p.forecasted_cash + p.swap_needed - p.cash_threshold,
+      ),
+      0,
+    );
+    if (shortfall >= -0.0001) break;
+    leg = roundMoney(leg - shortfall);
+  }
+  return settleFarLegAtMaturity(projection);
+}
+
+/**
+ * Term cover matures with the horizon: the far leg delivers the notional back on
+ * the last date, so the last cycle closes on the balance after repayment rather
+ * than carrying cover that never runs off. The repayment lands at the close, so
+ * it leaves that cycle's trough — and every H* on the path — untouched.
+ */
+function settleFarLegAtMaturity(
+  projection: LiquidityCycleProjection[],
+): LiquidityCycleProjection[] {
+  const last = projection[projection.length - 1];
+  if (!last || Math.abs(last.standing_swap) < 0.001) return projection;
+  const far_leg = roundMoney(-last.standing_swap);
+  return [
+    ...projection.slice(0, -1),
+    { ...last, far_leg, cycle_end_cash: roundMoney(last.cycle_end_cash + far_leg) },
+  ];
+}
+
+/** One forward-dated near-leg tranche to book today for a future cycle's incremental need. */
+export interface ForwardSwapTranche {
+  /** Which future cycle this tranche funds (1 = next cycle, …). */
+  cycleIndex: number;
+  /** Months from today the near leg should be value-dated. */
+  valueDateMonths: number;
+  /** Incremental buffer (M FCY) to fund near, beyond what cycle 0's threshold already covers. */
+  amount_fcy: number;
+}
+
+/** Cycles after the first whose threshold outgrows cycle 0's — the pre-funding schedule. */
+export function forwardSwapSchedule(
+  projection: readonly LiquidityCycleProjection[],
+): ForwardSwapTranche[] {
+  return projection
+    .filter(p => p.cycleIndex > 0 && p.incremental_swap > 0.001)
+    .map(p => ({
+      cycleIndex: p.cycleIndex,
+      valueDateMonths: p.cycleIndex,
+      amount_fcy: p.incremental_swap,
+    }));
+}
+
+/** One line of the funding programme: the trade a cycle adds, and the book it leaves behind. */
+export interface SwapLegScheduleRow {
+  cycleIndex: number;
+  /** Months from today the near leg is value-dated — 0 is spot, the trade in front of us. */
+  valueDateMonths: number;
+  /** Notional this cycle adds: + buys FCY to fund the trough, − sells excess back. */
+  newLeg: number;
+  /** Notional carried in from earlier cycles — rolled at its far date instead of settled. */
+  rolledForward: number;
+  /** Notional outstanding once this cycle's leg is on. */
+  outstanding: number;
+  /**
+   * The size is already known from the projection, so the leg can be traded today
+   * as a forward-starting swap value-dated at this cycle rather than waiting for
+   * the shortfall to arrive. Cycle 0 is spot, so it is a trade, not a pre-booking.
+   */
+  preBookable: boolean;
+}
+
+/**
+ * Every leg the funded path asks for, in order, with what it rolls on top of.
+ *
+ * `forwardSwapSchedule` answers a narrower question — where the requirement
+ * OUTGROWS today's leg — so a drain that repeats at a constant size schedules
+ * nothing even though another leg is due every cycle. This is the whole
+ * programme: what to trade, when it is value-dated, and the book it builds into.
+ */
+export function swapLegSchedule(
+  projection: readonly LiquidityCycleProjection[],
+): SwapLegScheduleRow[] {
+  return projection
+    .filter(p => Math.abs(p.swap_needed) > 0.001)
+    .map(p => ({
+      cycleIndex: p.cycleIndex,
+      valueDateMonths: p.cycleIndex,
+      newLeg: p.swap_needed,
+      rolledForward: roundMoney(p.standing_swap - p.swap_needed),
+      outstanding: p.standing_swap,
+      preBookable: p.cycleIndex > 0,
+    }));
 }

@@ -3,6 +3,7 @@
 import {
   cloneElement,
   isValidElement,
+  useCallback,
   useState,
   useMemo,
   useEffect,
@@ -14,8 +15,17 @@ import { UnifiedSimulator } from '@/components/UnifiedSimulator';
 import { BufferOptimizer } from '@/components/BufferOptimizer';
 import { LayeredBufferAnalysis } from '@/components/LayeredBufferAnalysis';
 import { HedgingDecisionPanel } from '@/components/HedgingDecisionPanel';
+import { LiquiditySwapDecision } from '@/components/LiquiditySwapDecision';
+import {
+  resolveLiquidityTiming,
+  DEFAULT_LIQUIDITY_TIMING,
+  type LiquidityBookingMode,
+  type LiquiditySizingBasis,
+  type LiquidityTiming,
+} from '@/lib/liquidity-ladder';
 import { IRProfilePanel } from '@/components/IRProfilePanel';
-import { computeDashboardModel } from '@/lib/dashboard-model';
+import { computeDashboardModel, type FcyComputedRow } from '@/lib/dashboard-model';
+import { livePlanByCcyFrom } from '@/lib/test-mode/liquidity-strategies';
 import {
   INITIAL_ROWS,
   INITIAL_USD_PARAMS,
@@ -27,13 +37,16 @@ import {
 import {
   DEFAULT_FORECAST_PROFILE,
   type ForecastProfileState,
+  type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
 import {
   applyBookedHedgePositions,
   bookedPositionOffsetsByCcy,
   fxTableRiskMetrics,
   type HedgeTicket,
+  type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
+import { hedgeCashFlowsByMonth, withNonCashFxConversion } from '@/lib/test-mode/cash-carry-analytics';
 import { DEFAULT_VAR_SETUP, type VarSetup } from '@/lib/test-mode/var-setup';
 import type { FxInput } from '@/lib/workspace-store';
 
@@ -76,12 +89,15 @@ interface SimulatorProps {
   currencyFilter?: string[];
   initialRows?: RowState[];
   initialUsdCash?: number;
-  initialUsdNonNpCash?: number;
+  initialUsdNonLpCash?: number;
   initialUsdParams?: Partial<UsdParams>;
   initialActiveLayers?: LayerId[];
   fxInputs?: FxInput[];
   timing?: { fPayout: number; fPayin: number };
   formulas?: Record<string, string>;
+  /** Persisted forecast profile (flows, extras, growth, liquidity path). */
+  forecastProfile?: ForecastProfileState;
+  onForecastProfileChange?: (profile: ForecastProfileState) => void;
   onFormulaChange?: (cellKey: string, formula: string) => void;
   /** Batch formula writes for Excel-like column fill-down. */
   onFormulaChanges?: (updates: Record<string, string>) => void;
@@ -107,6 +123,8 @@ interface SimulatorProps {
   onVarSetupChange?: (setup: VarSetup) => void;
   /** Decision-layer booked spot/forward hedges — drive FX table VaR. */
   bookedHedges?: HedgeTicket[];
+  /** Staged hedge packages — settle in the liquidity path alongside booked legs. */
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
   /** Incremental hedge % on remaining net book (synced with Hedging Decision). */
   hedgeRatios?: Record<string, number>;
   tabLabels?: Partial<Record<SimulatorTab, string>>;
@@ -118,9 +136,13 @@ interface SimulatorProps {
     rows: RowState[];
     forecastProfile: ForecastProfileState;
   }) => void;
+  /**
+   * Liquidity tab book mode for Workbench desks:
+   * - curriculum — carry/liquidity book (hedges stay on FX Risk)
+   * - fullSimulator — full FX Simulator table on the Liquidity tab
+   */
+  liquidityMode?: 'curriculum' | 'fullSimulator';
 }
-
-const ALL_LAYERS: LayerId[] = ['sigmaP', 'carryOptim', 'floorH', 'portfolioDiv'];
 
 export function Simulator({
   accountMenu,
@@ -129,12 +151,14 @@ export function Simulator({
   currencyFilter,
   initialRows,
   initialUsdCash,
-  initialUsdNonNpCash,
+  initialUsdNonLpCash,
   initialUsdParams,
   initialActiveLayers,
   fxInputs,
   timing,
   formulas,
+  forecastProfile: forecastProfileProp,
+  onForecastProfileChange,
   onFormulaChange,
   onFormulaChanges,
   embedded = false,
@@ -148,8 +172,10 @@ export function Simulator({
   varSetup = DEFAULT_VAR_SETUP,
   onVarSetupChange,
   bookedHedges = [],
+  preparedByCcy,
   tabLabels,
   onAnalyticsBookChange,
+  liquidityMode = 'curriculum',
 }: SimulatorProps) {
   // Task Mode simplified book: never expose Sensitivity / Layer Setup / IR Profile.
   // Live Ladder + Analytics + Liquidity + Market data are Task Mode only — hide in the full book unless shown.
@@ -195,23 +221,43 @@ export function Simulator({
     return {
       rows,
       usdCash: initialUsdCash ?? 303.9,
-      usdNonNpCash: initialUsdNonNpCash ?? 154.1,
+      usdNonLpCash: initialUsdNonLpCash ?? 154.1,
       usdParams: { ...INITIAL_USD_PARAMS, ...initialUsdParams } as UsdParams,
     };
   });
   const [rows,      setRows]      = useState<RowState[]>(() => seed.rows.map(r => ({ ...r })));
   const [usdCash,      setUsdCash]      = useState(seed.usdCash);
-  const [usdNonNpCash, setUsdNonNpCash] = useState(seed.usdNonNpCash);
+  const [usdNonLpCash, setUsdNonLpCash] = useState(seed.usdNonLpCash);
   const [usdParams, setUsdParams] = useState<UsdParams>(() => ({ ...seed.usdParams }));
-  const [forecastProfile, setForecastProfile] = useState<ForecastProfileState>(
-    () => ({
+  // Persisted on the dashboard when the host supplies it, local otherwise.
+  const [localForecastProfile, setLocalForecastProfile] =
+    useState<ForecastProfileState>(() => ({
       ...DEFAULT_FORECAST_PROFILE,
       byCcy: {},
       extrasByCcy: {},
       formulas: {},
-    }),
+    }));
+  const forecastProfile = forecastProfileProp ?? localForecastProfile;
+  const setForecastProfile = useCallback(
+    (next: ForecastProfileState) => {
+      if (onForecastProfileChange) onForecastProfileChange(next);
+      else setLocalForecastProfile(next);
+    },
+    [onForecastProfileChange],
   );
   const [forecastProfileOpen, setForecastProfileOpen] = useState(false);
+
+  const liquidityTiming =
+    resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
+  const updateLiquidityTiming = useCallback(
+    (patch: Partial<LiquidityTiming>) => {
+      setForecastProfile({
+        ...forecastProfile,
+        liquidity: { ...liquidityTiming, ...patch },
+      });
+    },
+    [setForecastProfile, forecastProfile, liquidityTiming],
+  );
 
   useEffect(() => {
     onAnalyticsBookChange?.({ rows, forecastProfile });
@@ -220,20 +266,24 @@ export function Simulator({
   const onResetTable = () => {
     setRows(seed.rows.map(r => ({ ...r })));
     setUsdCash(seed.usdCash);
-    setUsdNonNpCash(seed.usdNonNpCash);
+    setUsdNonLpCash(seed.usdNonLpCash);
     setUsdParams({ ...seed.usdParams });
     setForecastProfile({ ...DEFAULT_FORECAST_PROFILE, byCcy: {}, formulas: {} });
   };
 
   const [policyVAR, setPolicyVAR] = useState(5.0);
 
+  // No layer until one is chosen: with no liquidity rule on the desk holds the
+  // book, so a structural gap is priced through carry instead of being funded by
+  // a swap the policy never asked for.
   const [activeLayers, setActiveLayers] = useState<Set<LayerId>>(
-    () => new Set((initialActiveLayers ?? ALL_LAYERS) as LayerId[])
+    () => new Set((initialActiveLayers ?? []) as LayerId[])
   );
   const onLayerToggle = (id: LayerId) =>
     setActiveLayers(prev => {
       const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
 
@@ -257,29 +307,60 @@ export function Simulator({
     [bookedHedges],
   );
 
+  // FCY leg of every hedge, month by month — the same schedule the Cash Carry
+  // forecast settles, so the liquidity book and that view agree on the dates.
+  const hedgeSettleByCcy = useMemo(() => {
+    const months = shared.forecastMonths ?? 1;
+    if (!(months > 0)) return {};
+    const map: Record<string, number[]> = {};
+    for (const r of rows) {
+      const flows = withNonCashFxConversion(
+        r,
+        hedgeCashFlowsByMonth({
+          ccy: r.ccy,
+          forecastMonths: months,
+          bookedHedges,
+          preparedByCcy,
+          setup: varSetup,
+        }),
+        months,
+        forecastProfile,
+      );
+      if (flows.some(f => Math.abs(f) > 1e-9)) map[r.ccy] = flows;
+    }
+    return map;
+  }, [rows, shared.forecastMonths, bookedHedges, preparedByCcy, varSetup, forecastProfile]);
+
   const dashboard = useMemo(
     () => computeDashboardModel({
       rows: displayRows,
       usdCash,
-      usdNonNpCash,
+      usdNonLpCash,
       usdParams,
       shared,
       activeLayers,
       policyVAR,
       timing,
       forecastProfile,
+      hedgeSettleByCcy,
     }),
     [
       displayRows,
       usdCash,
-      usdNonNpCash,
+      usdNonLpCash,
       usdParams,
       shared,
       activeLayers,
       policyVAR,
       timing,
       forecastProfile,
+      hedgeSettleByCcy,
     ],
+  );
+
+  const livePlanByCcy = useMemo(
+    () => livePlanByCcyFrom(dashboard.fcyComputed),
+    [dashboard.fcyComputed],
   );
 
   const riskMetricsByCcy = useMemo(() => {
@@ -365,7 +446,7 @@ export function Simulator({
               shared={shared}           onSharedChange={onSharedChange}
               rows={rows}               setRows={setRows}
               usdCash={usdCash}         setUsdCash={setUsdCash}
-              usdNonNpCash={usdNonNpCash} setUsdNonNpCash={setUsdNonNpCash}
+              usdNonLpCash={usdNonLpCash} setUsdNonLpCash={setUsdNonLpCash}
               usdParams={usdParams}     setUsdParams={setUsdParams}
               onResetTable={onResetTable}
               activeLayers={activeLayers}
@@ -385,11 +466,13 @@ export function Simulator({
               showRiskMetrics={showRiskMetrics}
               riskMetricsByCcy={riskMetricsByCcy}
               bookedPositionByCcy={bookedPositionByCcy}
+              hedgeSettleByCcy={hedgeSettleByCcy}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
               forecastProfile={forecastProfile}
               onForecastProfileChange={setForecastProfile}
-              forecastProfileOpen={forecastProfileOpen}
+              // Both tabs stay mounted — only the active one owns the modal.
+              forecastProfileOpen={forecastProfileOpen && activeTab === 'simulator'}
               onForecastProfileOpenChange={setForecastProfileOpen}
               simDark={embedded}
               formulas={formulas}
@@ -413,7 +496,7 @@ export function Simulator({
               policyVAR={policyVAR}       onPolicyVARChange={setPolicyVAR}
               usdCash={usdCash}           onUsdCashChange={setUsdCash}
               usdPayout={usdParams.payout} onUsdPayoutChange={v => setUsdParams(p => ({ ...p, payout: v }))}
-              usdNonNpCash={usdNonNpCash}
+              usdNonLpCash={usdNonLpCash}
             />
           </div>
         )}
@@ -427,12 +510,19 @@ export function Simulator({
           </div>
         )}
         {!effectiveHiddenTabs.includes('hedging') && (
-          <div className={activeTab === 'hedging' ? '' : 'hidden'}>
+          <div className={activeTab === 'hedging' ? 'space-y-4' : 'hidden'}>
             {hedgingPanel && isValidElement(hedgingPanel)
               ? cloneElement(
                   hedgingPanel as ReactElement<{
                     bookRows?: RowState[];
                     forecastProfile?: ForecastProfileState;
+                    fcyComputed?: FcyComputedRow[];
+                    r_USD?: number;
+                    sizingBasis?: LiquiditySizingBasis;
+                    bookingMode?: LiquidityBookingMode;
+                    forecastMonths?: number;
+                    onSizingBasisChange?: (v: LiquiditySizingBasis) => void;
+                    onBookingModeChange?: (v: LiquidityBookingMode) => void;
                   }>,
                   {
                     // Same live-injection pattern as Analytics/Liquidity tabs
@@ -442,9 +532,34 @@ export function Simulator({
                     // which read Simulator's `rows` state directly.
                     bookRows: rows,
                     forecastProfile,
+                    fcyComputed: dashboard.fcyComputed,
+                    r_USD: shared.r_USD,
+                    sizingBasis: liquidityTiming.sizingBasis ?? 'horizon',
+                    bookingMode: liquidityTiming.bookingMode ?? 'rolling',
+                    forecastMonths: shared.forecastMonths ?? 1,
+                    onSizingBasisChange: v => updateLiquidityTiming({ sizingBasis: v }),
+                    onBookingModeChange: v => updateLiquidityTiming({ bookingMode: v }),
                   },
                 )
-              : (hedgingPanel ?? <HedgingDecisionPanel r_USD={shared.r_USD} />)}
+              : (
+                <>
+                  {/*
+                    Funding decision first: the FX swap layer carries Δdelta = 0,
+                    so it is settled before the outright hedge. When a decision
+                    panel is injected it owns this table itself.
+                  */}
+                  <LiquiditySwapDecision
+                    rows={dashboard.fcyComputed}
+                    r_USD={shared.r_USD}
+                    sizingBasis={liquidityTiming.sizingBasis ?? 'horizon'}
+                    bookingMode={liquidityTiming.bookingMode ?? 'rolling'}
+                    forecastMonths={shared.forecastMonths ?? 1}
+                    onSizingBasisChange={v => updateLiquidityTiming({ sizingBasis: v })}
+                    onBookingModeChange={v => updateLiquidityTiming({ bookingMode: v })}
+                  />
+                  {hedgingPanel ?? <HedgingDecisionPanel r_USD={shared.r_USD} />}
+                </>
+              )}
           </div>
         )}
         {!effectiveHiddenTabs.includes('liveLadder') && (
@@ -484,12 +599,18 @@ export function Simulator({
                       profile: ForecastProfileState,
                     ) => void;
                     onOpenForecastProfile?: () => void;
+                    activeLayers?: Set<LayerId>;
+                    livePlanByCcy?: Readonly<
+                      Record<string, readonly LiquidityCycleProjection[]>
+                    >;
                   }>,
                   {
                     bookRows: rows,
                     forecastProfile,
                     onForecastProfileChange: setForecastProfile,
                     onOpenForecastProfile: () => setForecastProfileOpen(true),
+                    activeLayers,
+                    livePlanByCcy,
                   },
                 )
               : (analyticsPanel ?? (
@@ -505,16 +626,14 @@ export function Simulator({
         {!effectiveHiddenTabs.includes('liquidity') && (
           <div className={activeTab === 'liquidity' ? '' : 'hidden'}>
             {/*
-              Liquidity gap forecast and its management: Liquidity Book + Carry/Buffer (H*) +
-              Swap restructuring + Cash/Swap Carry, on the same live book as the FX Risk tab.
-              FX-hedge-specific content (Fwd/Option hedge, Hedge Carry, Portfolio VAR, hedging
-              strategy) is excluded — that lives in the FX Risk tab.
+              curriculum — Liquidity/carry book (hedges stay on FX Risk).
+              fullSimulator — former Workbench FX Simulator table (full book).
             */}
             <UnifiedSimulator
               shared={shared}           onSharedChange={onSharedChange}
               rows={rows}               setRows={setRows}
               usdCash={usdCash}         setUsdCash={setUsdCash}
-              usdNonNpCash={usdNonNpCash} setUsdNonNpCash={setUsdNonNpCash}
+              usdNonLpCash={usdNonLpCash} setUsdNonLpCash={setUsdNonLpCash}
               usdParams={usdParams}     setUsdParams={setUsdParams}
               onResetTable={onResetTable}
               activeLayers={activeLayers}
@@ -525,16 +644,34 @@ export function Simulator({
               fcyComputed={dashboard.fcyComputed}
               usdComputed={dashboard.usdComputed}
               showRates
-              showFxPosition
+              showFxPosition={liquidityMode === 'fullSimulator'}
               showLiquidity
+              showBonds={
+                liquidityMode === 'fullSimulator'
+                  && !!fxInputs
+                  && fxInputs.includes('bonds')
+              }
+              showInvestments={
+                liquidityMode === 'fullSimulator'
+                  && !!fxInputs
+                  && fxInputs.includes('investments')
+              }
+              showLiabilities={
+                liquidityMode === 'fullSimulator'
+                  && !!fxInputs
+                  && fxInputs.includes('liabilities')
+              }
               showAdvancedBook
-              hideFxHedge
-              pnlColumns="carryOnly"
+              hideFxHedge={liquidityMode !== 'fullSimulator'}
+              lockValues={liquidityMode !== 'fullSimulator'}
+              pnlColumns={liquidityMode === 'fullSimulator' ? undefined : 'carryOnly'}
+              bookedPositionByCcy={bookedPositionByCcy}
+              hedgeSettleByCcy={hedgeSettleByCcy}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
               forecastProfile={forecastProfile}
               onForecastProfileChange={setForecastProfile}
-              forecastProfileOpen={forecastProfileOpen}
+              forecastProfileOpen={forecastProfileOpen && activeTab === 'liquidity'}
               onForecastProfileOpenChange={setForecastProfileOpen}
               simDark={embedded}
               formulas={formulas}

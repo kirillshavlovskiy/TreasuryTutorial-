@@ -15,7 +15,7 @@ function baseInput(payoutByCcy: Record<string, number> = {}) {
   return {
     rows: INITIAL_ROWS.map(r => payoutByCcy[r.ccy] !== undefined ? { ...r, payout: payoutByCcy[r.ccy]! } : r),
     usdCash: 303.9,
-    usdNonNpCash: 154.1,
+    usdNonLpCash: 154.1,
     usdParams: INITIAL_USD_PARAMS,
     shared: SHARED,
     activeLayers: ACTIVE,
@@ -23,7 +23,7 @@ function baseInput(payoutByCcy: Record<string, number> = {}) {
   };
 }
 
-function openingNpUsd(m: ReturnType<typeof computeDashboardModel>) {
+function openingLpUsd(m: ReturnType<typeof computeDashboardModel>) {
   return m.fcyComputed.reduce((s, r) => s + fcyToUsdM(r.cash, r.ccy), 0) + m.usdComputed.cash;
 }
 
@@ -39,13 +39,13 @@ describe('FX simulator unified invariants', () => {
     expect(fcy + model.usdComputed.swapNear).toBeCloseTo(0, 0);
   });
 
-  it('2. Target = NP+Swap = opening NP + swap', () => {
+  it('2. Target = LP+Swap = opening LP + swap', () => {
     for (const r of model.fcyComputed) {
       expect(r.cash_threshold).toBeCloseTo(r.cash + r.swapNear, 4);
       expect(r.cashThresholdUSD).toBeCloseTo(fcyToUsdM(r.cash_threshold, r.ccy), 4);
       expect(r.postSwapCash).toBeCloseTo(r.cash + r.swapNear, 4);
       expect(r.postSwapUSD).toBeCloseTo(fcyToUsdM(r.postSwapCash, r.ccy), 4);
-      // Target and NP+Swap are the same funded position (swap sized to hit the target)
+      // Target and LP+Swap are the same funded position (swap sized to hit the target)
       expect(r.cash_threshold).toBeCloseTo(r.postSwapCash, 4);
     }
     const u = model.usdComputed;
@@ -53,35 +53,35 @@ describe('FX simulator unified invariants', () => {
     expect(u.postSwapCash).toBeCloseTo(u.cash + u.swapNear, 4);
   });
 
-  it('3. TOTAL Target $USD = Σ opening NP $USD (swap zero-sum)', () => {
-    expect(postSwapUsdTotal(model)).toBeCloseTo(openingNpUsd(model), 1);
+  it('3. TOTAL Target $USD = Σ opening LP $USD (swap zero-sum)', () => {
+    expect(postSwapUsdTotal(model)).toBeCloseTo(openingLpUsd(model), 1);
   });
 
   it('4. Post-payout cushion = pre-swap cushion H* when no clamp binds', () => {
     for (const r of model.fcyComputed) {
       if (r.debit_floor_binding || r.usd_stress_trim || r.funding_binding) continue;
-      expect(r.np_after_swap_trough).toBeCloseTo(r.cash_threshold_pre_swap, 1);
+      expect(r.lp_after_swap_trough).toBeCloseTo(r.cash_threshold_pre_swap, 1);
     }
   });
 
-  it('5. Cycle End = NP+Swap − payout + payins + fcast + Non-NP sweep', () => {
+  it('5. Cycle End = LP+Swap − payout + payins + fcast + Non-LP sweep', () => {
     for (const r of model.fcyComputed) {
       expect(r.cycleEndCash).toBeCloseTo(
-        r.postSwapCash + r.payout + r.collections + r.fcastFX + r.nonNpCash, 4);
+        r.postSwapCash + r.payout + r.collections + r.fcastFX + r.nonLpCash, 4);
     }
     const u = model.usdComputed;
     expect(u.cycleEndCash).toBeCloseTo(
-      u.postSwapCash + u.payout + u.collections + u.fcastFX + u.nonNpCash, 4);
+      u.postSwapCash + u.payout + u.collections + u.fcastFX + u.nonLpCash, 4);
   });
 
-  it('6. Payout response: Target = NP+Swap rises to fund the payout gap + σ', () => {
+  it('6. Payout response: Target = LP+Swap rises to fund the payout gap + σ', () => {
     const cad0 = model.fcyComputed.find(r => r.ccy === 'CAD')!;
     const m100 = computeDashboardModel(baseInput({ CAD: -100 }));
     const cad100 = m100.fcyComputed.find(r => r.ccy === 'CAD')!;
     const dTarget = cad100.cash_threshold - cad0.cash_threshold;
-    const dNpSwap = cad100.postSwapCash - cad0.postSwapCash;
-    // Target = NP+Swap by construction, so they move together
-    expect(dTarget).toBeCloseTo(dNpSwap, 4);
+    const dLpSwap = cad100.postSwapCash - cad0.postSwapCash;
+    // Target = LP+Swap by construction, so they move together
+    expect(dTarget).toBeCloseTo(dLpSwap, 4);
     // Hold-the-book: own cash (95.1) funds the payout first; the swap buys the
     // trough gap (100 − 95.1) plus the σ cushion — target rises by gap + σ.
     expect(dTarget).toBeGreaterThan(0);
@@ -99,7 +99,7 @@ describe('FX simulator unified invariants', () => {
     expect(cad0.cash_threshold).toBeLessThan(cad0.cash);
   });
 
-  it('7b. PAY CAD −150M: Target = NP+Swap rises with payout; swap buys the gap', () => {
+  it('7b. PAY CAD −150M: Target = LP+Swap rises with payout; swap buys the gap', () => {
     const cad0 = model.fcyComputed.find(r => r.ccy === 'CAD')!;
     const m150 = computeDashboardModel(baseInput({ CAD: -150 }));
     const cad = m150.fcyComputed.find(r => r.ccy === 'CAD')!;
@@ -135,7 +135,7 @@ describe('Min floor is a hard lower bound (floorH enabled)', () => {
   function assertFloorHeld(m: ReturnType<typeof computeDashboardModel>) {
     for (const r of m.fcyComputed) {
       expect(r.cash_threshold_pre_swap, `${r.ccy} target cushion`).toBeGreaterThanOrEqual(FLOOR - 1e-6);
-      expect(r.np_after_swap_trough!, `${r.ccy} trough after swap`).toBeGreaterThanOrEqual(FLOOR - 1e-6);
+      expect(r.lp_after_swap_trough!, `${r.ccy} trough after swap`).toBeGreaterThanOrEqual(FLOOR - 1e-6);
     }
   }
 
@@ -152,7 +152,7 @@ describe('Min floor is a hard lower bound (floorH enabled)', () => {
   });
 
   it('holds under USD liquidity stress', () => {
-    assertFloorHeld(computeDashboardModel(flooredInput({ usdCash: 5, usdNonNpCash: 0 }, { EUR: -500, GBP: -300 })));
+    assertFloorHeld(computeDashboardModel(flooredInput({ usdCash: 5, usdNonLpCash: 0 }, { EUR: -500, GBP: -300 })));
   });
 
   it('holds with carry layer selling PAY rows (no portfolio layer)', () => {

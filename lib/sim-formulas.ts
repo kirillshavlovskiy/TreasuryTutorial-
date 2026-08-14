@@ -12,8 +12,8 @@ export type SimSection = 'liquidity' | 'carry' | 'swap' | 'hedge';
 
 export type SimFieldKey =
   | 'troughCash' | 'cycleNetFlow' | 'totalCash' | 'totalCashUSD'
-  | 'targetNpCash' | 'targetNpCashUSD'
-  | 'swapNear' | 'swapUSD' | 'npSwap' | 'npSwapUSD' | 'cycleEnd' | 'cycleEndUSD'
+  | 'targetLpCash' | 'targetLpCashUSD'
+  | 'swapNear' | 'swapUSD' | 'lpSwap' | 'lpSwapUSD' | 'cycleEnd' | 'cycleEndUSD'
   | 'fwdHedgeUSD' | 'optionHedgeUSD';
 
 export interface SimFieldDef {
@@ -30,17 +30,22 @@ export interface SimFieldDef {
 
 // Resolution order == dependency order (a field may reference earlier ones).
 export const SIM_FIELDS: SimFieldDef[] = [
-  { key: 'troughCash',    label: 'Trough Cash',        section: 'liquidity', defaultFormula: 'cash + payout' },
-  { key: 'totalCash',     label: 'Total Cash',         section: 'liquidity', defaultFormula: 'cash + nonNpCash' },
-  { key: 'cycleNetFlow',  label: 'Cycle Net Flow',     section: 'liquidity', defaultFormula: 'totalCash + payout + collections' },
-  { key: 'totalCashUSD',  label: 'Total Cash $USD',    section: 'liquidity', defaultFormula: 'totalCash * spotRate' },
+  // modelTrough is cash + payout unless forecast liquidity timing is on, in
+  // which case it is the dated path low including FX settlement, no funding swap.
+  { key: 'troughCash',    label: 'Trough Cash',        section: 'liquidity', defaultFormula: 'modelTrough' },
+  // modelCycleNet is totalCash + payout + collections unless liquidity timing
+  // is on, where it is the cycle-1 closing across every forecast cash line.
+  { key: 'totalCash',     label: 'Closing Balance',    section: 'liquidity', defaultFormula: 'modelCycleNet' },
+  // A flow, not a balance: what lands and leaves inside the cycle.
+  { key: 'cycleNetFlow',  label: 'Cycle Net Flow',     section: 'liquidity', defaultFormula: 'modelCycleFlow' },
+  { key: 'totalCashUSD',  label: 'Closing Balance $USD', section: 'liquidity', defaultFormula: 'totalCash * spotRate' },
   { key: 'swapNear',      label: 'Swap Near',          section: 'swap',      defaultFormula: '' },
-  { key: 'targetNpCash',  label: 'Target NP Cash',     section: 'carry',     defaultFormula: 'cash + swapNear' },
-  { key: 'targetNpCashUSD', label: 'Target NP Cash $USD', section: 'carry',  defaultFormula: 'targetNpCash * spotRate' },
+  { key: 'targetLpCash',  label: 'Target LP Cash',     section: 'carry',     defaultFormula: 'cash + swapNear' },
+  { key: 'targetLpCashUSD', label: 'Target LP Cash $USD', section: 'carry',  defaultFormula: 'targetLpCash * spotRate' },
   { key: 'swapUSD',       label: 'Swap $USD',          section: 'swap',      defaultFormula: 'swapNear * spotRate' },
-  { key: 'npSwap',        label: 'NP+Swap',            section: 'swap',      defaultFormula: 'cash + swapNear' },
-  { key: 'npSwapUSD',     label: 'NP+Swap $USD',       section: 'swap',      defaultFormula: 'npSwap * spotRate' },
-  { key: 'cycleEnd',      label: 'Cycle End',          section: 'swap',      defaultFormula: 'npSwap + payout + collections + fcastFX + nonNpCash' },
+  { key: 'lpSwap',        label: 'LP+Swap',            section: 'swap',      defaultFormula: 'cash + swapNear' },
+  { key: 'lpSwapUSD',     label: 'LP+Swap $USD',       section: 'swap',      defaultFormula: 'lpSwap * spotRate' },
+  { key: 'cycleEnd',      label: 'Cycle End',          section: 'swap',      defaultFormula: 'modelCycleEnd' },
   { key: 'cycleEndUSD',   label: 'Cycle End $USD',     section: 'swap',      defaultFormula: 'cycleEnd * spotRate' },
   { key: 'fwdHedgeUSD',   label: 'Fwd Hedge $USD',     section: 'hedge',     defaultFormula: 'fwdNotional * spotRate' },
   { key: 'optionHedgeUSD', label: 'Option Hedge $USD', section: 'hedge',     defaultFormula: 'optNotional * optDelta * spotRate' },
@@ -49,12 +54,79 @@ export const SIM_FIELDS: SimFieldDef[] = [
 export const SIM_FIELD_BY_KEY: Record<SimFieldKey, SimFieldDef> =
   Object.fromEntries(SIM_FIELDS.map(f => [f.key, f])) as Record<SimFieldKey, SimFieldDef>;
 
+/**
+ * Names that changed when Notional Pool was renamed Liquidity Pool.
+ *
+ * Both halves of a saved override are affected: the storage key carries a
+ * field name (`${ccy}::npSwap`), and the expression the user typed may cite
+ * any of these as a reference (`npSwap * spotRate`). Migrating only the key
+ * would leave formulas that reference a name the evaluator no longer binds.
+ */
+export const RENAMED_SIM_REFS: Readonly<Record<string, string>> = {
+  npSwap: 'lpSwap',
+  npSwapUSD: 'lpSwapUSD',
+  targetNpCash: 'targetLpCash',
+  targetNpCashUSD: 'targetLpCashUSD',
+  nonNpCash: 'nonLpCash',
+};
+
+// Longest first: ordered alternation, so npSwapUSD is matched before npSwap.
+const RENAMED_REF_RE = new RegExp(
+  `\\b(${Object.keys(RENAMED_SIM_REFS)
+    .sort((a, b) => b.length - a.length)
+    .join('|')})\\b`,
+  'g',
+);
+
+/** Rewrite old reference names inside a user-authored formula expression. */
+export function migrateFormulaExpression(expr: string): string {
+  return expr.replace(RENAMED_REF_RE, m => RENAMED_SIM_REFS[m] ?? m);
+}
+
+/**
+ * Rewrite the field-name segment of an override key. Keys are
+ * `${ccy}::${fieldKey}` for simulator cells and `${ccy}::${field}::${monthIdx}`
+ * for forecast cells; only the segment at index 1 is a field name, so a
+ * currency or month that happens to collide with a renamed field is untouched.
+ */
+export function migrateFormulaKey(key: string): string {
+  const parts = key.split('::');
+  if (parts.length < 2) return key;
+  const renamed = RENAMED_SIM_REFS[parts[1]];
+  if (!renamed) return key;
+  parts[1] = renamed;
+  return parts.join('::');
+}
+
+/**
+ * Migrate a saved override map. Returns the same object when nothing changed
+ * so callers can skip writing back an identical workspace.
+ *
+ * A pre-existing entry under the new name wins: if a dashboard somehow holds
+ * both, the migrated one must not silently overwrite what the user last
+ * edited under the current name.
+ */
+export function migrateFormulaOverrides(
+  formulas: Record<string, string>,
+): Record<string, string> {
+  let changed = false;
+  const out: Record<string, string> = {};
+  for (const [key, expr] of Object.entries(formulas)) {
+    const nextKey = migrateFormulaKey(key);
+    const nextExpr = migrateFormulaExpression(expr);
+    if (nextKey !== key || nextExpr !== expr) changed = true;
+    if (nextKey !== key && Object.hasOwn(formulas, nextKey)) continue;
+    out[nextKey] = nextExpr;
+  }
+  return changed ? out : formulas;
+}
+
 /** Named references a user may use in a formula (row inputs + computed values). */
 export const AVAILABLE_REFS: { name: string; desc: string }[] = [
-  { name: 'cash',           desc: 'Opening NP cash (M FCY)' },
+  { name: 'cash',           desc: 'Opening LP cash (M FCY)' },
   { name: 'payout',         desc: 'Gross payouts (M FCY, negative = outflow)' },
   { name: 'collections',    desc: 'Gross payins (M FCY)' },
-  { name: 'nonNpCash',      desc: 'Non-NP cash (M FCY)' },
+  { name: 'nonLpCash',      desc: 'Non-LP cash (M FCY)' },
   { name: 'fcastFX',        desc: 'Forecast invoice FX (M FCY)' },
   { name: 'spot',           desc: 'TMS FX spot exposure (M FCY)' },
   { name: 'fwd',            desc: 'Outstanding fwd settlement (M USD)' },
@@ -69,11 +141,15 @@ export const AVAILABLE_REFS: { name: string; desc: string }[] = [
   { name: 'fwdNotional',    desc: 'Model forward notional (M FCY)' },
   { name: 'optNotional',    desc: 'Model option notional (M FCY)' },
   { name: 'optDelta',       desc: 'Option delta' },
+  { name: 'modelTrough',    desc: 'Model trough cash — dated path low including FX settlement, no funding swap (M FCY)' },
+  { name: 'modelCycleNet',  desc: 'Model closing balance — cycle-1 close across all forecast lines, before the swap (M FCY)' },
+  { name: 'modelCycleEnd',  desc: 'Model cycle-end cash — last close on the dated path after hedge settlement and the term far-leg repayment (M FCY)' },
+  { name: 'modelCycleFlow', desc: 'Model cycle net flow — payins − payouts inside one cycle (M FCY)' },
   { name: 'troughCash',     desc: 'Trough cash (resolved)' },
-  { name: 'totalCash',      desc: 'Total cash (resolved)' },
+  { name: 'totalCash',      desc: 'Closing balance (resolved)' },
   { name: 'swapNear',       desc: 'Swap near leg (resolved)' },
-  { name: 'targetNpCash',   desc: 'Target NP cash (resolved)' },
-  { name: 'npSwap',         desc: 'NP + swap (resolved)' },
+  { name: 'targetLpCash',   desc: 'Target LP cash (resolved)' },
+  { name: 'lpSwap',         desc: 'LP + swap (resolved)' },
   { name: 'cycleEnd',       desc: 'Cycle end cash (resolved)' },
 ];
 

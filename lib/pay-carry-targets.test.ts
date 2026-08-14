@@ -3,14 +3,14 @@ import { INITIAL_ROWS, INITIAL_USD_PARAMS, isPayCarry } from './fx-buffer';
 import { computeDashboardModel } from './dashboard-model';
 
 describe('PAY carry zero-payout targets', () => {
-  it('allowsNegativeNp PAY rows have negative H* pre (no +σ on stock)', () => {
+  it('allowsNegativeLp PAY rows have negative H* pre (no +σ on stock)', () => {
     const shared = { r_USD: 3.50, σ_P: 0.10, days: 3 };
     // Loose VAR budget + ample USD so the carry overlay is active (not VAR-trimmed):
     // PAY cheap-OD rows are sold below zero to earn the USD carry.
     const model = computeDashboardModel({
       rows: INITIAL_ROWS,
       usdCash: 900,
-      usdNonNpCash: 154.1,
+      usdNonLpCash: 154.1,
       usdParams: INITIAL_USD_PARAMS,
       shared,
       activeLayers: new Set(['sigmaP', 'carryOptim', 'floorH', 'portfolioDiv'] as const),

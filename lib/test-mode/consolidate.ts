@@ -13,7 +13,7 @@ import type { Entity } from '@/lib/workspace-store';
 export interface ConsolidatedBook {
   rows: RowState[];
   usdCash: number;
-  usdNonNpCash: number;
+  usdNonLpCash: number;
   usdParams: UsdParams;
   /** Entity contribution labels for tooltips. */
   sourcesByCcy: Record<string, string[]>;
@@ -45,13 +45,13 @@ function mergeRows(rows: RowState[]): RowState {
     out.cash += r.cash;
     out.payout += r.payout;
     out.collections += r.collections;
-    out.nonNpCash += r.nonNpCash;
+    out.nonLpCash += r.nonLpCash;
     out.fcastFX += r.fcastFX;
     out.ir_asset_notional += r.ir_asset_notional;
     out.ir_liab_notional += r.ir_liab_notional;
     out.ir_invest_notional = (out.ir_invest_notional ?? 0) + (r.ir_invest_notional ?? 0);
   }
-  // Rates: keep first entity's NP rates (notional-weighted average not needed for Task 01).
+  // Rates: keep first entity's LP rates (notional-weighted average not needed for Task 01).
   return out;
 }
 
@@ -63,14 +63,14 @@ export function consolidateEntityBooks(entities: Entity[]): ConsolidatedBook {
   const byCcy = new Map<string, RowState[]>();
   const sourcesByCcy: Record<string, string[]> = {};
   let usdCash = 0;
-  let usdNonNpCash = 0;
+  let usdNonLpCash = 0;
   let usdPayout = 0;
   let usdCollections = 0;
 
   for (const e of entities) {
     const seed = simSeedForEntity(e);
     usdCash += seed.usdCash;
-    usdNonNpCash += seed.usdNonNpCash;
+    usdNonLpCash += seed.usdNonLpCash;
     usdPayout += seed.usdParams.payout;
     usdCollections += seed.usdParams.collections;
     const label = e.name;
@@ -89,7 +89,7 @@ export function consolidateEntityBooks(entities: Entity[]): ConsolidatedBook {
   return {
     rows,
     usdCash,
-    usdNonNpCash,
+    usdNonLpCash,
     usdParams: {
       ...INITIAL_USD_PARAMS,
       payout: usdPayout,
@@ -101,7 +101,7 @@ export function consolidateEntityBooks(entities: Entity[]): ConsolidatedBook {
 
 /**
  * Risk layer for the consolidated dashboard: stock / 3m-avg exposure and
- * 1M 95% VaR per currency (curriculum VaR, not NP overlay portfolio VAR).
+ * 1M 95% VaR per currency (curriculum VaR, not LP overlay portfolio VAR).
  */
 export function computeConsolidatedRisk(
   entities: Entity[],
