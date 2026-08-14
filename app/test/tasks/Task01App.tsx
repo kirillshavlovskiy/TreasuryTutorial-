@@ -54,6 +54,7 @@ import {
   serializeRateVolOverride,
   serializeVolOverride,
   simSeedForEntity,
+  mergedEntityForecastProfile,
   setupLabel,
   VAR_PROFILE_OPTIONS,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
@@ -1129,6 +1130,10 @@ function GroupConsolidatedView({
   >;
 }) {
   const book = useMemo(() => consolidateEntityBooks(entities), [entities]);
+  const groupForecast = useMemo(
+    () => mergedEntityForecastProfile(entities),
+    [entities],
+  );
   const risk = useMemo(
     () => computeConsolidatedRisk(entities, varSetup),
     [entities, varSetup],
@@ -1303,6 +1308,7 @@ function GroupConsolidatedView({
           initialUsdParams={book.usdParams}
           initialActiveLayers={[]}
           fxInputs={[...TASK01_REQUIRED_FX_INPUTS]}
+          forecastProfile={groupForecast}
           hiddenTabs={hiddenTabsForLayers(decision, analytical)}
           tabLabels={TASK01_TAB_LABELS}
           onAnalyticsBookChange={setAnalyticsBook}
@@ -1957,7 +1963,13 @@ function DashboardView({
   const [analyticsBook, setAnalyticsBook] = useState<{
     rows: RowState[];
     forecastProfile: ForecastProfileState;
-  }>({ rows: [], forecastProfile: DEFAULT_FORECAST_PROFILE });
+  }>({
+    rows: [],
+    forecastProfile:
+      dashboard.forecastProfile ??
+      seed.forecastProfile ??
+      DEFAULT_FORECAST_PROFILE,
+  });
   /** Shared Analytics ↔ Decision: bullet vs rolling strip. */
   const [hedgeStructure, setHedgeStructure] =
     useState<ForecastHedgeStructure>('bullet');
@@ -2186,7 +2198,11 @@ function DashboardView({
                     formulas={dashboard.formulas}
                     onFormulaChange={onFormulaChange}
                     onFormulaChanges={onFormulaChanges}
-                    forecastProfile={dashboard.forecastProfile}
+                    forecastProfile={
+                      dashboard.forecastProfile ??
+                      seed.forecastProfile ??
+                      DEFAULT_FORECAST_PROFILE
+                    }
                     onForecastProfileChange={onForecastProfileChange}
                     hiddenTabs={hiddenTabsForLayers(
                       // Match Group FX: missing layers → Task 01 required defaults

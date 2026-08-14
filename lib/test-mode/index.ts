@@ -174,6 +174,16 @@ export {
   type FundingGapResult,
 } from '@/lib/test-mode/cfar-residual';
 export {
+  fxHedgeNetCfarByCcyUsdM,
+  sumNetCfarUsdM,
+} from '@/lib/test-mode/cfar-net-by-ccy';
+export {
+  fundingSwapOutstandingByMonth,
+  fundingSwapKnotsFromOutstanding,
+  fundingSwapBridgeBands,
+  applyFundingSwapBridge,
+} from '@/lib/test-mode/cfar-funding-swap';
+export {
   ensureTask01FxLayers,
   entityHasLocalPositions,
   localReadinessByEntity,
@@ -301,6 +311,7 @@ export {
 } from '@/lib/test-mode/hedge-var';
 export {
   classifyNordtechEntity,
+  mergedEntityForecastProfile,
   simSeedForEntity,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,

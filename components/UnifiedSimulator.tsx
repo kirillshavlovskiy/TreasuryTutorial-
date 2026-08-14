@@ -320,7 +320,7 @@ const BUFFER_LAYER_CHIPS: {
   id: LayerId;
   label: string;
   band: string;
-  hue: 'amber' | 'emerald' | 'violet';
+  hue: 'amber' | 'emerald' | 'violet' | 'sky';
   hint: string;
   /** Gear tooltip — what the layer's own settings dialog controls. */
   settingsLabel: string;
@@ -331,6 +331,9 @@ const BUFFER_LAYER_CHIPS: {
   { id: 'sigmaP', label: 'Payout σ buffer', band: '→ BUFFER', hue: 'amber',
     hint: 'Safety margin on uncovered payout deficit (prefunded payout → σ = 0)',
     settingsLabel: 'Forecast uncertainty σ — default and per-currency payout overrides' },
+  { id: 'cfarCover', label: 'CFaR cover', band: '→ BUFFER · SWAP', hue: 'sky',
+    hint: 'Fund a liquidity swap from FX-only Net CFaR. Displayed CFaR then includes this swap\'s rate-diff bridge.',
+    settingsLabel: 'Net CFaR cover — FX-hedge cash-at-risk per currency, converted to FCY' },
   { id: 'carryOptim', label: 'Carry target', band: '→ BUFFER · SWAP', hue: 'emerald',
     hint: 'Rate-driven buffer shift (PAY sell / EARN buy)',
     settingsLabel: 'Carry target inputs — overdraft rate r_OD and Δr per currency' },
@@ -339,35 +342,43 @@ const BUFFER_LAYER_CHIPS: {
     settingsLabel: 'Portfolio VAR — notional sensitivity limit' },
 ];
 
-const CHIP_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+type LayerChipHue = 'amber' | 'emerald' | 'violet' | 'sky';
+
+const CHIP_ON: Record<LayerChipHue, string> = {
   amber: 'border-amber-200 bg-amber-50',
   emerald: 'border-emerald-200 bg-emerald-50',
   violet: 'border-violet-200 bg-violet-50',
+  sky: 'border-sky-200 bg-sky-50',
 };
-const CHIP_BOX_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+const CHIP_BOX_ON: Record<LayerChipHue, string> = {
   amber: 'border-amber-500 bg-amber-500',
   emerald: 'border-emerald-500 bg-emerald-500',
   violet: 'border-violet-500 bg-violet-500',
+  sky: 'border-sky-500 bg-sky-500',
 };
-const CHIP_TAG_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+const CHIP_TAG_ON: Record<LayerChipHue, string> = {
   amber: 'border-amber-200 text-amber-700',
   emerald: 'border-emerald-200 text-emerald-700',
   violet: 'border-violet-200 text-violet-700',
+  sky: 'border-sky-200 text-sky-700',
 };
-const CHIP_GEAR_ON: Record<'amber' | 'emerald' | 'violet', string> = {
+const CHIP_GEAR_ON: Record<LayerChipHue, string> = {
   amber: 'bg-amber-100 text-amber-700',
   emerald: 'bg-emerald-100 text-emerald-700',
   violet: 'bg-violet-100 text-violet-700',
+  sky: 'bg-sky-100 text-sky-700',
 };
-const MODAL_HEAD_BG: Record<'amber' | 'emerald' | 'violet', string> = {
+const MODAL_HEAD_BG: Record<LayerChipHue, string> = {
   amber: 'bg-amber-50',
   emerald: 'bg-emerald-50',
   violet: 'bg-violet-50',
+  sky: 'bg-sky-50',
 };
-const MODAL_TITLE_FG: Record<'amber' | 'emerald' | 'violet', string> = {
+const MODAL_TITLE_FG: Record<LayerChipHue, string> = {
   amber: 'text-amber-700',
   emerald: 'text-emerald-700',
   violet: 'text-violet-700',
+  sky: 'text-sky-700',
 };
 
 /** Settings dialog for one buffer layer, opened from that layer's gear. */
@@ -382,7 +393,7 @@ function LayerModal({
   onClose,
   children,
 }: {
-  hue: 'amber' | 'emerald' | 'violet';
+  hue: LayerChipHue;
   title: string;
   subtitle: string;
   readout?: string;
@@ -757,6 +768,7 @@ function LiquidityTimingPanel({
   shared,
   activeLayers,
   bookTargetByCcy,
+  cfarNetByCcyUsd,
   onTimingChange,
 }: {
   fpu: ForecastUi;
@@ -770,6 +782,7 @@ function LiquidityTimingPanel({
   activeLayers: Set<LayerId>;
   /** Target the book settled per currency — anchors the preview to the desk's grid. */
   bookTargetByCcy?: Record<string, number>;
+  cfarNetByCcyUsd?: Record<string, number>;
   onTimingChange?: (patch: Partial<LiquidityTiming>) => void;
 }) {
   const fcyRows = rows.filter(r => r.ccy !== 'USD');
@@ -861,10 +874,13 @@ function LiquidityTimingPanel({
   // The funded plan, not the bare path: each cycle opens where its own near leg
   // left it, which is what keeps a repeating drain from compounding into a swap
   // the size of the whole horizon.
+  const previewCfarFcy = previewRow
+    ? usdToFcyM(cfarNetByCcyUsd?.[previewRow.ccy] ?? 0, previewRow.ccy)
+    : 0;
   const plan = ladder && previewRow
     ? fundedPlanFor(
         previewRow, shared, activeLayers, ladder, livePlanProfile, hedgeSettle,
-        bookTargetByCcy?.[previewRow.ccy],
+        bookTargetByCcy?.[previewRow.ccy], undefined, previewCfarFcy,
       )
     : [];
   // Sizing reads the requirement chain — a leg per cycle — whichever way the cover
@@ -872,7 +888,7 @@ function LiquidityTimingPanel({
   const sizingPlan = ladder && previewRow && (timing.bookingMode ?? 'rolling') === 'term'
     ? fundedPlanFor(
         previewRow, shared, activeLayers, ladder, livePlanProfile, hedgeSettle,
-        bookTargetByCcy?.[previewRow.ccy], 'rolling',
+        bookTargetByCcy?.[previewRow.ccy], 'rolling', previewCfarFcy,
       )
     : plan;
   const sizing = sizingPlan.length > 0
@@ -1496,6 +1512,7 @@ export function UnifiedSimulator({
    * hedge line on the liquidity path (see the Liquidity view of the profile).
    */
   hedgeSettleByCcy = {},
+  cfarNetByCcyUsd = {},
   /** Analytics regime — labels VaR columns (confidence · horizon · basis). */
   varSetup,
   /** Sync FX Risk forecast period into Analytics / answers. */
@@ -1548,6 +1565,8 @@ export function UnifiedSimulator({
   riskMetricsByCcy?: Record<string, FxRiskMetricCell>;
   bookedPositionByCcy?: Record<string, BookedPositionOffset>;
   hedgeSettleByCcy?: HedgeSettleByCcy;
+  /** FX-hedge Net CFaR per CCY (USD M) — sizes the CFaR cover layer. */
+  cfarNetByCcyUsd?: Record<string, number>;
   varSetup?: VarSetup;
   onVarSetupChange?: (setup: VarSetup) => void;
   /** Flat monthly×T or custom per-period Revenue/Expenses. */
@@ -2776,6 +2795,10 @@ export function UnifiedSimulator({
     if (id === 'sigmaP') return sigmaOverrideCount > 0 ? String(sigmaOverrideCount) : '';
     if (id === 'carryOptim') return carryTargetCount > 0 ? String(carryTargetCount) : '';
     if (id === 'portfolioDiv') return `$${n(policyVAR)}M`;
+    if (id === 'cfarCover') {
+      const total = Object.values(cfarNetByCcyUsd).reduce((s, v) => s + v, 0);
+      return total > 0.001 ? `$${n(total)}M` : '';
+    }
     return '';
   };
 
@@ -3401,6 +3424,7 @@ export function UnifiedSimulator({
                     shared={shared}
                     activeLayers={activeLayers}
                     bookTargetByCcy={bookTargetByCcy}
+                    cfarNetByCcyUsd={cfarNetByCcyUsd}
                     onTimingChange={
                       onForecastProfileChange ? updateLiquidityTiming : undefined
                     }
@@ -4815,6 +4839,41 @@ export function UnifiedSimulator({
                     </label>
                   );
                 })}
+            </div>
+          </LayerModal>
+        )}
+
+        {showAdvancedBook && layerPanel === 'cfarCover' && (
+          <LayerModal
+            hue="sky"
+            title="CFaR cover — Net CFaR only"
+            subtitle={`Liquidity swap sized from FX-only Net CFaR (no loop). Displayed CFaR then adds this swap's rate-diff bridge in parallel with the FX hedge${
+              activeLayers.has('cfarCover') ? '' : ' — turn the CFaR cover layer on to apply'
+            }`}
+            readout={`Σ ${f2(Object.values(cfarNetByCcyUsd).reduce((s, v) => s + v, 0))} $USD`}
+            footnote="USD Net CFaR → FCY at spot · additive to other buffers · funding-swap O/N + points sit on top of unfunded cash carry"
+            simDark={simDark}
+            onClose={() => setLayerPanel(null)}
+          >
+            <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
+              {floorRows.map(r => {
+                const netUsd = cfarNetByCcyUsd[r.ccy] ?? 0;
+                const coverFcy = netUsd > 0.001 ? usdToFcyM(netUsd, r.ccy) : 0;
+                return (
+                  <div
+                    key={r.id}
+                    className="grid grid-cols-[34px_minmax(0,1fr)_76px] items-center gap-2 rounded-md border border-gray-200 bg-white px-2 py-1"
+                  >
+                    <span className="font-mono text-[11px] font-semibold text-gray-700">{r.ccy}</span>
+                    <span className="text-right font-mono text-[11px] tabular-nums text-gray-700">
+                      {netUsd > 0.001 ? `${f2(coverFcy)} FCY` : '—'}
+                    </span>
+                    <span className="text-right font-mono text-[10px] tabular-nums text-gray-400">
+                      {netUsd > 0.001 ? `${f2(netUsd)} $USD` : 'no Net CFaR'}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           </LayerModal>
         )}
@@ -6268,14 +6327,14 @@ export function UnifiedSimulator({
                 </td>
                 )}
                 <td className={`${tdBase} bg-purple-50 font-medium ${pnlCarryOnly ? 'border-l-2 border-purple-300' : ''} ${r.floatNim >= 0 ? 'text-green-700' : 'text-red-600'}`}
-                  title={`Post-swap economic cash carry (USD): LP+Swap ${f2(r.postSwapCash)}M ${r.ccy} × spot × (${r.postSwapCash >= 0 ? `credit ${r.r_FCY.toFixed(2)}%` : `debit ${r.r_OD.toFixed(2)}%`} − r_USD ${shared.r_USD.toFixed(2)}%) / 100 = $${f2(r.floatNim)}M/yr. Opening cash swapped away is not counted — CIP cancels that differential through the swap points.`}>
+                  title={`Unfunded cash carry (no funding swap): opening LP ${f2(r.cash)}M ${r.ccy} path × spot × (r_actual − r_USD ${shared.r_USD.toFixed(2)}%) / 100 = $${f2(r.floatNim)}M/yr. FX Risk hedging only — liquidity buffer funding is not in this number.`}>
                   {usdCarry(r.floatNim, 0)}
                 </td>
                 <td className={`${tdBase} bg-purple-50 font-medium ${
                   Math.abs(r.swapCarryUsdYr) < 0.005 ? 'text-gray-300'
                     : r.swapCarryUsdYr >= 0 ? 'text-green-700' : 'text-red-600'
                 }`}
-                  title="FX swap at mid vs term SOFR is CIP carry-neutral: earn/pay on the moved FCY notional is cancelled by the opposite swap points P&L. Economic carry sits entirely in Cash Carry on the post-swap balance.">
+                  title={`Funding-swap overlay on top of unfunded carry. Sell FCY → pay/forgo O/N ${f2(r.swapOnUsdYr)} $M/yr; swap points ${f2(r.swapPointsUsdYr)} $M/yr. CIP mid nets to $${f2(r.swapCarryUsdYr)}M/yr. Additive to Cash Carry. Displayed CFaR RSS-combines this book as a rate-diff bridge — cover sizing stays FX-only.`}>
                   {usdCarry(r.swapCarryUsdYr)}
                 </td>
                 {!pnlCarryOnly && (<>
@@ -6289,7 +6348,7 @@ export function UnifiedSimulator({
                 <td className={`${tdBase} bg-purple-100 font-semibold ${
                   (r.floatNim + r.swapCarryUsdYr + (R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr)) >= 0 ? 'text-emerald-700' : 'text-red-600'
                 }`}
-                  title="Total annual USD carry = post-swap Cash Carry (CIP-neutral swap → Swap Carry 0) + Hedge Carry">
+                  title="Total annual USD carry = unfunded Cash Carry + funding-swap overlay (O/N + points) + Hedge Carry">
                   {usdCarry(r.floatNim + r.swapCarryUsdYr + (R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr), 0)}
                 </td>
                 </>)}
@@ -6926,11 +6985,11 @@ export function UnifiedSimulator({
               </td>
               )}
               <td className={`${tdBase} bg-purple-50 font-bold ${pnlCarryOnly ? 'border-l-2 border-purple-300' : ''} ${floatNimUsdTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
-                title="Σ post-swap economic cash carry across all rows, $M/yr USD — O/N earn/pay on the funded LP balance after CIP-neutral swaps">
+                title="Σ unfunded cash carry across all rows, $M/yr USD — FX book only, no funding swap">
                 {usdCarry(floatNimUsdTotal, 0)}
               </td>
               <td className={`${tdBase} bg-purple-50 font-bold ${swapCarryTotal >= 0 ? 'text-green-700' : 'text-red-600'}`}
-                title="Σ swap P&L — identically 0 under CIP (cancelled into Cash Carry on the post-swap balance)">
+                title="Σ funding-swap overlay (FCY O/N + USD O/N + points). 0 at CIP mid — additive to unfunded Cash Carry">
                 {usdCarry(swapCarryTotal, 0)}
               </td>
               {!pnlCarryOnly && (<>

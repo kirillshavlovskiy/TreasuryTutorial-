@@ -1,5 +1,11 @@
 import { makeSimRow, INITIAL_USD_PARAMS, type RowState, type UsdParams } from '@/lib/fx-buffer';
 import type { Entity } from '@/lib/workspace-store';
+import {
+  DEFAULT_FORECAST_PROFILE,
+  forecastProfileWithStoreReceivables,
+  type ForecastCashExtras,
+  type ForecastProfileState,
+} from '@/lib/forecast-profile';
 
 export interface EntitySimSeed {
   rows: RowState[];
@@ -10,6 +16,11 @@ export interface EntitySimSeed {
   currencyFilter: string[];
   /** Suggested FX profile currencies (same as filter). */
   profileCurrencies: string[];
+  /**
+   * Default company cash / FX / liquidity forecast (store AR collections,
+   * debt after Tf). Applied when the dashboard has no saved profile yet.
+   */
+  forecastProfile?: ForecastProfileState;
 }
 
 /** Resolve display name / base currency — tolerates legacy TestEntity fields. */
@@ -72,6 +83,8 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
     base === 'EUR'
   ) {
     // Cash FX (spot) + receivables − venture debt → Net FX / Exp stock = 1.9.
+    // Store AR collects 0.2/month over the 12-month cash / FX / liquidity
+    // forecast; venture debt is repaid after that projection.
     const eur = makeSimRow('de-1', 'EUR', 2.5, 0, 0, 2.5, 0, 1.2, 0);
     eur.nonCashAsset = 2.4; // EU receivables (FX Risk → Non-cash Asset)
     eur.ir_liab_notional = 3.0; // venture debt (FX POSITION → Debt)
@@ -87,6 +100,8 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
       usdParams: { ...INITIAL_USD_PARAMS },
       currencyFilter: ['EUR', 'GBP'],
       profileCurrencies: ['EUR', 'GBP'],
+      // Store AR 0.2/month × 12m into cash + FX + liquidity; debt repaid after Tf.
+      forecastProfile: forecastProfileWithStoreReceivables(['EUR']),
     };
   }
 
@@ -118,4 +133,17 @@ export function classifyNordtechEntity(
     return 'US';
   }
   return null;
+}
+
+/** Merge per-entity default cash / FX / liquidity extras for a consolidated desk. */
+export function mergedEntityForecastProfile(
+  entities: readonly Entity[],
+): ForecastProfileState {
+  const extrasByCcy: Record<string, ForecastCashExtras> = {};
+  for (const e of entities) {
+    const extras = simSeedForEntity(e).forecastProfile?.extrasByCcy;
+    if (!extras) continue;
+    Object.assign(extrasByCcy, extras);
+  }
+  return { ...DEFAULT_FORECAST_PROFILE, extrasByCcy };
 }

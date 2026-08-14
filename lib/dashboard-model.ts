@@ -28,6 +28,8 @@ import {
   usdToFcyM,
   roundMoney,
   fxBookNetLocalM,
+  fundingSwapOverlayUsdYr,
+  liquidityFormulaLayersActive,
   type LayerId,
   type LayerResult,
   type LayeredBufferResult,
@@ -158,17 +160,17 @@ export interface SimRowComputed {
   postSwapVar: number;
   varChange: number;
   swap_carry: number;
-  /** Annual USD swap P&L ($M/yr). Under CIP the FX swap is carry-neutral at mid,
-   *  so this is 0 — any earn/pay on FCY cash is already in `floatNim` on the
-   *  post-swap balance (the swap cancels the differential on the moved notional). */
+  /** FCY overnight on the funding-swap notional ($M/yr). Sell FCY → pay/forgo r_FCY. */
+  swapOnUsdYr: number;
+  /** CIP mid swap points on the funding-swap notional ($M/yr). */
+  swapPointsUsdYr: number;
+  /** Annual USD swap overlay ($M/yr) = FCY O/N + USD O/N + points. 0 at CIP mid. */
   swapCarryUsdYr: number;
   usd_consumed: number;
   carry: number;
   netDelta: number;
-  /** Annual USD economic carry on the post-swap LP cash balance ($M/yr):
-   *  cashTwa(postSwap) × spot × (r_actual − r_USD)/100, where r_actual is the
-   *  LP credit rate when the balance is ≥ 0 and the debit rate when overdrawn.
-   *  Opening-cash carry that was swapped away is NOT counted — CIP cancels it. */
+  /** Annual USD cash carry on the UNFUNDED path ($M/yr) — FX book only, no
+   *  funding swap. The swap overlay sits on top in `swapCarryUsdYr`. */
   floatNim: number;
   /** True when USD funding envelope / stress prevents reaching pre-swap H*. */
   funding_binding?: boolean;
@@ -233,6 +235,8 @@ export function fundedPlanFor(
    * rather than how the cover happens to be traded.
    */
   bookingMode?: LiquidityBookingMode,
+  /** Net CFaR in FCY — FX-hedge residual only; does not read this plan's swap. */
+  cfarCoverFcy = 0,
 ): LiquidityCycleProjection[] {
   const timing = resolveLiquidityTiming(forecastProfile);
   const shape = ladder.cycles.map(c => ({ drawdown: c.drawdown, net: c.net }));
@@ -246,6 +250,7 @@ export function fundedPlanFor(
     shape,
     bookingMode ?? timing?.bookingMode ?? 'rolling',
     targetShift,
+    cfarCoverFcy,
   );
   const raw = run(0);
   if (bookTarget === undefined) return raw;
@@ -309,6 +314,8 @@ export function computeSimdRow(
   hedgeSettleByCcy?: HedgeSettleByCcy,
   /** See `fundedPlanFor` — must match the target the layer pass sized this row on. */
   bookTarget?: number,
+  /** Net CFaR in FCY — sizes the CFaR cover layer; never derived from this swap. */
+  cfarCoverFcy = 0,
 ): SimRowComputed {
   const cashPos = r.cash + r.nonLpCash;
   const spot_rate = ccySpotRate(r.ccy);
@@ -351,7 +358,7 @@ export function computeSimdRow(
   const liquidityPlan = ladder
     ? fundedPlanFor(
         r, shared, activeLayers, ladder, forecastProfile,
-        hedgeSettle, bookTarget,
+        hedgeSettle, bookTarget, undefined, cfarCoverFcy,
       )
     : null;
   const liqTiming = resolveLiquidityTiming(forecastProfile);
@@ -362,7 +369,7 @@ export function computeSimdRow(
   const sizingPlan = ladder && liqTiming?.bookingMode === 'term'
     ? fundedPlanFor(
         r, shared, activeLayers, ladder, forecastProfile,
-        hedgeSettle, bookTarget, 'rolling',
+        hedgeSettle, bookTarget, 'rolling', cfarCoverFcy,
       )
     : liquidityPlan;
   const sizing = sizingPlan
@@ -384,6 +391,7 @@ export function computeSimdRow(
 
   const layered = computeLayeredBuffer(
     grossPayout, swapAnchor, shared.σ_P, shared.r_USD, r.r_FCY, r.r_OD, r.cash_floor, activeLayers, r.cash,
+    r.carry_target, cfarCoverFcy,
   );
   const cash_threshold_pre_swap = syncedThreshold ?? layered.cash_threshold;
 
@@ -394,8 +402,7 @@ export function computeSimdRow(
 
   const varBuffer = Math.max(r.cash_floor, Math.abs(peak_cash) * varFactor * irMult);
 
-  const formulaLayersActive = activeLayers.has('floorH') || activeLayers.has('sigmaP')
-    || activeLayers.has('carryOptim') || activeLayers.has('portfolioDiv');
+  const formulaLayersActive = liquidityFormulaLayersActive(activeLayers);
 
   const swapNear = syncedSwap ?? computeFcySwapNear(
     cash_threshold_pre_swap, cashPos, r.fcastFX, r.r_OD, shared.r_USD, formulaLayersActive, swapAnchor,
@@ -415,30 +422,30 @@ export function computeSimdRow(
     : postSwapCash + r.payout + r.collections + r.fcastFX + r.nonLpCash;
   const postSwapVar = Math.max(r.cash_floor, Math.abs(lp_after_swap_trough) * varFactor * irMult);
   const varChange = postSwapVar - varBuffer;
-  // CIP: FX swap far leg at mid vs term SOFR is carry-neutral on the moved
-  // notional — earn/pay on FCY cash is cancelled by the opposite swap points
-  // P&L. Economic carry therefore lives entirely on the POST-SWAP balance
-  // (see floatNim); swapCarryUsdYr is identically 0.
-  const swap_carry = 0;
-  const swapCarryUsdYr = 0;
+  // Unfunded cash carry (FX book only) + funding-swap overlay. The overlay is
+  // FCY O/N on the moved notional + opposite USD O/N + CIP mid points — additive
+  // to the unfunded path, no loop back into CFaR / Cash Carry.
+  const overlay = fundingSwapOverlayUsdYr(swapNear, spot_rate, r.r_FCY, shared.r_USD);
+  const swap_carry = overlay.fcyOnUsdYr;
+  const swapOnUsdYr = overlay.fcyOnUsdYr;
+  const swapPointsUsdYr = overlay.pointsUsdYr;
+  const swapCarryUsdYr = overlay.netUsdYr;
 
   const usd_consumed = Math.abs(swapNear) * spot_rate;
 
   const carry = netFxFCY * r.r_FCY / 100 / 12;
   const netDelta = netFxFCY + carry;
-  // Time-weighted average LP cash AFTER the funding swap: post-swap opening
-  // balance is held for the full period; payout / payins apply only for the
-  // remaining (1 − timing) of the cycle. Default (no timing) → postSwapCash.
-  // r_actual = LP credit when the TWA balance is ≥ 0, debit when overdrawn.
+  // Time-weighted average LP cash WITHOUT the funding swap. Payout / payins
+  // apply only for the remaining (1 − timing) of the cycle.
   const payoutWeight = timing ? (1 - timing.fPayout) : 0;
   const payinWeight = timing ? (1 - timing.fPayin) : 0;
-  const cashTwa = postSwapCash + r.payout * payoutWeight + r.collections * payinWeight;
+  const cashTwa = r.cash + r.payout * payoutWeight + r.collections * payinWeight;
   const r_actual = cashTwa >= 0 ? r.r_FCY : r.r_OD;
   // A dated path prices each day on its own side of zero. One average balance
   // cannot: a cycle that spends 20 days overdrawn and 10 in credit averages
   // positive and would earn the credit rate throughout. The ladder's shapes
   // supersede the coarse payout / payin fractions when both are configured.
-  const carrySplit = ladder ? cycleCarrySplit(ladder, swapNear) : null;
+  const carrySplit = ladder ? cycleCarrySplit(ladder, 0) : null;
   const floatNim = carrySplit
     ? (carrySplit.avgCredit * (r.r_FCY - shared.r_USD)
       + carrySplit.avgDebit * (r.r_OD - shared.r_USD)) / 100 * spot_rate
@@ -472,7 +479,7 @@ export function computeSimdRow(
       : undefined,
     swapNear, swapFar: -swapNear,
     postSwapCash, lp_after_swap_trough, cycleEndCash, postSwapVar, varChange,
-    swap_carry, swapCarryUsdYr, usd_consumed,
+    swap_carry, swapOnUsdYr, swapPointsUsdYr, swapCarryUsdYr, usd_consumed,
     carry, netDelta, floatNim,
   };
 }
@@ -492,8 +499,7 @@ export function computeSimdUsdRow(
   const cash_after_payins = cashPos + r.payout + r.collections;
   const lp_month_end = cash_after_payins;
 
-  const formulaLayersActive = activeLayers.has('floorH') || activeLayers.has('sigmaP')
-    || activeLayers.has('carryOptim') || activeLayers.has('portfolioDiv');
+  const formulaLayersActive = liquidityFormulaLayersActive(activeLayers);
   const payoutDeficit = netPayoutDeficit(r.payout, r.cash);
   const payoutBuffer = computeUsdBuffer(
     r.payout, r.cash_floor, shared.σ_P, usdActiveLayers(activeLayers),
@@ -550,7 +556,7 @@ export function computeSimdUsdRow(
     lp_peak_cash, cash_after_payins, lp_month_end,
     swapNear, swapFar: -swapNear,
     postSwapCash, lp_after_swap_trough, cycleEndCash, postSwapVar: 0, varChange: 0,
-    swap_carry: 0, swapCarryUsdYr: 0, usd_consumed: 0,
+    swap_carry: 0, swapOnUsdYr: 0, swapPointsUsdYr: 0, swapCarryUsdYr: 0, usd_consumed: 0,
     carry: (r.spot + r.fwd + r.nonCash + (r.nonCashAsset ?? 0)) * r.r_FCY / 100 / 12,
     netDelta: (r.spot + r.fwd + r.nonCash + (r.nonCashAsset ?? 0)) * (1 + r.r_FCY / 100 / 12),
     floatNim: 0,
@@ -636,6 +642,12 @@ export interface DashboardInputs {
    * the hedge book, so it arrives beside the forecast rather than inside it.
    */
   hedgeSettleByCcy?: HedgeSettleByCcy;
+  /**
+   * Per-CCY Net CFaR in USD M — FX-hedge residual only. The CFaR cover layer
+   * converts this to FCY and sizes the funding swap. Must not include liquidity
+   * buffer funding or this swap, or the two modules loop.
+   */
+  cfarNetByCcyUsd?: Record<string, number>;
 }
 
 export interface PortfolioSummary {
@@ -674,6 +686,13 @@ function forecastHorizonMonths(shared: SharedGlobals): number {
  * delivering FCY is cash the account must fund, so it shows in the trough.
  * The funding swap does not — that is applied after, in the SWAP band.
  */
+/** Net CFaR (USD M) → FCY cover. 0 when missing or not a reserve. */
+function cfarCoverFcyFor(ccy: string, netByCcy?: Record<string, number>): number {
+  const usd = netByCcy?.[ccy];
+  if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0.001) return 0;
+  return usdToFcyM(usd, ccy);
+}
+
 function liquidityLadderFor(
   r: RowState,
   shared: SharedGlobals,
@@ -695,6 +714,7 @@ function buildPass1Fcy(
   forecastProfile?: ForecastProfileState | null,
   hedgeSettleByCcy?: HedgeSettleByCcy,
   bookTarget?: number,
+  cfarCoverFcy = 0,
 ): Pass1Row {
   const p = CURRENCY_PARAMS[sr.ccy];
   const payout = sr.payout;
@@ -715,7 +735,7 @@ function buildPass1Fcy(
   const sizingPlan = ladder
     ? fundedPlanFor(
         sr, shared, layersForPass1, ladder, forecastProfile,
-        hedgeSettle, bookTarget, 'rolling',
+        hedgeSettle, bookTarget, 'rolling', cfarCoverFcy,
       )
     : null;
   const planSizing = sizingPlan
@@ -732,7 +752,7 @@ function buildPass1Fcy(
   const planned_near_leg = ladder && timing?.bookingMode === 'term'
     ? fundedPlanFor(
         sr, shared, activeLayers, ladder, forecastProfile,
-        hedgeSettle, bookTarget,
+        hedgeSettle, bookTarget, undefined, cfarCoverFcy,
       )[0]?.swap_needed
     : undefined;
   const forecasted_cash = ladder
@@ -740,7 +760,7 @@ function buildPass1Fcy(
     : peak_cash + collections + Math.max(0, hedgeCycle1);
   const l = computeLayeredBuffer(
     Math.abs(payout), peak_cash, shared.σ_P, shared.r_USD, r_FCY, r_OD, h_min, layersForPass1, cash,
-    sr.carry_target,
+    sr.carry_target, cfarCoverFcy,
   );
   const spot_raw = sr.spot;
   const fwd_raw = sr.fwd;
@@ -798,6 +818,7 @@ export function computeLayerTargets(
     buildPass1Fcy(
       sr, shared, layersForPass1, activeLayers, input.forecastProfile,
       input.hedgeSettleByCcy, bookTargetByCcy?.[sr.ccy],
+      cfarCoverFcyFor(sr.ccy, input.cfarNetByCcyUsd),
     ),
   );
   const pass1Usd = buildPass1Usd(usdCash, usdNonLpCash, usdParams, shared, layersForPass1);
@@ -822,6 +843,7 @@ export function computeLayerTargets(
       forecasted_cash: r.peak_cash,
       floor_contrib: r.floor_contrib,
       delta_sigma: r.delta_sigma,
+      delta_cfar: r.delta_cfar,
       r_FCY: r.r_FCY,
       r_OD: r.r_OD,
       carry_target: carryTargetByCcy[r.ccy],
@@ -837,8 +859,7 @@ export function computeLayerTargets(
     });
   }
 
-  const formulaLayersActive = activeLayers.has('floorH') || activeLayers.has('sigmaP')
-    || activeLayers.has('carryOptim') || activeLayers.has('portfolioDiv');
+  const formulaLayersActive = liquidityFormulaLayersActive(activeLayers);
 
   const fcyRowsPreStress = pass1Fcy.map(r => {
     const delta_portfolio = deltaPortfolio[r.ccy] ?? 0;
@@ -900,6 +921,7 @@ export function computeLayerTargets(
         P_contrib: r.P_contrib,
         floor_contrib: r.floor_contrib,
         delta_sigma: r.delta_sigma,
+        delta_cfar: r.delta_cfar,
         r_FCY: r.r_FCY,
         r_OD: r.r_OD,
       })),
@@ -1048,9 +1070,9 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
     const overlayLeg = (layer && !layer.usd_stress_trim)
       ? layer.cash_threshold - (layer.base_hold ?? layer.cash_threshold)
       : 0;
-    // Incremental overlay P&L vs hold-the-book (banner metric only). Total row
-    // P&L already includes this via floatNim on the post-swap target balance —
-    // do NOT add overlayCarryUSD into Cash/Swap/Total Carry columns.
+    // Incremental overlay P&L vs hold-the-book (banner metric only). Do NOT add
+    // overlayCarryUSD into Cash/Swap/Total Carry — Cash is unfunded, Swap is
+    // the funding-swap overlay.
     const overlayCarryUSD = overlayLeg * (CURRENCY_PARAMS[r.ccy]?.spot ?? 0)
       * (r.r_FCY - input.shared.r_USD) / 100;
     const row = {
@@ -1065,6 +1087,7 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
         input.forecastProfile,
         input.hedgeSettleByCcy,
         bookTargetByCcy[r.ccy],
+        cfarCoverFcyFor(r.ccy, input.cfarNetByCcyUsd),
       ),
       cash_threshold_raw: layer?.cash_threshold_raw,
       debit_floor_binding: layer?.debit_floor_binding,

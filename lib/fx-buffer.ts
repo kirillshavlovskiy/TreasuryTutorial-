@@ -350,18 +350,30 @@ export function calcMultiCcyTable(
 //   1. Floor    (floor_contrib = cash_floor if floorH on, else 0) — hard minimum
 //   2. Safety   (+delta_sigma = P × σ_P × z_neutral)             — forecast uncertainty margin
 //   3. Carry    (±delta_carry = P × σ_P × Δz)                    — rate-differential adjustment
+//   4. CFaR     (+delta_cfar = Net CFaR in FCY)                  — FX-hedge residual cash at risk
 // P is the expected outflow volume scale — it sizes the safety and carry deltas only.
 
 export const Z_NEUTRAL = 1.645; // 95% confidence neutral z-score
 
-export type LayerId = 'sigmaP' | 'carryOptim' | 'floorH' | 'portfolioDiv';
+export type LayerId = 'sigmaP' | 'carryOptim' | 'floorH' | 'portfolioDiv' | 'cfarCover';
+
+/** True when any liquidity-funding layer is on — no layer selected means no swap. */
+export function liquidityFormulaLayersActive(active: Set<LayerId>): boolean {
+  return active.has('floorH')
+    || active.has('sigmaP')
+    || active.has('carryOptim')
+    || active.has('portfolioDiv')
+    || active.has('cfarCover');
+}
 
 export interface LayeredBufferResult {
   P_contrib: number;      // P when sigmaP layer is active, else 0 — the payout base included in H*
   floor_contrib: number;  // per-currency floor contribution (cash_floor if floorH on, else 0)
   delta_sigma: number;   // always ≥ 0 — safety margin for outflow forecast uncertainty
   delta_carry: number;   // can be negative (PAY carry) or positive (EARN carry)
-  raw_sum: number;       // P_contrib + floor_contrib + delta_sigma + delta_carry — full H* (PRE-PAYOUT)
+  /** Net CFaR converted to FCY — 0 unless the CFaR cover layer is on. */
+  delta_cfar: number;
+  raw_sum: number;       // P_contrib + floor_contrib + delta_sigma + delta_carry + delta_cfar
   cash_threshold: number; // PRE-PAYOUT target (may be floored at 0 when r_OD > r_FCY)
   floor_binding: boolean; // display indicator: true when (delta_sigma + delta_carry) < 0
   z_opt: number;         // optimal z used (= Z_NEUTRAL when carryOptim is off)
@@ -372,6 +384,36 @@ export interface LayeredBufferResult {
   carry_target_applied?: boolean;
   /** The manual carry target could not be met — a floor or debit clamp bound first. */
   carry_target_binding?: boolean;
+}
+
+/**
+ * Funding-swap overlay vs the unfunded cash path. Selling FCY pays/forgoes
+ * that currency's O/N (negative rates included) and the opposite USD O/N;
+ * CIP mid swap points offset the differential, so `netUsdYr` is 0 at mid.
+ * Additive to unfunded cash carry — does not reprice the cash path.
+ */
+export interface FundingSwapOverlay {
+  fcyOnUsdYr: number;
+  usdOnUsdYr: number;
+  pointsUsdYr: number;
+  netUsdYr: number;
+}
+
+export function fundingSwapOverlayUsdYr(
+  swapNear: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+): FundingSwapOverlay {
+  const fcyOnUsdYr = swapNear * (r_FCY / 100) * spot;
+  const usdOnUsdYr = -swapNear * (r_USD / 100) * spot;
+  const pointsUsdYr = -(fcyOnUsdYr + usdOnUsdYr);
+  return {
+    fcyOnUsdYr,
+    usdOnUsdYr,
+    pointsUsdYr,
+    netUsdYr: fcyOnUsdYr + usdOnUsdYr + pointsUsdYr,
+  };
 }
 
 /**
@@ -417,6 +459,8 @@ export function computeLayeredBuffer(
   active: Set<LayerId>,
   lp_cash_M?: number,    // opening LP — carry/portfolio scale (defaults to |trough|)
   carry_target_M?: number, // manual Target LP Cash (M FCY) — replaces the z_opt carry leg
+  /** Net CFaR in FCY — exogenous FX-hedge residual; never reads the funding swap. */
+  cfarCoverFcy?: number,
 ): LayeredBufferResult {
   const Δr = r_USD - r_FCY;
   const trough = forecasted_cash;
@@ -454,9 +498,15 @@ export function computeLayeredBuffer(
   }
 
   const P_contrib = active.has('sigmaP') && payoutScale > 0.001 && !payCarry ? payoutScale : 0;
+  // Cover only Net CFaR (never Gross). Input is FX-hedge CFaR — no funding-swap loop.
+  // Stacked on the other-layer hold (or the unfunded trough when that hold is 0)
+  // so the swap increment equals the cover, PAY and EARN alike.
+  const delta_cfar = active.has('cfarCover') && (cfarCoverFcy ?? 0) > 0.001
+    ? cfarCoverFcy!
+    : 0;
   const layerSum = floor_contrib + delta_sigma + delta_carry;
-  // Cushion at trough: PAY sells excess stock; EARN holds remaining stock (never counts a deficit)
-  const raw_sum = payCarry ? layerSum : Math.max(trough, 0) + layerSum;
+  const hold = payCarry ? layerSum : Math.max(trough, 0) + layerSum;
+  const raw_sum = (Math.abs(hold) < 0.001 && delta_cfar > 0.001 ? trough : hold) + delta_cfar;
 
   const noNeg = applyNoNegativeLpFloor(raw_sum, r_OD, r_USD);
   // Hard minimum: with the floor layer on, the trough cushion never drops below cash_floor.
@@ -465,7 +515,7 @@ export function computeLayeredBuffer(
   const floor_binding = floor_contrib > 0.001 && layerSum < floor_contrib - 0.001;
 
   return {
-    P_contrib, floor_contrib, delta_sigma, delta_carry, raw_sum, cash_threshold, floor_binding, z_opt,
+    P_contrib, floor_contrib, delta_sigma, delta_carry, delta_cfar, raw_sum, cash_threshold, floor_binding, z_opt,
     carry_dir: Δr > 0.05 ? 'pay' : Δr < -0.05 ? 'earn' : 'neutral',
     delta_r: Δr,
     debit_floor_binding,
@@ -517,7 +567,7 @@ export function computeUsdBuffer(
   const floor_binding = floor_contrib > 0.001 && raw_sum < floor_contrib;
 
   return {
-    P_contrib, floor_contrib, delta_sigma, delta_carry: 0, raw_sum, cash_threshold, floor_binding,
+    P_contrib, floor_contrib, delta_sigma, delta_carry: 0, delta_cfar: 0, raw_sum, cash_threshold, floor_binding,
     z_opt: Z_NEUTRAL, carry_dir: 'neutral', delta_r: 0, debit_floor_binding: false,
   };
 }
@@ -730,8 +780,9 @@ export function payoutLiquidityMinimum(
   delta_sigma: number,
   r_OD: number,
   r_USD: number,
+  delta_cfar = 0,
 ): number {
-  const raw = P_contrib + floor_contrib + delta_sigma;
+  const raw = P_contrib + floor_contrib + delta_sigma + delta_cfar;
   return applyNoNegativeLpFloor(raw, r_OD, r_USD).cash_threshold;
 }
 
@@ -748,6 +799,7 @@ export function usdStressTrimFloor(
     P_contrib: number;
     floor_contrib: number;
     delta_sigma: number;
+    delta_cfar?: number;
     r_FCY: number;
     r_OD: number;
   },
@@ -755,7 +807,7 @@ export function usdStressTrimFloor(
   r_USD: number,
 ): number {
   const payoutMin = payoutLiquidityMinimum(
-    row.P_contrib, row.floor_contrib, row.delta_sigma, row.r_OD, r_USD,
+    row.P_contrib, row.floor_contrib, row.delta_sigma, row.r_OD, r_USD, row.delta_cfar ?? 0,
   );
   const dir = carryDirFromDeltaR(r_USD, row.r_FCY);
 
@@ -809,6 +861,7 @@ export interface FcyStressRow {
   P_contrib: number;
   floor_contrib: number;
   delta_sigma: number;
+  delta_cfar?: number;
   r_FCY: number;
   r_OD: number;
 }
@@ -873,7 +926,7 @@ export function enforceUsdLiquidityStress(
 
   function fundingTrimFloor(row: FcyStressRow): number {
     return payoutLiquidityMinimum(
-      row.P_contrib, row.floor_contrib, row.delta_sigma, row.r_OD, r_USD,
+      row.P_contrib, row.floor_contrib, row.delta_sigma, row.r_OD, r_USD, row.delta_cfar ?? 0,
     );
   }
 
@@ -1155,6 +1208,8 @@ export interface PortfolioCarryInput {
   forecasted_cash: number;  // trough = lp_cash + payout (anchor for H*)
   floor_contrib: number;    // floor contribution already computed (floorH layer)
   delta_sigma: number;      // safety margin already computed (sigmaP layer)
+  /** Net CFaR cover — part of the hold-the-book base, not the overlay. */
+  delta_cfar?: number;
   r_FCY: number;            // % p.a.
   r_OD: number;             // % p.a.
   /** Manual Target LP Cash (M FCY) — when set it defines the overlay direction. */
@@ -1345,7 +1400,7 @@ export function optimizePortfolioCarry(
     const Δr = r_USD - inp.r_FCY;
     const payCarry = isPayCarry(r_USD, inp.r_FCY);
     const trough = inp.forecasted_cash;
-    const base = Math.max(trough, 0) + inp.floor_contrib + inp.delta_sigma;
+    const base = Math.max(trough, 0) + inp.floor_contrib + inp.delta_sigma + (inp.delta_cfar ?? 0);
     let dir = 0, z_opt = Z_NEUTRAL;
     let manual = false;
     if (payoutCarry && p) {

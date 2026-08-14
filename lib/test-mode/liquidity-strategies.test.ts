@@ -16,11 +16,15 @@ import {
   evaluateLiquidityStrategies,
   liveLiquidityCostUsdYrM,
   livePlanByCcyFrom,
+  resolveBufferConstraint,
   strategyForRegime,
+  swapLegScheduleWithCarry,
   LIQUIDITY_STRATEGIES,
   type LiquidityStrategyId,
   type LiquidityStrategyResult,
 } from '@/lib/test-mode/liquidity-strategies';
+import { fundingSwapOverlayUsdYr } from '@/lib/fx-buffer';
+import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
 
 const gbp = INITIAL_ROWS.find(r => r.ccy === 'GBP')!;
 
@@ -92,9 +96,10 @@ describe('the unfunded baseline', () => {
     expect(unfunded.usdGiveUpUsdYrM).toBe(0);
   });
 
-  it('still carries a cost — the overdraft the trough runs', () => {
+  it('still prices the unfunded path — overdraft days sit in Cash Carry', () => {
     expect(unfunded.odPaidUsdYrM).toBeGreaterThan(0);
-    expect(unfunded.netCostUsdYrM).toBeGreaterThan(0);
+    expect(unfunded.swapCarryUsdYrM).toBeCloseTo(0, 9);
+    expect(unfunded.netCostUsdYrM).toBeCloseTo(-unfunded.cashCarryUsdYrM, 9);
   });
 
   it('reports the requirement it leaves open, not zero', () => {
@@ -165,12 +170,21 @@ describe('the term swap commits its cover up front', () => {
 });
 
 describe('the interest ledger adds up', () => {
-  it('net = USD give-up − FCY earned + overdraft paid, on every strategy', () => {
+  it('net cost = −(unfunded Cash Carry + Swap Carry), on every strategy', () => {
     for (const r of evaluate([row()])) {
       expect(r.netCostUsdYrM).toBeCloseTo(
-        r.usdGiveUpUsdYrM - r.fcyEarnedUsdYrM + r.odPaidUsdYrM,
+        -(r.cashCarryUsdYrM + r.swapCarryUsdYrM),
         6,
       );
+      expect(r.swapCarryUsdYrM).toBeCloseTo(0, 9);
+    }
+  });
+
+  it('Cash Carry is the unfunded path — identical on every strategy', () => {
+    const results = evaluate([row()]);
+    const cash = pick(results, 'unfunded').cashCarryUsdYrM;
+    for (const r of results) {
+      expect(r.cashCarryUsdYrM).toBeCloseTo(cash, 9);
     }
   });
 
@@ -198,6 +212,62 @@ describe('the interest ledger adds up', () => {
       expect(r.fcyEarnedUsdYrM).toBeGreaterThan(0);
     }
     expect(pick(results, 'unfunded').floorBreaches).toBe(0);
+  });
+});
+
+describe('swapLegScheduleWithCarry', () => {
+  it('prices every funding leg as a swap — points on the spot-start too', () => {
+    const rows = swapLegScheduleWithCarry(
+      [
+        { cycleIndex: 0, valueDateMonths: 0, newLeg: -2.5, rolledForward: 0, outstanding: -2.5, preBookable: false },
+        { cycleIndex: 1, valueDateMonths: 1, newLeg: -1.4, rolledForward: -2.5, outstanding: -3.9, preBookable: true },
+      ],
+      1.26,
+      4.31,
+      3.5,
+    );
+    const first = fundingSwapOverlayUsdYr(-2.5, 1.26, 4.31, 3.5);
+    expect(rows[0]!.hasPoints).toBe(true);
+    expect(rows[0]!.fcyOnUsdYr).toBeCloseTo(first.fcyOnUsdYr, 12);
+    expect(rows[0]!.pointsUsdYr).toBeCloseTo(first.pointsUsdYr, 12);
+    expect(rows[0]!.interestUsdYr).toBeCloseTo(first.fcyOnUsdYr + first.usdOnUsdYr, 12);
+    expect(rows[0]!.netUsdYr).toBeCloseTo(0, 12);
+    expect(rows[1]!.hasPoints).toBe(true);
+    expect(rows[1]!.netUsdYr).toBeCloseTo(0, 12);
+  });
+});
+
+describe('regime summary — constraint and final CFaR', () => {
+  it('labels the H* constraint from the desk layers', () => {
+    expect(resolveBufferConstraint(new Set(['floorH']))).toBe('balance');
+    expect(resolveBufferConstraint(new Set(['carryOptim']))).toBe('carry');
+    expect(resolveBufferConstraint(new Set(['cfarCover']))).toBe('var');
+    expect(resolveBufferConstraint(new Set(['floorH', 'cfarCover']))).toBe('var');
+    const results = evaluateLiquidityStrategies({
+      rows: [row()],
+      forecastProfile: profileWith(),
+      months: 3,
+      shared,
+      activeLayers: new Set(['carryOptim']),
+    });
+    expect(results[0]!.constraint).toBe('carry');
+    expect(results[0]!.constraintDetail).toContain('Carry target');
+  });
+
+  it('keeps Default Carry the same and raises Final CFaR when a funding book is on', () => {
+    const results = evaluateLiquidityStrategies({
+      rows: [row()],
+      forecastProfile: profileWith(),
+      months: 3,
+      shared,
+      setup: DEFAULT_VAR_SETUP,
+      activeLayers: new Set(['floorH', 'sigmaP']),
+    });
+    const unfunded = pick(results, 'unfunded');
+    const term = pick(results, 'termSwap');
+    expect(term.cashCarryUsdYrM).toBeCloseTo(unfunded.cashCarryUsdYrM, 8);
+    expect(term.finalCfarUsdM).toBeGreaterThan(unfunded.finalCfarUsdM);
+    expect(unfunded.constraint).toBe('var');
   });
 });
 

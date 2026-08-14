@@ -43,11 +43,12 @@ export const FX_INPUTS: { id: FxInput; label: string; description: string }[] = 
 ];
 
 // Optimization metrics → simulator layers.
-export type OptMetric = 'minFloor' | 'payoutBuffer' | 'carryTarget' | 'portfolioVar';
+export type OptMetric = 'minFloor' | 'payoutBuffer' | 'carryTarget' | 'portfolioVar' | 'cfarCover';
 
 export const OPT_METRICS: { id: OptMetric; label: string; layer: LayerId; description: string }[] = [
   { id: 'minFloor',     label: 'Min Floor',      layer: 'floorH',       description: 'Hard per-currency minimum cash floor.' },
   { id: 'payoutBuffer', label: 'Payout Buffer',  layer: 'sigmaP',       description: 'Forecast-uncertainty (σ_P) safety margin on payouts.' },
+  { id: 'cfarCover',    label: 'CFaR Cover',     layer: 'cfarCover',    description: 'Liquidity swap sized from FX-only Net CFaR; displayed CFaR also prices the funding-swap bridge.' },
   { id: 'carryTarget',  label: 'Carry Target',   layer: 'carryOptim',   description: 'Rate-differential carry optimisation.' },
   { id: 'portfolioVar', label: 'Portfolio VaR',  layer: 'portfolioDiv', description: 'Diversified portfolio VaR budget across currencies.' },
 ];
@@ -752,6 +753,9 @@ export function fxConfigFromDashboardSetup(setup: DashboardSetup): FxProfileConf
   }
   if (setup.optimize.includes('hedgeCarry') || setup.optimize.includes('cfar')) {
     optimizationMetrics.push('carryTarget');
+  }
+  if (setup.optimize.includes('cfar')) {
+    optimizationMetrics.push('cfarCover');
   }
   if (optimizationMetrics.length === 0) {
     optimizationMetrics.push(...defaultCurriculumFxConfig().optimizationMetrics);

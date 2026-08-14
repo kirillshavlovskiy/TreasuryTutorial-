@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { decisionRowFor } from '@/components/LiquiditySwapDecision';
+import {
+  clampCoverRatio,
+  decisionRowFor,
+  scaleDecisionRow,
+} from '@/components/LiquiditySwapDecision';
 import type { FcyComputedRow } from '@/lib/dashboard-model';
 import type { LiquidityCycleProjection } from '@/lib/forecast-profile';
 
@@ -113,5 +117,54 @@ describe('decisionRowFor', () => {
     )!;
     expect(d.rolling).toBe(false);
     expect(d.peakBook).toBe(10);
+  });
+});
+
+describe('clampCoverRatio', () => {
+  it('defaults non-finite values to full cover', () => {
+    expect(clampCoverRatio(Number.NaN)).toBe(1);
+    expect(clampCoverRatio(Number.POSITIVE_INFINITY)).toBe(1);
+  });
+
+  it('clamps to [0, 1]', () => {
+    expect(clampCoverRatio(-0.2)).toBe(0);
+    expect(clampCoverRatio(0.4)).toBe(0.4);
+    expect(clampCoverRatio(1.8)).toBe(1);
+  });
+});
+
+describe('scaleDecisionRow', () => {
+  it('leaves the proposal unchanged at 100% cover', () => {
+    const plan = mkPlan([
+      { swap_needed: 10, standing_swap: 10, drawdown: 8 },
+      { swap_needed: 5, standing_swap: 15, drawdown: 6 },
+    ]);
+    const d = decisionRowFor(mkRow({ ccy: 'ZZZ', r_FCY: 2, liquidityPlan: plan }), 4)!;
+    expect(scaleDecisionRow(d, 1)).toBe(d);
+  });
+
+  it('scales near leg, book, USD, carry, and each schedule amount by cover', () => {
+    const plan = mkPlan([
+      { swap_needed: 10, standing_swap: 10, drawdown: 8 },
+      { swap_needed: 5, standing_swap: 15, drawdown: 6 },
+    ]);
+    const d = decisionRowFor(mkRow({ ccy: 'ZZZ', r_FCY: 2, liquidityPlan: plan }), 4)!;
+    const half = scaleDecisionRow(d, 0.5);
+    expect(half.nearLeg).toBeCloseTo(5, 10);
+    expect(half.endingBook).toBeCloseTo(7.5, 10);
+    expect(half.peakBook).toBeCloseTo(7.5, 10);
+    expect(half.usdFunded).toBeCloseTo(d.usdFunded * 0.5, 10);
+    expect(half.costUsdYr).toBeCloseTo(d.costUsdYr * 0.5, 10);
+    expect(half.schedule[0]!.newLeg).toBeCloseTo(d.schedule[0]!.newLeg * 0.5, 10);
+    expect(half.schedule[0]!.outstanding).toBeCloseTo(d.schedule[0]!.outstanding * 0.5, 10);
+    expect(half.drawdown).toBe(d.drawdown);
+  });
+
+  it('books nothing at 0% cover — remaining delta is 1', () => {
+    const plan = mkPlan([{ swap_needed: 10, standing_swap: 10, drawdown: 8 }]);
+    const d = decisionRowFor(mkRow({ ccy: 'ZZZ', r_FCY: 2, liquidityPlan: plan }), 4)!;
+    const none = scaleDecisionRow(d, 0);
+    expect(none.nearLeg).toBe(0);
+    expect(none.usdFunded).toBe(0);
   });
 });

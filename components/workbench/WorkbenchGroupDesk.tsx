@@ -22,6 +22,7 @@ import {
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
   TASK01_REQUIRED_FX_INPUTS,
+  mergedEntityForecastProfile,
   type EntityHedgeBook,
   type HedgeTicket,
   type PreparedHedgeProfile,
@@ -55,6 +56,10 @@ export function WorkbenchGroupDesk({
   >;
 }) {
   const book = useMemo(() => consolidateEntityBooks(entities), [entities]);
+  const groupForecast = useMemo(
+    () => mergedEntityForecastProfile(entities),
+    [entities],
+  );
   const risk = useMemo(
     () => computeConsolidatedRisk(entities, varSetup),
     [entities, varSetup],
@@ -187,6 +192,7 @@ export function WorkbenchGroupDesk({
           initialUsdParams={book.usdParams}
           initialActiveLayers={[]}
           fxInputs={[...TASK01_REQUIRED_FX_INPUTS]}
+          forecastProfile={groupForecast}
           hiddenTabs={hiddenTabsForLayers(decision, analytical)}
           tabLabels={CURRICULUM_TAB_LABELS}
           onAnalyticsBookChange={setAnalyticsBook}

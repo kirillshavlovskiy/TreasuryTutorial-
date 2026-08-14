@@ -62,6 +62,7 @@ import {
   type StripForwardLeg,
 } from '@/lib/test-mode/rolling-hedge';
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
+import { AnalyticsHedgeSummary } from '@/components/test-mode/AnalyticsHedgeSummary';
 import { CashCarryAnalyticsView } from '@/components/test-mode/CashCarryAnalyticsView';
 import { CfarAnalysisView } from '@/components/test-mode/CfarAnalysisView';
 import { LiquidityAnalyticsView } from '@/components/test-mode/LiquidityAnalyticsView';
@@ -72,9 +73,11 @@ import {
   sumCashCarryTotalUsdM,
 } from '@/lib/test-mode/cash-carry-analytics';
 import { residualCfarClosedFormUsdM } from '@/lib/test-mode/cfar-residual';
+import { fundingSwapOutstandingByMonth } from '@/lib/test-mode/cfar-funding-swap';
 import {
+  evaluateLiquidityStrategies,
   liquidityStrategyInputFrom,
-  liveLiquidityCostUsdYrM,
+  strategyForRegime,
 } from '@/lib/test-mode/liquidity-strategies';
 import {
   DEFAULT_LIQUIDITY_TIMING,
@@ -162,6 +165,8 @@ interface VarAnalyticsPanelProps {
   activeLayers?: Set<LayerId>;
   /** Desk-computed funded plan per CCY. Live strategy uses this strip as-is. */
   livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
+  /** FX-hedge Net CFaR per CCY — sizes the CFaR cover layer on Liquidity Analytics. */
+  cfarNetByCcyUsd?: Record<string, number>;
 }
 
 function fmtVarK(usdM: number): string {
@@ -337,6 +342,7 @@ export function VarAnalyticsPanel({
   onMarketRatesByCcyChange,
   activeLayers,
   livePlanByCcy,
+  cfarNetByCcyUsd,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -1220,6 +1226,7 @@ export function VarAnalyticsPanel({
             marketRates: rates,
           }).totalCarryUsdM
         : 0;
+      const funding = fundingSwapOutstandingByMonth(livePlanByCcy?.[ccy], T);
       net += residualCfarClosedFormUsdM({
         stockM,
         monthlyFlows: flows,
@@ -1230,6 +1237,8 @@ export function VarAnalyticsPanel({
         tenureMonths: T,
         carryUsdM: carry,
         forecastProfile,
+        fundingSwapOutstandingM: funding.outstandingM,
+        fundingSwapTermSettles: funding.termSettles,
       }).netCashUsdM;
     }
     return net;
@@ -1242,17 +1251,21 @@ export function VarAnalyticsPanel({
     ratesScopeId,
     bookedHedges,
     preparedByCcy,
+    livePlanByCcy,
   ]);
 
   /**
-   * Net annual cost of the funding regime the book is running, on the same
-   * evaluator the Liquidity tab tables — not a second computation that has to
-   * be kept in step with it.
+   * Live funding programme — same evaluator as the Liquidity tab, so the
+   * summary strip, tab-rail cost, and regime table cannot drift.
    */
-  const liquidityCostUsdYrM = useMemo(() => {
+  const liveFunding = useMemo(() => {
     const timing =
       resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
-    return liveLiquidityCostUsdYrM(
+    const live = strategyForRegime(
+      timing.sizingBasis ?? 'horizon',
+      timing.bookingMode ?? 'rolling',
+    );
+    const results = evaluateLiquidityStrategies(
       liquidityStrategyInputFrom({
         setup,
         bookRows,
@@ -1263,10 +1276,10 @@ export function VarAnalyticsPanel({
         marketRatesByCcy,
         activeLayers,
         livePlanByCcy,
+        cfarNetByCcyUsd,
       }),
-      timing.sizingBasis ?? 'horizon',
-      timing.bookingMode ?? 'rolling',
     );
+    return results.find(r => r.strategy.id === live.id) ?? results[0] ?? null;
   }, [
     setup,
     bookRows,
@@ -1277,7 +1290,9 @@ export function VarAnalyticsPanel({
     marketRatesByCcy,
     activeLayers,
     livePlanByCcy,
+    cfarNetByCcyUsd,
   ]);
+  const liquidityCostUsdYrM = liveFunding?.netCostUsdYrM ?? 0;
 
   const perspectiveTabStats = useMemo((): Partial<
     Record<RiskPerspective, RiskPerspectiveTabStat>
@@ -1332,6 +1347,17 @@ export function VarAnalyticsPanel({
         }
       />
 
+      {liveFunding && (
+        <AnalyticsHedgeSummary
+          regimeLabel={liveFunding.strategy.label}
+          regimeDetail={liveFunding.strategy.summary}
+          constraint={liveFunding.constraint}
+          constraintDetail={liveFunding.constraintDetail}
+          defaultCarryUsdYrM={liveFunding.cashCarryUsdYrM}
+          finalCfarUsdM={liveFunding.finalCfarUsdM}
+        />
+      )}
+
       {perspective === 'cashCarry' ? (
         <CashCarryAnalyticsView
           risk={risk}
@@ -1359,19 +1385,20 @@ export function VarAnalyticsPanel({
           forecastProfile={forecastProfile}
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
+          livePlanByCcy={livePlanByCcy}
         />
       ) : perspective === 'liquidity' ? (
         <LiquidityAnalyticsView
           setup={setup}
           bookRows={bookRows}
           forecastProfile={forecastProfile}
-          onForecastProfileChange={onForecastProfileChange}
           bookedHedges={bookedHedges}
           preparedByCcy={preparedByCcy}
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
           activeLayers={activeLayers}
           livePlanByCcy={livePlanByCcy}
+          cfarNetByCcyUsd={cfarNetByCcyUsd}
         />
       ) : perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">

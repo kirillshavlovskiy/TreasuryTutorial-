@@ -47,6 +47,7 @@ import {
   type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
 import { hedgeCashFlowsByMonth, withNonCashFxConversion } from '@/lib/test-mode/cash-carry-analytics';
+import { fxHedgeNetCfarByCcyUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
 import { DEFAULT_VAR_SETUP, type VarSetup } from '@/lib/test-mode/var-setup';
 import type { FxInput } from '@/lib/workspace-store';
 
@@ -79,7 +80,7 @@ const SHARED_DEFAULTS: SharedGlobals = {
   r_USD: 3.50,
   σ_P:   0.10,
   days:  3,
-  forecastMonths: 1,
+  forecastMonths: 12,
 };
 
 interface SimulatorProps {
@@ -331,6 +332,18 @@ export function Simulator({
     return map;
   }, [rows, shared.forecastMonths, bookedHedges, preparedByCcy, varSetup, forecastProfile]);
 
+  // FX-hedge Net CFaR only — never reads the funding swap / buffer layers.
+  const cfarNetByCcyUsd = useMemo(
+    () => fxHedgeNetCfarByCcyUsdM({
+      rows,
+      setup: varSetup,
+      forecastProfile,
+      bookedHedges,
+      preparedByCcy,
+    }),
+    [rows, varSetup, forecastProfile, bookedHedges, preparedByCcy],
+  );
+
   const dashboard = useMemo(
     () => computeDashboardModel({
       rows: displayRows,
@@ -343,6 +356,7 @@ export function Simulator({
       timing,
       forecastProfile,
       hedgeSettleByCcy,
+      cfarNetByCcyUsd,
     }),
     [
       displayRows,
@@ -355,6 +369,7 @@ export function Simulator({
       timing,
       forecastProfile,
       hedgeSettleByCcy,
+      cfarNetByCcyUsd,
     ],
   );
 
@@ -467,6 +482,7 @@ export function Simulator({
               riskMetricsByCcy={riskMetricsByCcy}
               bookedPositionByCcy={bookedPositionByCcy}
               hedgeSettleByCcy={hedgeSettleByCcy}
+              cfarNetByCcyUsd={cfarNetByCcyUsd}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
               forecastProfile={forecastProfile}
@@ -543,11 +559,7 @@ export function Simulator({
                 )
               : (
                 <>
-                  {/*
-                    Funding decision first: the FX swap layer carries Δdelta = 0,
-                    so it is settled before the outright hedge. When a decision
-                    panel is injected it owns this table itself.
-                  */}
+                  {hedgingPanel ?? <HedgingDecisionPanel r_USD={shared.r_USD} />}
                   <LiquiditySwapDecision
                     rows={dashboard.fcyComputed}
                     r_USD={shared.r_USD}
@@ -556,8 +568,8 @@ export function Simulator({
                     forecastMonths={shared.forecastMonths ?? 1}
                     onSizingBasisChange={v => updateLiquidityTiming({ sizingBasis: v })}
                     onBookingModeChange={v => updateLiquidityTiming({ bookingMode: v })}
+                    embedded={embedded}
                   />
-                  {hedgingPanel ?? <HedgingDecisionPanel r_USD={shared.r_USD} />}
                 </>
               )}
           </div>
@@ -603,6 +615,7 @@ export function Simulator({
                     livePlanByCcy?: Readonly<
                       Record<string, readonly LiquidityCycleProjection[]>
                     >;
+                    cfarNetByCcyUsd?: Record<string, number>;
                   }>,
                   {
                     bookRows: rows,
@@ -611,6 +624,7 @@ export function Simulator({
                     onOpenForecastProfile: () => setForecastProfileOpen(true),
                     activeLayers,
                     livePlanByCcy,
+                    cfarNetByCcyUsd,
                   },
                 )
               : (analyticsPanel ?? (
@@ -667,6 +681,7 @@ export function Simulator({
               pnlColumns={liquidityMode === 'fullSimulator' ? undefined : 'carryOnly'}
               bookedPositionByCcy={bookedPositionByCcy}
               hedgeSettleByCcy={hedgeSettleByCcy}
+              cfarNetByCcyUsd={cfarNetByCcyUsd}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
               forecastProfile={forecastProfile}

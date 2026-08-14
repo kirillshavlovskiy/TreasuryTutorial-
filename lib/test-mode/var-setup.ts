@@ -202,12 +202,12 @@ export const FORECAST_UNCERTAINTY_OPTIONS: {
   { id: '30', label: '30%', value: 0.3 },
 ];
 
-/** Default Analytics: simple average + bullet-friendly profile. */
+/** Default Analytics: 12-month company cash / FX / liquidity forecast. */
 export const DEFAULT_VAR_SETUP: VarSetup = {
   confidencePct: 95,
   exposureBasis: 'simpleAvg',
   horizon: '1m',
-  forecastMonths: 1,
+  forecastMonths: 12,
   forecastUncertainty1m: 0,
   volSource: 'historical',
   averagingConvention: 'midMonth',

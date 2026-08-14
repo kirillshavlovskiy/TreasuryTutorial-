@@ -2,36 +2,29 @@
 
 /**
  * Liquidity perspective on Analytics — how the desk covers the dip in the dated
- * cash path, and what each way of covering it costs.
+ * cash path under the live sizing/booking regime.
  *
- * The other perspectives measure a risk; this one prices the response to one.
- * Every strategy runs over the same ladder and is charged on the same interest
- * ledger (see `lib/test-mode/liquidity-strategies`), so the columns are
- * comparable and the choice is a choice rather than a preference. Adopting a
- * strategy writes its regime onto the forecast profile, which is the same state
- * the Liquidity desk toolbar and the simulator's swap book read.
+ * The other perspectives measure a risk; this one prices the live funding
+ * programme: the desk's current sizing/booking regime, charged on the same
+ * interest ledger as the Liquidity desk (see `lib/test-mode/liquidity-strategies`).
  */
 
 import { Fragment, useMemo, useState } from 'react';
 import {
+  bufferConstraintLabel,
   evaluateLiquidityStrategies,
   liquidityStrategyInputFrom,
   strategyForRegime,
   type LiquidityAnalyticsSource,
   type LiquidityStrategyCcy,
-  type LiquidityStrategyId,
   type LiquidityStrategyResult,
 } from '@/lib/test-mode/liquidity-strategies';
 import {
   DEFAULT_LIQUIDITY_TIMING,
   resolveLiquidityTiming,
 } from '@/lib/liquidity-ladder';
-import type { ForecastProfileState } from '@/lib/forecast-profile';
 
-interface LiquidityAnalyticsViewProps extends LiquidityAnalyticsSource {
-  /** Adopting a strategy writes its regime here. Read-only without it. */
-  onForecastProfileChange?: (profile: ForecastProfileState) => void;
-}
+type LiquidityAnalyticsViewProps = LiquidityAnalyticsSource;
 
 function fmtK(usdM: number): string {
   const k = usdM * 1000;
@@ -56,7 +49,7 @@ export function LiquidityAnalyticsView({
   marketRatesByCcy,
   activeLayers,
   livePlanByCcy,
-  onForecastProfileChange,
+  cfarNetByCcyUsd,
 }: LiquidityAnalyticsViewProps) {
   const months = setup.forecastMonths;
   const timing = resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
@@ -77,6 +70,7 @@ export function LiquidityAnalyticsView({
         marketRatesByCcy,
         activeLayers,
         livePlanByCcy,
+        cfarNetByCcyUsd,
       }),
     [
       setup,
@@ -88,44 +82,20 @@ export function LiquidityAnalyticsView({
       marketRatesByCcy,
       activeLayers,
       livePlanByCcy,
+      cfarNetByCcyUsd,
     ],
   );
   const rUsd = input.shared.r_USD;
   const results = useMemo(() => evaluateLiquidityStrategies(input), [input]);
-
-  const [selectedId, setSelectedId] = useState<LiquidityStrategyId | null>(null);
   const selected =
-    results.find(r => r.strategy.id === selectedId) ??
-    results.find(r => r.strategy.id === liveStrategy.id) ??
-    results[0];
-
-  const cheapestId = useMemo(() => {
-    if (results.length === 0) return null;
-    return results.reduce((best, r) =>
-      r.netCostUsdYrM < best.netCostUsdYrM ? r : best,
-    ).strategy.id;
-  }, [results]);
-
-  const adopt = (result: LiquidityStrategyResult) => {
-    const regime = result.strategy.regime;
-    if (!regime || !onForecastProfileChange || !forecastProfile) return;
-    onForecastProfileChange({
-      ...forecastProfile,
-      liquidity: {
-        ...timing,
-        sizingBasis: regime.sizingBasis,
-        bookingMode: regime.bookingMode,
-      },
-    });
-    setSelectedId(result.strategy.id);
-  };
+    results.find(r => r.strategy.id === liveStrategy.id) ?? results[0];
 
   if (results.length === 0 || !selected) {
     return (
       <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
         {months > 0
           ? 'No FCY book to fund — the liquidity path is built from the currency rows on the simulator.'
-          : 'Pick a forecast period of 1 month or more: without a cash path there is no trough to cover and nothing to compare.'}
+          : 'Pick a forecast period of 1 month or more: without a cash path there is no trough to cover.'}
       </div>
     );
   }
@@ -137,167 +107,114 @@ export function LiquidityAnalyticsView({
           Funding regime · {months}-cycle dated path
         </div>
         <p className="max-w-[62rem] text-xs leading-relaxed text-slate-400">
-          The dated path says how deep the book dips and when. It does not say
-          how the dip is covered, and the cover has a price. Each strategy below
-          runs over the same ladder and is charged on the same annual interest
-          ledger — USD given up to hold the swap book, less interest earned on
-          positive FCY balances, plus overdraft paid on negative ones — so the
-          only thing that differs between the cards is the funding decision.
-          The Live card is the desk&apos;s own strip when one is on the book;
-          the other cards are counterfactuals on the same dated path. Cushions
-          follow the desk layers, against a USD rate of{' '}
+          Each row is a funding regime. Constraint is what sizes H* (VaR,
+          Carry, or Balance). Default Carry is the unfunded FX path — the same
+          on every regime. Final CFaR is displayed Net CFaR after the FX hedge
+          and that regime&apos;s funding-swap bridge. USD rate{' '}
           <span className="font-mono text-slate-300">{rUsd.toFixed(2)}%</span>.
         </p>
       </section>
 
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {results.map(r => {
-          const on = selected.strategy.id === r.strategy.id;
-          const isLive = liveStrategy.id === r.strategy.id;
-          const short = r.gapToThresholdUsdM < -0.0005;
-          return (
-            <button
-              key={r.strategy.id}
-              type="button"
-              aria-pressed={on}
-              onClick={() => setSelectedId(r.strategy.id)}
-              className={`flex cursor-pointer flex-col gap-2 rounded-lg border p-3 text-left transition-colors ${
-                on
-                  ? 'border-sky-500/70 bg-sky-500/[0.07]'
-                  : 'border-slate-700 bg-slate-950/40 hover:border-slate-500'
-              }`}
-            >
-              <div className="flex items-start justify-between gap-2">
-                <span className="text-xs font-semibold text-slate-100">
-                  {r.strategy.label}
-                </span>
-                <span className="flex shrink-0 flex-wrap justify-end gap-1">
-                  {isLive && (
-                    <span
-                      className="rounded bg-sky-500/20 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-sky-200"
-                      title="The regime persisted on the forecast profile — what the simulator's swap book is running now"
-                    >
-                      Live
-                    </span>
-                  )}
-                  {cheapestId === r.strategy.id && (
-                    <span
-                      className="rounded bg-emerald-500/15 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-emerald-300"
-                      title="Lowest net annual funding cost of the strategies compared"
-                    >
-                      Cheapest
-                    </span>
-                  )}
-                </span>
-              </div>
+      <RegimeSummaryTable results={results} liveId={liveStrategy.id} />
 
-              <div>
-                <div
-                  className={`font-mono text-lg font-semibold tabular-nums ${
-                    on ? 'text-slate-50' : 'text-slate-300'
-                  }`}
-                >
-                  {fmtK(r.netCostUsdYrM)}
-                </div>
-                <div className="text-[9px] uppercase tracking-[0.09em] text-slate-600">
-                  Net funding cost $/yr
-                </div>
-              </div>
-
-              <dl className="space-y-0.5 border-t border-slate-800 pt-1.5 font-mono text-[10px] tabular-nums text-slate-500">
-                <div className="flex justify-between gap-2">
-                  <dt title="USD forgone to hold the FCY swap book over the horizon">
-                    USD give-up
-                  </dt>
-                  <dd className="text-slate-400">{fmtK(r.usdGiveUpUsdYrM)}</dd>
-                </div>
-                <div className="flex justify-between gap-2">
-                  <dt title="Interest earned on the positive part of the funded balance">
-                    FCY earned
-                  </dt>
-                  <dd className="text-emerald-300/80">−{fmtK(r.fcyEarnedUsdYrM)}</dd>
-                </div>
-                <div className="flex justify-between gap-2">
-                  <dt title="Debit interest on the days the balance is still negative">
-                    Overdraft
-                  </dt>
-                  <dd className={r.odPaidUsdYrM > 0.0005 ? 'text-amber-300/90' : 'text-slate-600'}>
-                    {fmtK(r.odPaidUsdYrM)}
-                  </dd>
-                </div>
-              </dl>
-
-              <dl className="space-y-0.5 border-t border-slate-800 pt-1.5 font-mono text-[10px] tabular-nums text-slate-500">
-                <div className="flex justify-between gap-2">
-                  <dt title="Notional traded today: the spot leg plus anything pre-booked forward">
-                    Commit today
-                  </dt>
-                  <dd className="text-slate-400">
-                    {r.committedTodayUsdM > 0.005
-                      ? `$${r.committedTodayUsdM.toFixed(1)}M`
-                      : '—'}
-                  </dd>
-                </div>
-                <div className="flex justify-between gap-2">
-                  <dt title="Trades the desk has to put on across the horizon — a trip left to a future cycle is priced at whatever the points are then">
-                    Market trips
-                  </dt>
-                  <dd className="text-slate-400">{r.marketTrips || '—'}</dd>
-                </div>
-                <div className="flex justify-between gap-2">
-                  <dt title="Cycles whose low still sits under the cash floor after funding">
-                    Below floor
-                  </dt>
-                  <dd className={r.floorBreaches > 0 ? 'text-amber-300/90' : 'text-slate-600'}>
-                    {r.floorBreaches || '—'}
-                  </dd>
-                </div>
-              </dl>
-
-              <p className="text-[10px] leading-snug text-slate-500">
-                {r.strategy.summary}
-              </p>
-
-              {short && (
-                <p
-                  className="rounded border border-amber-500/25 bg-amber-500/[0.07] px-1.5 py-1 font-mono text-[9px] text-amber-200/90"
-                  title="Deepest shortfall of a cycle low against its own policy cushion H*"
-                >
-                  Leaves {fmtK(-r.gapToThresholdUsdM)} short of H*
-                </p>
-              )}
-            </button>
-          );
-        })}
-      </div>
-
-      <SelectedStrategyDetail
-        result={selected}
-        isLive={selected.strategy.id === liveStrategy.id}
-        onAdopt={
-          selected.strategy.regime && onForecastProfileChange && forecastProfile
-            ? () => adopt(selected)
-            : undefined
-        }
-      />
+      <SelectedStrategyDetail result={selected} />
     </div>
   );
 }
 
+function RegimeSummaryTable({
+  results,
+  liveId,
+}: {
+  results: readonly LiquidityStrategyResult[];
+  liveId: string;
+}) {
+  return (
+    <section className="overflow-x-auto rounded-lg border border-slate-700 bg-slate-950/40 p-3">
+      <div className="mb-2 font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
+        Regime · constraint · default Carry · swap Carry · final CFaR
+      </div>
+      <table className="w-full min-w-[640px] text-left text-xs">
+        <thead>
+          <tr className="border-b border-slate-800 text-slate-500">
+            <th className={TH}>Regime</th>
+            <th className={TH} title="What sizes H* on the desk layers">
+              Constraint
+            </th>
+            <th className={TH} title="Unfunded FX cash carry — same on every regime">
+              Default Carry
+            </th>
+            <th className={TH} title="Rate-diff carry on this regime's book (FCY O/N + USD O/N). Points offset this to 0 at CIP mid.">
+              Swap Carry
+            </th>
+            <th className={TH} title="Displayed Net CFaR: FX hedge + this regime's funding-swap bridge">
+              Final CFaR
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {results.map(r => {
+            const live = r.strategy.id === liveId;
+            return (
+              <tr
+                key={r.strategy.id}
+                className={`border-b border-slate-800/60 font-mono tabular-nums ${
+                  live ? 'bg-sky-500/[0.06] text-slate-100' : 'text-slate-300'
+                }`}
+              >
+                <td className="py-1.5 pr-3">
+                  <span className="font-semibold text-slate-200">{r.strategy.label}</span>
+                  {live && (
+                    <span className="ml-2 rounded bg-sky-500/20 px-1 py-px text-[9px] font-semibold uppercase tracking-wide text-sky-200">
+                      Live
+                    </span>
+                  )}
+                  <div className="text-[10px] font-normal text-slate-500">
+                    {r.strategy.summary}
+                  </div>
+                </td>
+                <td className="py-1.5 pr-3">
+                  <div className="font-semibold text-slate-100">
+                    {bufferConstraintLabel(r.constraint)}
+                  </div>
+                  <div className="text-[10px] text-slate-500">{r.constraintDetail}</div>
+                </td>
+                <td
+                  className={`py-1.5 pr-3 ${r.cashCarryUsdYrM >= 0 ? 'text-emerald-300/80' : 'text-slate-400'}`}
+                >
+                  {fmtK(r.cashCarryUsdYrM)}/yr
+                </td>
+                <td
+                  className={`py-1.5 pr-3 ${
+                    Math.abs(r.swapInterestUsdYrM) < 0.0005
+                      ? 'text-slate-600'
+                      : r.swapInterestUsdYrM >= 0 ? 'text-emerald-300/80' : 'text-slate-400'
+                  }`}
+                  title={`Rate-diff carry ${fmtK(r.swapInterestUsdYrM)} = FCY O/N ${fmtK(r.swapOnUsdYrM)} + USD O/N. Points ${fmtK(r.swapPointsUsdYrM)} offset this to CIP net ${fmtK(r.swapCarryUsdYrM)}.`}
+                >
+                  {fmtK(r.swapInterestUsdYrM)}/yr
+                </td>
+                <td className="py-1.5 pr-3 font-semibold text-yellow-200/90">
+                  {fmtK(r.finalCfarUsdM)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
 /**
- * The programme behind the selected card, currency by currency: what the near
- * leg is, how big the book gets, where the funded path troughs, and — opened up
- * — every leg with its value date and the book it rolls onto.
+ * The live funding programme, currency by currency: what the near leg is, how
+ * big the book gets, where the funded path troughs, and — opened up — every
+ * leg with its value date and the book it rolls onto.
  */
 function SelectedStrategyDetail({
   result,
-  isLive,
-  onAdopt,
 }: {
   result: LiquidityStrategyResult;
-  isLive: boolean;
-  /** Omitted when the strategy is the baseline, or the profile is read-only. */
-  onAdopt?: () => void;
 }) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const toggle = (ccy: string) =>
@@ -315,31 +232,10 @@ function SelectedStrategyDetail({
         <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
           {result.strategy.label} · by currency
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="font-mono text-[10px] text-slate-500">
-            net {fmtK(result.netCostUsdYrM)}/yr · peak book $
-            {result.peakBookUsdM.toFixed(1)}M
-          </span>
-          {onAdopt && (
-            <button
-              type="button"
-              disabled={isLive}
-              onClick={onAdopt}
-              title={
-                isLive
-                  ? 'Already the live regime'
-                  : 'Write this regime onto the forecast profile — the Liquidity desk toolbar and the simulator swap book follow it'
-              }
-              className={`rounded-md border px-2 py-1 text-[10px] font-semibold transition-colors ${
-                isLive
-                  ? 'cursor-default border-slate-800 text-slate-600'
-                  : 'cursor-pointer border-sky-500/50 text-sky-200 hover:bg-sky-500/10'
-              }`}
-            >
-              {isLive ? 'Running' : 'Adopt this regime'}
-            </button>
-          )}
-        </div>
+        <span className="font-mono text-[10px] text-slate-500">
+          {bufferConstraintLabel(result.constraint)} · default Carry{' '}
+          {fmtK(result.cashCarryUsdYrM)}/yr · final CFaR {fmtK(result.finalCfarUsdM)}
+        </span>
       </div>
       <p className="mb-3 max-w-[62rem] text-[11px] leading-relaxed text-slate-500">
         {result.strategy.tradeoff}
@@ -359,16 +255,13 @@ function SelectedStrategyDetail({
               <th className={TH} title="Deepest low on this strategy's funded path (M FCY)">
                 Trough
               </th>
-              <th className={TH} title="USD forgone to hold the book, per year">
-                USD give-up
+              <th className={TH} title="Unfunded FX cash carry vs USD — no funding swap. Same on every regime.">
+                Default Carry
               </th>
-              <th className={TH} title="Interest earned on positive FCY balances, per year">
-                FCY earned
+              <th className={TH} title="Funding-swap overlay: FCY O/N + USD O/N + swap points. 0 at CIP mid.">
+                Swap Carry
               </th>
-              <th className={TH} title="Debit interest on the days the balance stays negative">
-                Overdraft
-              </th>
-              <th className={TH} title="USD give-up − FCY earned + overdraft">
+              <th className={TH} title="−(Cash Carry + Swap Carry) — funding cost $/yr">
                 Net $/yr
               </th>
               <th className={TH} title="Deepest shortfall against the cycle's own cushion H*">
@@ -410,12 +303,21 @@ function SelectedStrategyDetail({
                     >
                       {fmtM(c.trough)}
                     </td>
-                    <td className="py-1.5 pr-3 text-slate-400">{fmtK(c.usdGiveUpUsdYrM)}</td>
-                    <td className="py-1.5 pr-3 text-emerald-300/80">
-                      {fmtK(c.fcyEarnedUsdYrM)}
+                    <td
+                      className={`py-1.5 pr-3 ${c.cashCarryUsdYrM >= 0 ? 'text-emerald-300/80' : 'text-slate-400'}`}
+                      title="Unfunded FX cash carry — does not include the funding swap"
+                    >
+                      {fmtK(c.cashCarryUsdYrM)}
                     </td>
-                    <td className={`py-1.5 pr-3 ${c.odPaidUsdYrM > 0.0005 ? 'text-amber-300/90' : 'text-slate-600'}`}>
-                      {fmtK(c.odPaidUsdYrM)}
+                    <td
+                      className={`py-1.5 pr-3 ${
+                        Math.abs(c.swapInterestUsdYrM) < 0.0005
+                          ? 'text-slate-600'
+                          : c.swapInterestUsdYrM >= 0 ? 'text-emerald-300/80' : 'text-slate-400'
+                      }`}
+                      title={`Rate-diff ${fmtK(c.swapInterestUsdYrM)} = FCY O/N ${fmtK(c.swapOnUsdYrM)} + USD O/N. Points ${fmtK(c.swapPointsUsdYrM)} offset to CIP net ${fmtK(c.swapCarryUsdYrM)}.`}
+                    >
+                      {fmtK(c.swapInterestUsdYrM)}
                     </td>
                     <td className="py-1.5 pr-3 font-semibold text-slate-100">
                       {fmtK(c.netCostUsdYrM)}
@@ -426,7 +328,7 @@ function SelectedStrategyDetail({
                   </tr>
                   {open && (
                     <tr>
-                      <td colSpan={9} className="border-b border-slate-800/60 bg-slate-950/60 px-3 py-2">
+                      <td colSpan={8} className="border-b border-slate-800/60 bg-slate-950/60 px-3 py-2">
                         <LegSchedule row={c} />
                       </td>
                     </tr>
@@ -445,9 +347,8 @@ function SelectedStrategyDetail({
                 {result.peakBookUsdM > 0.005 ? `$${result.peakBookUsdM.toFixed(1)}M` : '—'}
               </td>
               <td className="py-2 pr-3" />
-              <td className="py-2 pr-3">{fmtK(result.usdGiveUpUsdYrM)}</td>
-              <td className="py-2 pr-3 text-emerald-300/80">{fmtK(result.fcyEarnedUsdYrM)}</td>
-              <td className="py-2 pr-3">{fmtK(result.odPaidUsdYrM)}</td>
+              <td className="py-2 pr-3">{fmtK(result.cashCarryUsdYrM)}</td>
+              <td className="py-2 pr-3">{fmtK(result.swapInterestUsdYrM)}</td>
               <td className="py-2 pr-3 text-slate-50">{fmtK(result.netCostUsdYrM)}</td>
               <td className="py-2 pr-3" />
             </tr>
@@ -457,10 +358,10 @@ function SelectedStrategyDetail({
 
       {baseline && (
         <p className="mt-2 border-t border-slate-800 pt-2 text-[10px] leading-relaxed text-slate-500">
-          Nothing is booked on the baseline, so the whole cost is debit interest
-          and the requirement stays open. It is here to be beaten: a funded
-          programme is only worth its points if it takes more off the overdraft
-          line than it adds to the give-up line.
+          Nothing is booked on the baseline, so Swap Carry is zero and the
+          number is unfunded Cash Carry only. A funded programme adds the
+          swap overlay on top — at CIP mid that overlay nets to zero, and the
+          requirement is what the strip actually covers.
         </p>
       )}
     </section>
@@ -471,6 +372,15 @@ function LegSchedule({ row }: { row: LiquidityStrategyCcy }) {
   const th =
     'border-b border-slate-800 px-2 py-1 text-right text-[9px] font-semibold uppercase tracking-wide text-slate-500';
   const td = 'border-b border-slate-800/50 px-2 py-0.5 text-right text-slate-400';
+  const tot = row.schedule.reduce(
+    (s, l) => ({
+      fcy: s.fcy + l.fcyOnUsdYr,
+      usd: s.usd + l.usdOnUsdYr,
+      pts: s.pts + l.pointsUsdYr,
+      net: s.net + l.interestUsdYr,
+    }),
+    { fcy: 0, usd: 0, pts: 0, net: 0 },
+  );
 
   return (
     <div className="overflow-x-auto">
@@ -488,6 +398,18 @@ function LegSchedule({ row }: { row: LiquidityStrategyCcy }) {
             <th className={th} title="Notional outstanding once this leg is on">
               Outstanding
             </th>
+            <th className={th} title="FCY overnight on this new leg, $K/yr">
+              FCY O/N
+            </th>
+            <th className={th} title="Opposite USD overnight on this new leg, $K/yr">
+              USD O/N
+            </th>
+            <th className={th} title="CIP mid points on the swap (near→far tenor). Every funding leg is a swap.">
+              Points
+            </th>
+            <th className={th} title="Rate-diff carry (FCY O/N + USD O/N). Points offset this to 0 at CIP mid.">
+              Leg carry
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -500,16 +422,16 @@ function LegSchedule({ row }: { row: LiquidityStrategyCcy }) {
                 {l.preBookable ? (
                   <span
                     className="rounded bg-sky-500/15 px-1 py-px text-sky-200"
-                    title={`Already sized by the path — bookable today as a swap value-dated M${l.valueDateMonths + 1}`}
+                    title={`FX swap booked today, near leg value-dated M${l.valueDateMonths + 1}. Has swap points.`}
                   >
-                    forward-start
+                    fwd-start swap
                   </span>
                 ) : (
                   <span
                     className="rounded bg-amber-500/15 px-1 py-px text-amber-200"
-                    title="The near cycle's trade: spot start, book now"
+                    title="FX swap booked today: near leg at spot, far leg rolled or repaid. Has swap points — not a spot outright."
                   >
-                    spot · book now
+                    spot-start swap
                   </span>
                 )}
               </td>
@@ -522,15 +444,39 @@ function LegSchedule({ row }: { row: LiquidityStrategyCcy }) {
               <td className={`${td} font-semibold text-slate-300`}>
                 {l.outstanding.toFixed(2)}
               </td>
+              <td className={td}>{fmtK(l.fcyOnUsdYr)}</td>
+              <td className={td}>{fmtK(l.usdOnUsdYr)}</td>
+              <td className={td}>{fmtK(l.pointsUsdYr)}</td>
+              <td
+                className={`${td} font-semibold ${
+                  Math.abs(l.interestUsdYr) < 0.0005
+                    ? 'text-slate-600'
+                    : l.interestUsdYr >= 0 ? 'text-emerald-300/80' : 'text-rose-300/80'
+                }`}
+                title={`Spot-start swap: FCY O/N ${fmtK(l.fcyOnUsdYr)} + USD O/N ${fmtK(l.usdOnUsdYr)} = ${fmtK(l.interestUsdYr)}/yr. Points ${fmtK(l.pointsUsdYr)} offset to CIP net ${fmtK(l.netUsdYr)}.`}
+              >
+                {fmtK(l.interestUsdYr)}
+              </td>
             </tr>
           ))}
         </tbody>
+        <tfoot>
+          <tr className="font-semibold text-slate-300">
+            <td className={`${td} text-left text-slate-500`} colSpan={5}>
+              Σ new-leg overlay
+            </td>
+            <td className={td}>{fmtK(tot.fcy)}</td>
+            <td className={td}>{fmtK(tot.usd)}</td>
+            <td className={td}>{fmtK(tot.pts)}</td>
+            <td className={`${td} text-slate-200`}>{fmtK(tot.net)}</td>
+          </tr>
+        </tfoot>
       </table>
       <p className="mt-1.5 text-[9px] leading-relaxed text-slate-500">
-        Rolling a leg keeps its cash, it does not repay the drain: a drain that
-        repeats adds a leg every cycle and the outstanding book grows to the
-        horizon&rsquo;s burn. Only a cycle that turns cash-positive retires
-        notional — the far date is extended, not settled.
+        Every funding leg is an FX swap (near + far), not a spot outright.
+        M1 is a spot-starting swap — near today, far rolled or repaid — so it
+        has points. Forward-start legs are the same instrument, value-dated
+        later. Leg carry is the rate differential; points offset it at CIP mid.
       </p>
     </div>
   );

@@ -140,34 +140,31 @@ describe('computeDashboardModel', () => {
     expect(t20).toBeLessThan(cadCarry);    // 20M: sell amplified beyond carry optimum
   });
 
-  it('CIP: swap carry is zero; cash carry is post-swap economic P&L', () => {
-    // FX swap at mid cancels the rate differential on the moved notional.
-    // Economic carry = post-swap (TWA) balance × (r_actual − r_USD) × spot —
-    // NOT opening-cash × full differential (that double-counted vs the swap).
+  it('CIP: swap overlay nets to zero; cash carry is the unfunded path', () => {
+    // Funding-swap O/N + points cancel at CIP mid. Cash carry is the unfunded
+    // FX path — it does not move when the swap is booked.
     const m = computeDashboardModel({ ...input, policyVAR: 10 });
     for (const r of m.fcyComputed) {
       const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 0;
       expect(r.swapCarryUsdYr).toBeCloseTo(0, 9);
-      const r_actual = r.postSwapCash >= 0 ? r.r_FCY : r.r_OD;
-      const expected = r.postSwapCash * (r_actual - input.shared.r_USD) / 100 * spot;
+      expect(r.swapOnUsdYr + r.swapPointsUsdYr + (-r.swapNear * (input.shared.r_USD / 100) * spot))
+        .toBeCloseTo(0, 9);
+      const r_actual = r.cash >= 0 ? r.r_FCY : r.r_OD;
+      const expected = r.cash * (r_actual - input.shared.r_USD) / 100 * spot;
       expect(r.floatNim).toBeCloseTo(expected, 6);
     }
   });
 
-  it('P&L does not book opening-cash carry after the position is swapped away', () => {
-    // Regression: PAY sells (e.g. EUR/CAD) swap nearly all opening LP to the
-    // overlay target — Cash Carry must reflect the residual post-swap balance,
-    // not the opening stock. Overlay banner carry is incremental attribution
-    // only and must not be added again into floatNim.
+  it('funding-swap overlay sits on top of unfunded carry and does not replace it', () => {
     const m = computeDashboardModel({ ...input, policyVAR: 10 });
     const eur = m.fcyComputed.find(r => r.ccy === 'EUR')!;
     expect(Math.abs(eur.overlayLeg)).toBeGreaterThan(50);
     expect(Math.abs(eur.postSwapCash)).toBeLessThan(Math.abs(eur.cash) * 0.2);
     const openingNaive = eur.cash * (eur.r_FCY - input.shared.r_USD) / 100
       * (CURRENCY_PARAMS.EUR?.spot ?? 0);
-    // Post-swap economic carry is much smaller in magnitude than opening-cash naive.
-    expect(Math.abs(eur.floatNim)).toBeLessThan(Math.abs(openingNaive) * 0.25);
-    // Total row P&L cash+swap equals floatNim alone (swap CIP-cancelled).
+    // Unfunded cash carry stays on the opening path; the swap is a separate line.
+    expect(eur.floatNim).toBeCloseTo(openingNaive, 6);
+    expect(eur.swapCarryUsdYr).toBeCloseTo(0, 9);
     expect(eur.floatNim + eur.swapCarryUsdYr).toBeCloseTo(eur.floatNim, 9);
   });
 

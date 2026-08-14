@@ -79,7 +79,10 @@ export function WorkbenchFxDesk({
     forecastProfile: ForecastProfileState;
   }>({
     rows: [],
-    forecastProfile: dashboard.forecastProfile ?? DEFAULT_FORECAST_PROFILE,
+    forecastProfile:
+      dashboard.forecastProfile ??
+      seed.forecastProfile ??
+      DEFAULT_FORECAST_PROFILE,
   });
   const [hedgeStructure, setHedgeStructure] =
     useState<ForecastHedgeStructure>('bullet');
@@ -165,9 +168,9 @@ export function WorkbenchFxDesk({
     // Keep desk scoped when switching profiles / entities.
     setAnalyticsBook({
       rows: [],
-      forecastProfile: dashboard.forecastProfile ?? DEFAULT_FORECAST_PROFILE,
+      forecastProfile: dashboard.forecastProfile ?? seed.forecastProfile ?? DEFAULT_FORECAST_PROFILE,
     });
-  }, [entity.id, profile.id, dashboard.forecastProfile]);
+  }, [entity.id, profile.id, dashboard.forecastProfile, seed.forecastProfile]);
 
   return (
     <Simulator
@@ -196,7 +199,9 @@ export function WorkbenchFxDesk({
       fxInputs={fxConfig?.inputs ?? [...TASK01_REQUIRED_FX_INPUTS]}
       timing={fractions}
       formulas={dashboard.formulas}
-      forecastProfile={dashboard.forecastProfile}
+      forecastProfile={
+        dashboard.forecastProfile ?? seed.forecastProfile ?? DEFAULT_FORECAST_PROFILE
+      }
       onForecastProfileChange={onForecastProfileChange}
       onFormulaChange={onFormulaChange}
       onFormulaChanges={onFormulaChanges}

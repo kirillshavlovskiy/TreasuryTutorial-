@@ -66,6 +66,15 @@ const LAYER_DEFS: LayerDef[] = [
     textColor: 'text-violet-700',
     bg: 'bg-violet-50 border-violet-200',
   },
+  {
+    id: 'cfarCover',
+    label: 'CFaR cover',
+    formula: 'Net CFaR → FCY buffer',
+    hint: 'Sizes a funding swap from FX-only Net CFaR (not Gross) so the swap cannot resize itself. Displayed CFaR then RSS-combines this swap\'s rate-diff bridge with the FX hedge.',
+    activeColor: '#0ea5e9',
+    textColor: 'text-sky-700',
+    bg: 'bg-sky-50 border-sky-200',
+  },
 ];
 
 // ─── Policy limit indicator ────────────────────────────────────────────────────
@@ -212,7 +221,7 @@ export function LayeredBufferAnalysis({
     if (getSimRow(ccy)) onRowFieldChange(ccy, 'cash_floor', val);
   };
   const portfolioActive = activeLayers.has('portfolioDiv');
-  const noLayers = !activeLayers.has('floorH') && !activeLayers.has('sigmaP') && !activeLayers.has('carryOptim') && !activeLayers.has('portfolioDiv');
+  const noLayers = !activeLayers.has('floorH') && !activeLayers.has('sigmaP') && !activeLayers.has('carryOptim') && !activeLayers.has('portfolioDiv') && !activeLayers.has('cfarCover');
 
   // Portfolio VAR summary panel — OVERLAY VAR (deviation of targets from the
   // hold-the-book base), matching the optimizer and the policy limit. Existing
@@ -521,7 +530,7 @@ export function LayeredBufferAnalysis({
                   }`}
                     title={noLayers
                       ? `No layers active.`
-                      : `P(${f2(Math.abs(r.payout))}) + floor(${f2(r.floor_contrib)}) + safety(${f2(r.delta_sigma)}) + carry(${f2(r.delta_carry)}) + portfolio(${f2(r.delta_portfolio)}) = ${f2(r.cash_threshold)} M FCY = ${fM(r.cash_threshold * r.spot)} $M USD (PRE-PAYOUT target)${r.floor_binding ? ' ⌊carry < 0⌋' : ''}${(r as { usd_stress_trim?: boolean }).usd_stress_trim ? ` — USD stress trim from ${f2((r as { stress_trim_from?: number }).stress_trim_from ?? r.cash_threshold)}` : ''}`}
+                      : `P(${f2(Math.abs(r.payout))}) + floor(${f2(r.floor_contrib)}) + safety(${f2(r.delta_sigma)}) + cfar(${f2(r.delta_cfar)}) + carry(${f2(r.delta_carry)}) + portfolio(${f2(r.delta_portfolio)}) = ${f2(r.cash_threshold)} M FCY = ${fM(r.cash_threshold * r.spot)} $M USD (PRE-PAYOUT target)${r.floor_binding ? ' ⌊carry < 0⌋' : ''}${(r as { usd_stress_trim?: boolean }).usd_stress_trim ? ` — USD stress trim from ${f2((r as { stress_trim_from?: number }).stress_trim_from ?? r.cash_threshold)}` : ''}`}
                   >
                     {noLayers ? '—' : fM(r.cash_threshold)}
                     {!noLayers && (r as { usd_stress_trim?: boolean }).usd_stress_trim && (

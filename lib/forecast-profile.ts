@@ -5,6 +5,7 @@ import {
   roundMoney,
   computeLayeredBuffer,
   computeFcySwapNear,
+  liquidityFormulaLayersActive,
   type RowState,
   type SharedGlobals,
   type LayerId,
@@ -46,6 +47,24 @@ export const EMPTY_FORECAST_EXTRAS: ForecastCashExtras = {
   otherIn: 0,
   otherOut: 0,
 };
+
+/** Default company cash / FX / liquidity forecast horizon (months). */
+export const DEFAULT_FORECAST_MONTHS = 12;
+
+/**
+ * Default store-receivables collection per month (M FCY) over the 12-month
+ * projection. Debt repayment is not in this window — it lands after Tf.
+ */
+export const DEFAULT_STORE_RECEIVABLES_MONTHLY_M = 0.2;
+
+/** Working-capital extras: collect store AR monthly; do not repay debt inside Tf. */
+export function defaultCompanyCashExtras(): ForecastCashExtras {
+  return {
+    ...EMPTY_FORECAST_EXTRAS,
+    nwcIn: DEFAULT_STORE_RECEIVABLES_MONTHLY_M,
+    debtOut: 0,
+  };
+}
 
 /**
  * One month of cash inflows / outflows. Signs match RowState:
@@ -255,6 +274,18 @@ export const DEFAULT_FORECAST_PROFILE: ForecastProfileState = {
   calcRowsByCcy: {},
   calcByCcy: {},
 };
+
+/** Flat forecast profile with store-receivables collections on the given FCYs. */
+export function forecastProfileWithStoreReceivables(
+  currencies: readonly string[],
+): ForecastProfileState {
+  const extrasByCcy: Record<string, ForecastCashExtras> = {};
+  for (const ccy of currencies) {
+    if (!ccy || ccy === 'USD') continue;
+    extrasByCcy[ccy] = defaultCompanyCashExtras();
+  }
+  return { ...DEFAULT_FORECAST_PROFILE, extrasByCcy };
+}
 
 export function calcFieldKey(calcId: string): string {
   return `calc_${calcId}`;
@@ -1208,6 +1239,7 @@ function runLiquidityCycles(
   /** Term booking has nothing left to pre-book: the one leg is already on. */
   preBookable: boolean,
   targetShift: number,
+  cfarCoverFcy: number,
 ): LiquidityCycleProjection[] {
   const out: LiquidityCycleProjection[] = [];
   let opening = row.cash;
@@ -1237,15 +1269,16 @@ function runLiquidityCycles(
       activeLayers,
       opening,
       row.carry_target,
+      cfarCoverFcy,
     );
     // A budget verdict can take away the carry overlay and the stock hold; the
-    // floor and the forecast-uncertainty cushion are not discretionary, so the
-    // shift never funds a cycle below them.
+    // floor, σ cushion and CFaR cover are not discretionary, so the shift never
+    // funds a cycle below them.
     const cash_threshold = targetShift === 0
       ? layered.cash_threshold
       : roundMoney(Math.max(
         layered.cash_threshold + targetShift,
-        layered.floor_contrib + layered.delta_sigma,
+        layered.floor_contrib + layered.delta_sigma + layered.delta_cfar,
       ));
 
     const swap_needed = nearLeg(k, { opening, forecasted_cash, cash_threshold });
@@ -1326,17 +1359,14 @@ export function projectLiquidityCycles(
    * starting target is the policy the book reached, not the raw layer sum.
    */
   targetShift = 0,
+  cfarCoverFcy = 0,
 ): LiquidityCycleProjection[] {
   const T = Math.max(1, Math.floor(cycles));
-  const formulaLayersActive =
-    activeLayers.has('floorH') ||
-    activeLayers.has('sigmaP') ||
-    activeLayers.has('carryOptim') ||
-    activeLayers.has('portfolioDiv');
+  const formulaLayersActive = liquidityFormulaLayersActive(activeLayers);
 
   const run = (nearLeg: NearLegPolicy, preBookable: boolean) => runLiquidityCycles(
     row, shared, activeLayers, T, forecastProfile, hedgeSettle, datedCycles,
-    nearLeg, preBookable, targetShift,
+    nearLeg, preBookable, targetShift, cfarCoverFcy,
   );
 
   const rolling = run((_k, ctx) => computeFcySwapNear(

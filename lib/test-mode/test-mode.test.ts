@@ -66,6 +66,7 @@ import {
   type VarSetup,
 } from '@/lib/test-mode';
 import { usdToFcyM } from '@/lib/fx-buffer';
+import { periodFlowSumLocalM } from '@/lib/forecast-profile';
 import {
   createDashboard,
   createRiskProfile,
@@ -148,6 +149,20 @@ describe('NordTech seed exposures', () => {
       eur.cash + (eur.nonCashAsset ?? 0) - eur.ir_liab_notional,
     ).toBeCloseTo(1.9, 6);
     expect(eur.collections).toBeCloseTo(1.2, 6);
+  });
+
+  it('store receivables collect 0.2/month over 12m; debt is not repaid inside Tf', () => {
+    const entities = seedNordtechWorkspace().entities;
+    const de = entities.find(e => classifyNordtechEntity(e) === 'DE')!;
+    const seed = simSeedForEntity(de);
+    const eur = seed.rows.find(r => r.ccy === 'EUR')!;
+    const extras = seed.forecastProfile?.extrasByCcy?.EUR;
+    expect(extras?.nwcIn).toBeCloseTo(0.2, 8);
+    expect(extras?.debtOut).toBe(0);
+    expect(periodFlowSumLocalM(eur, 12, seed.forecastProfile)).toBeCloseTo(
+      1.2 * 12 + 0.2 * 12,
+      6,
+    );
   });
 });
 

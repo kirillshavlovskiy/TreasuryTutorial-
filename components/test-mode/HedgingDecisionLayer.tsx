@@ -1237,17 +1237,6 @@ export function HedgingDecisionLayer({
         </div>
       </div>
 
-      <LiquiditySwapDecision
-        rows={fcyComputed ?? []}
-        r_USD={r_USD ?? 0}
-        sizingBasis={sizingBasis ?? 'horizon'}
-        bookingMode={bookingMode ?? 'rolling'}
-        forecastMonths={forecastMonths ?? varSetup.forecastMonths ?? 1}
-        onSizingBasisChange={onSizingBasisChange}
-        onBookingModeChange={onBookingModeChange}
-        embedded={embedded}
-      />
-
       <>
       <div className="grid gap-3 sm:grid-cols-3">
         <Stat
@@ -2069,6 +2058,17 @@ export function HedgingDecisionLayer({
               );
             })}
       </div>
+
+      <LiquiditySwapDecision
+        rows={fcyComputed ?? []}
+        r_USD={r_USD ?? 0}
+        sizingBasis={sizingBasis ?? 'horizon'}
+        bookingMode={bookingMode ?? 'rolling'}
+        forecastMonths={forecastMonths ?? varSetup.forecastMonths ?? 1}
+        onSizingBasisChange={onSizingBasisChange}
+        onBookingModeChange={onBookingModeChange}
+        embedded={embedded}
+      />
 
       {draft && (
         <BookHedgeModal

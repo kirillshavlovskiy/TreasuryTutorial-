@@ -203,6 +203,7 @@ describe('createDashboardFromWizard', () => {
     expect(cfg.currencyMode).toBe('selected');
     expect(cfg.currencies).toEqual(['GBP']);
     expect(cfg.optimizationMetrics).toContain('carryTarget');
+    expect(cfg.optimizationMetrics).toContain('cfarCover');
   });
 
   it('updates an existing dashboard via wizard edit workflow', () => {

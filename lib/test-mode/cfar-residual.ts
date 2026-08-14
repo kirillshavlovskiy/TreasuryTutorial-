@@ -9,6 +9,7 @@ import {
   type CfarBandsResult,
   type ExposureKnot,
 } from '@/lib/test-mode/cfar-drawdown';
+import { fundingSwapKnotsFromOutstanding } from '@/lib/test-mode/cfar-funding-swap';
 import {
   buildHedgedVarProfileWithCoverAt,
   buildStripHedgedVarProfile,
@@ -399,11 +400,13 @@ export interface CfarRiskBreakdown {
   /** Expected (deterministic) swap-points cost/gain accrued by T, from the
    * JPM NP rate differential applied to the swap-bridge notional path. */
   swapExpectedCostUsdM: number;
+  /** Peak funding-swap bridge (outstanding liquidity swap × rate-diff vol). */
+  fundingPeakUsdM: number;
 }
 
 /**
- * Full CFaR bands combining THREE risk sources, replacing a single spot-vol
- * pass over the settlement gap:
+ * Full CFaR bands combining the FX-book risk sources, replacing a single
+ * spot-vol pass over the settlement gap:
  *
  * 1. Spot risk — the piece of the gap with NO forward dealt at all
  *    (r_trade(t) = e(t) − H_traded(t), from {@link residualKnotsForHedge}).
@@ -422,9 +425,13 @@ export interface CfarRiskBreakdown {
  *    future moment you're forced to bridge, i.e. rate-differential vol
  *    over the SAME √t horizon, not spot vol.
  *
- * The two dollar-risk components are computed independently (different vols
+ * The dollar-risk components are computed independently (different vols
  * on different notionals) then combined in quadrature (RSS) at every point
  * in time — they're different risk factors, not perfectly correlated.
+ *
+ * 4. Funding-swap bridge (optional) — outstanding liquidity funding swap,
+ *    same rate-diff vol as (3). Displayed CFaR only; cover sizing must omit
+ *    this input so the swap cannot feed back into its own size.
  */
 export function computeHedgeCfarBands(input: {
   stockM: number;
@@ -438,6 +445,10 @@ export function computeHedgeCfarBands(input: {
   carryScheduleUsdM?: readonly number[];
   /** When set, Revenue / line σ overrides global Analytics u₁ₘ for this CCY. */
   forecastProfile?: ForecastProfileState | null;
+  /** Outstanding liquidity funding swap (FCY M) by month — displayed CFaR. */
+  fundingSwapOutstandingM?: readonly number[];
+  /** Term cover: outstanding goes to 0 at T when the far leg settles. */
+  fundingSwapTermSettles?: boolean;
 }): CfarBandsResult & { breakdown: CfarRiskBreakdown; hedged: boolean } {
   const { ccy } = input;
   // Line-level projection σ (Forecast profile) → effective u₁ₘ for quantity risk.
@@ -552,24 +563,40 @@ export function computeHedgeCfarBands(input: {
     confidencePct: setup.confidencePct,
     steps,
   });
+  const fundingKnots = fundingSwapKnotsFromOutstanding(
+    input.fundingSwapOutstandingM ?? [],
+    T,
+    input.fundingSwapTermSettles,
+  );
+  const fundingBands = fundingKnots.length > 0
+    ? computeCfarBands({
+        knots: fundingKnots,
+        spotUsd,
+        sigmaMonthly: rateDiffVolMonthly(ccy, setup),
+        confidencePct: setup.confidencePct,
+        steps,
+      })
+    : null;
 
   const rss = (a: number, b: number) => Math.sqrt(a * a + b * b);
+  const rss3 = (a: number, b: number, c: number) => Math.sqrt(a * a + b * b + c * c);
   // Fan percentiles stay at fixed ±1.6449 (visual p05/p95) — the plotted
   // shape only, not the headline figure (see criticalCashUsdM below).
   const points: CfarBandPoint[] = spotBands.points.map((sp, i) => {
     const sw = swapBands.points[i]!;
-    const p05 = -rss(sp.p05, sw.p05);
-    const carryUsdM = sp.carryUsdM + sw.carryUsdM;
+    const fw = fundingBands?.points[i];
+    const p05 = fw ? -rss3(sp.p05, sw.p05, fw.p05) : -rss(sp.p05, sw.p05);
+    const carryUsdM = sp.carryUsdM + sw.carryUsdM + (fw?.carryUsdM ?? 0);
     const netP05 = p05 + carryUsdM;
     return {
       t: sp.t,
       exposureLocalM: sp.exposureLocalM,
       carryUsdM,
       p05,
-      p25: -rss(sp.p25, sw.p25),
+      p25: fw ? -rss3(sp.p25, sw.p25, fw.p25) : -rss(sp.p25, sw.p25),
       p50: 0,
-      p75: rss(sp.p75, sw.p75),
-      p95: rss(sp.p95, sw.p95),
+      p75: fw ? rss3(sp.p75, sw.p75, fw.p75) : rss(sp.p75, sw.p75),
+      p95: fw ? rss3(sp.p95, sw.p95, fw.p95) : rss(sp.p95, sw.p95),
       netP05,
       netP50: carryUsdM,
     };
@@ -588,22 +615,31 @@ export function computeHedgeCfarBands(input: {
   // factors are combined when they need not co-occur — keeps strip
   // count/spacing visible in Gross and Net CFaR across the whole range, not
   // only bullet-vs-any-strip.
-  const criticalCashUsdM = rss(spotBands.criticalCashUsdM, swapBands.criticalCashUsdM);
-  const grossPeakMonth =
-    spotBands.criticalCashUsdM >= swapBands.criticalCashUsdM
-      ? spotBands.grossPeakMonth
-      : swapBands.grossPeakMonth;
+  const fundingPeak = fundingBands?.criticalCashUsdM ?? 0;
+  const criticalCashUsdM = rss3(
+    spotBands.criticalCashUsdM, swapBands.criticalCashUsdM, fundingPeak,
+  );
+  const grossLead = [
+    { v: spotBands.criticalCashUsdM, m: spotBands.grossPeakMonth },
+    { v: swapBands.criticalCashUsdM, m: swapBands.grossPeakMonth },
+    { v: fundingPeak, m: fundingBands?.grossPeakMonth ?? 0 },
+  ].reduce((a, b) => (b.v > a.v ? b : a));
+  const grossPeakMonth = grossLead.m;
   // Net: spot nets against the real hedge carry it was given, at its own
   // peak timeline. Swap-bridge's expected swap-points value stays
   // informational only (swapExpectedCostUsdM below) — netting it here would
   // let a slower, bigger bullet look "safer" than a fine strip purely by
   // earning more carry on more unsettled notional, the opposite of the
   // settlement-matching incentive this metric exists to encourage.
-  const netCriticalCashUsdM = rss(spotBands.netCriticalCashUsdM, swapBands.criticalCashUsdM);
-  const peakMonth =
-    spotBands.netCriticalCashUsdM >= swapBands.criticalCashUsdM
-      ? spotBands.peakMonth
-      : swapBands.grossPeakMonth;
+  const netCriticalCashUsdM = rss3(
+    spotBands.netCriticalCashUsdM, swapBands.criticalCashUsdM, fundingPeak,
+  );
+  const netLead = [
+    { v: spotBands.netCriticalCashUsdM, m: spotBands.peakMonth },
+    { v: swapBands.criticalCashUsdM, m: swapBands.grossPeakMonth },
+    { v: fundingPeak, m: fundingBands?.grossPeakMonth ?? 0 },
+  ].reduce((a, b) => (b.v > a.v ? b : a));
+  const peakMonth = netLead.m;
   return {
     points,
     openPathVarUsdM: criticalCashUsdM,
@@ -617,6 +653,7 @@ export function computeHedgeCfarBands(input: {
       spotPeakUsdM: spotBands.criticalCashUsdM,
       swapPeakUsdM: swapBands.criticalCashUsdM,
       swapExpectedCostUsdM: swapCostSchedule[swapCostSchedule.length - 1] ?? 0,
+      fundingPeakUsdM: fundingPeak,
     },
   };
 }
@@ -643,6 +680,8 @@ export function residualCfarClosedFormUsdM(
   input: ResidualHedgeInput & {
     carryUsdM?: number;
     forecastProfile?: ForecastProfileState | null;
+    fundingSwapOutstandingM?: readonly number[];
+    fundingSwapTermSettles?: boolean;
   },
 ): ResidualCfarClosedForm {
   const bands = computeHedgeCfarBands(input);

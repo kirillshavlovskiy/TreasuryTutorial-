@@ -55,17 +55,11 @@ import {
 } from '@/lib/test-mode/hedge-var';
 import {
   FORECAST_UNCERTAINTY_OPTIONS,
-  MONTHLY_VOL_MAX,
-  MONTHLY_VOL_MIN,
-  VAR_VOL_SOURCE_OPTIONS,
-  clampMonthlyVol,
   horizonMonths,
   monthlyVolForSetup,
   type VarSetup,
-  type VarVolSource,
 } from '@/lib/test-mode/var-setup';
 import { VolSourceControl } from '@/components/test-mode/VolSourceControl';
-import { DeskStepper } from '@/components/DeskStepper';
 import {
   resolveMarketRatesForCcy,
   resolveForwardDepositRates,
@@ -83,7 +77,13 @@ import {
   monthlyInflowSeriesLocalM,
   monthlyOutflowSeriesLocalM,
   type ForecastProfileState,
+  type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
+import {
+  applyFundingSwapBridge,
+  fundingSwapBridgeBands,
+  fundingSwapOutstandingByMonth,
+} from '@/lib/test-mode/cfar-funding-swap';
 
 interface CfarAnalysisViewProps {
   risk: CurrencyRiskRow[];
@@ -99,6 +99,8 @@ interface CfarAnalysisViewProps {
   ratesScopeId?: string;
   marketRates?: FxMarketRatesBundle;
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  /** Desk-computed funded plan — outstanding swap feeds displayed CFaR. */
+  livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
 }
 
 function fmtK(usdM: number): string {
@@ -220,11 +222,6 @@ function GearIcon({ className }: { className?: string }) {
 
 function fmtPct(pct: number): string {
   return `${pct.toFixed(0)}%`;
-}
-
-/** Shortest readable form of a σ input value — 2.5 → "2.5", 3 → "3". */
-function trimNum(v: number): string {
-  return String(Number(v.toFixed(3)));
 }
 
 /** Compact “i” control — click opens a short explanation popover. */
@@ -613,9 +610,10 @@ const FRONTIER_PATHS = 600;
 /**
  * CFaR analysis tab — critical cash absorption per currency, computed off the
  * REAL hedge chosen in Cash Carry via {@link computeMonteCarloMismatchCfar}
- * (2026-08-10 rebuild — replaces the earlier closed-form spot/swap-bridge
- * split entirely; there is no swap/liquidity-funding assumption in this
- * analysis at all, gap-bridging mechanics are out of scope here):
+ * (2026-08-10 rebuild — FX mismatch is Monte Carlo). Displayed headlines then
+ * RSS-combine the desk's outstanding funding-swap bridge (rate-diff vol) so
+ * the tab moves with both the FX hedge and the liquidity hedge. Cover sizing
+ * still uses FX-only Net CFaR — this overlay does not resize the swap.
  *
  * - A single unified mismatch e(t)−H_settled(t) — no split between
  *   "not-dealt" and "dealt-not-settled" notional. The stochastic INPUTS
@@ -628,9 +626,9 @@ const FRONTIER_PATHS = 600;
  * - Carry is itself stochastic — both the rate differential and the
  *   notional it applies to (the random mismatch) are random draws, summed
  *   across the path (a genuine accruing flow, unlike the FX shock).
- * - Settlement frequency lowers CFaR through the SIZE of the mismatch
+ * - Settlement frequency lowers FX CFaR through the SIZE of the mismatch
  *   (H_settled updates more often against the continuously-accruing
- *   exposure as legs settle) — not through any separate swap-bridge term.
+ *   exposure as legs settle). The funding-swap bridge is RSS'd on after.
  *
  * The "Funding gap" column is the same e(t)−H_settled(t) mismatch's
  * deterministic (zero-vol) floor — see {@link settlementFundingGapForHedge}.
@@ -649,6 +647,7 @@ export function CfarAnalysisView({
   ratesScopeId,
   marketRates: marketRatesProp,
   marketRatesByCcy,
+  livePlanByCcy,
 }: CfarAnalysisViewProps) {
   // Stable across renders but re-created the moment any rate input changes,
   // so the Monte Carlo memos below can depend on it directly: they re-run when
@@ -670,20 +669,8 @@ export function CfarAnalysisView({
       if (cleared !== forecastProfile) onForecastProfileChange(cleared);
     }
   };
-  const patchVolOverride = (source: VarVolSource, monthlyVol: number) =>
-    patch({
-      volOverrides: { ...setup.volOverrides, [source]: clampMonthlyVol(monthlyVol) },
-    });
-  const resetVolOverride = (source: VarVolSource) => {
-    const next = { ...setup.volOverrides };
-    delete next[source];
-    patch({ volOverrides: Object.keys(next).length > 0 ? next : undefined });
-  };
   const sigmaMonthly = monthlyVolForSetup(setup);
   const zConf = zForConfidence(setup.confidencePct);
-  const activeVolIsOverridden =
-    setup.volOverrides?.[setup.volSource] !== undefined;
-  const activeVolOpt = VAR_VOL_SOURCE_OPTIONS.find(o => o.id === setup.volSource);
 
   const Tf =
     typeof setup.forecastMonths === 'number' && setup.forecastMonths > 0
@@ -815,6 +802,26 @@ export function CfarAnalysisView({
     sigmaMonthly,
   ]);
 
+  const fundingBridgeByCcy = useMemo(() => {
+    const out: Record<string, NonNullable<ReturnType<typeof fundingSwapBridgeBands>>> = {};
+    for (const spec of rowSpecs) {
+      const { outstandingM, termSettles } = fundingSwapOutstandingByMonth(
+        livePlanByCcy?.[spec.ccy],
+        T,
+      );
+      const bands = fundingSwapBridgeBands({
+        outstandingM,
+        T,
+        spotUsd: NORDTECH_VAR.spotUsd[spec.ccy] ?? 1,
+        sigmaMonthly: rateVolBpYrFor(spec.ccy, setup) / 10000 / Math.sqrt(12),
+        confidencePct: setup.confidencePct,
+        termSettles,
+      });
+      if (bands) out[spec.ccy] = bands;
+    }
+    return out;
+  }, [rowSpecs, livePlanByCcy, T, setup]);
+
   const rowJobs = useMemo(
     () => rowSpecs.map(s => ({ key: s.jobKey, input: s.mcInput })),
     [rowSpecs],
@@ -829,7 +836,12 @@ export function CfarAnalysisView({
   const freshRows: CfarRow[] = [];
   for (const spec of rowSpecs) {
     const bands = rowSim.results.get(spec.jobKey);
-    if (bands) freshRows.push({ ...spec, bands });
+    if (bands) {
+      freshRows.push({
+        ...spec,
+        bands: applyFundingSwapBridge(bands, fundingBridgeByCcy[spec.ccy]),
+      });
+    }
   }
   /**
    * Hold the last complete set on screen while a new one computes. Every key
@@ -1342,7 +1354,10 @@ export function CfarAnalysisView({
   if (whatIfSpec) {
     const bands = detailSim.results.get(whatIfSpec.jobKey);
     if (bands) {
-      whatIf = { ...whatIfSpec, bands };
+      whatIf = {
+        ...whatIfSpec,
+        bands: applyFundingSwapBridge(bands, fundingBridgeByCcy[selected?.ccy ?? '']),
+      };
       lastWhatIfRef.current = whatIf;
     } else {
       // Falling back to null here would swap the chart to the applied hedge
@@ -1363,10 +1378,14 @@ export function CfarAnalysisView({
     const bands = detailSim.results.get(spec.jobKey);
     if (!bands) continue;
     landed += 1;
+    const combined = applyFundingSwapBridge(
+      bands,
+      fundingBridgeByCcy[selected?.ccy ?? ''],
+    );
     const point: FrontierPoint = {
       coverRatio: spec.coverRatio,
-      grossCfarUsdM: bands.criticalCashUsdM,
-      netCfarUsdM: bands.netCriticalCashUsdM,
+      grossCfarUsdM: combined.criticalCashUsdM,
+      netCfarUsdM: combined.netCriticalCashUsdM,
       carryUsdM: spec.carryUsdM,
     };
     if (spec.applied) freshApplied = point;
@@ -1443,47 +1462,11 @@ export function CfarAnalysisView({
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-300">
               Volatility σ₁ₘ
             </div>
-            <div className="flex flex-wrap items-end gap-1.5">
-              <VolSourceControl
-                setup={setup}
-                onSetupChange={onSetupChange}
-                rateVolCcy={selected.ccy}
-              />
-              <DeskStepper
-                label={activeVolOpt?.label ?? 'σ₁ₘ'}
-                value={sigmaMonthly * 100}
-                min={MONTHLY_VOL_MIN * 100}
-                max={MONTHLY_VOL_MAX * 100}
-                step={0.1}
-                onChange={pct => patchVolOverride(setup.volSource, pct / 100)}
-                formatValue={v =>
-                  `${trimNum(v)}%${activeVolIsOverridden ? '*' : ''}`
-                }
-                suffix="/mo"
-                editable
-                disabled={!onSetupChange}
-                tickValues={[0, 12.5, 25, 37.5, 50]}
-                tickLabels={['0', '', '25', '', '50']}
-                className="w-[220px]"
-                title={`Edit σ₁ₘ for the ${setup.volSource} source (0–${MONTHLY_VOL_MAX * 100}% per month). Set 0 to switch FX vol off — the structural gap then costs nothing and only size and timing move CFaR.`}
-                ariaLabel={`${setup.volSource} monthly volatility`}
-                headerExtra={
-                  onSetupChange ? (
-                    <button
-                      type="button"
-                      onClick={() => resetVolOverride(setup.volSource)}
-                      disabled={!activeVolIsOverridden}
-                      title={`Restore the desk preset (${(
-                        (activeVolOpt?.monthlyVol ?? 0) * 100
-                      ).toFixed(1)}%)`}
-                      className="rounded px-1.5 py-0.5 font-mono text-[9px] text-slate-500 transition-colors hover:text-emerald-300 disabled:cursor-default disabled:opacity-30 disabled:hover:text-slate-500"
-                    >
-                      reset
-                    </button>
-                  ) : undefined
-                }
-              />
-            </div>
+            <VolSourceControl
+              setup={setup}
+              onSetupChange={onSetupChange}
+              rateVolCcy={selected.ccy}
+            />
           </div>
           <div>
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-blue-300">
@@ -1561,11 +1544,13 @@ export function CfarAnalysisView({
             </p>
             <InfoTip label="CriticalCash formula">
               <p>
-                CriticalCash = √(spot² + swap²) at peak. Spot =
-                z·S₀·σ_fx·√t·|not-dealt| + z·S₀·σ_E (u₁ₘ). Swap =
-                z·S₀·σ_rate·√t·|dealt-not-settled|. FX σ only hits undelt
-                exposure — a 100% Target bullet has spot FX ≈ 0. u₁ₘ syncs with
-                Forecast profile line σ (top chips clear line overrides).
+                CriticalCash = √(spot² + FX-hedge swap² + funding swap²) at
+                peak. Spot = z·S₀·σ_fx·√t·|not-dealt| + z·S₀·σ_E (u₁ₘ).
+                FX-hedge swap = z·S₀·σ_rate·√t·|dealt-not-settled|. Funding
+                swap = z·S₀·σ_rate·√t·|outstanding liquidity swap|. FX σ only
+                hits undelt exposure — a 100% Target bullet has spot FX ≈ 0.
+                u₁ₘ syncs with Forecast profile line σ. Cover sizing still
+                uses FX-only Net CFaR so the funding swap cannot loop.
               </p>
             </InfoTip>
           </div>
