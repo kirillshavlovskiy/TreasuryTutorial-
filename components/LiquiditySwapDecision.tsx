@@ -78,23 +78,48 @@ function rowFromNearLeg(r: FcyComputedRow, r_USD: number, nearLeg: number, cycle
   };
 }
 
+function rowSwapNear(r: FcyComputedRow): number {
+  const v = r.swapNear;
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+function peakOutstanding(book: readonly number[]): number {
+  let peak = 0;
+  for (const v of book) {
+    if (Math.abs(v) > Math.abs(peak)) peak = v;
+  }
+  return peak;
+}
+
 export function decisionRowFor(r: FcyComputedRow, r_USD: number): DecisionRow | null {
   const plan = r.liquidityPlan;
-  // A buffer layer sizes the row's swap even before the dated plan is on —
-  // still a proposed trade the decision module has to show.
+  const rowSwap = rowSwapNear(r);
+  // A buffer layer sizes Swap near on the Liquidity row. That is the staged
+  // funding trade — show it even before a dated plan exists, and even when
+  // cycle 1 of a dated plan does not happen to be the H* cycle.
   if (!plan || plan.length === 0) {
-    const rowSwap = r.swapNear;
-    if (typeof rowSwap !== 'number' || !Number.isFinite(rowSwap) || Math.abs(rowSwap) <= 0.001) {
-      return null;
-    }
+    if (Math.abs(rowSwap) <= 0.001) return null;
     return rowFromNearLeg(r, r_USD, rowSwap, 1);
   }
-  const nearLeg = plan[0]?.swap_needed ?? 0;
+  const planNear = plan[0]?.swap_needed ?? 0;
   // Each cycle's leg is rolled, so the book is the running sum — a drain that
   // repeats every cycle funds at the whole horizon's burn, not at one leg.
   const book = plan.map(p => p.standing_swap);
   const endingBook = book[book.length - 1] ?? 0;
-  const peakBook = book.reduce((m, v) => Math.max(m, v), 0);
+  const peakBook = peakOutstanding(book);
+  const hasPlanStrip =
+    book.some(v => Math.abs(v) > 0.001)
+    || plan.some(p => Math.abs(p.swap_needed) > 0.001);
+  if (!hasPlanStrip) {
+    if (Math.abs(rowSwap) <= 0.001) return null;
+    return rowFromNearLeg(r, r_USD, rowSwap, plan.length);
+  }
+  const firstLeg = plan.find(p => Math.abs(p.swap_needed) > 0.001)?.swap_needed ?? 0;
+  const nearLeg = Math.abs(planNear) > 0.001
+    ? planNear
+    : Math.abs(rowSwap) > 0.001
+      ? rowSwap
+      : firstLeg;
   const avgBook = book.reduce((s, v) => s + v, 0) / book.length;
   const spot = ccySpotRate(r.ccy);
   const deltaR = r_USD - r.r_FCY;
@@ -343,7 +368,12 @@ export function LiquiditySwapDecision({
   const term = bookingMode === 'term';
   const decisions = rows
     .map(r => decisionRowFor(r, r_USD))
-    .filter((d): d is DecisionRow => d !== null && (d.nearLeg > 0.001 || d.peakBook > 0.001));
+    .filter((d): d is DecisionRow =>
+      d !== null
+      && (Math.abs(d.nearLeg) > 0.001
+        || Math.abs(d.peakBook) > 0.001
+        || Math.abs(d.endingBook) > 0.001)
+    );
 
   const [openCcy, setOpenCcy] = useState<string | null>(null);
   const [coverByCcy, setCoverByCcy] = useState<Record<string, number>>({});

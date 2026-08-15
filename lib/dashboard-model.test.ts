@@ -140,15 +140,22 @@ describe('computeDashboardModel', () => {
     expect(t20).toBeLessThan(cadCarry);    // 20M: sell amplified beyond carry optimum
   });
 
-  it('CIP: swap overlay nets to zero; cash carry is the unfunded path', () => {
-    // Funding-swap O/N + points cancel at CIP mid. Cash carry is the unfunded
-    // FX path — it does not move when the swap is booked.
+  it('CIP: deploying surplus nets to 0; covering a short keeps r_OD − r_FCY', () => {
     const m = computeDashboardModel({ ...input, policyVAR: 10 });
     for (const r of m.fcyComputed) {
       const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 0;
-      expect(r.swapCarryUsdYr).toBeCloseTo(0, 9);
-      expect(r.swapOnUsdYr + r.swapPointsUsdYr + (-r.swapNear * (input.shared.r_USD / 100) * spot))
-        .toBeCloseTo(0, 9);
+      expect(r.swapInterestUsdYr).toBeCloseTo(r.swapOnUsdYr + r.usdOnUsdYr, 9);
+      if (r.swapNear > 1e-6) {
+        expect(r.swapCarryUsdYr).toBeCloseTo(
+          r.swapNear * ((r.r_OD - r.r_FCY) / 100) * spot,
+          6,
+        );
+      } else {
+        expect(r.swapCarryUsdYr).toBeCloseTo(0, 9);
+      }
+      if (Math.abs(r.swapNear) > 0.01) {
+        expect(Math.abs(r.swapInterestUsdYr)).toBeGreaterThan(0);
+      }
       const r_actual = r.cash >= 0 ? r.r_FCY : r.r_OD;
       const expected = r.cash * (r_actual - input.shared.r_USD) / 100 * spot;
       expect(r.floatNim).toBeCloseTo(expected, 6);
@@ -164,8 +171,16 @@ describe('computeDashboardModel', () => {
       * (CURRENCY_PARAMS.EUR?.spot ?? 0);
     // Unfunded cash carry stays on the opening path; the swap is a separate line.
     expect(eur.floatNim).toBeCloseTo(openingNaive, 6);
-    expect(eur.swapCarryUsdYr).toBeCloseTo(0, 9);
-    expect(eur.floatNim + eur.swapCarryUsdYr).toBeCloseTo(eur.floatNim, 9);
+    // Overlay sits on top — CIP-zero only when deploying surplus (sell FCY).
+    if (eur.swapNear > 1e-6) {
+      const spot = CURRENCY_PARAMS.EUR?.spot ?? 0;
+      expect(eur.swapCarryUsdYr).toBeCloseTo(
+        eur.swapNear * ((eur.r_OD - eur.r_FCY) / 100) * spot,
+        6,
+      );
+    } else {
+      expect(eur.swapCarryUsdYr).toBeCloseTo(0, 9);
+    }
   });
 
   it('per-row overlay carry sums to the aggregate portfolio figure', () => {

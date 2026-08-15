@@ -101,28 +101,28 @@ import type { CfarBandPoint, CfarBandsResult } from '@/lib/test-mode/cfar-drawdo
  * and long EUR, or long USD and short PLN, is funded from the buffer, not
  * penalised in CFaR.
  *
- * THE STRUCTURAL GAP IS NOT A RISK BY ITSELF. The settlement schedule not
- * lining up with the forecast accrual pattern is a planned, fully known
- * cash-timing fact — its SIZE is a decision, not a random variable. It enters
- * CFaR through exactly one channel: the rate at which that known balance is
- * eventually valued is uncertain. So at sigmaFxMonthly = 0 the structural gap
- * contributes precisely zero, however large it is. Ledger A is what enforces this — it runs the
- * plan's own flows and settlement dates, differing from the plan only in the
- * spot path, so plan − A collapses to zero the moment spot stops moving. The
- * same applies to the gap's carry: with no drawdown to cover there is nothing
- * for the buffer to absorb, so gross AND net are both zero for a purely structural book
- * at zero FX vol whatever the rate-differential vol. See the "structural gap
- * is a planned SIZE" block in the tests, which pins the invariant on a ~9.9M
- * known gap. Note that with principal netted out of the drawdown, size and
- * timing are priced through the rate too, so sigma = 0 leaves CFaR near zero
- * across the board rather than only zeroing the structural leg.
+ * THE STRUCTURAL GAP IS NOT A CFaR INPUT. The settlement schedule not lining
+ * up with the forecast accrual pattern is a planned, fully known cash-timing
+ * fact — its SIZE is a decision, not a random variable. Revaluing that known
+ * balance at a simulated spot (plan − ledger A) is FX VaR by another name:
+ * it uses the core funding gap as a proxy for market vols. Headline CFaR
+ * does not do that. Gross is ledger A − ledger C with operating principal
+ * netted — size and timing mismatches only, both marked on the SAME spot
+ * path, so the planned gap cancels. A squared delivery shortfall keeps
+ * amt·(S−K), the unwind, not the open-book FX mark. Ledger A is still run:
+ * it is the counterfactual the other two nest on, and plan − A is kept as a
+ * diagnostic (structuralFxRisk) so the excluded FX-vol proxy stays visible.
+ * A purely structural book (no forecast error, no date jitter) therefore has
+ * zero Gross and Net CFaR at any σ. See the "structural gap is a planned
+ * SIZE" block in the tests.
  *
  * ATTRIBUTION is sequential, not RSS. Three ledgers per path, each adding one
  * stochastic driver on top of the last:
  *   A  plan flows, planned settlement, STOCHASTIC spot  → structural
  *   B  realized flow AMOUNTS on forecast dates          → size     = B − A
  *   C  realized amounts on jittered dates, jittered settlement → timing = C − B
- * so structural + size + timing = total exactly. The old RSS combination
+ * so size + timing = headline CFaR exactly. Structural (plan − A) is
+ * diagnostic only — not in the headline. The old RSS combination
  * assumed the three legs were independent risk factors when in fact they
  * share a single underlying factor (spot), and it needed different √t
  * conventions per leg to stay plausible. Nesting the counterfactuals removes
@@ -235,8 +235,8 @@ export interface McCfarComponentPoint {
    * planned and known. (It is the mean of ledger A rather than of the plan
    * ledger so the three parts stay exactly additive — the two differ only by
    * interest accrued at the path's random-walked rate, which is immaterial in
-   * level but would otherwise leave a residual.) Its USD cash impact is
-   * structuralFxRiskUsdM: a known gap is still valued at an unknown rate. */
+ * level but would otherwise leave a residual.) Its USD cash impact
+ * (structuralFxRiskUsdM) is the excluded FX-vol proxy — not in headline CFaR. */
   structuralGapLocalM: number;
   /** TIMING — the incremental FCY balance from jittered flow and settlement
    * DATES (ledger C − ledger B), mean and p05/p95 across paths. */
@@ -248,20 +248,18 @@ export interface McCfarComponentPoint {
   sizeMismatchLocalM: number;
   sizeMismatchP05: number;
   sizeMismatchP95: number;
-  /** Raw (non-running-max) point-in-time gross USD shortfall vs plan at the
-   * setup confidence — "if I marked the book right now." Equals
-   * structuralFxRiskUsdM + sizeFxRiskUsdM + timingFxRiskUsdM in the mean;
-   * the percentiles of the parts do not sum, since each is percentiled
-   * separately. */
+  /** Raw (non-running-max) point-in-time gross USD shortfall of ledger C
+   * vs ledger A at the setup confidence — size + timing only. Equals
+   * sizeFxRiskUsdM + timingFxRiskUsdM in the mean; the percentiles of the
+   * parts do not sum, since each is percentiled separately. */
   rawGrossUsdM: number;
   /** USD cash impact of holding the STRUCTURAL gap through a realized spot
-   * path (ledger A vs plan). The gap's LCY size is known, so this is purely
-   * the revaluation: identically 0 when sigmaFxMonthly is 0, no matter how
-   * large the gap, and rising with FX vol from there. Computed on GROSS
-   * equity, so interest never enters it. */
+   * path (ledger A vs plan). Diagnostic only — the FX-vol proxy on a known
+   * funding gap. Not in headline Gross / Net CFaR. Identically 0 when
+   * sigmaFxMonthly is 0; rises with FX vol. Computed on GROSS equity. */
   structuralFxRiskUsdM: number;
-  /** Incremental USD cash impact of flow AMOUNTS differing from forecast
-   * (ledger B − ledger A) — a real, permanent translation difference. */
+  /** Incremental conversion P&L of flow AMOUNTS differing from forecast
+   * (ledger B − ledger A) — unwind of a delivery shortfall, not an FX mark. */
   sizeFxRiskUsdM: number;
   /** Incremental USD cash impact of flow and settlement DATES differing from
    * plan (ledger C − ledger B). Unlike the previous engine's √jitterMonths
@@ -498,6 +496,13 @@ interface LedgerRun {
    */
   deliveredOp: Float64Array;
   /**
+   * Cumulative FCY amount squared on the GROSS ledger by t (local M, ≥0) —
+   * forced spot purchases that honoured a delivery. Incremental squares
+   * add amt·(S−K) back onto the principal-netted drawdown so a shortfall
+   * keeps its unwind.
+   */
+  squaredLocal: Float64Array;
+  /**
    * Cash injection required at t to hold both accounts non-negative (USD M,
    * ≥0), from the interest-bearing balances. Not a running max — the
    * aggregation loop takes that per path.
@@ -513,6 +518,7 @@ function makeLedgerRun(G: number): LedgerRun {
     interest: new Float64Array(G),
     squaringCost: new Float64Array(G),
     deliveredOp: new Float64Array(G),
+    squaredLocal: new Float64Array(G),
     bridgeNeed: new Float64Array(G),
   };
 }
@@ -556,7 +562,7 @@ function runLedger(
   const G = grid.length;
   const {
     grossEquity, netEquity, fcyBalance, interest, squaringCost, deliveredOp,
-    bridgeNeed,
+    squaredLocal, bridgeNeed,
   } = out;
 
   let fcyNet = openingFcyM;
@@ -565,6 +571,7 @@ function runLedger(
   let usdGross = openingUsdCashM;
   let squaring = 0;
   let delivered = 0;
+  let squaredAmt = 0;
   let tPrev = grid[0] ?? 0;
 
   for (let gi = 0; gi < G; gi += 1) {
@@ -601,6 +608,7 @@ function runLedger(
       fcyNet = 0;
     }
     if (fcyGross * expSign < 0) {
+      squaredAmt += Math.abs(fcyGross);
       usdGross += fcyGross * spot;
       fcyGross = 0;
     }
@@ -613,6 +621,7 @@ function runLedger(
     interest[gi] = n - g;
     squaringCost[gi] = squaring;
     deliveredOp[gi] = delivered;
+    squaredLocal[gi] = squaredAmt;
     // Either account can be the one short of cash: a payer book is meant to
     // run its FCY account negative, and squaring only ever clears a
     // wrong-signed balance, so both sides have to be checked.
@@ -754,6 +763,34 @@ export function computeMonteCarloMismatchCfar(
   const strikes = input.hedgeSettleSchedule.map(
     leg => leg.strikeUsd ?? input.spotUsd * Math.exp(driftMonthly * leg.settleMonths),
   );
+  // Notional-weighted strike: the residual after netting a squared amount is
+  // amt·(S−K), the unwind, not amt·S (the purchase principal).
+  let strikeW = 0;
+  let strikeN = 0;
+  for (let i = 0; i < strikes.length; i += 1) {
+    const n = Math.abs(input.hedgeSettleSchedule[i]!.notionalLocalM);
+    strikeW += n * strikes[i]!;
+    strikeN += n;
+  }
+  const avgStrike = strikeN > 0 ? strikeW / strikeN : input.spotUsd;
+  /** Size + timing of `worse` vs `better` on the same spot path. Op principal
+   * is netted at live spot (a late/light flow is still owed). Incremental
+   * squares add back amt·(S−K) so a delivery shortfall keeps its unwind
+   * instead of netting to zero. */
+  const mismatchDraw = (
+    better: LedgerRun,
+    worse: LedgerRun,
+    gi: number,
+    spot: number,
+  ): number => {
+    const dOp = better.deliveredOp[gi]! - worse.deliveredOp[gi]!;
+    const dSq = worse.squaredLocal[gi]! - better.squaredLocal[gi]!;
+    return (
+      better.grossEquity[gi]! - worse.grossEquity[gi]!
+      - dOp * spot
+      + dSq * (spot - avgStrike)
+    );
+  };
 
   // Book direction — the side the FCY account is supposed to be on. Taken
   // from the largest-magnitude planned exposure so a book that briefly
@@ -968,32 +1005,24 @@ export function computeMonteCarloMismatchCfar(
       const i = gi * paths + k;
       const spot = spotPath[gi]!;
       /**
-       * Principal of operating flows one ledger has banked and another has
-       * not, valued at the live rate. A receivable that is four days late, or
-       * one that lands 8% light against a hedge, has not destroyed its own
-       * face value — the path is simply still owed it, so crediting the
-       * difference back leaves only what the displacement actually costs: the
-       * FX move over the gap, the forced unwind, and the funding. Without
-       * this the metric scored a one-day slip on a 1.2M receivable as a 1.3M
-       * loss.
+       * Headline CFaR is size + timing of C vs A on the same spot path.
+       * Revaluing the planned structural gap at simulated spot (plan − A) is
+       * FX VaR on a known funding fact — kept as a diagnostic, not charged.
+       * Op principal is netted; a squared delivery shortfall adds back
+       * amt·(S−K) so the unwind survives.
        */
       const dPlan = plan.deliveredOp[gi]!;
       const dA = ledgerA.deliveredOp[gi]!;
-      const dB = ledgerB.deliveredOp[gi]!;
-      const dC = ledgerC.deliveredOp[gi]!;
-      const gapPlanC = (dPlan - dC) * spot;
-      // Shortfall vs plan — positive = worse off than planned.
-      const grossDraw =
-        plan.grossEquity[gi]! - ledgerC.grossEquity[gi]! - gapPlanC;
+      const grossDraw = mismatchDraw(ledgerA, ledgerC, gi, spot);
       /**
        * UNPLANNED USD FUNDING — the cash the desk has to move that it never
        * budgeted for, to bring fact back onto plan at this instant.
        *
        * Topping up both accounts costs (usdPlan − usdFact) + (fcyPlan −
-       * fcyFact)·S, which is exactly grossDraw BEFORE the deliveredOp netting.
-       * So the principal that netting strips out to leave a pure cost is
-       * precisely the funding requirement, and the two are complements: CFaR
-       * says what a mismatch COSTS, this says what it takes to CARRY.
+       * fcyFact)·S — plan equity minus realized equity, including principal.
+       * CFaR (grossDraw) is the size+timing COST of that deviation; this is
+       * the CASH to carry it. The planned structural gap's FX reval sits in
+       * funding, not in CFaR.
        *
        * Unlike CFaR this is non-zero at σ=0 — a shortfall still has to be
        * bought at whatever the rate happens to be, and zero vol only means
@@ -1002,7 +1031,7 @@ export function computeMonteCarloMismatchCfar(
        * payer book's PLANNED overdraft does not count; only the deviation
        * does.
        */
-      const funding = grossDraw + gapPlanC;
+      const funding = plan.grossEquity[gi]! - ledgerC.grossEquity[gi]!;
       if (grossDraw > worstGross) worstGross = grossDraw;
       if (funding > worstFunding) worstFunding = funding;
       sGross[i] = worstGross;
@@ -1012,14 +1041,12 @@ export function computeMonteCarloMismatchCfar(
       sStructLocal[i] = ledgerA.fcyBalance[gi]!;
       sSize[i] = ledgerB.fcyBalance[gi]! - ledgerA.fcyBalance[gi]!;
       sTiming[i] = ledgerC.fcyBalance[gi]! - ledgerB.fcyBalance[gi]!;
-      // Same principal netting on each leg, so the three still telescope to
-      // grossDraw exactly (A and the plan share flows, so their gap is 0).
+      // Size + timing telescope to headline grossDraw. Structural (plan − A)
+      // is the excluded FX-vol proxy — diagnostic only.
       sStructUsd[i] =
         plan.grossEquity[gi]! - ledgerA.grossEquity[gi]! - (dPlan - dA) * spot;
-      sSizeUsd[i] =
-        ledgerA.grossEquity[gi]! - ledgerB.grossEquity[gi]! - (dA - dB) * spot;
-      sTimingUsd[i] =
-        ledgerB.grossEquity[gi]! - ledgerC.grossEquity[gi]! - (dB - dC) * spot;
+      sSizeUsd[i] = mismatchDraw(ledgerA, ledgerB, gi, spot);
+      sTimingUsd[i] = mismatchDraw(ledgerB, ledgerC, gi, spot);
       /**
        * CARRY IS A RANDOM VARIABLE HERE, not a mean laid over the top.
        *

@@ -108,8 +108,9 @@ export function LiquidityAnalyticsView({
         </div>
         <p className="max-w-[62rem] text-xs leading-relaxed text-slate-400">
           Each row is a funding regime. Constraint is what sizes H* (VaR,
-          Carry, or Balance). Default Carry is the unfunded FX path — the same
-          on every regime. Final CFaR is displayed Net CFaR after the FX hedge
+          Carry, or Balance). Cash Carry is the unfunded FX path — the same
+          on every regime. Swap Carry is the funding-swap rate-diff (FCY O/N
+          + USD O/N). Final CFaR is displayed Net CFaR after the FX hedge
           and that regime&apos;s funding-swap bridge. USD rate{' '}
           <span className="font-mono text-slate-300">{rUsd.toFixed(2)}%</span>.
         </p>
@@ -132,7 +133,7 @@ function RegimeSummaryTable({
   return (
     <section className="overflow-x-auto rounded-lg border border-slate-700 bg-slate-950/40 p-3">
       <div className="mb-2 font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
-        Regime · constraint · default Carry · swap Carry · final CFaR
+        Regime · constraint · cash Carry · swap Carry · final CFaR
       </div>
       <table className="w-full min-w-[640px] text-left text-xs">
         <thead>
@@ -141,8 +142,8 @@ function RegimeSummaryTable({
             <th className={TH} title="What sizes H* on the desk layers">
               Constraint
             </th>
-            <th className={TH} title="Unfunded FX cash carry — same on every regime">
-              Default Carry
+            <th className={TH} title="Unfunded FX cash carry — no funding swap. Same on every regime">
+              Cash Carry
             </th>
             <th className={TH} title="Rate-diff carry on this regime's book (FCY O/N + USD O/N). Points offset this to 0 at CIP mid.">
               Swap Carry
@@ -233,8 +234,9 @@ function SelectedStrategyDetail({
           {result.strategy.label} · by currency
         </div>
         <span className="font-mono text-[10px] text-slate-500">
-          {bufferConstraintLabel(result.constraint)} · default Carry{' '}
-          {fmtK(result.cashCarryUsdYrM)}/yr · final CFaR {fmtK(result.finalCfarUsdM)}
+          {bufferConstraintLabel(result.constraint)} · cash Carry{' '}
+          {fmtK(result.cashCarryUsdYrM)}/yr · swap Carry {fmtK(result.swapInterestUsdYrM)}/yr
+          · final CFaR {fmtK(result.finalCfarUsdM)}
         </span>
       </div>
       <p className="mb-3 max-w-[62rem] text-[11px] leading-relaxed text-slate-500">
@@ -256,9 +258,9 @@ function SelectedStrategyDetail({
                 Trough
               </th>
               <th className={TH} title="Unfunded FX cash carry vs USD — no funding swap. Same on every regime.">
-                Default Carry
+                Cash Carry
               </th>
-              <th className={TH} title="Funding-swap overlay: FCY O/N + USD O/N + swap points. 0 at CIP mid.">
+              <th className={TH} title="Liquidity funding-swap carry: FCY O/N + USD O/N. Points offset this to 0 at CIP mid.">
                 Swap Carry
               </th>
               <th className={TH} title="−(Cash Carry + Swap Carry) — funding cost $/yr">

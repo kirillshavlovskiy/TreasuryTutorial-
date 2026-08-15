@@ -19,7 +19,15 @@
 
 ---
 
-## Active Decisions
+## Liquidity book never includes the funding swap
+
+**Date:** 2026-08-15
+**Decision:** Dashboard LIQUIDITY POOL BOOK is the unfunded operating path only. Funding swap (`swapNear` / `swap_needed` / `standing_swap`) lives in the SWAP band. Expanded-cycle liquidity cells read `liquidityCycles`, never funded `opening_cash`.
+**Alternatives considered:** Show funded openings in the liquidity book so M2 matches SWAP LP+Swap — rejected; it hides the operating path and loops funding into the book.
+**Reason:** Liquidity, buffer, funding swap, and FX hedge are orthogonal books. Mixing swap cash into Open/Trough/Close makes the desk unable to see the unfunded path the swap is meant to cover.
+**Anti-patterns:** Do not put `p.opening_cash` or `cycle_end_cash - swap_needed` in liquidity-book cells. Do not chain funded close into the next liquidity opening. Do not write strategy Fwd sized on Swap Near back into `hedgeSettle`. FX hedge settlement cash may stay on the path; the funding swap may not.
+**Ticket:** —
+
 
 ## Dynamic minimum cash threshold H — VAR and IR carry proxy (PENDING DECISION)
 

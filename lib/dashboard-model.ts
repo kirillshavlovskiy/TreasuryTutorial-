@@ -39,7 +39,7 @@ import {
   type UsdParams,
 } from './fx-buffer';
 import {
-  periodFlowSumLocalM,
+  periodFxFlowSumLocalM,
   projectLiquidityCycles,
   type ForecastProfileState,
   type LiquidityCycleProjection,
@@ -162,9 +162,14 @@ export interface SimRowComputed {
   swap_carry: number;
   /** FCY overnight on the funding-swap notional ($M/yr). Sell FCY → pay/forgo r_FCY. */
   swapOnUsdYr: number;
+  /** Opposite USD overnight on the funding-swap notional ($M/yr). */
+  usdOnUsdYr: number;
   /** CIP mid swap points on the funding-swap notional ($M/yr). */
   swapPointsUsdYr: number;
-  /** Annual USD swap overlay ($M/yr) = FCY O/N + USD O/N + points. 0 at CIP mid. */
+  /** Rate-diff carry ($M/yr) = FCY O/N + USD O/N (points excluded). */
+  swapInterestUsdYr: number;
+  /** Annual USD swap overlay ($M/yr) = FCY O/N + USD O/N + points.
+   *  0 at CIP mid when deploying surplus; covering a short keeps (r_OD − r_FCY). */
   swapCarryUsdYr: number;
   usd_consumed: number;
   carry: number;
@@ -339,7 +344,7 @@ export function computeSimdRow(
   // Forecast net FX over the FX Risk period: book + flat (F×T) or custom Σ months.
   // T = 0 → no forecast (Net FX Forecast = Net FX book only).
   const T = forecastHorizonMonths(shared);
-  const periodFlow = periodFlowSumLocalM(r, T, forecastProfile);
+  const periodFlow = periodFxFlowSumLocalM(r, T, forecastProfile);
   const netFxForecast = roundMoney(netFxFCY + periodFlow);
 
   const varFactor = var95_1m_factor(r.σ_daily);
@@ -352,6 +357,8 @@ export function computeSimdRow(
   // not in it — that is the SWAP band. Binding cycle is picked on the funded
   // requirement chain so a repeating drain is not sized on the free-fall last
   // cycle; Trough Cash still reads this unfunded path.
+  // Booked and staged settle both belong on this path: a staged delivery is
+  // cash the buffer layers have to fund, and SWAP has to show that leg.
   const ladder = liquidityLadderFor(r, shared, forecastProfile, hedgeSettleByCcy);
   const hedgeSettle = hedgeSettleByCcy?.[r.ccy];
   const hedgeCycle1 = hedgeSettle?.[0] ?? 0;
@@ -425,10 +432,14 @@ export function computeSimdRow(
   // Unfunded cash carry (FX book only) + funding-swap overlay. The overlay is
   // FCY O/N on the moved notional + opposite USD O/N + CIP mid points — additive
   // to the unfunded path, no loop back into CFaR / Cash Carry.
-  const overlay = fundingSwapOverlayUsdYr(swapNear, spot_rate, r.r_FCY, shared.r_USD);
+  const overlay = fundingSwapOverlayUsdYr(
+    swapNear, spot_rate, r.r_FCY, shared.r_USD, r.r_OD,
+  );
   const swap_carry = overlay.fcyOnUsdYr;
   const swapOnUsdYr = overlay.fcyOnUsdYr;
+  const usdOnUsdYr = overlay.usdOnUsdYr;
   const swapPointsUsdYr = overlay.pointsUsdYr;
+  const swapInterestUsdYr = overlay.fcyOnUsdYr + overlay.usdOnUsdYr;
   const swapCarryUsdYr = overlay.netUsdYr;
 
   const usd_consumed = Math.abs(swapNear) * spot_rate;
@@ -479,7 +490,7 @@ export function computeSimdRow(
       : undefined,
     swapNear, swapFar: -swapNear,
     postSwapCash, lp_after_swap_trough, cycleEndCash, postSwapVar, varChange,
-    swap_carry, swapOnUsdYr, swapPointsUsdYr, swapCarryUsdYr, usd_consumed,
+    swap_carry, swapOnUsdYr, usdOnUsdYr, swapPointsUsdYr, swapInterestUsdYr, swapCarryUsdYr, usd_consumed,
     carry, netDelta, floatNim,
   };
 }
@@ -556,7 +567,7 @@ export function computeSimdUsdRow(
     lp_peak_cash, cash_after_payins, lp_month_end,
     swapNear, swapFar: -swapNear,
     postSwapCash, lp_after_swap_trough, cycleEndCash, postSwapVar: 0, varChange: 0,
-    swap_carry: 0, swapOnUsdYr: 0, swapPointsUsdYr: 0, swapCarryUsdYr: 0, usd_consumed: 0,
+    swap_carry: 0, swapOnUsdYr: 0, usdOnUsdYr: 0, swapPointsUsdYr: 0, swapInterestUsdYr: 0, swapCarryUsdYr: 0, usd_consumed: 0,
     carry: (r.spot + r.fwd + r.nonCash + (r.nonCashAsset ?? 0)) * r.r_FCY / 100 / 12,
     netDelta: (r.spot + r.fwd + r.nonCash + (r.nonCashAsset ?? 0)) * (1 + r.r_FCY / 100 / 12),
     floatNim: 0,
@@ -638,8 +649,9 @@ export interface DashboardInputs {
   /** Flat monthly×T or custom per-period Revenue/Expenses profile. */
   forecastProfile?: ForecastProfileState | null;
   /**
-   * FCY leg of booked and prepared hedges, per currency and month. Derived from
-   * the hedge book, so it arrives beside the forecast rather than inside it.
+   * FCY leg of booked and staged hedges per currency and month. Lands on the
+   * cash path and sizes the funding swap — a staged delivery is cash the
+   * buffer layers have to fund, same as a booked one.
    */
   hedgeSettleByCcy?: HedgeSettleByCcy;
   /**

@@ -25,6 +25,7 @@ import {
   interpolateSwapPoints,
   resolveCashRatesForHorizon,
   resolveForwardDepositRates,
+  resolveMarketRatesForCcy,
   resolveOvernightCashRates,
   selectCreditDebitRate,
   swapPointsToPriceDelta,
@@ -893,6 +894,79 @@ export function resolvedHedgedTotalCarryUsdM(input: {
     totalCarryUsdM: cmp.categories.hedgedIncomeUsdM + fwdAdjust,
     benefitUsdM: cmp.categories.hedgeVsNoHedgeUsdM + fwdAdjust,
   };
+}
+
+/**
+ * Liquidity P&L split from the Cash Carry forecast book (same engine as the
+ * Cash Carry table). Cash = residual FCY int + USD int after strip/bullet
+ * conversion; FWD = live swap-points. Only CCYs with a staged or booked
+ * hedge are included — others keep the unfunded LP NIM.
+ */
+export function cashForecastCarrySplitByCcyUsdM(input: {
+  rows: readonly RowState[];
+  forecastProfile?: ForecastProfileState | null;
+  forecastMonths: number;
+  bookedHedges?: readonly HedgeTicket[];
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  setup?: VarSetup;
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  ratesScopeId?: string | null;
+}): Record<string, {
+  cashUsdM: number;
+  fwdUsdM: number;
+  /** M1…MT incremental dual-book cash int and FWD pts (sums to cash/fwd). */
+  byMonth: { cashUsdM: number; fwdUsdM: number }[];
+}> {
+  const booked = input.bookedHedges ?? [];
+  const prepared = input.preparedByCcy ?? {};
+  const out: Record<string, {
+    cashUsdM: number;
+    fwdUsdM: number;
+    byMonth: { cashUsdM: number; fwdUsdM: number }[];
+  }> = {};
+  for (const row of input.rows) {
+    if (row.ccy === 'USD') continue;
+    const prep = prepared[row.ccy];
+    const hasPrepared = Boolean(prep && Math.abs(prep.coverLocalM) > 1e-12);
+    const hasBooked = booked.some(
+      t => t.ccy === row.ccy && isLiveHedgeTicket(t),
+    );
+    if (!hasPrepared && !hasBooked) continue;
+    const rates = resolveMarketRatesForCcy(
+      input.marketRatesByCcy,
+      row.ccy,
+      input.ratesScopeId,
+    );
+    const cmp = buildCashForecastCarryComparison({
+      ccy: row.ccy,
+      bookRows: input.rows,
+      forecastProfile: input.forecastProfile,
+      forecastMonths: input.forecastMonths,
+      marketRates: rates,
+      bookedHedges: booked,
+      preparedByCcy: prepared,
+      setup: input.setup,
+    });
+    if (!cmp) continue;
+    const resolved = resolvedHedgedTotalCarryUsdM({
+      comparison: cmp,
+      prepared: prep,
+      marketRates: rates,
+    });
+    const schedFwd = cmp.hedged.months.reduce((s, m) => s + m.fwdCarryUsdM, 0);
+    const fwdScale =
+      Math.abs(schedFwd) > 1e-15 ? resolved.fwdCarryUsdM / schedFwd : 1;
+    const byMonth = cmp.hedged.months.map(m => ({
+      cashUsdM: m.residualEurInterestUsdM + m.usdInterestUsdM,
+      fwdUsdM: m.fwdCarryUsdM * fwdScale,
+    }));
+    out[row.ccy] = {
+      cashUsdM: resolved.totalCarryUsdM - resolved.fwdCarryUsdM,
+      fwdUsdM: resolved.fwdCarryUsdM,
+      byMonth,
+    };
+  }
+  return out;
 }
 
 /**

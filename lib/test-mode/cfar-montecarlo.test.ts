@@ -48,9 +48,10 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
   });
 
   it('is deterministic for a given seed and varies with it', () => {
-    const a = computeMonteCarloMismatchCfar(baseInput());
-    const b = computeMonteCarloMismatchCfar(baseInput());
-    const c = computeMonteCarloMismatchCfar(baseInput({ seed: 999 }));
+    const hedged = { hedgeSettleSchedule: [{ settleMonths: 6, notionalLocalM: 5 }] };
+    const a = computeMonteCarloMismatchCfar(baseInput(hedged));
+    const b = computeMonteCarloMismatchCfar(baseInput(hedged));
+    const c = computeMonteCarloMismatchCfar(baseInput({ ...hedged, seed: 999 }));
     expect(a.criticalCashUsdM).toBe(b.criticalCashUsdM);
     expect(a.criticalCashUsdM).not.toBe(c.criticalCashUsdM);
   });
@@ -74,11 +75,11 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     }
   });
 
-  // ── the structural gap is a planned SIZE, priced only through the rate ──
+  // ── the structural gap is a planned SIZE, not an FX-vol proxy ──────────
   //
-  // A known liquidity gap must not generate risk merely by being large. Its
-  // only channel into CFaR is that the rate it is eventually valued at is
-  // uncertain, so at zero FX vol it has to contribute exactly nothing.
+  // A known liquidity gap must not generate CFaR merely by being large, and
+  // it must not generate CFaR by being revalued at simulated spot either —
+  // that is FX VaR on a funding fact. Headline CFaR is size + timing only.
 
   /** Bullet at M12: the whole book runs unhedged all year — a ~9.9M known gap. */
   const bigGapBullet = [{ settleMonths: 12, notionalLocalM: 10.6 }];
@@ -145,23 +146,27 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     expect(r.criticalCashUsdM).toBeLessThan(0.02);
   });
 
-  it('makes gross CFaR insensitive to structural gap SIZE at zero FX vol', () => {
+  it('keeps headline CFaR at zero for a purely structural book at any FX vol', () => {
     const at = (sigmaFxMonthly: number, hedgeSettleSchedule: typeof bigGapBullet) =>
       computeMonteCarloMismatchCfar(
-        baseInput({ hedgeSettleSchedule, sigmaFxMonthly }),
+        baseInput({
+          hedgeSettleSchedule,
+          sigmaFxMonthly,
+          forecastUncertainty1m: 0,
+          flowJitterDays: 0,
+          settlementJitterDays: 0,
+          rateVolPctPa: 0,
+        }),
       ).criticalCashUsdM;
-    // A 9.9M known gap and a ~1M one both cost essentially nothing when the
-    // rate cannot move — compared absolutely, since both collapse to ~0 and a
-    // ratio between two near-zero numbers says nothing.
-    expect(Math.abs(at(0, bigGapBullet) - at(0, smallGapStrip))).toBeLessThan(0.02);
-    // Turn the rate back on and the big gap costs materially more, which is
-    // the one way its size is allowed to matter.
-    expect(at(0.025, bigGapBullet)).toBeGreaterThan(at(0.025, smallGapStrip) * 1.2);
+    for (const sigma of [0, 0.025, 0.05]) {
+      expect(at(sigma, bigGapBullet)).toBeLessThan(1e-9);
+      expect(at(sigma, smallGapStrip)).toBeLessThan(1e-9);
+    }
   });
 
-  it('scales the structural attribution with FX vol', () => {
-    const structuralAt = (sigmaFxMonthly: number) => {
-      const r = computeMonteCarloMismatchCfar(
+  it('keeps the excluded structural FX-vol proxy scaling with σ, out of CFaR', () => {
+    const at = (sigmaFxMonthly: number) =>
+      computeMonteCarloMismatchCfar(
         baseInput({
           hedgeSettleSchedule: bigGapBullet,
           sigmaFxMonthly,
@@ -171,28 +176,10 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
           rateVolPctPa: 0,
         }),
       );
-      return Math.max(...r.components.map(c => c.structuralFxRiskUsdM));
-    };
-    expect(structuralAt(0)).toBeLessThan(1e-9);
-    expect(structuralAt(0.05)).toBeGreaterThan(structuralAt(0.01) * 3);
-  });
-
-  it('scales CFaR roughly linearly with FX vol once other drivers are off', () => {
-    // The other drivers are switched off to isolate the FX relationship, not
-    // because they would swamp it — they are priced through the rate too.
-    const fxOnly = (sigmaFxMonthly: number) =>
-      computeMonteCarloMismatchCfar(
-        baseInput({
-          sigmaFxMonthly,
-          forecastUncertainty1m: 0,
-          flowJitterDays: 0,
-          settlementJitterDays: 0,
-          rateVolPctPa: 0,
-        }),
-      ).criticalCashUsdM;
-    const ratio = fxOnly(0.05) / fxOnly(0.01);
-    expect(ratio).toBeGreaterThan(3.5);
-    expect(ratio).toBeLessThan(6.5);
+    expect(Math.max(...at(0).components.map(c => c.structuralFxRiskUsdM))).toBeLessThan(1e-9);
+    expect(Math.max(...at(0.05).components.map(c => c.structuralFxRiskUsdM)))
+      .toBeGreaterThan(Math.max(...at(0.01).components.map(c => c.structuralFxRiskUsdM)) * 3);
+    expect(at(0.05).criticalCashUsdM).toBeLessThan(1e-9);
   });
 
   // ── displaced principal is not a loss ─────────────────────────────────
@@ -204,6 +191,8 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
   // loss and CFaR came out the same for 1, 5 and 10 days of jitter.
 
   it('charges a volume shortfall its unwind cost, not its principal', () => {
+    // Full-cover bullet: a 15% miss is a delivery shortfall, not an open-book
+    // FX mark. Without a hedge the same miss is unconverted and CFaR stays 0.
     const volumeOnly = (sigmaFxMonthly: number) =>
       computeMonteCarloMismatchCfar(
         baseInput({
@@ -212,6 +201,7 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
           settlementJitterDays: 0,
           rateVolPctPa: 0,
           forecastUncertainty1m: 0.15,
+          hedgeSettleSchedule: [{ settleMonths: 12, notionalLocalM: 10.6 }],
         }),
       ).criticalCashUsdM;
     // Rate frozen: a 15% forecast miss unwinds at exactly the rate it was
@@ -342,23 +332,23 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     expect(r.netCriticalCashUsdM).toBeLessThan(0.1);
   });
 
-  it('keeps a hedged book far below an unhedged one and below a plain FX VaR', () => {
+  it('does not charge an unhedged book FX VaR as CFaR', () => {
     const open = computeMonteCarloMismatchCfar(
-      baseInput({ hedgeSettleSchedule: [] }),
-    ).criticalCashUsdM;
-    const hedged = computeMonteCarloMismatchCfar(
-      baseInput({ hedgeSettleSchedule: smallGapStrip }),
-    ).criticalCashUsdM;
-    expect(hedged).toBeLessThan(open * 0.4);
-    // An unhedged book's CFaR is an FX loss on the accrued balance, so it
-    // cannot exceed a 95% FX VaR on the terminal exposure by any margin.
-    const terminalUsd = (1 + 12 * 0.8) * 1.08;
-    expect(open).toBeLessThan(1.645 * 0.025 * Math.sqrt(12) * terminalUsd * 1.15);
+      baseInput({
+        hedgeSettleSchedule: [],
+        forecastUncertainty1m: 0,
+        flowJitterDays: 0,
+        settlementJitterDays: 0,
+      }),
+    );
+    expect(open.criticalCashUsdM).toBeLessThan(1e-9);
+    expect(Math.max(...open.components.map(c => c.structuralFxRiskUsdM))).toBeGreaterThan(0.5);
   });
 
-  it('cuts CFaR when the book is hedged on a matching schedule', () => {
-    const open = computeMonteCarloMismatchCfar(baseInput());
-    // Exposure accrues +0.8M/month from 1.0M stock; settle roughly with it.
+  it('charges conversion mismatch, not the open book, when a schedule is on', () => {
+    const open = computeMonteCarloMismatchCfar(
+      baseInput({ hedgeSettleSchedule: [] }),
+    );
     const schedule = [3, 6, 9, 12].map(m => ({
       settleMonths: m,
       notionalLocalM: m === 3 ? 1 + 0.8 * 3 : 0.8 * 3,
@@ -366,7 +356,8 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     const hedged = computeMonteCarloMismatchCfar(
       baseInput({ hedgeSettleSchedule: schedule }),
     );
-    expect(hedged.criticalCashUsdM).toBeLessThan(open.criticalCashUsdM);
+    expect(open.criticalCashUsdM).toBeLessThan(0.05);
+    expect(hedged.criticalCashUsdM).toBeGreaterThan(open.criticalCashUsdM);
   });
 
   it('charges a forced FCY purchase when the hedge over-delivers', () => {
@@ -384,31 +375,24 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     expect(over.squaringCostMeanUsdM).toBeGreaterThan(under.squaringCostMeanUsdM);
   });
 
-  it('penalises the net path through the borrow spread on a mismatch excursion', () => {
-    // A net-payer book hedged with a monthly strip and funded with USD, so the
-    // PLAN never runs either account overdrawn. Only the size/timing mismatch
-    // can push a balance negative — and the spread charged on that excursion
-    // is genuine risk, so it must widen the net shortfall while gross is
-    // untouched. (Spread on a PLANNED overdraft would be planned carry, and is
-    // deliberately not measured here: see the structural-carry test above.)
-    const payer = (spread: number) =>
+  it('keeps the borrow spread out of gross CFaR', () => {
+    // Gross is conversion P&L, interest off. The spread is a carry term —
+    // it can change the reserve only through the floored buffer, never the
+    // headline drawdown.
+    const at = (spread: number) =>
       computeMonteCarloMismatchCfar(
         baseInput({
-          stockM: 0,
-          monthlyInflows: new Array(12).fill(0.2),
-          monthlyOutflows: new Array(12).fill(1.2),
-          hedgeSettleSchedule: Array.from({ length: 12 }, (_, i) => ({
-            settleMonths: i + 1,
-            notionalLocalM: -1,
-          })),
-          openingUsdCashM: 20,
+          stockM: 4,
+          monthlyInflows: new Array(12).fill(1.2),
+          monthlyOutflows: new Array(12).fill(0),
+          hedgeSettleSchedule: [{ settleMonths: 6, notionalLocalM: 18.4 }],
           forecastUncertainty1m: 0.25,
           borrowSpreadPctPa: spread,
         }),
       );
-    const cheap = payer(0);
-    const dear = payer(8);
-    expect(dear.netCriticalCashUsdM).toBeGreaterThan(cheap.netCriticalCashUsdM);
+    const cheap = at(0);
+    const dear = at(8);
+    expect(cheap.criticalCashUsdM).toBeGreaterThan(0.01);
     expect(dear.criticalCashUsdM).toBeCloseTo(cheap.criticalCashUsdM, 10);
   });
 
@@ -444,14 +428,19 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
         settlementJitterDays: 10,
       }),
     );
-    expect(sizeOnly.criticalCashUsdM).toBeCloseTo(quiet.criticalCashUsdM, 9);
+    // Under-hedged: a forecast miss stays unconverted, so size is not a
+    // CFaR input. Date jitter still moves a real delivery across a real rate.
+    expect(quiet.criticalCashUsdM).toBeLessThan(0.02);
+    expect(sizeOnly.criticalCashUsdM).toBeLessThan(0.02);
     expect(datesOnly.criticalCashUsdM).toBeGreaterThan(
-      quiet.criticalCashUsdM * 1.02,
+      Math.max(quiet.criticalCashUsdM, sizeOnly.criticalCashUsdM, 0.005),
     );
   });
 
   it('keeps the reported peak on the running-max plateau', () => {
-    const r = computeMonteCarloMismatchCfar(baseInput());
+    const r = computeMonteCarloMismatchCfar(
+      baseInput({ hedgeSettleSchedule: [{ settleMonths: 6, notionalLocalM: 5 }] }),
+    );
     const last = r.points[r.points.length - 1]!;
     // p05 carries the loss-negative convention, so |p05| at the final point is
     // the headline gross CFaR.
@@ -459,11 +448,10 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     expect(r.grossPeakMonth).toBeGreaterThan(0);
   });
 
-  it('releases the live line when flows net out but holds the running max', () => {
-    // 3.0M lands, an equal 3.0M leaves ~12 days later, repeatedly. Exposure is
-    // zero most of the time and nothing is ever converted, so at those instants
-    // the book carries no risk at all — while the high-water mark must remember
-    // every pulse it lived through.
+  it('does not charge unhedged exposure pulses as CFaR', () => {
+    // 3.0M lands, an equal 3.0M leaves ~12 days later, repeatedly. Nothing
+    // converts. Headline CFaR stays off; the excluded FX-vol proxy tracks the
+    // pulse.
     const r = computeMonteCarloMismatchCfar(
       baseInput({
         stockM: 0,
@@ -476,30 +464,15 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
         settlementJitterDays: 0,
       }),
     );
-    const closed = r.points.filter(
-      (p, i) => p.t > 1.3 && Math.abs(r.components[i]!.mismatchLocalM) < 0.05,
+    expect(r.criticalCashUsdM).toBeLessThan(1e-9);
+    const closed = r.components.filter(
+      c => c.t > 1.3 && Math.abs(c.mismatchLocalM) < 0.05,
     );
-    const open = r.points.filter(
-      (_, i) => Math.abs(r.components[i]!.mismatchLocalM) > 1,
-    );
+    const open = r.components.filter(c => Math.abs(c.mismatchLocalM) > 1);
     expect(closed.length).toBeGreaterThan(5);
     expect(open.length).toBeGreaterThan(5);
-    const rawAt = (i: number) => Math.abs(r.components[i]!.rawGrossUsdM);
-    for (let i = 0; i < r.points.length; i += 1) {
-      const flat = Math.abs(r.components[i]!.mismatchLocalM) < 0.05;
-      if (r.points[i]!.t > 1.3 && flat) expect(rawAt(i)).toBeLessThan(0.005);
-      // Exposure now RAMPS rather than stepping, so a point that has only just
-      // crossed 1M has carried that exposure for a fraction of the time an
-      // instant bullet would have. The separation that matters still holds by
-      // a wide margin: closed reads under $5K, open over $20K.
-      if (Math.abs(r.components[i]!.mismatchLocalM) > 1) {
-        expect(rawAt(i)).toBeGreaterThan(0.02);
-      }
-    }
-    // The ratchet only ever climbs, including across the closed stretches.
-    for (let i = 1; i < r.points.length; i += 1) {
-      expect(r.points[i]!.p05).toBeLessThanOrEqual(r.points[i - 1]!.p05 + 1e-9);
-    }
+    for (const c of r.components) expect(Math.abs(c.rawGrossUsdM)).toBeLessThan(0.005);
+    expect(Math.max(...open.map(c => c.structuralFxRiskUsdM))).toBeGreaterThan(0.02);
   });
 
   it('keeps a realized unwind on the live line after settlement', () => {
@@ -523,14 +496,15 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
       const peakLive = Math.max(...cs.map(c => Math.abs(c.rawGrossUsdM)));
       return { tail: Math.abs(cs[cs.length - 1]!.rawGrossUsdM), peakLive };
     };
-    // A clean hedge settles at the rate the plan also assumed: nothing deviated,
-    // so the live line comes all the way back down.
+    // A clean hedge settles at the rate the plan also assumed: nothing
+    // converted off-strike, so the live line stays flat.
     expect(settled(0).tail).toBeLessThan(0.005);
-    // With shortfalls the unwind is realized, so the tail stays lifted — but
-    // still far below the pre-settlement mark, which did release.
+    // A shortfall's unwind is realized at delivery. Headline CFaR does not
+    // mark the pre-settlement gap, so the tail is the peak — not a leftover
+    // after an FX-vol release.
     const shortfall = settled(0.15);
     expect(shortfall.tail).toBeGreaterThan(0.005);
-    expect(shortfall.tail).toBeLessThan(shortfall.peakLive * 0.5);
+    expect(shortfall.tail).toBeGreaterThanOrEqual(shortfall.peakLive * 0.8);
   });
 
   describe('net against the carry buffer', () => {
@@ -583,9 +557,10 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
         return v;
       };
       const netTv = tv(i => r.points[i]!.netP05);
-      const grossTv = tv(i => r.points[i]!.p05);
       const sawTv = tv(i => -r.components[i]!.rawGrossUsdM);
-      expect(netTv).toBeLessThan(grossTv * 1.35);
+      // Gross is conversion-only and can be nearly flat; carry still shapes
+      // net. The property that matters is that net is a running max, not the
+      // point-in-time sawtooth.
       expect(netTv).toBeLessThan(sawTv * 0.6);
       // And it really is gross plus carry, not a separate shape — the two
       // differ only by the carry/drawdown correlation the per-path netting
@@ -721,6 +696,8 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     });
 
     it('prices carry as a random variable, not as its mean', () => {
+      // Early over-hedge so conversion CFaR peaks before much carry has
+      // accrued. An unhedged book has no headline CFaR to net against.
       const withRateVol = (rateVolPctPa: number) =>
         computeMonteCarloMismatchCfar(
           baseInput({
@@ -728,7 +705,7 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
             monthlyInflows: Array(12).fill(1),
             monthlyOutflows: Array(12).fill(0),
             tenureMonths: 12,
-            hedgeSettleSchedule: [],
+            hedgeSettleSchedule: [{ settleMonths: 3, notionalLocalM: 25 }],
             rateVolPctPa,
             forecastUncertainty1m: 0.1,
           }),
@@ -892,21 +869,23 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
     });
 
     it('is not cured by hedging, unlike the cost line', () => {
-      // A forward locks the RATE on the gap; it does not conjure the currency
-      // the forecast said would arrive. Cost collapses, funding does not.
+      // A forward locks the RATE on a conversion; it does not conjure the
+      // currency the forecast said would arrive. Unhedged CFaR is ~0 (no
+      // delivery). Hedged CFaR is unwind cost. Funding stays on both.
       const open = receiver(0.3, 0.025, false);
       const hedged = receiver(0.3, 0.025, true);
-      expect(hedged.criticalCashUsdM).toBeLessThan(open.criticalCashUsdM * 0.5);
-      expect(hedged.peakUnplannedUsdFundingUsdM).toBeGreaterThan(
-        hedged.criticalCashUsdM * 3,
-      );
+      expect(open.criticalCashUsdM).toBeLessThan(0.05);
+      expect(hedged.peakUnplannedUsdFundingUsdM).toBeGreaterThan(1);
+      expect(open.peakUnplannedUsdFundingUsdM).toBeGreaterThan(1);
     });
 
-    it('excludes the plan and reduces to CFaR when nothing is displaced', () => {
-      // No size or timing mismatch: the only gap left is FX revaluation, so
-      // there is no principal to net out and funding must equal the cost.
+    it('keeps unplanned funding on the excluded FX reval when nothing is displaced', () => {
+      // No size or timing mismatch: CFaR is zero. Funding still sees plan − C,
+      // which is the structural gap marked at live spot — the excluded proxy.
       const r = receiver(0, 0.025, true);
-      expect(r.peakUnplannedUsdFundingUsdM).toBeCloseTo(r.criticalCashUsdM, 6);
+      expect(r.criticalCashUsdM).toBeLessThan(1e-9);
+      expect(r.peakUnplannedUsdFundingUsdM).toBeGreaterThan(0.05);
+      expect(Math.max(...r.components.map(c => c.structuralFxRiskUsdM))).toBeGreaterThan(0.05);
     });
   });
 
@@ -930,42 +909,34 @@ describe('computeMonteCarloMismatchCfar — cash ledger', () => {
       // Nothing is ever converted, so a forecast miss or a late flow only
       // changes how much currency is sitting there — and the ledger credits
       // that principal back. Zero COST is the right answer under the
-      // cost-only rule, even though the book is plainly risky.
+      // cost-only rule. The open book's FX reval is the excluded proxy.
       const r = book([]);
       for (const c of r.components) {
         expect(c.sizeFxRiskUsdM).toBeCloseTo(0, 12);
         expect(c.timingFxRiskUsdM).toBeCloseTo(0, 12);
       }
-      // The risk has not vanished — it is all revaluation, and it all lands
-      // in the structural leg.
-      expect(r.criticalCashUsdM).toBeGreaterThan(0.5);
+      expect(r.criticalCashUsdM).toBeLessThan(1e-9);
       const struct = Math.max(...r.components.map(c => c.structuralFxRiskUsdM));
       expect(struct).toBeGreaterThan(0.5);
     });
 
-    it('leaves gross CFaR untouched by forecast quality when nothing converts', () => {
-      // The strong form of the cost-only rule, and the claim chart ⑤ makes to
-      // the user: on an unhedged book the credit-back cancels the revaluation
-      // of the miss on every path at every instant, so gross is not merely
-      // insensitive to forecast error, it is bit-for-bit identical.
-      const gross = [0, 0.15, 0.3, 0.6].map(
-        u =>
-          computeMonteCarloMismatchCfar(
-            baseInput({
-              stockM: 4,
-              monthlyInflows: Array(12).fill(1.2),
-              monthlyOutflows: Array(12).fill(0),
-              tenureMonths: 12,
-              sigmaFxMonthly: 0.03,
-              forecastUncertainty1m: u,
-              hedgeSettleSchedule: [],
-            }),
-          ).criticalCashUsdM,
-      );
-      for (const g of gross) expect(g).toBeCloseTo(gross[0]!, 12);
-      // Guard the test itself: the book has to be risky for this to mean
-      // anything, otherwise a zero would pass trivially.
-      expect(gross[0]!).toBeGreaterThan(0.5);
+    it('leaves gross CFaR at zero when nothing converts, at any forecast quality', () => {
+      const run = (u: number) =>
+        computeMonteCarloMismatchCfar(
+          baseInput({
+            stockM: 4,
+            monthlyInflows: Array(12).fill(1.2),
+            monthlyOutflows: Array(12).fill(0),
+            tenureMonths: 12,
+            sigmaFxMonthly: 0.03,
+            forecastUncertainty1m: u,
+            hedgeSettleSchedule: [],
+          }),
+        );
+      const rows = [0, 0.15, 0.3, 0.6].map(run);
+      for (const r of rows) expect(r.criticalCashUsdM).toBeLessThan(1e-9);
+      const struct = Math.max(...rows[0]!.components.map(c => c.structuralFxRiskUsdM));
+      expect(struct).toBeGreaterThan(0.5);
     });
 
     it('comes alive once a hedge forces a delivery', () => {

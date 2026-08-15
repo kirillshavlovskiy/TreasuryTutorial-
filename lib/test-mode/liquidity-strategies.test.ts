@@ -176,8 +176,8 @@ describe('the interest ledger adds up', () => {
         -(r.cashCarryUsdYrM + r.swapCarryUsdYrM),
         6,
       );
-      expect(r.swapCarryUsdYrM).toBeCloseTo(0, 9);
     }
+    expect(pick(evaluate([row()]), 'unfunded').swapCarryUsdYrM).toBeCloseTo(0, 9);
   });
 
   it('Cash Carry is the unfunded path — identical on every strategy', () => {

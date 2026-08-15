@@ -229,9 +229,13 @@ export type HedgePathSummaryMetrics = {
   coverValue: string;
   coverPct: string | null;
   coverSub: string;
+  /** Signed FCY M cover currently on the path (0 if none). */
+  coverLocalM: number;
   legsTitle: string;
   legsValue: string;
   legsSub: string;
+  /** 0 = none, 1 = bullet, ≥2 = strip legs. */
+  legCount: number;
   residVarValue: string;
   residVarPct: string | null;
   residVarSub: string;
@@ -2503,6 +2507,11 @@ export function ExposureHedgePathChart({
           ? fmtM(hedgeLevel)
           : '—',
       coverPct: hedgedExposurePct != null ? fmtPct(hedgedExposurePct) : null,
+      coverLocalM: showRollingStrip
+        ? activeStripCoverM
+        : hasHedge
+          ? hedgeLevel
+          : 0,
       coverSub:
         hedgedExposurePct != null
           ? `of forecast E_end · ${fmtPct(unhedgedExposurePct!)} unhedged`
@@ -2519,6 +2528,11 @@ export function ExposureHedgePathChart({
         : hasHedge
           ? '1'
           : '—',
+      legCount: showRollingStrip
+        ? activeHedgeLegs.length || rollingEdges.length
+        : hasHedge
+          ? 1
+          : 0,
       legsSub: showRollingStrip
         ? anyStripLegOff
           ? `${activeHedgeLegs.length} ticked · ${rollingEdges.length} program`
@@ -2615,12 +2629,12 @@ export function ExposureHedgePathChart({
     return {
       label: stripBooked
         ? 'Strip booked (change regime / cancel to rebook)'
-        : `Prebook ${regimeLabel} ${structureLabel}`,
+        : 'Stage hedging strategy',
       title: stripBooked
         ? 'Strip already on the book — cancel it to rebook'
         : showRollingStrip
-          ? `Prebook ${activeLadderEdges.length}-leg strip (Hedge % applied) for Hedging Decision — Send under this CCY to book`
-          : 'Prebook bullet for Hedging Decision — Send under this CCY to book',
+          ? `Stage ${regimeLabel} ${structureLabel} (Hedge % applied) — then Book under this CCY`
+          : `Stage ${regimeLabel} bullet — then Book under this CCY`,
       disabled: stripBooked,
       structure: effectiveStructure,
       edges: showRollingStrip ? activeLadderEdges : EMPTY_LADDER_EDGES,
@@ -3548,7 +3562,7 @@ export function ExposureHedgePathChart({
                             </p>
                             <p>
                               Real settlement moment per leg — Carry uses CIP /
-                              interest to these points; Prebook stamps ticket
+                              interest to these points; Stage stamps ticket
                               maturity from them. Amber dots mark the same
                               settle.
                             </p>
@@ -4131,7 +4145,7 @@ export function ExposureHedgePathChart({
                             </p>
                             <p>
                               Real settlement for the single bullet forward —
-                              Carry uses CIP / interest to this point; Prebook
+                              Carry uses CIP / interest to this point; Stage
                               stamps ticket maturity from it. Amber marker on
                               the path chart marks the same settle.
                             </p>
@@ -4425,23 +4439,13 @@ export function ExposureHedgePathChart({
                     showRollingStrip && stripAlreadyBooked
                       ? 'Strip already on the book — cancel it to rebook'
                       : showRollingStrip
-                        ? `Prebook ${activeLadderEdges.length}-leg strip (Hedge % applied) for Hedging Decision — Send under this CCY to book`
-                        : 'Prebook bullet for Hedging Decision — Send under this CCY to book'
+                        ? `Stage ${activeLadderEdges.length}-leg strip (Hedge % applied) — then Book under this CCY`
+                        : 'Stage bullet — then Book under this CCY'
                   }
                 >
                   {showRollingStrip && stripAlreadyBooked
                     ? 'Strip booked (change regime / cancel to rebook)'
-                    : `Prebook ${
-                        selectedBasis === 'cash'
-                          ? 'Expected stock'
-                          : selectedBasis === 'totalExpected'
-                            ? 'Total'
-                            : 'VaR-neutral'
-                      } ${
-                        showRollingStrip
-                          ? `${activeLadderEdges.length}-leg strip`
-                          : 'bullet'
-                      }`}
+                    : 'Stage hedging strategy'}
                 </button>
               )}
             </>
@@ -4455,15 +4459,9 @@ export function ExposureHedgePathChart({
               type="button"
               onClick={() => bookProfile(effectiveStructure, [])}
               className="mt-2 rounded-md border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30"
-              title="Prebook selected regime + structure for Hedging Decision — Send under this CCY to book"
+              title="Stage selected regime + structure — then Book under this CCY"
             >
-              {`Prebook ${
-                selectedBasis === 'cash'
-                  ? 'Expected stock'
-                  : selectedBasis === 'totalExpected'
-                    ? 'Total'
-                    : 'VaR-neutral'
-              } ${effectiveStructure === 'strip' ? 'strip' : 'bullet'}`}
+              Stage hedging strategy
             </button>
           )}
         </div>

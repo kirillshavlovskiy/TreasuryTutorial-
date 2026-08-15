@@ -1,0 +1,63 @@
+import { describe, expect, it } from 'vitest';
+import { makeSimRow } from '@/lib/fx-buffer';
+import {
+  fxHedgeMcCfarByCcy,
+  fxHedgeNetCfarByCcyUsdM,
+} from '@/lib/test-mode/cfar-net-by-ccy';
+import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
+import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
+
+const EUR = makeSimRow('1', 'EUR', 10, 0, 0, 2.5, 0, 1.2, 0);
+const SETUP = {
+  ...DEFAULT_VAR_SETUP,
+  forecastMonths: 12,
+  confidencePct: 95 as const,
+  forecastUncertainty1m: 0.3,
+};
+/** Over-hedge so conversion CFaR survives the carry buffer (Net, not Gross). */
+const HEDGE: HedgeTicket = {
+  id: 'eur-fwd',
+  ccy: 'EUR',
+  instrument: 'forward',
+  basis: 'simpleAvg',
+  amountLocalM: 25,
+  maturity: '1y',
+  maturityLabel: 'M12',
+  varUsdM: 0,
+  addressesHigherVar: false,
+};
+
+describe('fxHedgeNetCfarByCcyUsdM — cover vs displayed', () => {
+  it('gives an unhedged book ~0 cover CFaR (no conversion)', () => {
+    const cover = fxHedgeNetCfarByCcyUsdM({ rows: [EUR], setup: SETUP });
+    expect(cover.EUR ?? 0).toBeLessThan(0.001);
+  });
+
+  it('raises Gross CFaR once a hedge forces a delivery', () => {
+    const open = fxHedgeMcCfarByCcy({ rows: [EUR], setup: SETUP });
+    const hedged = fxHedgeMcCfarByCcy({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+    });
+    expect(open.EUR!.criticalCashUsdM).toBeLessThan(0.05);
+    expect(hedged.EUR!.criticalCashUsdM).toBeGreaterThan(open.EUR!.criticalCashUsdM);
+  });
+
+  it('does not put the funding swap into cover, and RSS-adds it when displayed', () => {
+    const cover = fxHedgeNetCfarByCcyUsdM({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+    });
+    const displayed = fxHedgeNetCfarByCcyUsdM({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+      fundingPlanByCcy: {
+        EUR: Array.from({ length: 12 }, () => ({ standing_swap: 4, far_leg: 0 })),
+      },
+    });
+    expect(displayed.EUR ?? 0).toBeGreaterThan(cover.EUR ?? 0);
+  });
+});

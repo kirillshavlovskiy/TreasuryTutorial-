@@ -799,15 +799,8 @@ export function effectiveMonthlyFlowLocalM(
   return roundMoney(periodFlowSumLocalM(row, T, profile) / T);
 }
 
-/**
- * Per-month net flows for VaR path / average / cash book (length = T).
- */
-export function monthlyFlowSeriesLocalM(
-  row: RowState,
-  forecastMonths: number,
-  profile?: ForecastProfileState | null,
-): number[] {
-  const T = Math.max(
+function forecastHorizonMonths(forecastMonths: number): number {
+  return Math.max(
     0,
     Math.floor(
       Number.isFinite(forecastMonths) && forecastMonths >= 0
@@ -815,20 +808,91 @@ export function monthlyFlowSeriesLocalM(
         : 1,
     ),
   );
+}
+
+/** Per-month cash-line objects (custom schedule or flat + extras). */
+export function forecastMonthFlowSeries(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): ForecastMonthFlow[] {
+  const T = forecastHorizonMonths(forecastMonths);
   if (T === 0) return [];
   if (profile?.mode === 'custom') {
-    const months = resizeMonthSeries(
+    return resizeMonthSeries(
       profile.byCcy[row.ccy],
       T,
       row,
       profile.extrasByCcy?.[row.ccy],
     );
-    return months.map(m => roundMoney(monthNet(m)));
   }
   const extras = normalizeExtras(profile?.extrasByCcy?.[row.ccy]);
   return Array.from({ length: T }, (_, k) =>
-    roundMoney(monthNet(flatMonthFlowAt(row, extras, profile, k))),
+    normalizeMonthFlow(flatMonthFlowAt(row, extras, profile, k)),
   );
+}
+
+/**
+ * Per-month net flows for the cash / liquidity book (length = T).
+ * Includes NWC collection and debt draw/repay — those are real cash.
+ */
+export function monthlyFlowSeriesLocalM(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): number[] {
+  return forecastMonthFlowSeries(row, forecastMonths, profile).map(m =>
+    roundMoney(monthNet(m)),
+  );
+}
+
+/**
+ * Collecting AR already on the book (nwcIn vs nonCashAsset) or drawing/repaying
+ * debt already in Stock does not change net FX — cash and the BS item swap.
+ * Those legs stay on the cash path; stripping them here stops a 2.4 receivable
+ * from sitting in Stock and again as 0.2×12 in the hedge flow.
+ */
+export function monthlyFxFlowSeriesLocalM(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): number[] {
+  const months = forecastMonthFlowSeries(row, forecastMonths, profile);
+  let nwcLeft = Math.max(0, row.nonCashAsset ?? 0);
+  let debtLeft = Math.max(0, row.ir_liab_notional);
+  return months.map(m => {
+    const n = normalizeMonthFlow(m);
+    const convNwc = Math.min(Math.max(0, n.nwcIn), nwcLeft);
+    nwcLeft = roundMoney(Math.max(0, nwcLeft - convNwc));
+    const repay = Math.min(Math.max(0, -n.debtOut), debtLeft);
+    debtLeft = roundMoney(Math.max(0, debtLeft - repay));
+    return roundMoney(monthNet(n) - convNwc - n.debtIn + repay);
+  });
+}
+
+/** Horizon Σ of FX-changing flow (cash Σ minus book conversions). */
+export function periodFxFlowSumLocalM(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): number {
+  return roundMoney(
+    monthlyFxFlowSeriesLocalM(row, forecastMonths, profile).reduce(
+      (s, f) => s + f,
+      0,
+    ),
+  );
+}
+
+/** Monthly equivalent of {@link periodFxFlowSumLocalM} for S+F×T helpers. */
+export function effectiveMonthlyFxFlowLocalM(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): number {
+  const T = forecastHorizonMonths(forecastMonths);
+  if (T === 0) return 0;
+  return roundMoney(periodFxFlowSumLocalM(row, T, profile) / T);
 }
 
 /**

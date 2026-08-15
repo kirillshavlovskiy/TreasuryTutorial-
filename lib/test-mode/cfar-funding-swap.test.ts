@@ -115,7 +115,9 @@ describe('displayed CFaR vs cover sizing', () => {
 
     const coverA = fxHedgeNetCfarByCcyUsdM({ rows: [EUR], setup: SETUP });
     const coverB = fxHedgeNetCfarByCcyUsdM({ rows: [EUR], setup: SETUP });
-    expect(coverA.EUR).toBeGreaterThan(0.001);
-    expect(coverA.EUR).toBeCloseTo(coverB.EUR ?? 0, 12);
+    // Unhedged: no conversion, so FX-only cover is ~0. The swap residual is
+    // displayed-only and must not size cover.
+    expect(coverA.EUR ?? 0).toBeLessThan(0.001);
+    expect(coverA.EUR ?? 0).toBeCloseTo(coverB.EUR ?? 0, 12);
   });
 });

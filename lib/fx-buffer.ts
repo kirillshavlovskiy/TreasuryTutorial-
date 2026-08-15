@@ -387,9 +387,16 @@ export interface LayeredBufferResult {
 }
 
 /**
- * Funding-swap overlay vs the unfunded cash path. Selling FCY pays/forgoes
- * that currency's O/N (negative rates included) and the opposite USD O/N;
- * CIP mid swap points offset the differential, so `netUsdYr` is 0 at mid.
+ * Funding-swap overlay vs the unfunded cash path.
+ *
+ * Near buy FCY (swapNear > 0, covering a short / zero H*): FCY O/N is the
+ * debit you extinguish (`r_OD`), USD O/N is the credit you miss on the USD
+ * sold to buy FCY, points are CIP mid on the **credit** curve (the swap
+ * market). Net = (r_OD − r_FCY) × notional — OD vs market, not CIP-zero.
+ *
+ * Near sell FCY (swapNear < 0, deploying surplus): FCY O/N is credit forgone
+ * (`r_FCY`); CIP mid points offset FCY+USD so `netUsdYr` is 0.
+ *
  * Additive to unfunded cash carry — does not reprice the cash path.
  */
 export interface FundingSwapOverlay {
@@ -404,16 +411,54 @@ export function fundingSwapOverlayUsdYr(
   spot: number,
   r_FCY: number,
   r_USD: number,
+  r_OD?: number,
 ): FundingSwapOverlay {
-  const fcyOnUsdYr = swapNear * (r_FCY / 100) * spot;
+  const covering = swapNear > 0
+    && typeof r_OD === 'number'
+    && Number.isFinite(r_OD);
+  const fcyRate = covering ? r_OD : r_FCY;
+  const fcyOnUsdYr = swapNear * (fcyRate / 100) * spot;
   const usdOnUsdYr = -swapNear * (r_USD / 100) * spot;
-  const pointsUsdYr = -(fcyOnUsdYr + usdOnUsdYr);
+  // Swap market points stay on the credit curve even when FCY O/N is OD.
+  const pointsUsdYr = -swapNear * ((r_FCY - r_USD) / 100) * spot;
   return {
     fcyOnUsdYr,
     usdOnUsdYr,
     pointsUsdYr,
     netUsdYr: fcyOnUsdYr + usdOnUsdYr + pointsUsdYr,
   };
+}
+
+const FUNDING_SWAP_MONTHS_PA = 12;
+
+/** One cycle's overlay as a month fraction of the annual rate (sums across M1…MT). */
+export function fundingSwapMonthCarryUsdM(
+  standingSwap: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+  r_OD?: number,
+): number {
+  return fundingSwapOverlayUsdYr(
+    standingSwap, spot, r_FCY, r_USD, r_OD,
+  ).netUsdYr / FUNDING_SWAP_MONTHS_PA;
+}
+
+/** Path Swap Carry = Σ monthly overlay on each cycle's standing book. */
+export function fundingSwapPathCarryUsdM(
+  plan: readonly { standing_swap: number }[] | undefined,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+  r_OD?: number,
+): number | null {
+  if (!plan?.length) return null;
+  return plan.reduce(
+    (s, p) => s + fundingSwapMonthCarryUsdM(
+      p.standing_swap, spot, r_FCY, r_USD, r_OD,
+    ),
+    0,
+  );
 }
 
 /**

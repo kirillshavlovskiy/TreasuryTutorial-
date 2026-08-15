@@ -1302,6 +1302,8 @@ function GroupConsolidatedView({
           bookedHedges={bookedHedges}
           preparedByCcy={preparedByCcy}
           hedgeRatios={hedgeRatios}
+          marketRatesByCcy={marketRatesByCcy}
+          ratesScopeId={GROUP_HEDGE_SCOPE}
           initialRows={book.rows}
           initialUsdCash={book.usdCash}
           initialUsdNonLpCash={book.usdNonLpCash}
@@ -2185,6 +2187,8 @@ function DashboardView({
                     bookedHedges={bookedHedges}
                     preparedByCcy={preparedByCcy}
                     hedgeRatios={hedgeRatios}
+                    marketRatesByCcy={marketRatesByCcy}
+                    ratesScopeId={entity.id}
                     onAnalyticsBookChange={setAnalyticsBook}
                     showRiskMetrics={
                       (

@@ -41,14 +41,20 @@ import {
 } from '@/lib/forecast-profile';
 import {
   applyBookedHedgePositions,
-  bookedPositionOffsetsByCcy,
+  hedgePositionOffsetsByCcy,
   fxTableRiskMetrics,
+  stagedFxHedgeCarryByCcyUsdM,
   type HedgeTicket,
   type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
-import { hedgeCashFlowsByMonth, withNonCashFxConversion } from '@/lib/test-mode/cash-carry-analytics';
+import {
+  hedgeCashFlowsByMonth,
+  cashForecastCarrySplitByCcyUsdM,
+  withNonCashFxConversion,
+} from '@/lib/test-mode/cash-carry-analytics';
 import { fxHedgeNetCfarByCcyUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
 import { DEFAULT_VAR_SETUP, type VarSetup } from '@/lib/test-mode/var-setup';
+import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import type { FxInput } from '@/lib/workspace-store';
 
 export type SimulatorTab =
@@ -126,6 +132,9 @@ interface SimulatorProps {
   bookedHedges?: HedgeTicket[];
   /** Staged hedge packages — settle in the liquidity path alongside booked legs. */
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  /** Per-CCY JPM / uploaded curves — Cash Carry P&L on the liquidity table. */
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  ratesScopeId?: string | null;
   /** Incremental hedge % on remaining net book (synced with Hedging Decision). */
   hedgeRatios?: Record<string, number>;
   tabLabels?: Partial<Record<SimulatorTab, string>>;
@@ -139,10 +148,39 @@ interface SimulatorProps {
   }) => void;
   /**
    * Liquidity tab book mode for Workbench desks:
-   * - curriculum — carry/liquidity book (hedges stay on FX Risk)
-   * - fullSimulator — full FX Simulator table on the Liquidity tab
+   * - curriculum — locked carry/liquidity book (hedges stay on FX Risk)
+   * - fullSimulator — editable liquidity book (no FX position / hedge columns)
    */
   liquidityMode?: 'curriculum' | 'fullSimulator';
+}
+
+function hedgeSettleByCcyFrom(input: {
+  rows: readonly RowState[];
+  forecastMonths: number;
+  bookedHedges: readonly HedgeTicket[];
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  varSetup: VarSetup;
+  forecastProfile?: ForecastProfileState | null;
+}): Record<string, number[]> {
+  const months = input.forecastMonths;
+  if (!(months > 0)) return {};
+  const map: Record<string, number[]> = {};
+  for (const r of input.rows) {
+    const flows = withNonCashFxConversion(
+      r,
+      hedgeCashFlowsByMonth({
+        ccy: r.ccy,
+        forecastMonths: months,
+        bookedHedges: input.bookedHedges,
+        preparedByCcy: input.preparedByCcy,
+        setup: input.varSetup,
+      }),
+      months,
+      input.forecastProfile,
+    );
+    if (flows.some(f => Math.abs(f) > 1e-9)) map[r.ccy] = flows;
+  }
+  return map;
 }
 
 export function Simulator({
@@ -174,6 +212,8 @@ export function Simulator({
   onVarSetupChange,
   bookedHedges = [],
   preparedByCcy,
+  marketRatesByCcy,
+  ratesScopeId,
   tabLabels,
   onAnalyticsBookChange,
   liquidityMode = 'curriculum',
@@ -230,19 +270,27 @@ export function Simulator({
   const [usdCash,      setUsdCash]      = useState(seed.usdCash);
   const [usdNonLpCash, setUsdNonLpCash] = useState(seed.usdNonLpCash);
   const [usdParams, setUsdParams] = useState<UsdParams>(() => ({ ...seed.usdParams }));
-  // Persisted on the dashboard when the host supplies it, local otherwise.
+  // Persisted when the host supplies a writer. Group consolidated passes a
+  // merged profile with no writer — treat that as uncontrolled so Swap funding
+  // toggles (One term swap / sizing) still stick instead of writing into a
+  // local copy the render never reads.
   const [localForecastProfile, setLocalForecastProfile] =
     useState<ForecastProfileState>(() => ({
-      ...DEFAULT_FORECAST_PROFILE,
-      byCcy: {},
-      extrasByCcy: {},
-      formulas: {},
+      ...(forecastProfileProp ?? {
+        ...DEFAULT_FORECAST_PROFILE,
+        byCcy: {},
+        extrasByCcy: {},
+        formulas: {},
+      }),
     }));
-  const forecastProfile = forecastProfileProp ?? localForecastProfile;
+  const forecastProfile =
+    onForecastProfileChange && forecastProfileProp
+      ? forecastProfileProp
+      : localForecastProfile;
   const setForecastProfile = useCallback(
     (next: ForecastProfileState) => {
-      if (onForecastProfileChange) onForecastProfileChange(next);
-      else setLocalForecastProfile(next);
+      setLocalForecastProfile(next);
+      onForecastProfileChange?.(next);
     },
     [onForecastProfileChange],
   );
@@ -297,42 +345,80 @@ export function Simulator({
     value: number,
   ) => setRows(prev => prev.map(r => r.ccy === ccy ? { ...r, [field]: value } : r));
 
-  // Overlay booked Decision-layer spot/forward into FX POSITION (FWD CCY / FWD USD).
-  // Risk Metrics still uses the unadjusted book + tickets separately (no double-count).
+  // Overlay booked + staged Decision-layer spot/forward into FX POSITION
+  // (FWD / Hedge columns). Risk Metrics still uses the unadjusted book +
+  // live tickets separately (no double-count). Staged FCY settlement lands
+  // on the liquidity path and sizes the funding swap with the buffer layers.
   const displayRows = useMemo(
-    () => applyBookedHedgePositions(rows, bookedHedges),
-    [rows, bookedHedges],
+    () => applyBookedHedgePositions(rows, bookedHedges, preparedByCcy),
+    [rows, bookedHedges, preparedByCcy],
   );
   const bookedPositionByCcy = useMemo(
-    () => bookedPositionOffsetsByCcy(bookedHedges),
-    [bookedHedges],
+    () => hedgePositionOffsetsByCcy(bookedHedges, preparedByCcy),
+    [bookedHedges, preparedByCcy],
   );
-
-  // FCY leg of every hedge, month by month — the same schedule the Cash Carry
-  // forecast settles, so the liquidity book and that view agree on the dates.
-  const hedgeSettleByCcy = useMemo(() => {
-    const months = shared.forecastMonths ?? 1;
-    if (!(months > 0)) return {};
-    const map: Record<string, number[]> = {};
-    for (const r of rows) {
-      const flows = withNonCashFxConversion(
-        r,
-        hedgeCashFlowsByMonth({
-          ccy: r.ccy,
-          forecastMonths: months,
-          bookedHedges,
-          preparedByCcy,
-          setup: varSetup,
-        }),
-        months,
+  const cashForecastCarryByCcy = useMemo(
+    () =>
+      cashForecastCarrySplitByCcyUsdM({
+        rows,
         forecastProfile,
-      );
-      if (flows.some(f => Math.abs(f) > 1e-9)) map[r.ccy] = flows;
+        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
+        bookedHedges,
+        preparedByCcy,
+        setup: varSetup,
+        marketRatesByCcy,
+        ratesScopeId,
+      }),
+    [
+      rows,
+      forecastProfile,
+      shared.forecastMonths,
+      varSetup,
+      bookedHedges,
+      preparedByCcy,
+      marketRatesByCcy,
+      ratesScopeId,
+    ],
+  );
+  const stagedCashCarryByCcyUsdM = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
+      map[ccy] = split.cashUsdM;
     }
     return map;
-  }, [rows, shared.forecastMonths, bookedHedges, preparedByCcy, varSetup, forecastProfile]);
+  }, [cashForecastCarryByCcy]);
+  const stagedHedgeCarryByCcyUsdM = useMemo(() => {
+    const map = stagedFxHedgeCarryByCcyUsdM(preparedByCcy);
+    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
+      map[ccy] = split.fwdUsdM;
+    }
+    return map;
+  }, [preparedByCcy, cashForecastCarryByCcy]);
+  const stagedCarryByMonthByCcyUsdM = useMemo(() => {
+    const map: Record<string, { cashUsdM: number; fwdUsdM: number }[]> = {};
+    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
+      map[ccy] = split.byMonth;
+    }
+    return map;
+  }, [cashForecastCarryByCcy]);
 
-  // FX-hedge Net CFaR only — never reads the funding swap / buffer layers.
+  // Booked + staged FCY legs — the same schedule the cash path and SWAP
+  // band answer. Buffer layers size H* / Swap near against this path.
+  const hedgeSettleByCcy = useMemo(
+    () =>
+      hedgeSettleByCcyFrom({
+        rows,
+        forecastMonths: shared.forecastMonths ?? 1,
+        bookedHedges,
+        preparedByCcy,
+        varSetup,
+        forecastProfile,
+      }),
+    [rows, shared.forecastMonths, bookedHedges, preparedByCcy, varSetup, forecastProfile],
+  );
+
+  // FX-hedge Net CFaR (MC size+timing) including staged packages — CFaR cover
+  // sizes off this number. The funding swap is not an input (no loop).
   const cfarNetByCcyUsd = useMemo(
     () => fxHedgeNetCfarByCcyUsdM({
       rows,
@@ -482,6 +568,9 @@ export function Simulator({
               riskMetricsByCcy={riskMetricsByCcy}
               bookedPositionByCcy={bookedPositionByCcy}
               hedgeSettleByCcy={hedgeSettleByCcy}
+              stagedHedgeCarryByCcyUsdM={stagedHedgeCarryByCcyUsdM}
+              stagedCashCarryByCcyUsdM={stagedCashCarryByCcyUsdM}
+              stagedCarryByMonthByCcyUsdM={stagedCarryByMonthByCcyUsdM}
               cfarNetByCcyUsd={cfarNetByCcyUsd}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
@@ -640,8 +729,9 @@ export function Simulator({
         {!effectiveHiddenTabs.includes('liquidity') && (
           <div className={activeTab === 'liquidity' ? '' : 'hidden'}>
             {/*
-              curriculum — Liquidity/carry book (hedges stay on FX Risk).
-              fullSimulator — former Workbench FX Simulator table (full book).
+              Liquidity book: path + Carry/Buffer + FX HEDGE.
+              FX POSITION and IR / FIXED-RATE BOOK stay on FX Risk / IR Profile.
+              fullSimulator keeps the book editable (Workbench); curriculum locks it.
             */}
             <UnifiedSimulator
               shared={shared}           onSharedChange={onSharedChange}
@@ -658,29 +748,19 @@ export function Simulator({
               fcyComputed={dashboard.fcyComputed}
               usdComputed={dashboard.usdComputed}
               showRates
-              showFxPosition={liquidityMode === 'fullSimulator'}
+              showFxPosition={false}
               showLiquidity
-              showBonds={
-                liquidityMode === 'fullSimulator'
-                  && !!fxInputs
-                  && fxInputs.includes('bonds')
-              }
-              showInvestments={
-                liquidityMode === 'fullSimulator'
-                  && !!fxInputs
-                  && fxInputs.includes('investments')
-              }
-              showLiabilities={
-                liquidityMode === 'fullSimulator'
-                  && !!fxInputs
-                  && fxInputs.includes('liabilities')
-              }
+              showBonds={false}
+              showInvestments={false}
+              showLiabilities={false}
               showAdvancedBook
-              hideFxHedge={liquidityMode !== 'fullSimulator'}
               lockValues={liquidityMode !== 'fullSimulator'}
-              pnlColumns={liquidityMode === 'fullSimulator' ? undefined : 'carryOnly'}
+              pnlColumns="carryOnly"
               bookedPositionByCcy={bookedPositionByCcy}
               hedgeSettleByCcy={hedgeSettleByCcy}
+              stagedHedgeCarryByCcyUsdM={stagedHedgeCarryByCcyUsdM}
+              stagedCashCarryByCcyUsdM={stagedCashCarryByCcyUsdM}
+              stagedCarryByMonthByCcyUsdM={stagedCarryByMonthByCcyUsdM}
               cfarNetByCcyUsd={cfarNetByCcyUsd}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}

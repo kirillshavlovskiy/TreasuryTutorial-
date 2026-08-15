@@ -73,7 +73,7 @@ import {
   DEFAULT_FORECAST_PROFILE,
   clearLineUncertainties,
   effectiveForecastUncertainty1m,
-  monthlyFlowSeriesLocalM,
+  monthlyFxFlowSeriesLocalM,
   monthlyInflowSeriesLocalM,
   monthlyOutflowSeriesLocalM,
   type ForecastProfileState,
@@ -690,7 +690,7 @@ export function CfarAnalysisView({
           bar?.stockNetM ??
           (typeof bookRow?.cash === 'number' ? bookRow.cash : 0);
         const flows = bookRow
-          ? monthlyFlowSeriesLocalM(
+          ? monthlyFxFlowSeriesLocalM(
               bookRow,
               Math.max(1, T),
               forecastProfile ?? DEFAULT_FORECAST_PROFILE,
@@ -2597,7 +2597,7 @@ function CfarDecompositionCharts({
       </div>
       <MiniChart
         title="Structural liquidity gap — the PLAN ledger's own FCY balance"
-        desc="Fully deterministic SIZE (single line, no band) — the settlement schedule vs. the (correctly-forecast) accrual pattern, including the intra-month outflow-before-inflow sawtooth. A 100%-planned, known cash-timing fact — its LCY size is never treated as uncertain (no p05/p95 here, unlike ① and ②). It is NOT excluded from CFaR though: holding this known gap open still means it is converted at whatever spot the path delivers — see ④ below, which is the dollar impact it generates."
+        desc="Fully deterministic SIZE (single line, no band) — the settlement schedule vs. the (correctly-forecast) accrual pattern, including the intra-month outflow-before-inflow sawtooth. A 100%-planned, known cash-timing fact — its LCY size is never treated as uncertain (no p05/p95 here, unlike ① and ②). It is not a CFaR input. Revaluing it at simulated spot would be FX VaR on a funding fact — that excluded proxy is ④, diagnostic only."
         unit="local M"
         color="#94a3b8"
         mean={structuralMean}
@@ -2634,8 +2634,8 @@ function CfarDecompositionCharts({
         fmt={v => v.toFixed(2)}
       />
       <MiniChart
-        title="④ Structural USD impact — revaluation only, zero at σ=0"
-        desc="The structural gap is a planned SIZE, not a risk in itself, so it is never charged for merely being large. Its only route into CFaR is that the rate the known balance is eventually valued at is uncertain. Ledger A runs the FORECAST flows on their FORECAST dates against the planned settlement schedule and differs from the plan ONLY in the simulated spot path — so this line is identically zero when FX vol is zero, however big the gap, and scales up with σ from there. Percentiled across paths at the setup confidence."
+        title="④ Structural USD impact — excluded FX-vol proxy, not in CFaR"
+        desc="Ledger A vs plan: the planned funding gap revalued at the simulated spot. That is FX VaR by another name — a known cash-timing fact used as a proxy for market vols. Headline Gross / Net CFaR do not include it. Identically zero when FX vol is zero; scales with σ. Shown so the excluded channel stays visible. Percentiled across paths at the setup confidence."
         unit="$K"
         color="#94a3b8"
         mean={structuralFxRiskK}
@@ -2651,15 +2651,15 @@ function CfarDecompositionCharts({
       />
       <MiniChart
         title="⑥ Timing USD impact — ledger B vs ledger C · spikes at settlements, zero between"
-        desc="EXPECT A SPIKE AT EACH SETTLEMENT AND $0 EITHER SIDE OF IT — that shape is the answer, not a glitch. A spike is the leg's mark-to-market, notional × (strike − spot), over the window where one ledger has settled and the jittered one has not; it is the only moment the two books differ. It falls back to zero afterwards because a forward pays CONTRACTUAL amounts at a CONTRACTUAL strike, so once both ledgers have delivered they hold identical positions and settling two days apart leaves no trace outside the interest. Before the first settlement, and for the whole horizon on an UNHEDGED book, this is flat $0 however late the flows run: a date shift only changes WHEN currency you still hold arrived, and the principal credit cancels it exactly, so there is no rate to have been wrong about. What it does charge is the FX move across a genuine conversion gap plus the borrow rate over any window the shift leaves an account overdrawn. A late receivable is never charged its face value — it is delayed, not lost. On an unhedged book the entire drawdown is revaluation and lands in ④; for the displacement itself rather than its cost, read the local-currency mismatch charts above."
+        desc="EXPECT A SPIKE AT EACH SETTLEMENT AND $0 EITHER SIDE OF IT — that shape is the answer, not a glitch. A spike is the leg's mark-to-market, notional × (strike − spot), over the window where one ledger has settled and the jittered one has not; it is the only moment the two books differ. It falls back to zero afterwards because a forward pays CONTRACTUAL amounts at a CONTRACTUAL strike, so once both ledgers have delivered they hold identical positions and settling two days apart leaves no trace outside the interest. Before the first settlement, and for the whole horizon on an UNHEDGED book, this is flat $0 however late the flows run: a date shift only changes WHEN currency you still hold arrived, and the principal credit cancels it exactly, so there is no rate to have been wrong about. What it does charge is the FX move across a genuine conversion gap plus the borrow rate over any window the shift leaves an account overdrawn. A late receivable is never charged its face value — it is delayed, not lost. On an unhedged book ④ is the excluded FX reval of the planned gap; headline CFaR stays on ⑤+⑥. For the displacement itself rather than its cost, read the local-currency mismatch charts above."
         unit="$K"
         color="#a78bfa"
         mean={timingFxRiskK}
         fmt={v => Math.round(v).toString()}
       />
       <MiniChart
-        title="⑦ Raw gross shortfall vs plan — the whole, before running-max"
-        desc="The point-in-time USD shortfall of the realized ledger against the plan ledger, interest accrual off. Unlike ⑤ and ⑥ this does NOT wait for a settlement — it is live from the first month on any book carrying an FCY position, because ④ alone drives it until something converts. DO NOT expect ④+⑤+⑥ to equal this line. The three are nested counterfactuals, so they telescope to it exactly PATH BY PATH — but each is percentiled separately, and the path that is worst for timing is not the path that is worst for FX, so adding the three plotted lines overstates the whole — by more than 20% at the end of a typical hedged book. Read ④/⑤/⑥ for which driver dominates and how that ranking shifts over the horizon; read this line, never the sum, for the size. This is 'how far behind plan am I right now'; the main chart's amber curve is its running max."
+        title="⑦ Raw gross shortfall — size + timing, before running-max"
+        desc="The point-in-time USD shortfall of ledger C against ledger A, interest accrual off — size and timing mismatches only, on the same spot path. The planned structural gap cancels, so ④ is not in this line. ⑤+⑥ telescope to it PATH BY PATH; each is percentiled separately, so adding the plotted lines overstates the whole. Read ⑤/⑥ for which driver dominates; read this line, never the sum, for the size. The main chart's amber curve is its running max."
         unit="$K"
         color="#fb923c"
         mean={rawGrossK}

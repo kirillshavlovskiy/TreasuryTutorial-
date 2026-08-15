@@ -21,6 +21,7 @@ export function AnalyticsHedgeSummary({
   constraint,
   constraintDetail,
   defaultCarryUsdYrM,
+  swapCarryUsdYrM,
   finalCfarUsdM,
 }: {
   regimeLabel: string;
@@ -28,6 +29,8 @@ export function AnalyticsHedgeSummary({
   constraint: BufferConstraint;
   constraintDetail: string;
   defaultCarryUsdYrM: number;
+  /** Funding-swap rate-diff carry (FCY O/N + USD O/N). */
+  swapCarryUsdYrM: number;
   finalCfarUsdM: number;
 }) {
   const constraintHue =
@@ -40,7 +43,7 @@ export function AnalyticsHedgeSummary({
   return (
     <section
       aria-label="Hedging proposition"
-      className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4"
+      className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5"
     >
       <SummaryCell
         label="Live regime"
@@ -54,11 +57,21 @@ export function AnalyticsHedgeSummary({
         valueClass={constraintHue}
       />
       <SummaryCell
-        label="Default Carry"
+        label="Cash Carry"
         value={fmtCarryYr(defaultCarryUsdYrM)}
-        detail="Unfunded FX path — same on every regime"
+        detail="Unfunded FX path — no funding swap"
         valueClass={
           defaultCarryUsdYrM >= 0 ? 'text-emerald-200' : 'text-rose-200/90'
+        }
+      />
+      <SummaryCell
+        label="Swap Carry"
+        value={fmtCarryYr(swapCarryUsdYrM)}
+        detail="FCY O/N + USD missed credit + CIP points"
+        valueClass={
+          Math.abs(swapCarryUsdYrM) < 0.0005
+            ? 'text-slate-400'
+            : swapCarryUsdYrM >= 0 ? 'text-emerald-200' : 'text-rose-200/90'
         }
       />
       <SummaryCell

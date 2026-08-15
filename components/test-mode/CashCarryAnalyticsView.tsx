@@ -42,6 +42,7 @@ import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   equalVarLinearHedgeNotionalLocalM,
   setPreparedHedgeForCcy,
+  clearPreparedHedgeForCcy,
   type CarryProfileSessionV1,
   type HedgeTicket,
   type PreparedHedgeProfile,
@@ -87,7 +88,7 @@ import { setMarketRatesForCcy } from '@/lib/test-mode/hedge-var';
 import type { RowState } from '@/lib/fx-buffer';
 import {
   DEFAULT_FORECAST_PROFILE,
-  monthlyFlowSeriesLocalM,
+  monthlyFxFlowSeriesLocalM,
   normalizeMonthFlow,
   resizeMonthSeries,
   seedMonthsFromRow,
@@ -3091,7 +3092,7 @@ export function CashCarryAnalyticsView({
         ? setup.forecastMonths
         : horizonMonths(setup.horizon);
     const flows = bookRow
-      ? monthlyFlowSeriesLocalM(
+      ? monthlyFxFlowSeriesLocalM(
           bookRow,
           Math.max(1, tfLocal),
           forecastProfile ?? DEFAULT_FORECAST_PROFILE,
@@ -3370,7 +3371,7 @@ export function CashCarryAnalyticsView({
       }),
     );
     setProfileDraftDirty(false);
-    // Persist session + prepared package so reload restores Prebook state.
+    // Persist session + prepared package so reload restores staged state.
     const prev = profileSessionByCcyRef.current[chartCcy];
     persistProfileSession(chartCcy, {
       draft: pkg,
@@ -3388,6 +3389,12 @@ export function CashCarryAnalyticsView({
         selectedSettleMonths ?? prev?.selectedSettleMonths ?? null,
       shapeStartManual: shapeStartManualRef.current,
     });
+  };
+
+  const unstageProfile = () => {
+    if (!chartCcy || !onPreparedByCcyChange) return;
+    lastStagedPkgSigRef.current = '';
+    onPreparedByCcyChange(clearPreparedHedgeForCcy(preparedByCcy, chartCcy));
   };
 
   const profileOpen = profileCcy != null && profileCcy === chartCcy;
@@ -3993,7 +4000,7 @@ export function CashCarryAnalyticsView({
     (typeof pathBookRow?.cash === 'number' ? pathBookRow.cash : 0);
   const pathFlows = useMemo(() => {
     if (!pathBookRow) return undefined;
-    return monthlyFlowSeriesLocalM(
+    return monthlyFxFlowSeriesLocalM(
       pathBookRow,
       Math.max(1, Tf > 0 ? Tf : 1),
       forecastProfile ?? DEFAULT_FORECAST_PROFILE,
@@ -5400,16 +5407,22 @@ export function CashCarryAnalyticsView({
                       }
                       chips={chips.length > 0 ? chips : undefined}
                       isPrebooked={staged}
+                      draftDirty={staged && profileDraftDirty}
                       prepareAction={
                         profileDraft && onPreparedByCcyChange
                           ? {
-                              label: `Prebook ${optStruct}`,
+                              label: 'Stage hedging strategy',
                               title:
-                                'Prebook package for Hedging Decision — Send under this CCY to book',
+                                'Stage this package — then Book under this CCY',
                               disabled: false,
                               run: () => stageProfileDraft(),
                             }
                           : null
+                      }
+                      onReset={
+                        staged && onPreparedByCcyChange
+                          ? unstageProfile
+                          : undefined
                       }
                       onClose={closeCcyProfile}
                     />
@@ -5505,7 +5518,7 @@ export function CashCarryAnalyticsView({
                   {!hasStrategyHedge || settleScenarios.length === 0 ? (
                     <p className="py-6 text-center text-xs text-slate-500">
                       No model hedge for {chartCcy} yet — set cover / structure
-                      in Hedge path below (stays in this modal until Prebook).
+                      in Hedge path below (stays in this modal until Stage).
                     </p>
                   ) : (
                     <>
@@ -5841,7 +5854,7 @@ export function CashCarryAnalyticsView({
                             applyStripShapeAroundWam(shapePreviewScore)
                           }
                           className="rounded-md border border-emerald-700/50 bg-emerald-950/40 px-2.5 py-1 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-900/50"
-                          title="Lock this strip into the modal draft — Prebook in the header to stage to Hedging Decision"
+                          title="Lock this strip into the modal draft — Stage in the header to send to Decision and Liquidity"
                         >
                           {appliedShape ? 'Re-apply shape' : 'Apply shape'}
                         </button>
@@ -6207,7 +6220,7 @@ export function CashCarryAnalyticsView({
                                         : ''
                                   }`}
                                   onClick={() => applyStripShapeAroundWam(c)}
-                                  title="Apply this strip locally · Prebook in the header to stage to Hedging Decision"
+                                  title="Apply this strip locally · Stage in the header to send to Decision and Liquidity"
                                 >
                                   <td className="py-1.5 pr-2 text-slate-500">
                                     {i + 1}
@@ -6265,7 +6278,7 @@ export function CashCarryAnalyticsView({
                       </div>
                       <p className="text-[10px] text-slate-500">
                         Click a rank row to Apply the shape locally. Use
-                        Prebook in the header to stage it to Hedging Decision.
+                        Stage in the header to send it to Decision and Liquidity.
                       </p>
                     </>
                   )}

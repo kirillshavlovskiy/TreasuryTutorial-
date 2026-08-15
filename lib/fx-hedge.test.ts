@@ -146,6 +146,20 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
     expect(h.fwdNotional).toBeCloseTo(-base.currentFx, 6);
     expect(h.residualFx).toBeCloseTo(0, 6);
   });
+
+  it('funding-swap near is in the hedge basis (hedging/funding layer)', () => {
+    const swapNear = 40;
+    const only = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear });
+    expect(only.fwdNotional).toBe(0);
+    expect(only.residualFx).toBeCloseTo(base.forecastFx + swapNear, 6);
+
+    const fwd = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear });
+    expect(fwd.fwdNotional).toBeCloseTo(-(base.forecastFx + swapNear), 6);
+    expect(fwd.residualFx).toBeCloseTo(0, 6);
+
+    const none = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear: 0 });
+    expect(Math.abs(fwd.fwdNotional)).toBeGreaterThan(Math.abs(none.fwdNotional));
+  });
 });
 
 describe('hedge overlay carry (on top of the swap book)', () => {

@@ -33,6 +33,7 @@ export {
   optimizeStripShapeAroundWam,
   scoreStripShapeAroundWam,
   resolvedHedgedTotalCarryUsdM,
+  cashForecastCarrySplitByCcyUsdM,
   preparedLegFwdCarryUsdM,
   preparedStripFwdCarryUsdM,
   preparedBulletFwdCarryUsdM,
@@ -174,7 +175,10 @@ export {
   type FundingGapResult,
 } from '@/lib/test-mode/cfar-residual';
 export {
+  fxHedgeMcCfarByCcy,
   fxHedgeNetCfarByCcyUsdM,
+  displayedCfarNetByCcyUsdM,
+  hedgeSettleScheduleForCfar,
   sumNetCfarUsdM,
 } from '@/lib/test-mode/cfar-net-by-ccy';
 export {
@@ -269,6 +273,8 @@ export {
   type StripHedgedVarLeg,
   type StripHedgedVarProfilePoint,
   bookedPositionOffsetsByCcy,
+  hedgePositionOffsetsByCcy,
+  preparedPositionOffsetsByCcy,
   bookedTicketForCcy,
   buildHedgeVarSummary,
   equalVarLinearHedgeNotionalLocalM,
@@ -292,6 +298,7 @@ export {
   clearPreparedHedgeForCcy,
   setPreparedHedgeForCcy,
   setMarketRatesForCcy,
+  stagedFxHedgeCarryByCcyUsdM,
   fxTableRiskMetrics,
   GROUP_HEDGE_SCOPE,
   overlayRiskFromFxBook,

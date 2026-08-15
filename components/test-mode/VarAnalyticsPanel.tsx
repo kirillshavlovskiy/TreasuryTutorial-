@@ -16,11 +16,12 @@ import {
 import {
   chipsFromPathSummary,
   HedgeStagingHeader,
+  pathChartDraftDirty,
 } from '@/components/test-mode/HedgeStagingHeader';
 import {
   DEFAULT_FORECAST_PROFILE,
   clearLineUncertainties,
-  monthlyFlowSeriesLocalM,
+  monthlyFxFlowSeriesLocalM,
   type ForecastProfileState,
   type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
@@ -41,6 +42,7 @@ import {
   overlayRiskFromFxBook,
   residualVarFromMismatchUsdM,
   setPreparedHedgeForCcy,
+  clearPreparedHedgeForCcy,
   stripTicketsForCcy,
   varSetupWithLineUncertainty,
   type HedgeTicket,
@@ -68,12 +70,12 @@ import { CfarAnalysisView } from '@/components/test-mode/CfarAnalysisView';
 import { LiquidityAnalyticsView } from '@/components/test-mode/LiquidityAnalyticsView';
 import {
   assignImpliedCarryFromSwapPoints,
-  buildCashForecastCarryComparison,
-  resolvedHedgedTotalCarryUsdM,
   sumCashCarryTotalUsdM,
 } from '@/lib/test-mode/cash-carry-analytics';
-import { residualCfarClosedFormUsdM } from '@/lib/test-mode/cfar-residual';
-import { fundingSwapOutstandingByMonth } from '@/lib/test-mode/cfar-funding-swap';
+import {
+  fxHedgeNetCfarByCcyUsdM,
+  sumNetCfarUsdM,
+} from '@/lib/test-mode/cfar-net-by-ccy';
 import {
   evaluateLiquidityStrategies,
   liquidityStrategyInputFrom,
@@ -470,7 +472,7 @@ export function VarAnalyticsPanel({
           bar.ccy,
           setup.forecastMonths > 0 && Math.abs(bar.flowM) > 1e-15 ? bar.flowM : 0,
         );
-      out[bar.ccy] = monthlyFlowSeriesLocalM(row, T, forecastProfile);
+      out[bar.ccy] = monthlyFxFlowSeriesLocalM(row, T, forecastProfile);
     }
     return out;
   }, [bookRows, forecastProfile, risk, setup.forecastMonths]);
@@ -918,7 +920,7 @@ export function VarAnalyticsPanel({
           preparedFor: 'var',
         }),
       );
-      closePathChart();
+      // Stay open — Stage keeps the modal up with a live "Staged" badge.
       return;
     }
 
@@ -976,7 +978,7 @@ export function VarAnalyticsPanel({
         preparedFor: 'var',
       }),
     );
-    closePathChart();
+    // Stay open — same as Cash Carry / Decision: stage, don't dismiss.
   };
 
   /**
@@ -1181,78 +1183,33 @@ export function VarAnalyticsPanel({
       ? cashCarryTableTotalUsdM
       : cashCarryTotalUsdM;
 
-  /** Aggregate net CFaR @ setup confidence — closed form (no MC) for the tab. */
-  const cfarNetTotalUsdM = useMemo(() => {
-    const T =
-      setup.forecastMonths > 0
-        ? setup.forecastMonths
-        : horizonMonths(setup.horizon);
-    const ccys = new Set<string>();
-    for (const r of risk) ccys.add(r.bar.ccy);
-    for (const row of bookRows ?? []) if (row.ccy) ccys.add(row.ccy);
-    let net = 0;
-    for (const ccy of ccys) {
-      if (ccy === 'USD') continue;
-      const bar = risk.find(r => r.bar.ccy === ccy)?.bar;
-      const bookRow = bookRows?.find(r => r.ccy === ccy);
-      const stockM =
-        bar?.stockNetM ??
-        (typeof bookRow?.cash === 'number' ? bookRow.cash : 0);
-      const flows = bookRow
-        ? monthlyFlowSeriesLocalM(
-            bookRow,
-            Math.max(1, T),
-            forecastProfile ?? DEFAULT_FORECAST_PROFILE,
-          )
-        : [];
-      if (Math.abs(stockM) < 1e-9 && !flows.some(f => Math.abs(f) > 1e-9)) {
-        continue;
-      }
-      const rates = resolveMarketRatesForCcy(marketRatesByCcy, ccy, ratesScopeId);
-      const cmp = buildCashForecastCarryComparison({
-        ccy,
-        bookRows,
-        forecastProfile,
-        forecastMonths: setup.forecastMonths,
-        marketRates: rates,
-        bookedHedges,
-        preparedByCcy,
-        setup,
-      });
-      const carry = cmp
-        ? resolvedHedgedTotalCarryUsdM({
-            comparison: cmp,
-            prepared: preparedByCcy[ccy],
-            marketRates: rates,
-          }).totalCarryUsdM
-        : 0;
-      const funding = fundingSwapOutstandingByMonth(livePlanByCcy?.[ccy], T);
-      net += residualCfarClosedFormUsdM({
-        stockM,
-        monthlyFlows: flows,
-        ccy,
-        setup,
-        bookedHedges,
-        prepared: preparedByCcy[ccy],
-        tenureMonths: T,
-        carryUsdM: carry,
-        forecastProfile,
-        fundingSwapOutstandingM: funding.outstandingM,
-        fundingSwapTermSettles: funding.termSettles,
-      }).netCashUsdM;
-    }
-    return net;
-  }, [
-    risk,
-    bookRows,
-    forecastProfile,
-    setup,
-    marketRatesByCcy,
-    ratesScopeId,
-    bookedHedges,
-    preparedByCcy,
-    livePlanByCcy,
-  ]);
+  /** Aggregate Net CFaR — same Monte Carlo size+timing number as cover, plus
+   * the funding-swap residual when a live plan is on. */
+  const cfarNetTotalUsdM = useMemo(
+    () =>
+      sumNetCfarUsdM(
+        fxHedgeNetCfarByCcyUsdM({
+          rows: bookRows ?? [],
+          setup,
+          forecastProfile,
+          bookedHedges,
+          preparedByCcy,
+          marketRatesByCcy,
+          ratesScopeId,
+          fundingPlanByCcy: livePlanByCcy,
+        }),
+      ),
+    [
+      bookRows,
+      forecastProfile,
+      setup,
+      marketRatesByCcy,
+      ratesScopeId,
+      bookedHedges,
+      preparedByCcy,
+      livePlanByCcy,
+    ],
+  );
 
   /**
    * Live funding programme — same evaluator as the Liquidity tab, so the
@@ -1354,6 +1311,7 @@ export function VarAnalyticsPanel({
           constraint={liveFunding.constraint}
           constraintDetail={liveFunding.constraintDetail}
           defaultCarryUsdYrM={liveFunding.cashCarryUsdYrM}
+          swapCarryUsdYrM={liveFunding.swapCarryUsdYrM}
           finalCfarUsdM={liveFunding.finalCfarUsdM}
         />
       )}
@@ -2161,7 +2119,7 @@ export function VarAnalyticsPanel({
                         {struct ? (
                           <span
                             className="text-[9px] font-semibold uppercase tracking-wide text-violet-300/90"
-                            title="Hedge structure from Cash Carry Prebook / FX Risk Book / Decision"
+                            title="Hedge structure from staged Cash Carry / FX Risk / Decision package"
                           >
                             {hedgeStructureShortLabel(struct, legs)}
                           </span>
@@ -2292,7 +2250,24 @@ export function VarAnalyticsPanel({
                       : undefined
                   }
                   isPrebooked={Boolean(chartCcy && preparedByCcy[chartCcy])}
+                  draftDirty={Boolean(
+                    chartCcy
+                    && preparedByCcy[chartCcy]
+                    && pathSummaryMetrics
+                    && pathChartDraftDirty(
+                      preparedByCcy[chartCcy]!,
+                      pathSummaryMetrics,
+                    ),
+                  )}
                   prepareAction={pathPrepareAction}
+                  onReset={
+                    chartCcy && preparedByCcy[chartCcy] && onPreparedByCcyChange
+                      ? () =>
+                          onPreparedByCcyChange(
+                            clearPreparedHedgeForCcy(preparedByCcy, chartCcy),
+                          )
+                      : undefined
+                  }
                   onClose={closePathChart}
                 />
               </div>

@@ -231,7 +231,7 @@ export function VolSourceControl({
                 tickValues={[0, 12.5, 25, 37.5, 50]}
                 tickLabels={['0', '', '25', '', '50']}
                 className="w-full"
-                title={`σ₁ₘ for the ${opt.label.toLowerCase()} source, 0–${MONTHLY_VOL_MAX * 100}%/mo. Desk preset ${presetPct.toFixed(1)}%. Set 0 to switch FX vol off: the structural gap then costs nothing and only size and timing move CFaR.`}
+                title={`σ₁ₘ for the ${opt.label.toLowerCase()} source, 0–${MONTHLY_VOL_MAX * 100}%/mo. Desk preset ${presetPct.toFixed(1)}%. Headline CFaR is size and timing only — the planned structural gap is not revalued at this vol.`}
                 ariaLabel={`${opt.label} monthly volatility`}
                 headerExtra={
                   <VolResetBtn

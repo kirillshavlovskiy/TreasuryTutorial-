@@ -46,6 +46,31 @@ describe('decisionRowFor', () => {
     expect(d.schedule[0]!.preBookable).toBe(false);
   });
 
+  it('still stages the buffer-sized swap when the dated plan has not booked a cycle-1 leg', () => {
+    const plan = mkPlan([
+      { swap_needed: 0, standing_swap: 0, drawdown: 0 },
+      { swap_needed: 0, standing_swap: 0, drawdown: 0 },
+    ]);
+    const d = decisionRowFor(
+      mkRow({ ccy: 'ZZZ', r_FCY: 2, swapNear: 6.58, liquidityPlan: plan }),
+      4,
+    )!;
+    expect(d.nearLeg).toBeCloseTo(6.58, 6);
+    expect(d.schedule[0]!.newLeg).toBeCloseTo(6.58, 6);
+  });
+
+  it('keeps a sell-side (PAY) funding swap instead of dropping it', () => {
+    const plan = mkPlan([
+      { swap_needed: -4.2, standing_swap: -4.2, drawdown: 0 },
+    ]);
+    const d = decisionRowFor(
+      mkRow({ ccy: 'ZZZ', r_FCY: 1.78, swapNear: -4.2, liquidityPlan: plan }),
+      3.5,
+    )!;
+    expect(d.nearLeg).toBeCloseTo(-4.2, 6);
+    expect(d.peakBook).toBeCloseTo(-4.2, 6);
+  });
+
   it('returns null when the plan is empty', () => {
     const row = mkRow({ ccy: 'ZZZ', r_FCY: 2, liquidityPlan: [] });
     expect(decisionRowFor(row, 4)).toBeNull();

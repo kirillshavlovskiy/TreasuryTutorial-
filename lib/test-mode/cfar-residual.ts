@@ -669,12 +669,9 @@ export interface ResidualCfarClosedForm {
 }
 
 /**
- * Net CFaR for tab headlines — delegates straight to
- * {@link computeHedgeCfarBands} (the same spot + swap-bridge + forecast-
- * uncertainty combination the tab body uses), so the tab-rail preview and
- * the tab body are the SAME calculation, not two parallel implementations
- * that can drift. "Cheap" only in the sense that it discards the per-t
- * fan and keeps just the peak.
+ * Legacy closed-form peak (under-hedged residual × FX vol). Do not use for
+ * cover sizing or displayed headlines — those go through
+ * {@link fxHedgeNetCfarByCcyUsdM} (Monte Carlo size + timing).
  */
 export function residualCfarClosedFormUsdM(
   input: ResidualHedgeInput & {

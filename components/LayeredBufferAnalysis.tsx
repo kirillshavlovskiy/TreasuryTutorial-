@@ -70,7 +70,7 @@ const LAYER_DEFS: LayerDef[] = [
     id: 'cfarCover',
     label: 'CFaR cover',
     formula: 'Net CFaR → FCY buffer',
-    hint: 'Sizes a funding swap from FX-only Net CFaR (not Gross) so the swap cannot resize itself. Displayed CFaR then RSS-combines this swap\'s rate-diff bridge with the FX hedge.',
+    hint: 'Sizes a funding swap from FX-only Net CFaR (size + timing, not gap × σ) so the swap cannot resize itself. Displayed CFaR then RSS-combines this swap\'s rate-diff bridge with the FX hedge.',
     activeColor: '#0ea5e9',
     textColor: 'text-sky-700',
     bg: 'bg-sky-50 border-sky-200',

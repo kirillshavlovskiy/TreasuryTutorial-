@@ -42,6 +42,7 @@ import {
   equalVarNotionalAtTenureLocalM,
   eurRefExposureM,
   expectedEurVarUsdM,
+  fxHedgeTargetLocalM,
   growingExposurePathFactor,
   linearBulletNotionalFromVarUsdM,
   aggregateBookedHedges,
@@ -66,7 +67,7 @@ import {
   type VarSetup,
 } from '@/lib/test-mode';
 import { usdToFcyM } from '@/lib/fx-buffer';
-import { periodFlowSumLocalM } from '@/lib/forecast-profile';
+import { periodFlowSumLocalM, periodFxFlowSumLocalM } from '@/lib/forecast-profile';
 import {
   createDashboard,
   createRiskProfile,
@@ -161,6 +162,14 @@ describe('NordTech seed exposures', () => {
     expect(extras?.debtOut).toBe(0);
     expect(periodFlowSumLocalM(eur, 12, seed.forecastProfile)).toBeCloseTo(
       1.2 * 12 + 0.2 * 12,
+      6,
+    );
+    expect(periodFxFlowSumLocalM(eur, 12, seed.forecastProfile)).toBeCloseTo(
+      1.2 * 12,
+      6,
+    );
+    expect(fxHedgeTargetLocalM(eur, 12, seed.forecastProfile)).toBeCloseTo(
+      1.9 + 1.2 * 12,
       6,
     );
   });
@@ -368,6 +377,26 @@ describe('Book hedge tickets', () => {
     expect(Math.abs(seed.fwd)).toBeLessThan(1e-9);
     const displayed = applyBookedHedgePositions(book.rows, [ticket]).find(r => r.ccy === 'EUR')!;
     // Long exposure → SELL forward → short FWD position (−amount in local).
+    expect(usdToFcyM(displayed.fwd, 'EUR')).toBeCloseTo(-ticket.amountLocalM, 5);
+  });
+
+  it('staged prepared package overlays into FWD like a booked forward', () => {
+    const setup = setupOf({ confidencePct: 99, exposureBasis: 'avgBuildup', horizon: '1m' });
+    const ws = seedNordtechWorkspace();
+    const risk = computeConsolidatedRisk(ws.entities, setup);
+    const eur = risk.find(r => r.bar.ccy === 'EUR')!;
+    const ticket = proposeBookHedge(eur, 'avgBuildup', setup);
+    const book = consolidateEntityBooks(ws.entities);
+    const displayed = applyBookedHedgePositions(book.rows, [], {
+      EUR: {
+        structure: 'bullet',
+        basis: 'totalExpected',
+        ticketBasis: 'avgBuildup',
+        legs: [],
+        coverLocalM: ticket.amountLocalM,
+        hedgeRatio: 1,
+      },
+    }).find(r => r.ccy === 'EUR')!;
     expect(usdToFcyM(displayed.fwd, 'EUR')).toBeCloseTo(-ticket.amountLocalM, 5);
   });
 

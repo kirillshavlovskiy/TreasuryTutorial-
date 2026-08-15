@@ -3,7 +3,8 @@
 /**
  * Workbench FX desk — curriculum tab shell (FX Risk · Liquidity · Analytics ·
  * Hedging · Live Ladder · Market data) with Task01 calculation panels.
- * FX Risk = simplified curriculum book; Liquidity = former full FX Simulator.
+ * FX Risk = simplified curriculum book; Liquidity = editable liquidity book
+ * (no FX position / hedge table).
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -193,7 +194,10 @@ export function WorkbenchFxDesk({
       varSetup={varSetup}
       onVarSetupChange={onVarSetupChange}
       bookedHedges={bookedHedges}
+      preparedByCcy={preparedByCcy}
       hedgeRatios={hedgeRatios}
+      marketRatesByCcy={marketRatesByCcy}
+      ratesScopeId={entity.id}
       onAnalyticsBookChange={setAnalyticsBook}
       showRiskMetrics={analyticalLayers.includes('riskMetrics')}
       fxInputs={fxConfig?.inputs ?? [...TASK01_REQUIRED_FX_INPUTS]}

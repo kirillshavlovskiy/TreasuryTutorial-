@@ -410,6 +410,24 @@ describe('liquidity timing drives the desk model', () => {
       .not.toBeCloseTo(on.lp_peak_cash, 3);
   });
 
+  it('later-cycle liquidity-book openings do not include the funding swap', () => {
+    const withFloor = computeDashboardModel({
+      ...base,
+      shared: { ...base.shared, forecastMonths: 12 },
+      activeLayers: new Set<LayerId>(['floorH']),
+      rows: [row({ cash_floor: 20 })],
+      forecastProfile: spread,
+    });
+    const g = withFloor.fcyComputed.find(r => r.ccy === 'GBP')!;
+    expect(g.swapNear).toBeGreaterThan(0);
+    expect(g.liquidityCycles!.length).toBeGreaterThan(1);
+    expect(g.liquidityPlan!.length).toBeGreaterThan(1);
+    const bookM2 = g.liquidityCycles![1]!;
+    const fundedM2 = g.liquidityPlan![1]!;
+    expect(bookM2.opening).toBeCloseTo(g.liquidityCycles![0]!.closing, 8);
+    expect(fundedM2.opening_cash).not.toBeCloseTo(bookM2.opening, 3);
+  });
+
   it('a buffer layer does not rewrite collapsed-row operating totals on a repeating drain', () => {
     const profile = profileWith({ granularity: 'week', sizingBasis: 'horizon' });
     const input = {
@@ -624,6 +642,37 @@ describe('hedge settlement drives the liquidity book, not the exposure', () => {
     expect(hedged.lp_peak_cash).toBeCloseTo(bare.lp_peak_cash - 40, 6);
     expect(hedged.cash_after_payins).toBeCloseTo(bare.cash_after_payins - 40, 6);
     expect(hedged.swapNear).toBeCloseTo(bare.swapNear + 40, 6);
+  });
+
+  it('a staged delivery funds the swap the same way a booked one does', () => {
+    const booked = gbpFrom({ GBP: [0] });
+    const staged = gbpFrom({ GBP: [-40] });
+
+    expect(staged.liquidityPlan!.map(p => p.hedgeSettle)).toEqual([-40]);
+    expect(staged.liquidityCycles![0]!.outflow).toBeCloseTo(
+      booked.liquidityCycles![0]!.outflow + 40, 6,
+    );
+    expect(staged.lp_peak_cash).toBeCloseTo(booked.lp_peak_cash - 40, 6);
+    expect(staged.cash_after_payins).toBeCloseTo(booked.cash_after_payins - 40, 6);
+    expect(staged.swapNear).toBeCloseTo(booked.swapNear + 40, 6);
+    expect(staged.liquidityPlan![0]!.swap_needed).toBeCloseTo(
+      booked.liquidityPlan![0]!.swap_needed + 40, 6,
+    );
+  });
+
+  it('a buffer layer writes the funded strip the SWAP band reads', () => {
+    const off = computeDashboardModel({
+      ...base,
+      activeLayers: new Set<LayerId>(),
+      forecastProfile: spread,
+    }).fcyComputed.find(r => r.ccy === 'GBP')!;
+    const on = gbpFrom();
+    expect(off.swapNear).toBe(0);
+    expect(off.liquidityPlan!.every(p => Math.abs(p.swap_needed) < 0.001)).toBe(true);
+    expect(on.swapNear).toBeGreaterThan(0);
+    expect(on.liquidityPlan!.some(p => p.swap_needed > 0.001)).toBe(true);
+    expect(on.liquidityPlan![on.liquidityPlan!.length - 1]!.standing_swap)
+      .toBeGreaterThan(0.001);
   });
 
   it('leaves the book untouched where nothing settles', () => {

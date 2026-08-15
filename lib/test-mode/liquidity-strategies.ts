@@ -36,7 +36,11 @@ import {
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
 import { hedgeCashFlowsByMonth, withNonCashFxConversion } from '@/lib/test-mode/cash-carry-analytics';
-import { fxHedgeNetCfarByCcyUsdM, sumNetCfarUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
+import {
+  displayedCfarNetByCcyUsdM,
+  fxHedgeMcCfarByCcy,
+  sumNetCfarUsdM,
+} from '@/lib/test-mode/cfar-net-by-ccy';
 import type { HedgeTicket, PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
 import type { VarSetup } from '@/lib/test-mode/var-setup';
 import {
@@ -279,9 +283,10 @@ export function swapLegScheduleWithCarry(
   spot: number,
   r_FCY: number,
   r_USD: number,
+  r_OD?: number,
 ): LiquiditySwapLegRow[] {
   return schedule.map(l => {
-    const o = fundingSwapOverlayUsdYr(l.newLeg, spot, r_FCY, r_USD);
+    const o = fundingSwapOverlayUsdYr(l.newLeg, spot, r_FCY, r_USD, r_OD);
     return {
       ...l,
       fcyOnUsdYr: o.fcyOnUsdYr,
@@ -467,6 +472,7 @@ function evaluateCcy(
     spot,
     row.r_FCY,
     input.shared.r_USD,
+    row.r_OD,
   );
 
   // A leg lands before the cycle's first payout, so the whole cycle sits that
@@ -486,12 +492,15 @@ function evaluateCcy(
   const odPaidUsdYrM = -stats.avgDebit * spot * (row.r_OD / 100);
 
   // Cash Carry is the unfunded path (same number on every strategy). Swap Carry
-  // is the funding-swap overlay on that path — additive, CIP mid nets to 0.
+  // is the funding-swap overlay — CIP-zero when deploying surplus; covering a
+  // short keeps r_OD − r_FCY (OD saved vs market credit).
   const unfunded = pathStats(ladder, ladder.cycles.map(() => 0), ladder.floor);
   const cashCarryUsdYrM = unfundedCashCarryUsdYr(
     unfunded, spot, row.r_FCY, row.r_OD, input.shared.r_USD,
   );
-  const overlay = fundingSwapOverlayUsdYr(avgBook, spot, row.r_FCY, input.shared.r_USD);
+  const overlay = fundingSwapOverlayUsdYr(
+    avgBook, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
+  );
 
   const gapToThreshold =
     strategy.regime === null
@@ -579,6 +588,18 @@ export function evaluateLiquidityStrategies(
     }));
   if (paths.length === 0) return [];
 
+  const fxCfarByCcy = input.setup
+    ? fxHedgeMcCfarByCcy({
+        rows: input.rows,
+        setup: input.setup,
+        forecastProfile: input.forecastProfile,
+        bookedHedges: input.bookedHedges,
+        preparedByCcy: input.preparedByCcy,
+        marketRatesByCcy: input.marketRatesByCcy,
+        ratesScopeId: input.ratesScopeId,
+      })
+    : {};
+
   return LIQUIDITY_STRATEGIES.map(strategy => {
     const byCcy = paths.map(({ row, ladder }) =>
       evaluateCcy(row, ladder, strategy, input, activeLayers, liveStrategyId),
@@ -590,14 +611,8 @@ export function evaluateLiquidityStrategies(
 
     const planByCcy = Object.fromEntries(byCcy.map(c => [c.ccy, c.plan]));
     const finalCfarUsdM = input.setup
-      ? sumNetCfarUsdM(fxHedgeNetCfarByCcyUsdM({
-          rows: input.rows,
+      ? sumNetCfarUsdM(displayedCfarNetByCcyUsdM(fxCfarByCcy, {
           setup: input.setup,
-          forecastProfile: input.forecastProfile,
-          bookedHedges: input.bookedHedges,
-          preparedByCcy: input.preparedByCcy,
-          marketRatesByCcy: input.marketRatesByCcy,
-          ratesScopeId: input.ratesScopeId,
           fundingPlanByCcy: planByCcy,
         }))
       : 0;

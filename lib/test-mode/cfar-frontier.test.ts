@@ -168,27 +168,31 @@ describe('the cover sweep the frontier is drawn from', () => {
   const grossAt = (ratio: number, legCount = 12) =>
     computeMonteCarloMismatchCfar(mk(16.3 * ratio, legCount)).criticalCashUsdM;
 
-  it('turns risk back up once the hedge overshoots the exposure', () => {
+  it('turns conversion risk up once the hedge overshoots the exposure', () => {
+    // Unhedged CFaR is ~0 — no delivery, so the open book is not an FX-vol
+    // proxy. Cover introduces conversion; overshoot costs more via squaring.
     const unhedged = grossAt(0);
     const full = grossAt(1);
     const over = grossAt(1.5);
-    expect(full).toBeLessThan(unhedged * 0.5);
+    expect(unhedged).toBeLessThan(0.05);
+    expect(full).toBeGreaterThan(unhedged);
     expect(over).toBeGreaterThan(full * 1.5);
   });
 
-  it('falls monotonically on the way up to full cover', () => {
+  it('raises CFaR as cover first forces a delivery', () => {
     const walk = [0, 0.25, 0.5, 0.75, 0.9].map(r => grossAt(r));
-    for (let i = 1; i < walk.length; i += 1) {
-      expect(walk[i]!).toBeLessThan(walk[i - 1]!);
-    }
+    expect(walk[0]!).toBeLessThan(0.05);
+    expect(walk[walk.length - 1]!).toBeGreaterThan(walk[0]!);
   });
 
-  it('barely responds to cover at all on a single bullet', () => {
-    // The degenerate case the chart has to caption rather than draw: one
-    // settlement at maturity cannot touch a drawdown that peaks before it.
+  it('raises CFaR when a single bullet overshoots', () => {
+    // Under-hedged bullet: leftover FCY is unconverted, so headline stays
+    // near zero. Overshoot forces a square — conversion CFaR, not an FX-vol
+    // proxy on the open gap.
     const lo = grossAt(0.5, 1);
     const hi = grossAt(1.25, 1);
-    expect(Math.abs(hi - lo) / lo).toBeLessThan(0.05);
+    expect(lo).toBeLessThan(0.05);
+    expect(hi).toBeGreaterThan(lo + 0.05);
   });
 });
 

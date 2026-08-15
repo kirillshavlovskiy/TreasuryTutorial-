@@ -7,9 +7,9 @@ import {
 } from '@/lib/fx-buffer';
 import {
   effectiveForecastUncertainty1m,
-  effectiveMonthlyFlowLocalM,
-  monthlyFlowSeriesLocalM,
-  periodFlowSumLocalM,
+  effectiveMonthlyFxFlowLocalM,
+  monthlyFxFlowSeriesLocalM,
+  periodFxFlowSumLocalM,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
 import { computeTaskVar } from '@/lib/test-mode/task-var';
@@ -99,7 +99,7 @@ export function fxHedgeTargetLocalM(
 ): number {
   const T = Number.isFinite(forecastMonths) && forecastMonths >= 0 ? forecastMonths : 1;
   return roundMoney(
-    fxBookNetLocalM(row) + periodFlowSumLocalM(row, T, forecastProfile),
+    fxBookNetLocalM(row) + periodFxFlowSumLocalM(row, T, forecastProfile),
   );
 }
 
@@ -113,7 +113,7 @@ export function fxExposureForBasis(
   const T = Number.isFinite(forecastMonths) && forecastMonths >= 0 ? forecastMonths : 1;
   // When a custom period profile is active, feed an equivalent monthly flow
   // so existing S + F×T / S + ½×F×T helpers stay correct (F_eff × T = Σ months).
-  const flowM = effectiveMonthlyFlowLocalM(row, T, forecastProfile);
+  const flowM = effectiveMonthlyFxFlowLocalM(row, T, forecastProfile);
   return exposureLocalMForBasis(
     fxStockExposureLocalM(row),
     flowM,
@@ -159,7 +159,7 @@ export function overlayRiskFromFxBook(
 
   const barFromLive = (ccy: string, live: RowState) => {
     const stockNetM = fxBookNetLocalM(live);
-    const flowM = effectiveMonthlyFlowLocalM(live, T, forecastProfile);
+    const flowM = effectiveMonthlyFxFlowLocalM(live, T, forecastProfile);
     let direction: CurrencyRiskRow['bar']['direction'] = 'hub';
     if (Math.abs(stockNetM) < 1e-9 && Math.abs(flowM) > 1e-9) {
       direction = 'hub';
@@ -256,8 +256,8 @@ export function fxTableRiskMetrics(
           ? setup.forecastMonths
           : 1;
       const schedule =
-        T > 0 ? monthlyFlowSeriesLocalM(r, T, forecastProfile) : [];
-      const monthlyFlowM = effectiveMonthlyFlowLocalM(r, T > 0 ? T : 1, forecastProfile);
+        T > 0 ? monthlyFxFlowSeriesLocalM(r, T, forecastProfile) : [];
+      const monthlyFlowM = effectiveMonthlyFxFlowLocalM(r, T > 0 ? T : 1, forecastProfile);
       const flowForPath = T > 0 ? monthlyFlowM : 0;
       const exposureLocalM = fxHedgeTargetLocalM(r, T, forecastProfile);
       const tickets = bookedTickets.filter(
@@ -710,6 +710,21 @@ export interface PreparedHedgeProfile {
    * existed.
    */
   preparedFor?: 'var' | 'carry';
+}
+
+/** Staged (prepared) FX-hedge FWD-points carry per CCY — same $M as Decision Carry. */
+export function stagedFxHedgeCarryByCcyUsdM(
+  preparedByCcy?: Record<string, PreparedHedgeProfile>,
+): Record<string, number> {
+  const map: Record<string, number> = {};
+  if (!preparedByCcy) return map;
+  for (const [ccy, profile] of Object.entries(preparedByCcy)) {
+    const v = profile.impliedCarryUsdM;
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      map[ccy] = v;
+    }
+  }
+  return map;
 }
 
 /**
@@ -1233,13 +1248,40 @@ export function bookedPositionOffsetsByCcy(
   return map;
 }
 
-/** Apply booked Decision-layer hedges onto simulator rows for FWD/Spot display. */
-export function applyBookedHedgePositions(
-  rows: RowState[],
+/** Staged (prepared) package → FWD overlay. Same book sign as a live forward. */
+export function preparedPositionOffsetsByCcy(
+  preparedByCcy?: Record<string, PreparedHedgeProfile>,
+): Record<string, BookedPositionOffset> {
+  const map: Record<string, BookedPositionOffset> = {};
+  for (const [ccy, prep] of Object.entries(preparedByCcy ?? {})) {
+    if (Math.abs(prep.coverLocalM) < 1e-12) continue;
+    map[ccy] = { spotLocalM: 0, fwdLocalM: -prep.coverLocalM };
+  }
+  return map;
+}
+
+/**
+ * Merge booked + staged FX POSITION offsets.
+ * A staged package replaces booked forwards for that CCY (same as the
+ * cash-flow collector) so Stage cannot double-count FWD.
+ */
+export function hedgePositionOffsetsByCcy(
   bookedTickets: readonly HedgeTicket[],
+  preparedByCcy?: Record<string, PreparedHedgeProfile>,
+): Record<string, BookedPositionOffset> {
+  const map = bookedPositionOffsetsByCcy(bookedTickets);
+  for (const [ccy, o] of Object.entries(preparedPositionOffsetsByCcy(preparedByCcy))) {
+    const cur = map[ccy] ?? { spotLocalM: 0, fwdLocalM: 0 };
+    map[ccy] = { spotLocalM: cur.spotLocalM, fwdLocalM: o.fwdLocalM };
+  }
+  return map;
+}
+
+function applyPositionOffsets(
+  rows: RowState[],
+  offsets: Record<string, BookedPositionOffset>,
 ): RowState[] {
-  if (!bookedTickets.length) return rows;
-  const offsets = bookedPositionOffsetsByCcy(bookedTickets);
+  if (Object.keys(offsets).length === 0) return rows;
   return rows.map(r => {
     const o = offsets[r.ccy];
     if (!o) return r;
@@ -1251,6 +1293,21 @@ export function applyBookedHedgePositions(
       fwd: fcyToUsdM(fwdFcy, r.ccy),
     };
   });
+}
+
+/**
+ * Apply booked (and optional staged) Decision-layer hedges onto simulator
+ * rows for FWD/Spot display. Does not size the funding swap.
+ */
+export function applyBookedHedgePositions(
+  rows: RowState[],
+  bookedTickets: readonly HedgeTicket[],
+  preparedByCcy?: Record<string, PreparedHedgeProfile>,
+): RowState[] {
+  return applyPositionOffsets(
+    rows,
+    hedgePositionOffsetsByCcy(bookedTickets, preparedByCcy),
+  );
 }
 
 /**

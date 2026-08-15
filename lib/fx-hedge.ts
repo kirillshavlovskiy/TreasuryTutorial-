@@ -381,13 +381,13 @@ export function optionGammaCarryUsdYr(
 
 // ─── Strategy-level hedging (book-wide selection) ────────────────────────────
 //
-// SWAP_ONLY    — FX swaps only; current + forecasted FX exposure stays open.
-// SWAP_FWD     — swaps + outright forwards sized on the forecasted net flow
-//                (expected payins − payouts over the cycle).
-// SWAP_FWD_OPT — swaps + forwards + SHORT options: the forward squares the FULL
-//                cycle-end forecast (Fwd = −Net FX Forecast, same as SWAP_FWD);
-//                the option is written as a premium overlay that never resizes
-//                the forward. Sizing: the written notional is MATCHED 1:1 to
+// SWAP_ONLY    — funding swap only; Residual = Net FX Forecast + Swap Near.
+// SWAP_FWD     — swaps + outright forwards sized on the funded FX position
+//                (Net FX Forecast + funding-swap near).
+// SWAP_FWD_OPT — swaps + forwards + SHORT options: the forward squares the
+//                funded layer (Fwd = −(Net FX Forecast + Swap Near), same as
+//                SWAP_FWD); the option is written as a premium overlay that never
+//                resizes the forward. Sizing: the written notional is MATCHED 1:1 to
 //                the forward at ALL deltas — |optNotional| = |fwdNotional|.
 //                δ scales only the EFFECTIVE hedge (δ × notional), which is
 //                therefore linear in δ down to zero: δ = 1 offsets the full
@@ -416,6 +416,14 @@ export interface StrategyHedgeInput {
   /** Forecast net FX exposure at cycle end = current book + expected payins +
    *  payouts (M FCY) — the TOTAL hedging basis, not just the flows. */
   forecastFx: number;
+  /**
+   * Funding-swap near leg (M FCY). This is FX cash the funding layer just
+   * swapped in or out — it is not in `forecastFx` (spot book ≠ LP cash).
+   * The combined hedging/funding layer squares `forecastFx + swapNear`.
+   * The far/tenor leg stays in the SWAP band so a matched FX swap does not
+   * cancel the near out of this basis.
+   */
+  swapNear?: number;
   optDelta: number;
   horizonDays: number;
   r_FCY: number;
@@ -488,13 +496,18 @@ export function resolveStrategyHedge(
 ): StrategyHedgeResult {
   const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
 
-  // The forward ALWAYS squares the full cycle-end forecast (book + flows):
-  // Fwd = −Net FX Forecast in both hedging strategies. The written option is a
+  // Combined hedging/funding layer: Net FX Forecast plus the funding-swap
+  // near (FX cash the swap delivered). SWAP_FWD squares this; SWAP_ONLY
+  // leaves it open so Residual shows the funded FX position.
+  const hedgeBasis = inp.forecastFx + (inp.swapNear ?? 0);
+
+  // The forward ALWAYS squares the funded forecast (book + flows + swap near):
+  // Fwd = −hedgeBasis in both hedging strategies. The written option is a
   // PREMIUM OVERLAY on top — its δ-weighted delivery is NOT folded into the
   // forward sizing; its exercise delivers the trade the book wants anyway.
   const fwdNotional =
     strategy === 'SWAP_FWD' || strategy === 'SWAP_FWD_OPT'
-      ? dust(-inp.forecastFx)
+      ? dust(-hedgeBasis)
       : 0;
 
   // Option direction is keyed to the CARRY side, not the flow sign:
@@ -541,9 +554,8 @@ export function resolveStrategyHedge(
     optType,
     optDelta: optionDelta,
     effectiveHedge,
-    // Residual = forecast + TOTAL delta-weighted hedge (fwd + δ × option):
-    // both legs count toward coverage, the option at its delta weight.
-    residualFx: inp.forecastFx + effectiveHedge,
+    // Residual = funded forecast + TOTAL delta-weighted hedge (fwd + δ × option).
+    residualFx: hedgeBasis + effectiveHedge,
     fwdCarryUsdYr,
     optCarryUsdYr,
     optPremiumUsdYr: shortOpt.premiumEarnedUsdYr,

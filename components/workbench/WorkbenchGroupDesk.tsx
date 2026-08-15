@@ -185,7 +185,10 @@ export function WorkbenchGroupDesk({
           varSetup={varSetup}
           onVarSetupChange={onVarSetupChange}
           bookedHedges={bookedHedges}
+          preparedByCcy={preparedByCcy}
           hedgeRatios={hedgeRatios}
+          marketRatesByCcy={marketRatesByCcy}
+          ratesScopeId={GROUP_HEDGE_SCOPE}
           initialRows={book.rows}
           initialUsdCash={book.usdCash}
           initialUsdNonLpCash={book.usdNonLpCash}
