@@ -57,6 +57,7 @@ import {
   NORDTECH_REFERENCE,
   proposeBookHedge,
   proposeHigherVarHedge,
+  rowsForSelectedCurrencies,
   scoreTask01,
   seedNordtechWorkspace,
   simSeedForEntity,
@@ -139,6 +140,31 @@ function setupOf(
 }
 
 describe('NordTech seed exposures', () => {
+  it('materializes every selected Workbench currency for an empty USD seed', () => {
+    const rows = rowsForSelectedCurrencies([], ['EUR', 'GBP', 'JPY']);
+
+    expect(rows.map(row => row.ccy)).toEqual(['EUR', 'GBP', 'JPY']);
+    expect(rows.every(row => row.id.length > 0)).toBe(true);
+  });
+
+  it('preserves entity seed balances and adds selected currencies missing from the seed', () => {
+    const entities = seedNordtechWorkspace().entities;
+    const de = entities.find(e => classifyNordtechEntity(e) === 'DE')!;
+    const seed = simSeedForEntity(de);
+    const seededEur = seed.rows.find(row => row.ccy === 'EUR')!;
+
+    const rows = rowsForSelectedCurrencies(seed.rows, [
+      'JPY',
+      'EUR',
+      'JPY',
+      'USD',
+    ]);
+
+    expect(rows.map(row => row.ccy)).toEqual(['JPY', 'EUR']);
+    expect(rows[1]).toEqual(seededEur);
+    expect(rows[1]).not.toBe(seededEur);
+  });
+
   it('EUR Net FX stock = cash + receivables − debt ≈ 1.9', () => {
     const entities = seedNordtechWorkspace().entities;
     const de = entities.find(e => classifyNordtechEntity(e) === 'DE')!;

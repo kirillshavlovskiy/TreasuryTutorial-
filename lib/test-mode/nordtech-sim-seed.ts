@@ -1,4 +1,10 @@
-import { makeSimRow, INITIAL_USD_PARAMS, type RowState, type UsdParams } from '@/lib/fx-buffer';
+import {
+  INITIAL_ROWS,
+  INITIAL_USD_PARAMS,
+  makeSimRow,
+  type RowState,
+  type UsdParams,
+} from '@/lib/fx-buffer';
 import type { Entity } from '@/lib/workspace-store';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -21,6 +27,38 @@ export interface EntitySimSeed {
    * debt after Tf). Applied when the dashboard has no saved profile yet.
    */
   forecastProfile?: ForecastProfileState;
+}
+
+/**
+ * Build the simulator book for a dashboard's selected currencies.
+ *
+ * Entity seed rows win so their real opening balances are preserved. A
+ * selected currency missing from the entity seed is materialized from the
+ * simulator defaults; unknown currencies get an empty row. USD is omitted
+ * because the simulator keeps it in the dedicated USD book.
+ */
+export function rowsForSelectedCurrencies(
+  seedRows: readonly RowState[],
+  selectedCurrencies: readonly string[],
+): RowState[] {
+  const selected = [
+    ...new Set(
+      selectedCurrencies
+        .map(ccy => ccy.trim().toUpperCase())
+        .filter(ccy => ccy.length > 0 && ccy !== 'USD'),
+    ),
+  ];
+  const seedByCcy = new Map(seedRows.map(row => [row.ccy.toUpperCase(), row]));
+  const defaultsByCcy = new Map(
+    INITIAL_ROWS.map(row => [row.ccy.toUpperCase(), row]),
+  );
+
+  return selected.map(ccy => {
+    const source = seedByCcy.get(ccy) ?? defaultsByCcy.get(ccy);
+    return source
+      ? { ...source }
+      : makeSimRow(`selected-${ccy.toLowerCase()}`, ccy, 0, 0, 0, 0, 0);
+  });
 }
 
 /** Resolve display name / base currency — tolerates legacy TestEntity fields. */

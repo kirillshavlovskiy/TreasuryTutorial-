@@ -319,6 +319,7 @@ export {
 export {
   classifyNordtechEntity,
   mergedEntityForecastProfile,
+  rowsForSelectedCurrencies,
   simSeedForEntity,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,

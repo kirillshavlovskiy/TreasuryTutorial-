@@ -23,6 +23,7 @@ import {
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
   TASK01_REQUIRED_FX_INPUTS,
+  rowsForSelectedCurrencies,
   simSeedForEntity,
 } from '@/lib/test-mode/nordtech-sim-seed';
 import type {
@@ -159,8 +160,7 @@ export function WorkbenchFxDesk({
       fxConfig?.currencyMode === 'selected'
       && fxConfig.currencies.length > 0
     ) {
-      const filtered = seed.rows.filter(r => fxConfig.currencies.includes(r.ccy));
-      return filtered.length > 0 ? filtered : seed.rows;
+      return rowsForSelectedCurrencies(seed.rows, fxConfig.currencies);
     }
     return seed.rows;
   }, [fxConfig, seed.rows]);
@@ -175,7 +175,7 @@ export function WorkbenchFxDesk({
 
   return (
     <Simulator
-      key={`${entity.id}-${profile.id}`}
+      key={`${entity.id}-${profile.id}-${initialRows.map(row => row.ccy).join(',')}`}
       embedded
       initialRows={initialRows}
       initialUsdCash={seed.usdCash}
