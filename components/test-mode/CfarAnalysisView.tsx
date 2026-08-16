@@ -101,6 +101,8 @@ interface CfarAnalysisViewProps {
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   /** Desk-computed funded plan — outstanding swap feeds displayed CFaR. */
   livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
+  /** Desk Swap+Fwd replacement forwards (analytics settle legs only). */
+  extraForwards?: readonly import('@/lib/test-mode/cash-carry-analytics').AnalyticsForwardLeg[];
 }
 
 function fmtK(usdM: number): string {
@@ -648,6 +650,7 @@ export function CfarAnalysisView({
   marketRates: marketRatesProp,
   marketRatesByCcy,
   livePlanByCcy,
+  extraForwards = [],
 }: CfarAnalysisViewProps) {
   // Stable across renders but re-created the moment any rate input changes,
   // so the Monte Carlo memos below can depend on it directly: they re-run when
@@ -712,6 +715,7 @@ export function CfarAnalysisView({
           bookedHedges,
           preparedByCcy,
           setup,
+          extraForwards,
         });
         const resolved = cmp
           ? resolvedHedgedTotalCarryUsdM({
@@ -728,7 +732,16 @@ export function CfarAnalysisView({
           totalCarryUsdM,
         );
         const hedgeDetail = hedgeDetailForCcy(bookedHedges, preparedByCcy, ccy, setup);
-        const hedgeSettleSchedule = scheduleFromHedgeDetail(hedgeDetail);
+        let hedgeSettleSchedule = scheduleFromHedgeDetail(hedgeDetail);
+        if (hedgeSettleSchedule.length === 0) {
+          const extra = extraForwards.find(f => f.ccy === ccy);
+          if (extra && Math.abs(extra.amountLocalM) > 1e-9) {
+            hedgeSettleSchedule = [{
+              settleMonths: extra.settleMonths,
+              notionalLocalM: extra.amountLocalM,
+            }];
+          }
+        }
         const hedged = hedgeSettleSchedule.length > 0;
         const monthlyInflows = bookRow
           ? monthlyInflowSeriesLocalM(bookRow, Math.max(1, T), forecastProfile ?? DEFAULT_FORECAST_PROFILE)
@@ -800,6 +813,7 @@ export function CfarAnalysisView({
     T,
     marketRatesFor,
     sigmaMonthly,
+    extraForwards,
   ]);
 
   const fundingBridgeByCcy = useMemo(() => {

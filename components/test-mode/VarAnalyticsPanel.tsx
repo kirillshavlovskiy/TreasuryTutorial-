@@ -26,6 +26,11 @@ import {
   type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
 import type { LayerId, RowState } from '@/lib/fx-buffer';
+import {
+  analyticsForwardsFromOverlays,
+  retainedFundingPlanByCcy,
+  type SwapForwardOverlay,
+} from '@/lib/fx-hedge';
 import type { CurrencyRiskRow } from '@/lib/test-mode/consolidate';
 import {
   hedgeBasisNotionalLocalM,
@@ -169,6 +174,8 @@ interface VarAnalyticsPanelProps {
   livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
   /** FX-hedge Net CFaR per CCY — sizes the CFaR cover layer on Liquidity Analytics. */
   cfarNetByCcyUsd?: Record<string, number>;
+  /** Desk Swap+Fwd replacement overlays (Analytics / CFaR / Cash Carry). */
+  swapForwardOverlayByCcy?: Record<string, SwapForwardOverlay>;
 }
 
 function fmtVarK(usdM: number): string {
@@ -345,6 +352,7 @@ export function VarAnalyticsPanel({
   activeLayers,
   livePlanByCcy,
   cfarNetByCcyUsd,
+  swapForwardOverlayByCcy,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -1145,6 +1153,21 @@ export function VarAnalyticsPanel({
   };
 
   /** Same Σ as Cash Carry “All CCY” Total — risk CCYs only (matches the table). */
+  const analyticsExtraForwards = useMemo(
+    () =>
+      analyticsForwardsFromOverlays({
+        overlayByCcy: swapForwardOverlayByCcy,
+        planByCcy: livePlanByCcy,
+        forecastMonths: setup.forecastMonths,
+      }),
+    [swapForwardOverlayByCcy, livePlanByCcy, setup.forecastMonths],
+  );
+
+  const retainedLivePlanByCcy = useMemo(
+    () => retainedFundingPlanByCcy(livePlanByCcy, swapForwardOverlayByCcy),
+    [livePlanByCcy, swapForwardOverlayByCcy],
+  );
+
   const cashCarryTotalUsdM = useMemo(() => {
     const ccys = risk
       .map(r => r.bar.ccy)
@@ -1159,6 +1182,7 @@ export function VarAnalyticsPanel({
       bookedHedges,
       preparedByCcy,
       setup,
+      extraForwards: analyticsExtraForwards,
     });
   }, [
     risk,
@@ -1169,6 +1193,7 @@ export function VarAnalyticsPanel({
     ratesScopeId,
     bookedHedges,
     preparedByCcy,
+    analyticsExtraForwards,
   ]);
 
   /**
@@ -1184,7 +1209,7 @@ export function VarAnalyticsPanel({
       : cashCarryTotalUsdM;
 
   /** Aggregate Net CFaR — same Monte Carlo size+timing number as cover, plus
-   * the funding-swap residual when a live plan is on. */
+   * the funding-swap residual when a live plan is on (scaled by (1−Δ)). */
   const cfarNetTotalUsdM = useMemo(
     () =>
       sumNetCfarUsdM(
@@ -1197,6 +1222,7 @@ export function VarAnalyticsPanel({
           marketRatesByCcy,
           ratesScopeId,
           fundingPlanByCcy: livePlanByCcy,
+          swapForwardOverlayByCcy,
         }),
       ),
     [
@@ -1208,6 +1234,7 @@ export function VarAnalyticsPanel({
       bookedHedges,
       preparedByCcy,
       livePlanByCcy,
+      swapForwardOverlayByCcy,
     ],
   );
 
@@ -1330,6 +1357,7 @@ export function VarAnalyticsPanel({
           marketRatesByCcy={marketRatesByCcy}
           onMarketRatesByCcyChange={onMarketRatesByCcyChange}
           onAllCcyTotalCarryUsdMChange={setCashCarryTableTotalUsdM}
+          extraForwards={analyticsExtraForwards}
         />
       ) : perspective === 'cfar' ? (
         <CfarAnalysisView
@@ -1343,7 +1371,8 @@ export function VarAnalyticsPanel({
           forecastProfile={forecastProfile}
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
-          livePlanByCcy={livePlanByCcy}
+          livePlanByCcy={retainedLivePlanByCcy ?? livePlanByCcy}
+          extraForwards={analyticsExtraForwards}
         />
       ) : perspective === 'liquidity' ? (
         <LiquidityAnalyticsView
@@ -1355,7 +1384,7 @@ export function VarAnalyticsPanel({
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
           activeLayers={activeLayers}
-          livePlanByCcy={livePlanByCcy}
+          livePlanByCcy={retainedLivePlanByCcy ?? livePlanByCcy}
           cfarNetByCcyUsd={cfarNetByCcyUsd}
         />
       ) : perspective !== 'fxRisk' ? (

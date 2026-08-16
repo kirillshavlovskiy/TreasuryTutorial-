@@ -7,6 +7,10 @@
  */
 
 import { fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
+import {
+  fundingSwapFarLegCipUsdM,
+  type FxMarketRatesBundle,
+} from './fx-market-rates';
 
 export type HedgeMode = 'AUTO' | 'SPOT' | 'FWD' | 'OPTION' | 'NONE';
 export type ActiveHedgeMode = Exclude<HedgeMode, 'AUTO'>;
@@ -382,22 +386,20 @@ export function optionGammaCarryUsdYr(
 // ─── Strategy-level hedging (book-wide selection) ────────────────────────────
 //
 // SWAP_ONLY    — funding swap only; Residual = Net FX Forecast + Swap Near.
-// SWAP_FWD     — swaps + outright forwards sized on the funded FX position
-//                (Net FX Forecast + funding-swap near).
-// SWAP_FWD_OPT — swaps + forwards + SHORT options: the forward squares the
-//                funded layer (Fwd = −(Net FX Forecast + Swap Near), same as
-//                SWAP_FWD); the option is written as a premium overlay that never
-//                resizes the forward. Sizing: the written notional is MATCHED 1:1 to
-//                the forward at ALL deltas — |optNotional| = |fwdNotional|.
-//                δ scales only the EFFECTIVE hedge (δ × notional), which is
-//                therefore linear in δ down to zero: δ = 1 offsets the full
-//                forward, δ = 0.5 half of it, δ → 0 nothing.
-//                Direction is keyed to the carry side of the currency:
-//                  PAY LCY (r_FCY < r_USD)  → SELL CALLS (exercise: sell USD, buy LCY)
-//                  EARN LCY (r_FCY > r_USD) → SELL PUTS  (exercise: buy USD, sell LCY)
-//                Premium is EARNED (short gamma); exercise delivers the trade the
-//                book wants anyway (PAY re-acquires LCY for payouts, EARN disposes
-//                the long into USD).
+//                CIP points are booked in full on the standing far leg.
+// SWAP_FWD     — swaps + outright forwards with replacement Δ:
+//                  Forward = −Exposure − Δ × SwapNear
+//                  RemainingFar = −(1−Δ) × SwapNear
+//                  ResidualNear = (1−Δ) × SwapNear
+//                Δ = 0 keeps the full far leg; Δ = 1 cancels it into the forward.
+//                Locked carry reallocates between fwd points and retained CIP;
+//                total is invariant under matched curves.
+// SWAP_FWD_OPT — full-square forward −(E+S) + SHORT options. Option δ is
+//                separate from the Swap+Fwd replacement Δ. Written notional is
+//                MATCHED 1:1 to the forward; option δ scales only effective
+//                coverage. Direction:
+//                  PAY LCY  → SELL CALLS
+//                  EARN LCY → SELL PUTS
 
 export type HedgeStrategy = 'SWAP_ONLY' | 'SWAP_FWD' | 'SWAP_FWD_OPT';
 
@@ -408,6 +410,62 @@ export const HEDGE_STRATEGIES: { id: HedgeStrategy; label: string }[] = [
   { id: 'SWAP_FWD',     label: 'Swap + Fwd' },
   { id: 'SWAP_FWD_OPT', label: 'Swap + Fwd + Option' },
 ];
+
+/** Clamp replacement / option delta into [0, 1]. */
+export function clampHedgeDelta(delta: number): number {
+  if (!Number.isFinite(delta)) return 0;
+  return Math.min(1, Math.max(0, delta));
+}
+
+/**
+ * Swap + Forward far-leg replacement allocation.
+ * Exposure = Net FX Forecast; S = Swap Near.
+ */
+export interface SwapForwardOverlay {
+  /** Replacement fraction of Swap Near moved into the outright forward. */
+  delta: number;
+  exposureLocalM: number;
+  swapNearLocalM: number;
+  /** Outstanding standing book CIP accrues on (defaults to swap near). */
+  swapStandingLocalM: number;
+  /** Forward = −Exposure − Δ × SwapNear. */
+  forwardLocalM: number;
+  /** Remaining far = −(1−Δ) × SwapNear. */
+  remainingFarLocalM: number;
+  /** Pre-far residual near cash = (1−Δ) × SwapNear (= −remainingFar). */
+  residualNearLocalM: number;
+  /** Exposure + SwapNear + Forward + RemainingFar (= 0 by construction). */
+  finalNetLocalM: number;
+}
+
+export function allocateSwapForwardOverlay(input: {
+  exposureLocalM: number;
+  swapNearLocalM: number;
+  swapStandingLocalM?: number;
+  delta: number;
+}): SwapForwardOverlay {
+  const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
+  const delta = clampHedgeDelta(input.delta);
+  const E = input.exposureLocalM;
+  const S = input.swapNearLocalM;
+  const standing =
+    typeof input.swapStandingLocalM === 'number' && Number.isFinite(input.swapStandingLocalM)
+      ? input.swapStandingLocalM
+      : S;
+  const forwardLocalM = dust(-E - delta * S);
+  const remainingFarLocalM = dust(-(1 - delta) * S);
+  const residualNearLocalM = dust((1 - delta) * S);
+  return {
+    delta,
+    exposureLocalM: E,
+    swapNearLocalM: S,
+    swapStandingLocalM: standing,
+    forwardLocalM,
+    remainingFarLocalM,
+    residualNearLocalM,
+    finalNetLocalM: dust(E + S + forwardLocalM + remainingFarLocalM),
+  };
+}
 
 export interface StrategyHedgeInput {
   ccy: string;
@@ -429,6 +487,22 @@ export interface StrategyHedgeInput {
    * Defaults to `swapNear` when the path has not split M1 from later legs.
    */
   swapStanding?: number;
+  /** Market swap-points curve — far-leg CIP. Missing → deposit-rate CIP fallback. */
+  marketRates?: FxMarketRatesBundle | null;
+  /** Far-leg tenor in months (term = horizon; rolling = 1). */
+  farSettleMonths?: number;
+  /**
+   * Swap + Forward replacement Δ — fraction of Swap Near moved into the
+   * outright forward. Ignored by SWAP_ONLY; SWAP_FWD_OPT uses a separate
+   * full-square forward and keeps this for retained-far / CIP attribution
+   * when provided (defaults to 1 = full replacement into the option path's
+   * squared forward).
+   */
+  swapForwardDelta?: number;
+  /**
+   * Option δ for SWAP_FWD_OPT only — scales effective option coverage and
+   * option delivery-leg carry. Distinct from {@link swapForwardDelta}.
+   */
   optDelta: number;
   horizonDays: number;
   r_FCY: number;
@@ -444,10 +518,18 @@ export interface StrategyHedgeResult {
   optNotional: number;
   /** Which option we WRITE — SELL_CALL on PAY carry, SELL_PUT on EARN carry. */
   optType: ShortOptionType | null;
+  /** Option δ (SWAP_FWD_OPT); 0 on other strategies. */
   optDelta: number;
-  /** fwd + δ × option delivery — the delta-effective hedge. */
+  /** Swap + Forward replacement Δ (0 on SWAP_ONLY / when unused). */
+  swapForwardDelta: number;
+  /** Retained funding far leg after replacement: −(1−Δ)×SwapNear. */
+  remainingFarLocalM: number;
+  /** fwd + δ_opt × option delivery — the delta-effective hedge. */
   effectiveHedge: number;
-  /** cycle-end forecast exposure (incl. current book) + effective hedge — what stays open. */
+  /**
+   * Residual near FX after the forward (pre far-leg settle).
+   * On SWAP_FWD = (1−Δ)×SwapNear. On SWAP_FWD_OPT includes option overlay.
+   */
   residualFx: number;
   fwdCarryUsdYr: number;
   /** Short option carry at FAIR VALUE = δ-weighted delivery-leg fwd points only.
@@ -458,9 +540,8 @@ export interface StrategyHedgeResult {
    *  part of hedgeCarryUsdYr. */
   optPremiumUsdYr: number;
   /**
-   * Funding-swap CIP points booked here, scaled by δ.
-   * δ = 0 → none (delta-neutral, no extra greeks).
-   * δ ≠ 0 → harvest the points as hedge carry; residual FX / greeks open with δ.
+   * Retained funding-swap CIP points on the remaining far-leg book.
+   * SWAP_FWD: (1−Δ) × CIP(standing). SWAP_ONLY: full CIP(standing).
    */
   cipCarryUsdYr: number;
   /**
@@ -469,6 +550,8 @@ export interface StrategyHedgeResult {
    * not assumed exercised at strike, so that leg is contingent, not P&L.
    */
   hedgeCarryUsdYr: number;
+  /** Derived allocation (SWAP_FWD); null on other strategies. */
+  overlay: SwapForwardOverlay | null;
 }
 
 /**
@@ -511,67 +594,94 @@ export function resolveStrategyHedge(
   inp: StrategyHedgeInput,
 ): StrategyHedgeResult {
   const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
+  const swapNear = inp.swapNear ?? 0;
+  const swapStanding = inp.swapStanding ?? swapNear;
+  const spot = fcyToUsdM(1, inp.ccy);
+  const settleMonths = Math.max(1, inp.farSettleMonths ?? 12);
+  const cipOn = (standing: number) =>
+    fundingSwapFarLegCipUsdM({
+      standingLocalM: standing,
+      settleMonths,
+      bundle: inp.marketRates,
+      fallbackUsdM:
+        fundingSwapCipPointsUsdYr(standing, spot, inp.r_FCY, inp.r_USD)
+        * (settleMonths / 12),
+    });
+  const fullCip = cipOn(swapStanding);
 
-  // Combined hedging/funding layer: Net FX Forecast plus the funding-swap
-  // near (FX cash the swap delivered). SWAP_FWD squares this; SWAP_ONLY
-  // leaves it open so Residual shows the funded FX position.
-  const hedgeBasis = inp.forecastFx + (inp.swapNear ?? 0);
+  // ── SWAP_FWD: replacement Δ moves Swap Near into the outright forward ──
+  if (strategy === 'SWAP_FWD') {
+    const delta = clampHedgeDelta(
+      typeof inp.swapForwardDelta === 'number' ? inp.swapForwardDelta : inp.optDelta,
+    );
+    const overlay = allocateSwapForwardOverlay({
+      exposureLocalM: inp.forecastFx,
+      swapNearLocalM: swapNear,
+      swapStandingLocalM: swapStanding,
+      delta,
+    });
+    const fwdNotional = overlay.forwardLocalM;
+    const retainedStanding = (1 - delta) * swapStanding;
+    const cipCarryUsdYr = cipOn(retainedStanding);
+    const fwdCarryUsdYr = fwdHedgeCarryUsdYr(
+      fwdNotional, inp.ccy, inp.r_FCY, inp.r_USD,
+    );
+    return {
+      fwdNotional,
+      optNotional: 0,
+      optType: null,
+      optDelta: 0,
+      swapForwardDelta: delta,
+      remainingFarLocalM: overlay.remainingFarLocalM,
+      effectiveHedge: fwdNotional,
+      residualFx: overlay.residualNearLocalM,
+      fwdCarryUsdYr,
+      optCarryUsdYr: 0,
+      optPremiumUsdYr: 0,
+      cipCarryUsdYr,
+      hedgeCarryUsdYr: fwdCarryUsdYr + cipCarryUsdYr,
+      overlay,
+    };
+  }
 
-  // The forward ALWAYS squares the funded forecast (book + flows + swap near):
-  // Fwd = −hedgeBasis in both hedging strategies. The written option is a
-  // PREMIUM OVERLAY on top — its δ-weighted delivery is NOT folded into the
-  // forward sizing; its exercise delivers the trade the book wants anyway.
+  // Combined hedging/funding layer for SWAP_ONLY / SWAP_FWD_OPT.
+  const hedgeBasis = inp.forecastFx + swapNear;
+
+  // SWAP_FWD_OPT keeps a full-square forward; option δ is separate.
   const fwdNotional =
-    strategy === 'SWAP_FWD' || strategy === 'SWAP_FWD_OPT'
-      ? dust(-hedgeBasis)
-      : 0;
+    strategy === 'SWAP_FWD_OPT' ? dust(-hedgeBasis) : 0;
 
-  // Option direction is keyed to the CARRY side, not the flow sign:
-  //   PAY LCY  → SELL CALL: on exercise we sell USD / buy LCY (delivery +).
-  //   EARN LCY → SELL PUT:  on exercise we buy USD / sell LCY (delivery −).
-  // Neutral carry → no option; the forward squares the full forecast alone.
   const payCarry = inp.r_USD - inp.r_FCY > 0.05;
   const earnCarry = inp.r_FCY - inp.r_USD > 0.05;
   let optType: ShortOptionType | null =
     strategy === 'SWAP_FWD_OPT' && fwdNotional !== 0
       ? (payCarry ? 'SELL_CALL' : earnCarry ? 'SELL_PUT' : null)
       : null;
-  // Written notional MATCHED 1:1 to the forward at ALL deltas (ATM strike =
-  // spot): |optNotional| = |fwdNotional|. δ scales only the delta-EFFECTIVE
-  // hedge (δ × notional), so coverage is linear in δ all the way to 0.
   const optNotional = optType === 'SELL_CALL' ? dust(Math.abs(fwdNotional))
     : optType === 'SELL_PUT' ? dust(-Math.abs(fwdNotional))
     : 0;
   if (optNotional === 0) optType = null;
 
-  // Raw δ (clamped to [0, 1]) drives the effective hedge and residual, so
-  // δ → 0 → effective option coverage → 0. The premium/carry math keeps a
-  // floor of 0.05 to avoid degenerate pricing on the written notional.
-  const optionDelta = Math.min(1, Math.max(inp.optDelta, 0));
-  const carryDelta = Math.min(1, Math.max(inp.optDelta, 0.05));
-  const swapNear = inp.swapNear ?? 0;
-  const swapStanding = inp.swapStanding ?? swapNear;
-  // δ scales CIP P&L on every strategy. On SWAP_FWD_OPT the same δ also
-  // opens the option residual / greeks. δ = 0 → no CIP harvest.
-  const cipDelta = optionDelta;
+  const optionDelta = clampHedgeDelta(inp.optDelta);
+  const carryDelta = Math.min(1, Math.max(optionDelta, 0.05));
+
+  // SWAP_ONLY: full CIP on the standing far leg.
+  // SWAP_FWD_OPT: keep existing option-δ CIP harvest (premium-overlay path).
+  const cipCarryUsdYr =
+    strategy === 'SWAP_ONLY'
+      ? fullCip
+      : strategy === 'SWAP_FWD_OPT'
+        ? fullCip * optionDelta
+        : 0;
 
   const fwdCarryUsdYr = fwdHedgeCarryUsdYr(
     fwdNotional === 0 ? 0 : fwdNotional + swapNear,
     inp.ccy, inp.r_FCY, inp.r_USD,
   );
-  const cipCarryUsdYr = fundingSwapCipPointsUsdYr(
-    swapStanding, fcyToUsdM(1, inp.ccy), inp.r_FCY, inp.r_USD,
-  ) * cipDelta;
-  // Fair-value option overlay is CONTINGENT: you do not necessarily exercise
-  // at strike, so delivery-leg points are reported on `optCarryUsdYr` and
-  // never booked into locked structure carry. Premium is informational only.
   const shortOpt = shortOptionCarryUsdYr(
     optNotional, carryDelta, inp.horizonDays, inp.ccy, inp.r_FCY, inp.r_USD, inp.σ_daily,
   );
   const optCarryUsdYr = shortOpt.deliveryLegCarryUsdYr;
-
-  // Total hedge coverage = fwd + δ × option delivery (notional matched to
-  // |Fwd|; δ alone scales the option's contribution).
   const effectiveHedge = fwdNotional + optNotional * optionDelta;
 
   return {
@@ -579,15 +689,110 @@ export function resolveStrategyHedge(
     optNotional,
     optType,
     optDelta: optionDelta,
+    swapForwardDelta: strategy === 'SWAP_FWD_OPT' ? 1 : 0,
+    remainingFarLocalM: strategy === 'SWAP_FWD_OPT' ? 0 : dust(-swapNear),
     effectiveHedge,
-    // Residual = funded forecast + TOTAL delta-weighted hedge (fwd + δ × option).
     residualFx: hedgeBasis + effectiveHedge,
     fwdCarryUsdYr,
     optCarryUsdYr,
     optPremiumUsdYr: shortOpt.premiumEarnedUsdYr,
     cipCarryUsdYr,
     hedgeCarryUsdYr: fwdCarryUsdYr + cipCarryUsdYr,
+    overlay: null,
   };
+}
+
+/**
+ * Settle month for a Swap+Fwd replacement forward — prefer the term far-leg
+ * cycle on the funded plan, else the forecast horizon.
+ */
+export function settleMonthsForSwapForward(
+  forecastMonths: number,
+  plan?: readonly { cycleIndex?: number; far_leg?: number }[] | null,
+): number {
+  const Tf = Math.max(1, Math.floor(forecastMonths > 0 ? forecastMonths : 1));
+  if (plan?.length) {
+    for (let i = plan.length - 1; i >= 0; i -= 1) {
+      const p = plan[i]!;
+      if (Math.abs(p.far_leg ?? 0) > 1e-9) {
+        return Math.max(1, (p.cycleIndex ?? i) + 1);
+      }
+    }
+    return Math.max(1, plan.length);
+  }
+  return Tf;
+}
+
+/**
+ * Scale a funded plan's standing / far-leg book by retention = (1−Δ).
+ * Analytics / CFaR only — never write back into liquidityCycles.
+ */
+export function scaleFundingPlanByRetention<
+  T extends { standing_swap: number; far_leg?: number },
+>(plan: readonly T[], retention: number): T[] {
+  const r = clampHedgeDelta(retention);
+  return plan.map(p => ({
+    ...p,
+    standing_swap: p.standing_swap * r,
+    ...(typeof p.far_leg === 'number' ? { far_leg: p.far_leg * r } : {}),
+  }));
+}
+
+/**
+ * Extra Cash Carry / settle forward from a Swap+Fwd overlay (analytics only).
+ * Remaining far leg is NOT converted — it stays funding-swap metadata.
+ */
+export function extraForwardFromSwapOverlay(
+  ccy: string,
+  overlay: SwapForwardOverlay,
+  settleMonths: number,
+): { ccy: string; amountLocalM: number; settleMonths: number } | null {
+  if (Math.abs(overlay.forwardLocalM) < 1e-12) return null;
+  return {
+    ccy,
+    amountLocalM: overlay.forwardLocalM,
+    settleMonths: Math.max(1e-9, settleMonths),
+  };
+}
+
+/**
+ * Scale each CCY's funded plan by (1−Δ) from its Swap+Fwd overlay.
+ * Analytics / CFaR bridge only — never write back into liquidityCycles.
+ */
+export function retainedFundingPlanByCcy<
+  T extends { standing_swap: number; far_leg?: number },
+>(
+  planByCcy: Readonly<Record<string, readonly T[]>> | undefined,
+  overlayByCcy: Readonly<Record<string, SwapForwardOverlay>> | undefined,
+): Record<string, T[]> | undefined {
+  if (!planByCcy) return undefined;
+  const out: Record<string, T[]> = {};
+  for (const [ccy, plan] of Object.entries(planByCcy)) {
+    const overlay = overlayByCcy?.[ccy];
+    const retention = overlay ? 1 - clampHedgeDelta(overlay.delta) : 1;
+    out[ccy] = scaleFundingPlanByRetention(plan, retention);
+  }
+  return out;
+}
+
+/** Analytics-only forwards derived from desk Swap+Fwd overlays. */
+export function analyticsForwardsFromOverlays(input: {
+  overlayByCcy?: Readonly<Record<string, SwapForwardOverlay>>;
+  planByCcy?: Readonly<
+    Record<string, readonly { cycleIndex?: number; far_leg?: number }[]>
+  >;
+  forecastMonths: number;
+}): { ccy: string; amountLocalM: number; settleMonths: number }[] {
+  const out: { ccy: string; amountLocalM: number; settleMonths: number }[] = [];
+  for (const [ccy, overlay] of Object.entries(input.overlayByCcy ?? {})) {
+    const settle = settleMonthsForSwapForward(
+      input.forecastMonths,
+      input.planByCcy?.[ccy],
+    );
+    const leg = extraForwardFromSwapOverlay(ccy, overlay, settle);
+    if (leg) out.push(leg);
+  }
+  return out;
 }
 
 /** Resolved hedge legs after user mode / notional / delta overrides. */

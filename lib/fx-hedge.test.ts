@@ -3,8 +3,13 @@ import {
   suggestCarryHedge, excessLongLpCash, spotCarryBenefitUsdYr,
   fwdHedgeCarryUsdYr, optionGammaCarryUsdYr, shortOptionCarryUsdYr,
   resolveStrategyHedge,
+  allocateSwapForwardOverlay,
+  scaleFundingPlanByRetention,
+  retainedFundingPlanByCcy,
+  analyticsForwardsFromOverlays,
 } from './fx-hedge';
 import { fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
+import { DEFAULT_EURUSD_MARKET_RATES } from './fx-market-rates';
 
 describe('resolveStrategyHedge — book-wide strategy selection', () => {
   // forecastFx = current book + cycle flows (flows = −50: payouts exceed payins).
@@ -19,6 +24,61 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
     σ_daily: 0.004256,
   };
 
+  it('SWAP_FWD: forward = −E − Δ×S; residual near = (1−Δ)×S; carry reallocates', () => {
+    const swapNear = 40;
+    const E = base.forecastFx;
+    const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
+
+    const at0 = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 0, optDelta: 0,
+    });
+    expect(at0.fwdNotional).toBeCloseTo(-E, 6);
+    expect(at0.remainingFarLocalM).toBeCloseTo(-swapNear, 6);
+    expect(at0.residualFx).toBeCloseTo(swapNear, 6);
+    expect(at0.cipCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(at0.fwdCarryUsdYr).toBeCloseTo(
+      fwdHedgeCarryUsdYr(-E, 'CAD', base.r_FCY, base.r_USD), 9,
+    );
+    expect(at0.overlay?.finalNetLocalM ?? 1).toBeCloseTo(0, 6);
+
+    const at50 = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 0.5, optDelta: 0.5,
+    });
+    expect(at50.fwdNotional).toBeCloseTo(-(E + 0.5 * swapNear), 6);
+    expect(at50.remainingFarLocalM).toBeCloseTo(-0.5 * swapNear, 6);
+    expect(at50.residualFx).toBeCloseTo(0.5 * swapNear, 6);
+    expect(at50.cipCarryUsdYr).toBeCloseTo(pts * 0.5, 9);
+    expect(at50.hedgeCarryUsdYr).toBeCloseTo(at0.hedgeCarryUsdYr, 6);
+
+    const at100 = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 1, optDelta: 1,
+    });
+    expect(at100.fwdNotional).toBeCloseTo(-(E + swapNear), 6);
+    expect(at100.remainingFarLocalM).toBeCloseTo(0, 6);
+    expect(at100.residualFx).toBeCloseTo(0, 6);
+    expect(at100.cipCarryUsdYr).toBeCloseTo(0, 9);
+    expect(at100.hedgeCarryUsdYr).toBeCloseTo(at0.hedgeCarryUsdYr, 6);
+    expect(at100.fwdNotional + at100.remainingFarLocalM).toBeCloseTo(-(E + swapNear), 6);
+  });
+
+  it('SWAP_FWD clamps Δ outside [0,1] and handles negative Swap Near', () => {
+    const swapNear = -40;
+    const E = base.forecastFx;
+    const over = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 2, optDelta: 2,
+    });
+    expect(over.swapForwardDelta).toBe(1);
+    expect(over.fwdNotional).toBeCloseTo(-(E + swapNear), 6);
+    expect(over.remainingFarLocalM).toBeCloseTo(0, 6);
+
+    const under = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: -1, optDelta: -1,
+    });
+    expect(under.swapForwardDelta).toBe(0);
+    expect(under.fwdNotional).toBeCloseTo(-E, 6);
+    expect(under.remainingFarLocalM).toBeCloseTo(-swapNear, 6);
+  });
+
   it('SWAP_ONLY: no hedge legs, full cycle-end exposure stays open', () => {
     const h = resolveStrategyHedge('SWAP_ONLY', base);
     expect(h.fwdNotional).toBe(0);
@@ -27,12 +87,12 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
     expect(h.residualFx).toBeCloseTo(base.forecastFx, 6);
   });
 
-  it('SWAP_FWD: forward squares the FULL cycle-end exposure (book + flows)', () => {
-    const h = resolveStrategyHedge('SWAP_FWD', base);
-    expect(h.fwdNotional).toBeCloseTo(-(312.3 - 50), 6); // sell the whole forecast exposure
+  it('SWAP_FWD without swap: forward squares the FULL cycle-end exposure', () => {
+    const h = resolveStrategyHedge('SWAP_FWD', { ...base, swapForwardDelta: 1 });
+    expect(h.fwdNotional).toBeCloseTo(-(312.3 - 50), 6);
     expect(h.optNotional).toBe(0);
     expect(h.fwdCarryUsdYr).toBeCloseTo(fwdHedgeCarryUsdYr(-(312.3 - 50), 'CAD', 1.49, 3.50), 9);
-    expect(h.residualFx).toBeCloseTo(0, 6); // fully squared
+    expect(h.residualFx).toBeCloseTo(0, 6);
   });
 
   it('SWAP_FWD_OPT on PAY carry: fwd squares the FULL forecast, SELL CALL matched to it', () => {
@@ -152,39 +212,70 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
     expect(only.fwdNotional).toBe(0);
     expect(only.residualFx).toBeCloseTo(base.forecastFx + swapNear, 6);
 
-    const fwd = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear });
+    const fwd = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 1,
+    });
     expect(fwd.fwdNotional).toBeCloseTo(-(base.forecastFx + swapNear), 6);
     expect(fwd.residualFx).toBeCloseTo(0, 6);
+    expect(fwd.remainingFarLocalM).toBeCloseTo(0, 6);
 
-    const none = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear: 0 });
+    const none = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear: 0, swapForwardDelta: 1,
+    });
     expect(Math.abs(fwd.fwdNotional)).toBeGreaterThan(Math.abs(none.fwdNotional));
   });
 
-  it('SWAP_ONLY scales CIP P&L by δ — δ = 0 books none, δ ≠ 0 harvests the far-leg', () => {
+  it('SWAP_ONLY books full CIP on the standing far leg', () => {
     const swapNear = -40;
     const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
     expect(pts).toBeLessThan(0);
-    const at0 = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 0 });
-    const at50 = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 0.5 });
-    const at100 = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 1 });
-    expect(at0.cipCarryUsdYr).toBeCloseTo(0, 9);
-    expect(at50.cipCarryUsdYr).toBeCloseTo(pts * 0.5, 9);
-    expect(at100.cipCarryUsdYr).toBeCloseTo(pts, 9);
-    expect(at100.hedgeCarryUsdYr).toBeCloseTo(pts, 9);
+    const h = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 0.5 });
+    expect(h.cipCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(h.hedgeCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(h.fwdNotional).toBe(0);
   });
 
-  it('SWAP_FWD books swap CIP points in hedge carry scaled by δ', () => {
+  it('SWAP_ONLY far-leg CIP uses market swap points when the curve is on', () => {
+    const swapNear = -40;
+    const h = resolveStrategyHedge('SWAP_ONLY', {
+      ccy: 'EUR',
+      currentFx: 10,
+      forecastFx: 10,
+      swapNear,
+      optDelta: 1,
+      horizonDays: 30,
+      r_FCY: 1.78,
+      r_USD: 3.50,
+      σ_daily: 0.004372,
+      marketRates: DEFAULT_EURUSD_MARKET_RATES,
+      farSettleMonths: 12,
+    });
+    expect(h.cipCarryUsdYr).toBeCloseTo(swapNear * (170.98 / 10_000), 6);
+    const cash = fundingSwapCipPointsUsdYr(
+      swapNear, fcyToUsdM(1, 'EUR'), 1.78, 3.50,
+    );
+    expect(Math.abs(h.cipCarryUsdYr)).not.toBeCloseTo(Math.abs(cash), 2);
+  });
+
+  it('SWAP_FWD reallocates CIP into forward points as Δ rises', () => {
     const swapNear = 40;
-    const h = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear, optDelta: 1 });
     const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
-    expect(h.cipCarryUsdYr).toBeCloseTo(pts, 9);
-    expect(h.hedgeCarryUsdYr).toBeCloseTo(
+    const at0 = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 0,
+    });
+    const at100 = resolveStrategyHedge('SWAP_FWD', {
+      ...base, swapNear, swapForwardDelta: 1,
+    });
+    expect(at0.cipCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(at100.cipCarryUsdYr).toBeCloseTo(0, 9);
+    expect(at100.fwdCarryUsdYr).toBeCloseTo(
       fwdHedgeCarryUsdYr(-(base.forecastFx + swapNear), 'CAD', base.r_FCY, base.r_USD),
       6,
     );
+    expect(at100.hedgeCarryUsdYr).toBeCloseTo(at0.hedgeCarryUsdYr, 6);
   });
 
-  it('SWAP_FWD_OPT scales swap CIP points by δ — δ = 0 books none, δ ≠ 0 harvests them', () => {
+  it('SWAP_FWD_OPT scales swap CIP points by option δ — δ = 0 books none', () => {
     const swapNear = 40;
     const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
     expect(Math.abs(pts)).toBeGreaterThan(0.01);
@@ -302,5 +393,67 @@ describe('suggestCarryHedge', () => {
   it('spotCarryBenefitUsdYr positive for PAY spot sell', () => {
     const b = spotCarryBenefitUsdYr(-25, 'CAD', 1.49, 3.50);
     expect(b).toBeCloseTo(0.37, 1);
+  });
+});
+
+describe('allocateSwapForwardOverlay + retention helpers', () => {
+  it('final-net identity holds for both swap signs at Δ ∈ {0, 0.5, 1}', () => {
+    for (const S of [40, -40]) {
+      for (const delta of [0, 0.5, 1]) {
+        const o = allocateSwapForwardOverlay({
+          exposureLocalM: 100,
+          swapNearLocalM: S,
+          delta,
+        });
+        expect(o.finalNetLocalM).toBeCloseTo(0, 9);
+        expect(o.forwardLocalM).toBeCloseTo(-(100 + delta * S), 9);
+        expect(o.remainingFarLocalM).toBeCloseTo(-(1 - delta) * S, 9);
+        expect(o.residualNearLocalM).toBeCloseTo((1 - delta) * S, 9);
+      }
+    }
+  });
+
+  it('scaleFundingPlanByRetention scales standing and far by (1−Δ)', () => {
+    const plan = [
+      { standing_swap: 10, far_leg: 0 },
+      { standing_swap: 10, far_leg: -10 },
+    ];
+    const half = scaleFundingPlanByRetention(plan, 0.5);
+    expect(half[0]!.standing_swap).toBeCloseTo(5, 9);
+    expect(half[1]!.far_leg).toBeCloseTo(-5, 9);
+    const gone = scaleFundingPlanByRetention(plan, 0);
+    expect(gone.every(p => Math.abs(p.standing_swap) < 1e-12)).toBe(true);
+  });
+
+  it('retainedFundingPlanByCcy uses overlay Δ and leaves other CCYs full', () => {
+    const planByCcy = {
+      EUR: [{ standing_swap: 8, far_leg: -8 }],
+      GBP: [{ standing_swap: 4, far_leg: 0 }],
+    };
+    const overlays = {
+      EUR: allocateSwapForwardOverlay({
+        exposureLocalM: 10,
+        swapNearLocalM: 8,
+        delta: 0.75,
+      }),
+    };
+    const retained = retainedFundingPlanByCcy(planByCcy, overlays)!;
+    expect(retained.EUR![0]!.standing_swap).toBeCloseTo(8 * 0.25, 9);
+    expect(retained.GBP![0]!.standing_swap).toBeCloseTo(4, 9);
+  });
+
+  it('analyticsForwardsFromOverlays emits Forward only — never RemainingFar', () => {
+    const overlay = allocateSwapForwardOverlay({
+      exposureLocalM: 12,
+      swapNearLocalM: 5,
+      delta: 0.4,
+    });
+    const legs = analyticsForwardsFromOverlays({
+      overlayByCcy: { EUR: overlay },
+      forecastMonths: 12,
+    });
+    expect(legs).toHaveLength(1);
+    expect(legs[0]!.amountLocalM).toBeCloseTo(overlay.forwardLocalM, 9);
+    expect(legs[0]!.amountLocalM).not.toBeCloseTo(overlay.remainingFarLocalM, 6);
   });
 });

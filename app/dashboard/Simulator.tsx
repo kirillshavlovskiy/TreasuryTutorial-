@@ -34,6 +34,11 @@ import {
   type UsdParams,
   type LayerId,
 } from '@/lib/fx-buffer';
+import type {
+  HedgeStrategy,
+  SwapForwardOverlay,
+} from '@/lib/fx-hedge';
+import { analyticsForwardsFromOverlays } from '@/lib/fx-hedge';
 import {
   DEFAULT_FORECAST_PROFILE,
   type ForecastProfileState,
@@ -53,7 +58,11 @@ import {
   withNonCashFxConversion,
 } from '@/lib/test-mode/cash-carry-analytics';
 import { fxHedgeNetCfarByCcyUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
-import { DEFAULT_VAR_SETUP, type VarSetup } from '@/lib/test-mode/var-setup';
+import {
+  DEFAULT_VAR_SETUP,
+  computeAnalyticsVarUsdM,
+  type VarSetup,
+} from '@/lib/test-mode/var-setup';
 import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import type { FxInput } from '@/lib/workspace-store';
 
@@ -295,6 +304,17 @@ export function Simulator({
     [onForecastProfileChange],
   );
   const [forecastProfileOpen, setForecastProfileOpen] = useState(false);
+  const [hedgeStrategy, setHedgeStrategy] = useState<HedgeStrategy>('SWAP_ONLY');
+  /** Replacement Δ keyed by row id — default 1 when missing. */
+  const [swapForwardDeltaByRowId, setSwapForwardDeltaByRowId] = useState<
+    Record<string, number>
+  >({});
+  const [optionDeltaByRowId, setOptionDeltaByRowId] = useState<
+    Record<string, number>
+  >({});
+  const [swapForwardOverlayByCcy, setSwapForwardOverlayByCcy] = useState<
+    Record<string, SwapForwardOverlay>
+  >({});
 
   const liquidityTiming =
     resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
@@ -357,6 +377,19 @@ export function Simulator({
     () => hedgePositionOffsetsByCcy(bookedHedges, preparedByCcy),
     [bookedHedges, preparedByCcy],
   );
+  const analyticsExtraForwards = useMemo(
+    () =>
+      analyticsForwardsFromOverlays({
+        overlayByCcy: swapForwardOverlayByCcy,
+        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
+      }),
+    [
+      swapForwardOverlayByCcy,
+      shared.forecastMonths,
+      varSetup.forecastMonths,
+    ],
+  );
+
   const cashForecastCarryByCcy = useMemo(
     () =>
       cashForecastCarrySplitByCcyUsdM({
@@ -368,6 +401,7 @@ export function Simulator({
         setup: varSetup,
         marketRatesByCcy,
         ratesScopeId,
+        extraForwards: analyticsExtraForwards,
       }),
     [
       rows,
@@ -378,6 +412,7 @@ export function Simulator({
       preparedByCcy,
       marketRatesByCcy,
       ratesScopeId,
+      analyticsExtraForwards,
     ],
   );
   const stagedCashCarryByCcyUsdM = useMemo(() => {
@@ -475,6 +510,8 @@ export function Simulator({
         varBeforeUsdM: number;
         spotHedgeLocalM: number;
         forwardHedgeLocalM: number;
+        /** Gross VaR of the Swap+Fwd outright forward alone (when strategy applies). */
+        grossForwardVarUsdM?: number;
       }
     > = {};
     // Booked tickets only — Decision-layer Hedge-add % must not zero Residual/VaR
@@ -489,8 +526,43 @@ export function Simulator({
         forwardHedgeLocalM: m.forwardHedgeLocalM,
       };
     }
+    // Swap+Fwd desk overlay: gross forward VaR + economically net residual/VaR.
+    if (hedgeStrategy === 'SWAP_FWD') {
+      for (const row of rows) {
+        if (row.ccy === 'USD') continue;
+        const overlay = swapForwardOverlayByCcy[row.ccy];
+        if (!overlay) continue;
+        const cell = map[row.ccy];
+        if (!cell) continue;
+        const F = overlay.forwardLocalM;
+        // Strategy fwd is already hedge-signed (negative when selling long FCY).
+        cell.forwardHedgeLocalM = F;
+        // Complete structure nets to 0 directional FX (E + S + F + RemainingFar = 0).
+        cell.residualLocalM = overlay.finalNetLocalM;
+        cell.grossForwardVarUsdM = computeAnalyticsVarUsdM(
+          Math.abs(F),
+          0,
+          row.ccy,
+          varSetup,
+        );
+        cell.varUsdM = computeAnalyticsVarUsdM(
+          Math.abs(overlay.finalNetLocalM),
+          0,
+          row.ccy,
+          varSetup,
+        );
+      }
+    }
     return map;
-  }, [rows, showRiskMetrics, varSetup, bookedHedges, forecastProfile]);
+  }, [
+    rows,
+    showRiskMetrics,
+    varSetup,
+    bookedHedges,
+    forecastProfile,
+    hedgeStrategy,
+    swapForwardOverlayByCcy,
+  ]);
 
   const showRates       = !simplifiedBook && (!fxInputs || fxInputs.includes('rates'));
   const showFxPosition  = !fxInputs || fxInputs.includes('fxExposure');
@@ -583,6 +655,15 @@ export function Simulator({
               formulas={formulas}
               onFormulaChange={onFormulaChange}
               onFormulaChanges={onFormulaChanges}
+              hedgeStrategy={hedgeStrategy}
+              onHedgeStrategyChange={setHedgeStrategy}
+              swapForwardDeltaByCcy={swapForwardDeltaByRowId}
+              onSwapForwardDeltaByCcyChange={setSwapForwardDeltaByRowId}
+              optionDeltaByCcy={optionDeltaByRowId}
+              onOptionDeltaByCcyChange={setOptionDeltaByRowId}
+              onSwapForwardOverlayByCcyChange={setSwapForwardOverlayByCcy}
+              marketRatesByCcy={marketRatesByCcy}
+              ratesScopeId={ratesScopeId}
             />
           </div>
         )}
@@ -705,6 +786,7 @@ export function Simulator({
                       Record<string, readonly LiquidityCycleProjection[]>
                     >;
                     cfarNetByCcyUsd?: Record<string, number>;
+                    swapForwardOverlayByCcy?: Record<string, SwapForwardOverlay>;
                   }>,
                   {
                     bookRows: rows,
@@ -714,6 +796,7 @@ export function Simulator({
                     activeLayers,
                     livePlanByCcy,
                     cfarNetByCcyUsd,
+                    swapForwardOverlayByCcy,
                   },
                 )
               : (analyticsPanel ?? (
@@ -772,6 +855,15 @@ export function Simulator({
               formulas={formulas}
               onFormulaChange={onFormulaChange}
               onFormulaChanges={onFormulaChanges}
+              hedgeStrategy={hedgeStrategy}
+              onHedgeStrategyChange={setHedgeStrategy}
+              swapForwardDeltaByCcy={swapForwardDeltaByRowId}
+              onSwapForwardDeltaByCcyChange={setSwapForwardDeltaByRowId}
+              optionDeltaByCcy={optionDeltaByRowId}
+              onOptionDeltaByCcyChange={setOptionDeltaByRowId}
+              onSwapForwardOverlayByCcyChange={setSwapForwardOverlayByCcy}
+              marketRatesByCcy={marketRatesByCcy}
+              ratesScopeId={ratesScopeId}
             />
           </div>
         )}

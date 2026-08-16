@@ -6,7 +6,10 @@
 import * as XLSX from 'xlsx';
 import type { WorkBook } from 'xlsx';
 import defaultEurUsd from '@/data/fx-market-rates/EURUSD.json';
-import { CURRENCY_PARAMS } from '@/lib/fx-buffer';
+import {
+  CURRENCY_PARAMS,
+  fundingSwapFarSettleMonths,
+} from '@/lib/fx-buffer';
 
 export interface DepositSideRates {
   /** Earn on long cash — % p.a. (deposit bid). */
@@ -272,6 +275,69 @@ export function fwdCarryFromSwapPointsUsdM(input: {
     priceDelta,
     side,
   };
+}
+
+/**
+ * Funding-swap far-leg CIP P&L ($M over the tenor) from the swap-points curve.
+ * Same sign convention as {@link fwdCarryFromSwapPointsUsdM}: standing < 0
+ * (sold FCY near → buy FCY far) hits the ask. Overnight cash Δr is not used.
+ */
+export function fundingSwapFarLegCipUsdM(input: {
+  standingLocalM: number;
+  settleMonths: number;
+  bundle?: FxMarketRatesBundle | null;
+  /** Deposit-rate CIP fallback already scaled to the tenor ($M). */
+  fallbackUsdM?: number;
+}): number {
+  const N = input.standingLocalM;
+  if (Math.abs(N) < 1e-12) return 0;
+  if (input.settleMonths < 1 - 1e-12) return 0;
+  if (input.bundle) {
+    const pts = fwdCarryFromSwapPointsUsdM({
+      notionalLocalM: N,
+      settleMonths: input.settleMonths,
+      bundle: input.bundle,
+    });
+    if (pts) return pts.fwdCarryUsdM;
+  }
+  return input.fallbackUsdM ?? 0;
+}
+
+/**
+ * Desk CIP on the funding far: term = 12M (or far-cycle) points on M1 standing;
+ * rolling = Σ 1M points on each cycle's outstanding. Not overnight cash Δr.
+ */
+export function fundingSwapPathFarCipUsdM(input: {
+  plan?: readonly {
+    standing_swap: number;
+    cycleIndex?: number;
+    far_leg?: number;
+  }[];
+  standingFallback: number;
+  forecastMonths: number;
+  bundle?: FxMarketRatesBundle | null;
+  fallbackAnnualUsdYr: (standing: number) => number;
+}): number {
+  const cipAt = (standing: number, months: number) =>
+    fundingSwapFarLegCipUsdM({
+      standingLocalM: standing,
+      settleMonths: months,
+      bundle: input.bundle,
+      fallbackUsdM: input.fallbackAnnualUsdYr(standing) * (months / 12),
+    });
+
+  const plan = input.plan;
+  if (!plan?.length) {
+    return cipAt(input.standingFallback, Math.max(1, input.forecastMonths));
+  }
+  const term = plan.some(p => Math.abs(p.far_leg ?? 0) > 0.001);
+  if (term) {
+    return cipAt(
+      plan[0]!.standing_swap,
+      fundingSwapFarSettleMonths(plan, input.forecastMonths),
+    );
+  }
+  return plan.reduce((s, p) => s + cipAt(p.standing_swap, 1), 0);
 }
 
 /** Linear interpolate credit/debit on a sorted deposit curve at `months`. */

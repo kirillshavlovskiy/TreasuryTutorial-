@@ -283,7 +283,7 @@ export function fundedPlanFor(
  * and putting it on the collapsed SWAP row hides the trade booked today.
  */
 export function swapNearBookNow(
-  plan: readonly { swap_needed: number }[] | undefined,
+  plan: readonly { swap_needed: number }[] | null | undefined,
   fallback: number,
 ): number {
   if (!plan?.length) return fallback;

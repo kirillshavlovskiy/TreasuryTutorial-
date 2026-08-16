@@ -420,12 +420,20 @@ function monthIndexForSettle(settleMonths: number, T: number): number | null {
  * Per-month FCY hedge cash flows for a CCY (prepared + booked).
  * Index 0 = M1 … T−1 = MT. Sign: + = FCY received, − = FCY delivered.
  */
+export type AnalyticsForwardLeg = {
+  ccy: string;
+  amountLocalM: number;
+  settleMonths: number;
+};
+
 export function hedgeCashFlowsByMonth(input: {
   ccy: string;
   forecastMonths: number;
   bookedHedges: readonly HedgeTicket[];
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   setup: VarSetup;
+  /** Desk Swap+Fwd overlay forwards (analytics only — not liquidity-book). */
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }): number[] {
   const T = Math.max(0, Math.floor(input.forecastMonths));
   const flows = Array.from({ length: T }, () => 0);
@@ -435,6 +443,7 @@ export function hedgeCashFlowsByMonth(input: {
     preparedByCcy: input.preparedByCcy,
     setup: input.setup,
     horizon: T,
+    extraForwards: input.extraForwards,
   }).filter(l => l.ccy === input.ccy);
   for (const leg of legs) {
     const idx = monthIndexForSettle(leg.settleMonths, T);
@@ -469,6 +478,8 @@ export function buildCashForecastSchedule(input: {
   bookedHedges?: readonly HedgeTicket[];
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   setup?: VarSetup;
+  /** Desk Swap+Fwd overlay forwards (analytics only). */
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }): {
   openingCashM: number;
   months: CashForecastMonthRow[];
@@ -550,6 +561,7 @@ export function buildCashForecastSchedule(input: {
           bookedHedges: input.bookedHedges ?? [],
           preparedByCcy: input.preparedByCcy,
           setup: input.setup,
+          extraForwards: input.extraForwards,
         })
       : Array.from({ length: T }, () => 0);
   const bookConversionM = roundMoney(
@@ -563,6 +575,7 @@ export function buildCashForecastSchedule(input: {
           preparedByCcy: input.preparedByCcy,
           setup: input.setup,
           horizon: Math.max(T, 1e-9),
+          extraForwards: input.extraForwards,
         }).filter(l => l.ccy === input.ccy)
       : [];
 
@@ -767,6 +780,8 @@ export function buildCashForecastCarryComparison(input: {
   bookedHedges?: readonly HedgeTicket[];
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   setup?: VarSetup;
+  /** Desk Swap+Fwd overlay forwards (analytics only). */
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }): CashForecastCarryComparison | null {
   const hedged = buildCashForecastSchedule(input);
   if (!hedged) return null;
@@ -775,6 +790,7 @@ export function buildCashForecastCarryComparison(input: {
     ...input,
     bookedHedges: [],
     preparedByCcy: {},
+    extraForwards: [],
   });
   if (!unhedged) return null;
 
@@ -911,6 +927,7 @@ export function cashForecastCarrySplitByCcyUsdM(input: {
   setup?: VarSetup;
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   ratesScopeId?: string | null;
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }): Record<string, {
   cashUsdM: number;
   fwdUsdM: number;
@@ -919,6 +936,7 @@ export function cashForecastCarrySplitByCcyUsdM(input: {
 }> {
   const booked = input.bookedHedges ?? [];
   const prepared = input.preparedByCcy ?? {};
+  const extra = input.extraForwards ?? [];
   const out: Record<string, {
     cashUsdM: number;
     fwdUsdM: number;
@@ -931,7 +949,10 @@ export function cashForecastCarrySplitByCcyUsdM(input: {
     const hasBooked = booked.some(
       t => t.ccy === row.ccy && isLiveHedgeTicket(t),
     );
-    if (!hasPrepared && !hasBooked) continue;
+    const hasExtra = extra.some(
+      f => f.ccy === row.ccy && Math.abs(f.amountLocalM) > 1e-12,
+    );
+    if (!hasPrepared && !hasBooked && !hasExtra) continue;
     const rates = resolveMarketRatesForCcy(
       input.marketRatesByCcy,
       row.ccy,
@@ -946,6 +967,7 @@ export function cashForecastCarrySplitByCcyUsdM(input: {
       bookedHedges: booked,
       preparedByCcy: prepared,
       setup: input.setup,
+      extraForwards: extra,
     });
     if (!cmp) continue;
     const resolved = resolvedHedgedTotalCarryUsdM({
@@ -983,6 +1005,7 @@ export function sumCashCarryTotalUsdM(input: {
   bookedHedges: readonly HedgeTicket[];
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   setup: VarSetup;
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }): number {
   let sum = 0;
   for (const ccy of input.ccys) {
@@ -997,6 +1020,7 @@ export function sumCashCarryTotalUsdM(input: {
       bookedHedges: input.bookedHedges,
       preparedByCcy: input.preparedByCcy,
       setup: input.setup,
+      extraForwards: input.extraForwards,
     });
     if (!cmp) continue;
     sum += resolvedHedgedTotalCarryUsdM({
@@ -1189,12 +1213,13 @@ type HedgeLegSample = {
   structure: 'bullet' | 'strip';
 };
 
-/** Collect hedge legs (prepared + booked) for horizon sampling. */
+/** Collect hedge legs (prepared + booked + optional desk overlay forwards). */
 function collectHedgeLegs(input: {
   bookedHedges: readonly HedgeTicket[];
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   setup: VarSetup;
   horizon: number;
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }): HedgeLegSample[] {
   const legs: HedgeLegSample[] = [];
   const preparedCcys = new Set<string>();
@@ -1239,6 +1264,19 @@ function collectHedgeLegs(input: {
       settleMonths: tenureMonthsFromTicket(t, input.setup),
       recognizeMonths: 0,
       structure: t.stripId != null ? 'strip' : 'bullet',
+    });
+  }
+  // Desk Swap+Fwd replacement forward — only when Decision package is absent
+  // for that CCY (avoid double-counting the same exposure cover).
+  for (const f of input.extraForwards ?? []) {
+    if (preparedCcys.has(f.ccy)) continue;
+    if (Math.abs(f.amountLocalM) < 1e-12) continue;
+    legs.push({
+      ccy: f.ccy,
+      amountLocalM: f.amountLocalM,
+      settleMonths: f.settleMonths,
+      recognizeMonths: 0,
+      structure: 'bullet',
     });
   }
   return legs;

@@ -10,6 +10,8 @@ import {
   parseFxoCalculatorWorkbook,
   pickSharedUsdOvernight,
   fwdCarryFromSwapPointsUsdM,
+  fundingSwapFarLegCipUsdM,
+  fundingSwapPathFarCipUsdM,
   resolveCashRatesForHorizon,
   resolveForwardDepositRates,
   resolveMarketRatesForCcy,
@@ -76,6 +78,44 @@ describe('fx-market-rates', () => {
     expect(pts).toBeTruthy();
     expect(pts!.points).toBeCloseTo(14.14, 2); // sell → bid
     expect(pts!.fwdCarryUsdM).toBeCloseTo(10 * (14.14 / 10_000), 6);
+  });
+
+  it('prices funding-swap far-leg CIP from swap points, not overnight cash Δr', () => {
+    const short = -40;
+    const oneYAsk = 170.98;
+    const term = fundingSwapFarLegCipUsdM({
+      standingLocalM: short,
+      settleMonths: 12,
+      bundle: DEFAULT_EURUSD_MARKET_RATES,
+    });
+    expect(term).toBeCloseTo(short * (oneYAsk / 10_000), 6);
+    const overnight = short * ((1.78 - 3.50) / 100) * 1.1701;
+    expect(Math.abs(term)).not.toBeCloseTo(Math.abs(overnight), 2);
+
+    const rolling = fundingSwapPathFarCipUsdM({
+      plan: [
+        { standing_swap: short, far_leg: 0 },
+        { standing_swap: short, far_leg: 0 },
+      ],
+      standingFallback: short,
+      forecastMonths: 12,
+      bundle: DEFAULT_EURUSD_MARKET_RATES,
+      fallbackAnnualUsdYr: () => 0,
+    });
+    const oneMAsk = 14.19;
+    expect(rolling).toBeCloseTo(2 * short * (oneMAsk / 10_000), 6);
+
+    const termPath = fundingSwapPathFarCipUsdM({
+      plan: [
+        { standing_swap: short, cycleIndex: 0, far_leg: 0 },
+        { standing_swap: short, cycleIndex: 11, far_leg: -short },
+      ],
+      standingFallback: short,
+      forecastMonths: 12,
+      bundle: DEFAULT_EURUSD_MARKET_RATES,
+      fallbackAnnualUsdYr: () => 0,
+    });
+    expect(termPath).toBeCloseTo(term, 6);
   });
 
   it('carry uses overnight for cash int and swap points for FWD', () => {
@@ -157,7 +197,7 @@ describe('fx-market-rates', () => {
     expect(bundle.baseCcy).toBe('EUR');
     const cash = resolveOvernightCashRates(bundle, 'USD');
     expect(cash.fcy.creditPct).toBeCloseTo(3.505, 3);
-    expect(cash.source).toContain('pair file');
+    expect(cash.source).toContain('USD overnight (shared)');
     const fwd = resolveForwardDepositRates(bundle, 'USD', 1);
     const oneM = DEFAULT_EURUSD_MARKET_RATES.deposits.find(d => d.tenor === '1M');
     expect(fwd.fcy.creditPct).toBeCloseTo(oneM!.usd.creditPct, 3);

@@ -35,6 +35,7 @@ import {
   type CarryEvolutionBar,
   type CashCarryAnalytics,
   type CashForecastMonthRow,
+  type AnalyticsForwardLeg,
   type SettleWamScenario,
   type StripShapeScore,
 } from '@/lib/test-mode/cash-carry-analytics';
@@ -295,6 +296,8 @@ interface CashCarryAnalyticsViewProps {
    * in lockstep with the Cash Carry table.
    */
   onAllCcyTotalCarryUsdMChange?: (totalCarryUsdM: number) => void;
+  /** Desk Swap+Fwd replacement forwards (analytics settle legs only). */
+  extraForwards?: readonly AnalyticsForwardLeg[];
 }
 
 /** Prefer M12 for legend inspect; else last available month. */
@@ -2719,6 +2722,7 @@ export function CashCarryAnalyticsView({
   title,
   subtitle,
   onAllCcyTotalCarryUsdMChange,
+  extraForwards = [],
 }: CashCarryAnalyticsViewProps) {
   /** Resolve the uploaded curve for any CCY — multi-ccy table rows use this directly. */
   const marketRatesFor = useCallback(
@@ -3003,6 +3007,7 @@ export function CashCarryAnalyticsView({
           bookedHedges,
           preparedByCcy,
           setup,
+          extraForwards,
         });
         if (!cmp) return null;
         const prep = preparedByCcy[ccy];
@@ -3038,6 +3043,7 @@ export function CashCarryAnalyticsView({
     marketRates,
     bookedHedges,
     preparedByCcy,
+    extraForwards,
   ]);
 
   const multiCcyTotals = useMemo(() => {
@@ -3460,6 +3466,7 @@ export function CashCarryAnalyticsView({
         bookedHedges: carryBookedHedges,
         preparedByCcy: carryPreparedByCcy,
         setup,
+        extraForwards,
       }),
     [
       chartCcy,
@@ -3469,6 +3476,7 @@ export function CashCarryAnalyticsView({
       marketRates,
       carryBookedHedges,
       carryPreparedByCcy,
+      extraForwards,
     ],
   );
 

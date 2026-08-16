@@ -431,7 +431,26 @@ export function fundingSwapOverlayUsdYr(
   };
 }
 
-/** CIP far-leg points on a funding-swap notional — booked in FX hedge carry, scaled by δ. */
+/**
+ * FCY overnight used for cash Δr on the funding-swap book.
+ * Long FCY earns the credit rate; a short book pays the debit / OD rate.
+ */
+export function fundingSwapCashFcyRate(
+  standingSwap: number,
+  r_FCY: number,
+  r_OD?: number,
+): number {
+  return standingSwap < 0
+    && typeof r_OD === 'number'
+    && Number.isFinite(r_OD)
+    ? r_OD
+    : r_FCY;
+}
+
+/**
+ * Deposit-rate CIP fallback ($M/yr) when the swap-points curve is missing.
+ * Desk CIP P&L uses {@link fundingSwapPathFarCipUsdM} (Market data far-leg points).
+ */
 export function fundingSwapCipPointsUsdYr(
   swapNear: number,
   spot: number,
@@ -452,6 +471,23 @@ export function swapFarLegNotional(
 ): number {
   if (plan?.length) return plan[0]!.standing_swap;
   return swapNear;
+}
+
+/**
+ * Far-leg tenor in months. Term cover: cycle of `far_leg` (M12 → 12).
+ * Rolling: 1M — each cycle's outstanding is rolled at the next near.
+ */
+export function fundingSwapFarSettleMonths(
+  plan: readonly { cycleIndex?: number; far_leg?: number }[] | undefined,
+  forecastMonths = 12,
+): number {
+  if (!plan?.length) return Math.max(1, forecastMonths);
+  const termAt = plan.findIndex(p => Math.abs(p.far_leg ?? 0) > 0.001);
+  if (termAt >= 0) {
+    const idx = plan[termAt]!.cycleIndex ?? termAt;
+    return Math.max(1, idx + 1);
+  }
+  return 1;
 }
 
 const FUNDING_SWAP_MONTHS_PA = 12;
@@ -500,11 +536,7 @@ export function fundingSwapCashDeltaUsdYr(
   r_USD: number,
   r_OD?: number,
 ): number {
-  const fcyRate = standingSwap < 0
-    && typeof r_OD === 'number'
-    && Number.isFinite(r_OD)
-    ? r_OD
-    : r_FCY;
+  const fcyRate = fundingSwapCashFcyRate(standingSwap, r_FCY, r_OD);
   return standingSwap * ((fcyRate - r_USD) / 100) * spot;
 }
 
@@ -540,6 +572,8 @@ export function fundingSwapPathCarryUsdM(
     0,
   );
 }
+
+/** Path CIP P&L lives in fx-market-rates (`fundingSwapPathFarCipUsdM`) — far-leg swap points. */
 
 /**
  * Layered buffer + swap bridge (see also optimizePortfolioCarry when portfolioDiv is on).

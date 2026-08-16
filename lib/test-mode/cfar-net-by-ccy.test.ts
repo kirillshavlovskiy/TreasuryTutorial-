@@ -6,6 +6,7 @@ import {
 } from '@/lib/test-mode/cfar-net-by-ccy';
 import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
+import { allocateSwapForwardOverlay } from '@/lib/fx-hedge';
 
 const EUR = makeSimRow('1', 'EUR', 10, 0, 0, 2.5, 0, 1.2, 0);
 const SETUP = {
@@ -59,5 +60,59 @@ describe('fxHedgeNetCfarByCcyUsdM — cover vs displayed', () => {
       },
     });
     expect(displayed.EUR ?? 0).toBeGreaterThan(cover.EUR ?? 0);
+  });
+
+  it('scales funding-bridge CFaR by (1−Δ) and does not double-count directional FX', () => {
+    const plan = {
+      EUR: Array.from({ length: 12 }, () => ({ standing_swap: 8, far_leg: -8 })),
+    };
+    const overlayFull = allocateSwapForwardOverlay({
+      exposureLocalM: 10,
+      swapNearLocalM: 8,
+      delta: 0,
+    });
+    const overlayHalf = allocateSwapForwardOverlay({
+      exposureLocalM: 10,
+      swapNearLocalM: 8,
+      delta: 0.5,
+    });
+    const overlayGone = allocateSwapForwardOverlay({
+      exposureLocalM: 10,
+      swapNearLocalM: 8,
+      delta: 1,
+    });
+
+    const at0 = fxHedgeNetCfarByCcyUsdM({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+      fundingPlanByCcy: plan,
+      swapForwardOverlayByCcy: { EUR: overlayFull },
+    });
+    const at50 = fxHedgeNetCfarByCcyUsdM({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+      fundingPlanByCcy: plan,
+      swapForwardOverlayByCcy: { EUR: overlayHalf },
+    });
+    const at100 = fxHedgeNetCfarByCcyUsdM({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+      fundingPlanByCcy: plan,
+      swapForwardOverlayByCcy: { EUR: overlayGone },
+    });
+    const coverOnly = fxHedgeNetCfarByCcyUsdM({
+      rows: [EUR],
+      setup: SETUP,
+      bookedHedges: [HEDGE],
+    });
+
+    // Full retention ≥ half retention ≥ fully replaced (bridge → 0).
+    expect(at0.EUR ?? 0).toBeGreaterThanOrEqual(at50.EUR ?? 0);
+    expect(at50.EUR ?? 0).toBeGreaterThanOrEqual(at100.EUR ?? 0);
+    // Δ=1 cancels the funding bridge — displayed ≈ FX-only cover.
+    expect(at100.EUR ?? 0).toBeCloseTo(coverOnly.EUR ?? 0, 3);
   });
 });

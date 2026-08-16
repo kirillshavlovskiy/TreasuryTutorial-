@@ -20,8 +20,14 @@ import {
 } from '@/lib/forecast-profile';
 import { resolveMarketRatesForCcy, type FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import {
+  analyticsForwardsFromOverlays,
+  retainedFundingPlanByCcy,
+  type SwapForwardOverlay,
+} from '@/lib/fx-hedge';
+import {
   buildCashForecastCarryComparison,
   resolvedHedgedTotalCarryUsdM,
+  type AnalyticsForwardLeg,
 } from '@/lib/test-mode/cash-carry-analytics';
 import {
   applyFundingSwapBridge,
@@ -59,10 +65,14 @@ export type FxHedgeCfarInput = {
   /**
    * Outstanding funding-swap book per CCY. Omit for cover sizing (FX-only).
    * Pass the live / strategy plan to get displayed Net CFaR.
+   * When {@link swapForwardOverlayByCcy} is set, standing/far are scaled by
+   * (1−Δ) for the bridge only — never written back into liquidityCycles.
    */
   fundingPlanByCcy?: Readonly<
     Record<string, readonly { standing_swap: number; far_leg?: number }[]>
   >;
+  /** Desk Swap+Fwd replacement overlays — gross forward + retained-far scale. */
+  swapForwardOverlayByCcy?: Readonly<Record<string, SwapForwardOverlay>>;
 };
 
 function hashSeedForCcy(ccy: string): number {
@@ -80,6 +90,7 @@ export function hedgeSettleScheduleForCfar(
   ccy: string,
   setup: VarSetup,
   tenureMonths: number,
+  extraForward?: AnalyticsForwardLeg | null,
 ): McHedgeSettleLeg[] {
   const bookedStrip = stripTicketsForCcy(bookedHedges, ccy)
     .slice()
@@ -111,6 +122,12 @@ export function hedgeSettleScheduleForCfar(
       notionalLocalM: prepared.coverLocalM,
     }];
   }
+  if (extraForward && Math.abs(extraForward.amountLocalM) > 1e-9) {
+    return [{
+      settleMonths: extraForward.settleMonths,
+      notionalLocalM: extraForward.amountLocalM,
+    }];
+  }
   return [];
 }
 
@@ -120,6 +137,7 @@ function mcInputForRow(
   T: number,
   profile: ForecastProfileState,
   bookedHedges: readonly HedgeTicket[],
+  extraForwards: readonly AnalyticsForwardLeg[],
 ): McCfarInput | null {
   const ccy = row.ccy;
   if (!ccy || ccy === 'USD') return null;
@@ -145,6 +163,7 @@ function mcInputForRow(
     bookedHedges,
     preparedByCcy: input.preparedByCcy,
     setup: input.setup,
+    extraForwards,
   });
   const carryUsdM = cmp
     ? resolvedHedgedTotalCarryUsdM({
@@ -153,6 +172,7 @@ function mcInputForRow(
         marketRates: rates,
       }).totalCarryUsdM
     : 0;
+  const extra = extraForwards.find(f => f.ccy === ccy) ?? null;
   return {
     stockM,
     monthlyInflows,
@@ -172,6 +192,7 @@ function mcInputForRow(
       ccy,
       input.setup,
       T,
+      extra,
     ),
     hedgeCarryScheduleUsdM:
       T > 0 && Number.isFinite(carryUsdM)
@@ -193,9 +214,15 @@ export function fxHedgeMcCfarByCcy(
     : horizonMonths(input.setup.horizon);
   const profile = input.forecastProfile ?? DEFAULT_FORECAST_PROFILE;
   const bookedHedges = input.bookedHedges ?? [];
+  const extraForwards = analyticsForwardsFromOverlays({
+    overlayByCcy: input.swapForwardOverlayByCcy,
+    forecastMonths: T,
+  });
   const out: Record<string, CfarBandsResult> = {};
   for (const row of input.rows) {
-    const mc = mcInputForRow(row, input, Math.max(1, T), profile, bookedHedges);
+    const mc = mcInputForRow(
+      row, input, Math.max(1, T), profile, bookedHedges, extraForwards,
+    );
     if (!mc) continue;
     out[row.ccy] = computeMonteCarloMismatchCfar(mc);
   }
@@ -204,15 +231,22 @@ export function fxHedgeMcCfarByCcy(
 
 function displayedNetFromFx(
   fxByCcy: Record<string, CfarBandsResult>,
-  input: Pick<FxHedgeCfarInput, 'fundingPlanByCcy' | 'setup'>,
+  input: Pick<
+    FxHedgeCfarInput,
+    'fundingPlanByCcy' | 'setup' | 'swapForwardOverlayByCcy'
+  >,
 ): Record<string, number> {
   const T = input.setup.forecastMonths > 0
     ? input.setup.forecastMonths
     : horizonMonths(input.setup.horizon);
+  const retainedPlan = retainedFundingPlanByCcy(
+    input.fundingPlanByCcy,
+    input.swapForwardOverlayByCcy,
+  );
   const out: Record<string, number> = {};
   for (const [ccy, fx] of Object.entries(fxByCcy)) {
     const funding = fundingSwapOutstandingByMonth(
-      input.fundingPlanByCcy?.[ccy],
+      retainedPlan?.[ccy],
       T,
     );
     const bridge = fundingSwapBridgeBands({
@@ -242,7 +276,10 @@ export function fxHedgeNetCfarByCcyUsdM(
 /** Displayed nets from a precomputed FX-only MC run — one MC, many swap books. */
 export function displayedCfarNetByCcyUsdM(
   fxByCcy: Record<string, CfarBandsResult>,
-  input: Pick<FxHedgeCfarInput, 'fundingPlanByCcy' | 'setup'>,
+  input: Pick<
+    FxHedgeCfarInput,
+    'fundingPlanByCcy' | 'setup' | 'swapForwardOverlayByCcy'
+  >,
 ): Record<string, number> {
   return displayedNetFromFx(fxByCcy, input);
 }
