@@ -29,6 +29,7 @@ import {
   roundMoney,
   fxBookNetLocalM,
   fundingSwapOverlayUsdYr,
+  fundingSwapCarryUsdYr,
   liquidityFormulaLayersActive,
   type LayerId,
   type LayerResult,
@@ -81,9 +82,11 @@ export interface SimRowComputed {
   varFactor: number;
   irMult: number;
   varBuffer: number;
-  /** Target LP Cash = Opening LP + Swap — the cash target the swap funds to (before payout).
-   *  Equals LP+Swap by construction (swap is sized to reach this target). The cushion that
-   *  survives the payout is `lp_after_swap_trough` (= cash_threshold − payout). */
+  /**
+   * Target LP Cash — the layer / carry-target H* (what the buffer must hold).
+   * Not Opening + today's M1 swap: that identity only holds when H* is the near
+   * cycle. LP+Swap (`postSwapCash`) is Opening + the trade booked today.
+   */
   cash_threshold: number;
   /** Trough cushion H* from layer model (what must remain AFTER payout) — sizes the swap. */
   cash_threshold_pre_swap: number;
@@ -168,8 +171,8 @@ export interface SimRowComputed {
   swapPointsUsdYr: number;
   /** Rate-diff carry ($M/yr) = FCY O/N + USD O/N (points excluded). */
   swapInterestUsdYr: number;
-  /** Annual USD swap overlay ($M/yr) = FCY O/N + USD O/N + points.
-   *  0 at CIP mid when deploying surplus; covering a short keeps (r_OD − r_FCY). */
+  /** Annual USD swap overlay ($M/yr). CIP net when no carry target (0 on a
+   *  surplus deploy); cash Δr vs USD when a carry target is steering the book. */
   swapCarryUsdYr: number;
   usd_consumed: number;
   carry: number;
@@ -272,6 +275,19 @@ export function fundedPlanFor(
     anchor = next;
   }
   return plan;
+}
+
+/**
+ * Today's funding-swap near: cycle-0 `swap_needed`.
+ * Do not skip a quiet M1 to a later cycle's incremental — that is the H* leg,
+ * and putting it on the collapsed SWAP row hides the trade booked today.
+ */
+export function swapNearBookNow(
+  plan: readonly { swap_needed: number }[] | undefined,
+  fallback: number,
+): number {
+  if (!plan?.length) return fallback;
+  return plan[0]!.swap_needed;
 }
 
 /** The low H* and the swap size against, and which cycle it came from. */
@@ -411,15 +427,23 @@ export function computeSimdRow(
 
   const formulaLayersActive = liquidityFormulaLayersActive(activeLayers);
 
-  const swapNear = syncedSwap ?? computeFcySwapNear(
+  const hStarLeg = syncedSwap ?? computeFcySwapNear(
     cash_threshold_pre_swap, cashPos, r.fcastFX, r.r_OD, shared.r_USD, formulaLayersActive, swapAnchor,
   );
-  // Post-payout cushion (funded trough + swap = H*) — used for hedging / VAR.
-  const lp_after_swap_trough = swapAnchor + swapNear;
-  // LP+Swap = Opening LP + Swap — the funded LP position right after the swap, before payout.
+  // SWAP band = the trade booked today (M1 near). The H* cycle's increment stays
+  // on `hStarLeg` so trough + that leg still equals the cushion. Mixing the two
+  // (M1 opening + M2 increment) is what zeroed Target LP Cash on a carry ask.
+  const swapNear = swapNearBookNow(liquidityPlan, hStarLeg);
+  // Post-payout cushion (funded trough + H* increment = H*) — hedging / VAR.
+  const lp_after_swap_trough = swapAnchor + hStarLeg;
+  // LP+Swap = Opening LP + today's swap — funded position before payout.
   const postSwapCash = r.cash + swapNear;
-  // Target LP Cash = Opening LP + Swap — the cash target the swap funds to (before payout).
-  const cash_threshold = r.cash + swapNear;
+  // Target LP Cash is the policy H* quoted pre-payout: trough cushion + |payout|.
+  // That is the carry-target number. Do not use Opening + M1 swap (LP+Swap) and
+  // do not mix M1 opening with the H* increment (that printed 0 against a 462k ask).
+  const hStarPayout = sizingPlan?.[sizing?.index ?? 0]?.payout ?? r.payout;
+  const payoutScaleH = Math.abs(hStarPayout) > 0.001 ? Math.abs(hStarPayout) : 0;
+  const cash_threshold = cash_threshold_pre_swap + payoutScaleH;
   // Cycle End on a dated plan is the last close the path actually reaches —
   // hedge settlement included, and the term far-leg repaid — not the near cycle
   // with the cover still sitting in it. Without a plan the near-cycle close is
@@ -440,7 +464,10 @@ export function computeSimdRow(
   const usdOnUsdYr = overlay.usdOnUsdYr;
   const swapPointsUsdYr = overlay.pointsUsdYr;
   const swapInterestUsdYr = overlay.fcyOnUsdYr + overlay.usdOnUsdYr;
-  const swapCarryUsdYr = overlay.netUsdYr;
+  // CIP points live in FX hedge carry (δ-scaled). Swap Carry is cash Δr only.
+  const swapCarryUsdYr = fundingSwapCarryUsdYr(
+    swapNear, spot_rate, r.r_FCY, shared.r_USD, r.r_OD, 'cashDelta',
+  );
 
   const usd_consumed = Math.abs(swapNear) * spot_rate;
 
@@ -1113,7 +1140,10 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
   });
 
   const fcySwapNearUsd = sumFcySwapNearUsd(
-    fcyComputed.map(r => ({ ccy: r.ccy, swapNear: r.swapNear })),
+    fcyComputed.map(r => ({
+      ccy: r.ccy,
+      swapNear: r.liquidityPlan?.[0]?.swap_needed ?? r.swapNear,
+    })),
   );
 
   const fxTotals = fcyComputed.reduce(

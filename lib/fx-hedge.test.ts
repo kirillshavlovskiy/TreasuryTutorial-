@@ -4,7 +4,7 @@ import {
   fwdHedgeCarryUsdYr, optionGammaCarryUsdYr, shortOptionCarryUsdYr,
   resolveStrategyHedge,
 } from './fx-hedge';
-import { fcyToUsdM } from './fx-buffer';
+import { fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
 
 describe('resolveStrategyHedge — book-wide strategy selection', () => {
   // forecastFx = current book + cycle flows (flows = −50: payouts exceed payins).
@@ -57,12 +57,11 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
     // gross premium is still reported informationally, unchanged by the carry fix…
     expect(h.optPremiumUsdYr).toBeCloseTo(so.premiumEarnedUsdYr, 9);
     expect(h.optPremiumUsdYr).toBeGreaterThan(0);
-    // …but is EXCLUDED from carry (it offsets expected exercise cost at fair value)
-    expect(h.hedgeCarryUsdYr).toBeCloseTo(h.fwdCarryUsdYr + δLeg, 9);
-    expect(h.hedgeCarryUsdYr).toBeCloseTo(h.fwdCarryUsdYr * 0.5, 6); // fwd leg − half of it
-    // net positive but modest: selling CAD fwd earns points, δ-leg gives half back
+    // locked structure carry = fwd points only (CIP 0 with no swap). Option
+    // delivery-leg is contingent — not assumed exercised, not in Hedge Carry.
+    expect(h.hedgeCarryUsdYr).toBeCloseTo(h.fwdCarryUsdYr, 9);
+    expect(h.optCarryUsdYr).toBeCloseTo(δLeg, 9);
     expect(h.hedgeCarryUsdYr).toBeGreaterThan(0);
-    expect(h.hedgeCarryUsdYr).toBeLessThan(h.fwdCarryUsdYr);
     // residual = forecast + total delta-weighted hedge (fwd + δ × option):
     // 262.3 + (−262.3 + 262.3 × 0.5) = +131.15 — the sold call's δ-weighted
     // delivery (buy LCY) re-adds long exposure on top of the squared forward.
@@ -159,6 +158,43 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
 
     const none = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear: 0 });
     expect(Math.abs(fwd.fwdNotional)).toBeGreaterThan(Math.abs(none.fwdNotional));
+  });
+
+  it('SWAP_ONLY scales CIP P&L by δ — δ = 0 books none, δ ≠ 0 harvests the far-leg', () => {
+    const swapNear = -40;
+    const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
+    expect(pts).toBeLessThan(0);
+    const at0 = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 0 });
+    const at50 = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 0.5 });
+    const at100 = resolveStrategyHedge('SWAP_ONLY', { ...base, swapNear, optDelta: 1 });
+    expect(at0.cipCarryUsdYr).toBeCloseTo(0, 9);
+    expect(at50.cipCarryUsdYr).toBeCloseTo(pts * 0.5, 9);
+    expect(at100.cipCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(at100.hedgeCarryUsdYr).toBeCloseTo(pts, 9);
+  });
+
+  it('SWAP_FWD books swap CIP points in hedge carry scaled by δ', () => {
+    const swapNear = 40;
+    const h = resolveStrategyHedge('SWAP_FWD', { ...base, swapNear, optDelta: 1 });
+    const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
+    expect(h.cipCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(h.hedgeCarryUsdYr).toBeCloseTo(
+      fwdHedgeCarryUsdYr(-(base.forecastFx + swapNear), 'CAD', base.r_FCY, base.r_USD),
+      6,
+    );
+  });
+
+  it('SWAP_FWD_OPT scales swap CIP points by δ — δ = 0 books none, δ ≠ 0 harvests them', () => {
+    const swapNear = 40;
+    const pts = fundingSwapCipPointsUsdYr(swapNear, fcyToUsdM(1, 'CAD'), base.r_FCY, base.r_USD);
+    expect(Math.abs(pts)).toBeGreaterThan(0.01);
+    const at0 = resolveStrategyHedge('SWAP_FWD_OPT', { ...base, swapNear, optDelta: 0 });
+    const at50 = resolveStrategyHedge('SWAP_FWD_OPT', { ...base, swapNear, optDelta: 0.5 });
+    const at100 = resolveStrategyHedge('SWAP_FWD_OPT', { ...base, swapNear, optDelta: 1 });
+    expect(at0.cipCarryUsdYr).toBeCloseTo(0, 9);
+    expect(at50.cipCarryUsdYr).toBeCloseTo(pts * 0.5, 9);
+    expect(at100.cipCarryUsdYr).toBeCloseTo(pts, 9);
+    expect(at50.residualFx).toBeGreaterThan(at0.residualFx);
   });
 });
 

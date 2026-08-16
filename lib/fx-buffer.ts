@@ -392,10 +392,12 @@ export interface LayeredBufferResult {
  * Near buy FCY (swapNear > 0, covering a short / zero H*): FCY O/N is the
  * debit you extinguish (`r_OD`), USD O/N is the credit you miss on the USD
  * sold to buy FCY, points are CIP mid on the **credit** curve (the swap
- * market). Net = (r_OD − r_FCY) × notional — OD vs market, not CIP-zero.
+ * market far leg). Net = (r_OD − r_FCY) × notional — OD vs market, not CIP-zero.
  *
- * Near sell FCY (swapNear < 0, deploying surplus): FCY O/N is credit forgone
- * (`r_FCY`); CIP mid points offset FCY+USD so `netUsdYr` is 0.
+ * Near sell FCY (swapNear < 0): you receive USD on the near (USD O/N credit).
+ * FCY O/N is credit forgone (`r_FCY`); far-leg points offset FCY+USD so
+ * `netUsdYr` is 0 at CIP mid. There is no leftover “carry vs USD” on the
+ * FCY short — the matching USD long and the points reverse it.
  *
  * Additive to unfunded cash carry — does not reprice the cash path.
  */
@@ -429,7 +431,82 @@ export function fundingSwapOverlayUsdYr(
   };
 }
 
+/** CIP far-leg points on a funding-swap notional — booked in FX hedge carry, scaled by δ. */
+export function fundingSwapCipPointsUsdYr(
+  swapNear: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+): number {
+  return fundingSwapOverlayUsdYr(swapNear, spot, r_FCY, r_USD).pointsUsdYr;
+}
+
+/**
+ * Notional the funding-swap far leg is written on (M FCY).
+ * Today's standing after the near — not the last cycle after a term repay
+ * (that standing is 0) and not a later H* increment.
+ */
+export function swapFarLegNotional(
+  plan: readonly { standing_swap: number }[] | undefined,
+  swapNear: number,
+): number {
+  if (plan?.length) return plan[0]!.standing_swap;
+  return swapNear;
+}
+
 const FUNDING_SWAP_MONTHS_PA = 12;
+
+/**
+ * How Swap Carry is quoted.
+ *   `cip`       — FCY O/N + USD O/N + swap-market points (covering OD leftover;
+ *                 deploying surplus CIP-nets to 0).
+ *   `cashDelta` — cash-market carry vs USD on the standing book, no points.
+ *                 Carry target steers on this number.
+ */
+export type FundingSwapCarryView = 'cip' | 'cashDelta';
+
+/** Carry target is a cash-vs-USD ask — CIP would print 0 on the deploy that funds it. */
+export function fundingSwapCarryViewFor(
+  carryTarget: number | undefined,
+  carryLayerOn = true,
+): FundingSwapCarryView {
+  if (!carryLayerOn) return 'cip';
+  if (typeof carryTarget !== 'number' || !Number.isFinite(carryTarget)) return 'cip';
+  return 'cashDelta';
+}
+
+export function fundingSwapCarryUsdYr(
+  standingSwap: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+  r_OD?: number,
+  view: FundingSwapCarryView = 'cip',
+): number {
+  return view === 'cashDelta'
+    ? fundingSwapCashDeltaUsdYr(standingSwap, spot, r_FCY, r_USD, r_OD)
+    : fundingSwapOverlayUsdYr(standingSwap, spot, r_FCY, r_USD, r_OD).netUsdYr;
+}
+
+/**
+ * Carry vs USD on the funding-swap book (the leg Carry target sizes).
+ * Long FCY earns/pays r_FCY − r_USD; a short book uses r_OD (borrow FCY).
+ * CIP points are excluded — they belong to the swap market, not this P&L.
+ */
+export function fundingSwapCashDeltaUsdYr(
+  standingSwap: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+  r_OD?: number,
+): number {
+  const fcyRate = standingSwap < 0
+    && typeof r_OD === 'number'
+    && Number.isFinite(r_OD)
+    ? r_OD
+    : r_FCY;
+  return standingSwap * ((fcyRate - r_USD) / 100) * spot;
+}
 
 /** One cycle's overlay as a month fraction of the annual rate (sums across M1…MT). */
 export function fundingSwapMonthCarryUsdM(
@@ -438,10 +515,12 @@ export function fundingSwapMonthCarryUsdM(
   r_FCY: number,
   r_USD: number,
   r_OD?: number,
+  view: FundingSwapCarryView = 'cip',
 ): number {
-  return fundingSwapOverlayUsdYr(
-    standingSwap, spot, r_FCY, r_USD, r_OD,
-  ).netUsdYr / FUNDING_SWAP_MONTHS_PA;
+  const annual = fundingSwapCarryUsdYr(
+    standingSwap, spot, r_FCY, r_USD, r_OD, view,
+  );
+  return annual / FUNDING_SWAP_MONTHS_PA;
 }
 
 /** Path Swap Carry = Σ monthly overlay on each cycle's standing book. */
@@ -451,11 +530,12 @@ export function fundingSwapPathCarryUsdM(
   r_FCY: number,
   r_USD: number,
   r_OD?: number,
+  view: FundingSwapCarryView = 'cip',
 ): number | null {
   if (!plan?.length) return null;
   return plan.reduce(
     (s, p) => s + fundingSwapMonthCarryUsdM(
-      p.standing_swap, spot, r_FCY, r_USD, r_OD,
+      p.standing_swap, spot, r_FCY, r_USD, r_OD, view,
     ),
     0,
   );

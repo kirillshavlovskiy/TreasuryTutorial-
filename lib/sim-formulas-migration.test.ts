@@ -118,7 +118,7 @@ describe('migrateFormulaOverrides', () => {
   it('produces overrides the engine can actually evaluate', () => {
     // End to end: a formula saved under the old vocabulary still computes.
     const migrated = migrateFormulaOverrides({ 'EUR::npSwap': 'cash + swapNear + 5' });
-    const scope = { cash: 10, swapNear: 2, spotRate: 1.1, modelTrough: 0, modelCycleNet: 0, modelCycleEnd: 0, modelCycleFlow: 0 };
+    const scope = { cash: 10, swapNear: 2, spotRate: 1.1, modelTarget: 12, modelTrough: 0, modelCycleNet: 0, modelCycleEnd: 0, modelCycleFlow: 0 };
     const key = Object.keys(migrated)[0].split('::')[1] as 'lpSwap';
     const resolved = resolveSimRow(scope, { [key]: migrated['EUR::lpSwap'] });
     expect(resolved.errors.lpSwap).toBeUndefined();

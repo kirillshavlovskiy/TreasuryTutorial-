@@ -25,9 +25,11 @@ import {
   type UsdParams,
   type SharedGlobals,
   type LayerId,
-  fundingSwapOverlayUsdYr,
   fundingSwapMonthCarryUsdM,
   fundingSwapPathCarryUsdM,
+  fundingSwapCashDeltaUsdYr,
+  fundingSwapCipPointsUsdYr,
+  swapFarLegNotional,
 } from '@/lib/fx-buffer';
 import {
   fundedPlanFor,
@@ -192,25 +194,32 @@ function troughCellTitle(r: {
 }
 
 /**
- * Swap Near tooltip — which cycle of the funded plan the row's leg is sized on.
- * On the horizon basis that is not cycle 1, so the row and the expanded cycle
- * rows carry different legs by design; say so instead of letting them look like
- * a contradiction.
+ * Swap Near tooltip — the collapsed row is the trade booked today (M1 near).
+ * H* may sit on a later cycle; that increment is not this cell.
  */
 function swapCellTitle(r: {
   swapNear: number;
+  swapPointsUsdYr?: number;
   troughCycleIndex?: number;
   sizingCycleIndex?: number;
   liquidityPlan?: { cycleIndex: number; swap_needed: number }[];
 }): string {
-  const base = 'Swap near leg — sized by the buffer layer, not a formula cell';
+  const base = 'Swap near leg booked today — cycle 0 of the funded path';
   const plan = r.liquidityPlan;
-  if (!plan?.length) return base;
+  if (!plan?.length) {
+    const pts = r.swapPointsUsdYr;
+    return typeof pts === 'number' && Math.abs(pts) > 5e-8
+      ? `Swap near leg — sized by the buffer layer · CIP points ${usdCarry(pts)} (in FX Hedge Carry)`
+      : 'Swap near leg — sized by the buffer layer, not a formula cell';
+  }
   const sized = r.sizingCycleIndex ?? r.troughCycleIndex ?? 0;
-  const own = plan[0]?.swap_needed ?? 0;
-  const parts = [`${base} · sized on the H* cycle M${sized + 1}`];
-  if (sized > 0 && Math.abs(own - r.swapNear) > 0.001) {
-    parts.push(`cycle M1 on its own would need ${f2(own)}`);
+  const hStar = plan[sized]?.swap_needed ?? 0;
+  const parts = [base];
+  if (sized > 0 && Math.abs(hStar - r.swapNear) > 0.001) {
+    parts.push(`H* is M${sized + 1} (incremental ${f2(hStar)})`);
+  }
+  if (typeof r.swapPointsUsdYr === 'number' && Math.abs(r.swapPointsUsdYr) > 5e-8) {
+    parts.push(`CIP points ${usdCarry(r.swapPointsUsdYr)} (in FX Hedge Carry)`);
   }
   return parts.join(' · ');
 }
@@ -290,14 +299,14 @@ function fmtSwapUsd(v: number): string {
   return `${v >= 0 ? '+' : ''}${f2(v)}`;
 }
 
-/** P&L Hedge Carry: staged Decision FWD-points when present, else table strategy. */
+/** P&L Hedge Cash: predetermined cash impact of booked/staged forwards.
+ *  CIP and option expected delivery live in FX HEDGE — not here. */
 function pnlHedgeCarryUsdM(
   ccy: string,
-  strategyHedgeCarry: number,
   staged: Record<string, number>,
 ): number {
   const v = staged[ccy];
-  return typeof v === 'number' && Number.isFinite(v) ? v : strategyHedgeCarry;
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
 /** P&L Cash Carry: Cash Carry forecast dual-book interest when hedged, else LP NIM. */
@@ -310,14 +319,20 @@ function pnlCashCarryUsdM(
   return typeof v === 'number' && Number.isFinite(v) ? v : floatNim;
 }
 
-/** P&L Swap Carry: Σ monthly overlay on the funded path; else near-leg annual. */
+/** P&L Swap Carry: path Σ of cash Δr on the standing book. CIP points sit in FX hedge carry. */
 function pnlSwapCarryUsdM(
-  r: { liquidityPlan?: { standing_swap: number }[]; swapCarryUsdYr: number; ccy: string; r_FCY: number; r_OD: number },
+  r: {
+    liquidityPlan?: { standing_swap: number }[];
+    swapCarryUsdYr: number;
+    ccy: string;
+    r_FCY: number;
+    r_OD: number;
+  },
   r_USD: number,
 ): number {
   const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 1;
   return fundingSwapPathCarryUsdM(
-    r.liquidityPlan, spot, r.r_FCY, r_USD, r.r_OD,
+    r.liquidityPlan, spot, r.r_FCY, r_USD, r.r_OD, 'cashDelta',
   ) ?? r.swapCarryUsdYr;
 }
 
@@ -1690,7 +1705,7 @@ export function UnifiedSimulator({
   const showFxHedge = showAdvancedBook && !hideFxHedge;
   const showPnl = showAdvancedBook;
   const pnlCarryOnly = pnlColumns === 'carryOnly';
-  const pnlColCount = pnlCarryOnly ? 4 : 5;
+  const pnlColCount = pnlCarryOnly ? 5 : 6;
   // Rates / IR only apply in the full book (Task Mode simplified view omits them).
   const ratesOn = showAdvancedBook && showRates;
   /** Task Mode: Debt + Investments live in FX POSITION; every FX cell is editable. */
@@ -1729,7 +1744,7 @@ export function UnifiedSimulator({
     + (showIrBook ? irCols : 0)
     + (showCarry ? 3 : 0)
     + (showSwap ? swapCols : 0)
-    + (showFxHedge ? 5 : 0)
+    + (showFxHedge ? 6 : 0)
     + (showRiskMetrics ? riskMetricCols : 0)
     + (showPnl ? pnlColCount : 0);
   /** Currency whose funded per-cycle liquidity plan is expanded under its row. */
@@ -2751,6 +2766,11 @@ export function UnifiedSimulator({
     )));
   }, [setRows]);
 
+  /** A committed cash / P&L target is live setup — turn the layer on so the book takes it. */
+  const ensureCarryLayer = useCallback(() => {
+    if (!activeLayers.has('carryOptim')) onLayerToggle('carryOptim');
+  }, [activeLayers, onLayerToggle]);
+
   const clearCarryDrafts = useCallback((id: string) => {
     setDrafts(prev => {
       const next = { ...prev };
@@ -2765,8 +2785,11 @@ export function UnifiedSimulator({
     clearCarryDrafts(id);
     if (raw.trim() === '') return setCarryTarget(id, undefined);
     const v = parseFloat(raw);
-    if (Number.isFinite(v)) setCarryTarget(id, v);
-  }, [clearCarryDrafts, setCarryTarget]);
+    if (Number.isFinite(v)) {
+      ensureCarryLayer();
+      setCarryTarget(id, v);
+    }
+  }, [clearCarryDrafts, setCarryTarget, ensureCarryLayer]);
 
   /**
    * Typed carry ($k for the near period) inverts into the cash target that earns
@@ -2814,9 +2837,10 @@ export function UnifiedSimulator({
       return;
     }
     clearCarryDrafts(row.id);
+    ensureCarryLayer();
     setCarryTarget(row.id, target);
   }, [
-    clearCarryDrafts, setCarryTarget, shared.r_USD, liquidityTiming,
+    clearCarryDrafts, setCarryTarget, ensureCarryLayer, shared.r_USD, liquidityTiming,
     hedgeSettleByCcy,
   ]);
 
@@ -3044,11 +3068,13 @@ export function UnifiedSimulator({
       // Option notional is always matched to the forward; δ is the option's own
       // delta (ATM ≈ 0.5) = fraction of the open exposure the option covers.
       const optDelta = hedgeDeltas[r.id] ?? 0.5;
+      const standing = swapFarLegNotional(r.liquidityPlan, r.swapNear);
       const hedge = resolveStrategyHedge(strategy, {
         ccy: r.ccy,
         currentFx: r.netFxFCY,
         forecastFx: r.netFxForecast,
         swapNear: r.swapNear,
+        swapStanding: standing,
         optDelta,
         horizonDays: 30,
         r_FCY: r.r_FCY,
@@ -3066,6 +3092,7 @@ export function UnifiedSimulator({
     optUSD: computedWithHedge.reduce((s, r) => s + swapNearUsd(r.ccy, r.optNotional * r.optDelta), 0),
     residUSD: computedWithHedge.reduce((s, r) => s + swapNearUsd(r.ccy, r.residualFx), 0),
     hedgeCarryUsdYr: computedWithHedge.reduce((s, r) => s + r.hedgeCarryUsdYr, 0),
+    cipUsdYr: computedWithHedge.reduce((s, r) => s + r.cipCarryUsdYr, 0),
   }), [computedWithHedge]);
 
   // ── Per-cell formula resolution (Excel-like overrides) ────────────────────
@@ -3088,6 +3115,7 @@ export function UnifiedSimulator({
         netFxFCY: r.netFxFCY, netFxForecast: r.netFxForecast,
         fwdNotional: r.fwdNotional, optNotional: r.optNotional, optDelta: r.optDelta,
         swapNear: r.swapNear,
+        modelTarget: r.cash_threshold,
         modelTrough: r.lp_peak_cash,
         modelCycleNet: r.cash_after_payins,
         modelCycleEnd: r.cycleEndCash,
@@ -3112,13 +3140,15 @@ export function UnifiedSimulator({
         const fwdNotionalRes = spotRate ? resolved.values.fwdHedgeUSD / spotRate : 0;
         const optEffectiveRes = spotRate ? resolved.values.optionHedgeUSD / spotRate : 0;
         residualFx = r.netFxForecast + r.swapNear + fwdNotionalRes + optEffectiveRes;
-        hedgeCarryUsdYr = fwdHedgeCarryUsdYr(fwdNotionalRes, r.ccy, r.r_FCY, shared.r_USD)
-          + fwdHedgeCarryUsdYr(optEffectiveRes, r.ccy, r.r_FCY, shared.r_USD);
+        const cipDelta = r.optDelta;
+        const standing = swapFarLegNotional(r.liquidityPlan, r.swapNear);
+        hedgeCarryUsdYr = fwdHedgeCarryUsdYr(fwdNotionalRes === 0 ? 0 : fwdNotionalRes + r.swapNear, r.ccy, r.r_FCY, shared.r_USD)
+          + fundingSwapCipPointsUsdYr(standing, spotRate, r.r_FCY, shared.r_USD) * cipDelta;
       }
       map[r.ccy] = { values: resolved.values, errors: resolved.errors, residualFx, hedgeCarryUsdYr };
     }
     return map;
-  }, [computedWithHedge, formulas, shared.r_USD]);
+  }, [computedWithHedge, formulas, shared.r_USD, strategy]);
 
   // Total annual USD carry = unfunded cash + funding-swap O/N + staged (or strategy) hedge.
   const pnlCashCarryTotal = useMemo(
@@ -3128,11 +3158,10 @@ export function UnifiedSimulator({
     [computedWithHedge, stagedCashCarryByCcyUsdM, usdComputedRow.floatNim],
   );
   const pnlHedgeCarryTotal = useMemo(
-    () => computedWithHedge.reduce((s, r) => {
-      const strat = resolvedRows[r.ccy]?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr;
-      return s + pnlHedgeCarryUsdM(r.ccy, strat, stagedHedgeCarryByCcyUsdM);
-    }, 0),
-    [computedWithHedge, resolvedRows, stagedHedgeCarryByCcyUsdM],
+    () => computedWithHedge.reduce((s, r) => (
+      s + pnlHedgeCarryUsdM(r.ccy, stagedHedgeCarryByCcyUsdM)
+    ), 0),
+    [computedWithHedge, stagedHedgeCarryByCcyUsdM],
   );
   const totalCarryUsd = pnlCashCarryTotal + swapCarryTotal + pnlHedgeCarryTotal;
 
@@ -4994,7 +5023,9 @@ export function UnifiedSimulator({
             title="Carry target inputs"
             subtitle="steer the carry leg on the rate, the cash target, or the P&L target"
             readout={`r_USD ${f2(shared.r_USD)}% · ${carryHorizon}m ${usdK(carryTotals.horizon)}`}
-            footnote="Setup for the carry layer — figures show what this layer holds, which reaches the book once the layer is on · accrual on the time-weighted post-swap balance with flows mid-cycle · ACT/360 or ACT/365 per currency · carry vs USD = (r_FCY − r_USD), the leg the VAR budget is charged on · targets still clamp to floors and the portfolio VAR cap"
+            footnote={carryLive
+              ? 'Setup for the carry layer — a positive P&L ask on a PAY currency shorts FCY (sell near), which prints negative CIP points in FX Hedge Carry. Accrual on the time-weighted post-swap balance with flows mid-cycle · ACT/360 or ACT/365 per currency · carry vs USD = (r_FCY − r_USD). Targets still clamp to floors and the portfolio VAR cap'
+              : 'Preview only until you commit a cash or P&L target — that turns this layer on so Target LP Cash, Swap Near and CIP points land in the main table. A positive P&L ask on a PAY currency shorts FCY and prints negative CIP in FX Hedge Carry'}
             simDark={simDark}
             size="lg"
             onClose={() => setLayerPanel(null)}
@@ -5120,6 +5151,7 @@ export function UnifiedSimulator({
                                     }))
                                   }
                                   onBlur={e => commitCarryCash(r.id, e.target.value)}
+                                  onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
                                   title="Target LP Cash to hold (M FCY) — blank hands the leg back to z_opt"
                                   className={carryIn}
                                 />
@@ -5163,6 +5195,7 @@ export function UnifiedSimulator({
                                   }))
                                 }
                                 onBlur={e => commitCarryPnl(r, c.periods[0], e.target.value)}
+                                onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
                                 title="Carry vs USD to earn over the near period ($k) — solves back to the cash target"
                                 className={`${carryIn} ${note ? 'border-amber-400 bg-amber-50' : ''}`}
                               />
@@ -5513,7 +5546,7 @@ export function UnifiedSimulator({
               )}
 
               {showFxHedge && (
-              <th className={bandHeadCls('hedge')} data-band="hedge" colSpan={5}>
+              <th className={bandHeadCls('hedge')} data-band="hedge" colSpan={6}>
                 FX HEDGE
 
                 {strategy === 'SWAP_ONLY' && (
@@ -5762,11 +5795,12 @@ export function UnifiedSimulator({
               </>)}
 
               {showFxHedge && (<>
-              {/* FX HEDGE ×5 — all figures in $USD M */}
+              {/* FX HEDGE ×6 — notionals in $USD M; CIP / hedge carry in $k */}
               <th className={`${thBase} bg-rose-50 border-l-2 border-rose-400 min-w-[72px]`} title="Outright forward notional in $USD M (− = sell FCY fwd). Sized on Net FX Forecast + funding-swap near (hedging/funding layer).">Fwd Hedge $USD</th>
               <th className={`${thBase} bg-rose-50 min-w-[84px]`} title="SHORT option — delta-effective option hedge = δ × written notional; the written notional is matched 1:1 to the forward at all deltas, so the displayed amount = δ × Fwd Hedge $USD (δ 1 = full forward, δ 0.5 = half, δ → 0 = nothing). PAY carry: sell CALL (exercise: sell USD, buy LCY); EARN carry: sell PUT (exercise: buy USD, sell LCY). Amount in $USD M">Option Hedge $USD</th>
-              <th className={`${thBase} bg-rose-50 min-w-[44px] text-center`} title="Option delta — ATM ≈ 0.5. The written notional stays matched 1:1 to the forward at all deltas; δ scales only the delta-effective hedge shown in the Option column (= δ × notional), linear from the full forward at δ = 1 down to zero at δ = 0">Δ</th>
-              <th className={`${thBase} bg-rose-100 min-w-[76px]`} title="Fwd points + option δ-leg delivery points, $k. Gross premium harvested is shown in the cell tooltip for reference only — at fair value it offsets the expected exercise cost, so it is EXCLUDED from carry">Hedge Carry $k</th>
+              <th className={`${thBase} bg-rose-50 min-w-[44px] text-center`} title="δ (0–1) scales CIP P&L. δ = 0: no CIP harvest. δ ≠ 0: CIP × δ (carry-efficient). On Swap+Fwd+Option the same δ also opens residual FX / greeks.">Δ</th>
+              <th className={`${thBase} bg-rose-100 min-w-[72px]`} title="CIP P&L = funding-swap far-leg points × δ ($k/yr). Sell PAY FCY (EUR) → negative. Sweep Δ to see the carry vs residual trade-off.">CIP $k</th>
+              <th className={`${thBase} bg-rose-100 min-w-[76px]`} title="Locked FX-structure carry: CIP far-leg + outright fwd points ($k). A short option is not assumed exercised — its delivery-leg carry is contingent (tooltip), not in this number.">Hedge Carry $k</th>
               <th className={`${thBase} bg-rose-100 min-w-[76px]`} title="Net FX Forecast + funding-swap near + total hedge (Fwd + δ × Option) — what stays open, in $USD M">Residual FX $USD</th>
               </>)}
 
@@ -5810,19 +5844,19 @@ export function UnifiedSimulator({
               </th>
               <th
                 className={`${thBase} bg-purple-50 min-w-[76px]`}
-                title="Funding-swap overlay: FCY O/N (OD saved when covering / credit forgone when deploying) + USD O/N (credit missed on USD sold to buy FCY near) + CIP mid points. Covering a short does not CIP-net to 0 — leftover is r_OD − r_FCY. $k."
+                title="Funding-swap cash Δr vs USD on the standing book (FCY O/N vs USD O/N). CIP far-leg points sit in FX HEDGE CIP / Hedge Carry, scaled by δ. $k."
               >
                 Swap Carry $k
               </th>
               <th
                 className={`${thBase} bg-purple-50 min-w-[76px]`}
-                title="Staged / Decision FX-hedge FWD-points carry — same $k as Hedging Decision Carry. Expand the CCY row for the month path."
+                title="Predetermined cash impact of booked/staged forwards (Decision FWD pts). CIP and option expected delivery sit in FX HEDGE — a short option does not lock that carry."
               >
-                Hedge Carry $k
+                Hedge Cash $k
               </th>
               <th
                 className={`${thBase} bg-purple-100 min-w-[80px]`}
-                title="Cash Carry + Swap Carry + staged Hedge Carry ($k)"
+                title="Cash Carry + Swap Carry + Hedge Cash (staged FWD pts only) ($k)"
               >
                 Total Carry $k
               </th>
@@ -5847,11 +5881,8 @@ export function UnifiedSimulator({
                 r.floatNim,
                 stagedCashCarryByCcyUsdM,
               );
-              const hedgeCarry = pnlHedgeCarryUsdM(
-                r.ccy,
-                R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr,
-                stagedHedgeCarryByCcyUsdM,
-              );
+              const hedgeCarry = pnlHedgeCarryUsdM(r.ccy, stagedHedgeCarryByCcyUsdM);
+              const fxHedgeCarry = R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr;
               const swapCarry = pnlSwapCarryUsdM(r, shared.r_USD);
               const pnlTotalCarry = cashCarry + swapCarry + hedgeCarry;
               const residual = R?.residualFx ?? r.residualFx;
@@ -6294,7 +6325,7 @@ export function UnifiedSimulator({
                   tdClass={`${tdBase} bg-amber-50 font-semibold text-amber-900`}
                   display={<>{f2(fv('targetLpCash'))}{r.funding_binding && <span className="ml-0.5 text-xs text-red-600" title="USD funding bind — target trimmed">⛓</span>}</>}
                   formula={fFormula('targetLpCash')} defaultFormula={SIM_FIELD_BY_KEY.targetLpCash.defaultFormula}
-                  onCommit={fCommit('targetLpCash')} error={fErr('targetLpCash')} title="Target LP Cash = Opening LP + Swap"
+                  onCommit={fCommit('targetLpCash')} error={fErr('targetLpCash')} title="Target LP Cash — layer / carry-target H* (not Opening + today's M1 swap)"
                   columnKey="targetLpCash" rowKey={r.ccy} />
                 <FormulaCell
                   tdClass={`${tdBase} bg-amber-100 font-semibold ${clr(fv('targetLpCashUSD'))}`}
@@ -6382,12 +6413,9 @@ export function UnifiedSimulator({
                   title="Option Hedge $USD — δ × option notional × spot"
                   columnKey="optionHedgeUSD" rowKey={r.ccy} />
                 <td className={`${tdBase} bg-rose-50 text-center`}
-                  title={strategy !== 'SWAP_FWD_OPT'
-                    ? 'Option delta — select "Swap + Fwd + Option" strategy above to activate the written option'
-                    : 'Option delta (ATM ≈ 0.5) — editable regardless of current forward size; takes effect once this row has a non-zero forecast to hedge'}>
+                  title="δ (0–1) scales CIP P&L in this band. δ = 0 → no CIP harvest. δ ≠ 0 → CIP × δ (carry-efficient) and, on Swap+Fwd+Option, residual FX / greeks open.">
                     <CellInput
                       type="text" inputMode="decimal"
-                    disabled={strategy !== 'SWAP_FWD_OPT'}
                     value={drafts[`${r.id}.hedgeDelta`] ?? n((hedgeDeltas[r.id] ?? 0.5))}
                       onChange={e => {
                         setDrafts(prev => ({ ...prev, [`${r.id}.hedgeDelta`]: e.target.value }));
@@ -6395,14 +6423,18 @@ export function UnifiedSimulator({
                         if (!isNaN(v) && v >= 0 && v <= 1) setHedgeDeltas(prev => ({ ...prev, [r.id]: v }));
                       }}
                       onBlur={() => setDrafts(prev => { const next = { ...prev }; delete next[`${r.id}.hedgeDelta`]; return next; })}
-                    locked={lockValues} className={`${inBase} w-[36px] font-medium ${
-                      strategy !== 'SWAP_FWD_OPT' ? 'text-gray-300 cursor-not-allowed' : 'text-rose-700'
-                    }`}
+                    locked={lockValues} className={`${inBase} w-[36px] font-medium text-rose-700`}
                     />
                 </td>
-                <td className={`${tdBase} bg-rose-100 font-medium ${carryTone(hedgeCarry)}`}
-                  title={`Fwd points ${usdCarry(r.fwdCarryUsdYr)} + option δ-leg points ${usdCarry(r.optCarryUsdYr)} = ${usdCarry(hedgeCarry)}. Gross premium harvested ${usdCarry(r.optPremiumUsdYr)} shown for reference — excluded from carry (offsets expected exercise cost at fair value)`}>
-                  {usdCarry(hedgeCarry)}
+                <td
+                  className={`${tdBase} bg-rose-100 font-semibold ${carryTone(r.cipCarryUsdYr)}`}
+                  title={`CIP P&L = far-leg points × δ ${n((hedgeDeltas[r.id] ?? 0.5))}. Standing ${f2(swapFarLegNotional(r.liquidityPlan, r.swapNear))} M ${r.ccy}. Sell PAY FCY (EUR) → negative. ${usdCarry(r.cipCarryUsdYr)}.`}
+                >
+                  {usdCarry(r.cipCarryUsdYr)}
+                </td>
+                <td className={`${tdBase} bg-rose-100 font-medium ${carryTone(fxHedgeCarry)}`}
+                  title={`Locked structure: fwd points ${usdCarry(r.fwdCarryUsdYr)} + CIP ${usdCarry(r.cipCarryUsdYr)} = ${usdCarry(fxHedgeCarry)}. Option delivery ${usdCarry(r.optCarryUsdYr)} is contingent (strike may not print) — not in this number. Gross premium ${usdCarry(r.optPremiumUsdYr)} is tooltip-only.`}>
+                  {usdCarry(fxHedgeCarry)}
                 </td>
                 <td className={`${tdBase} bg-rose-100 font-medium ${
                   Math.abs(residual) < 0.005 ? 'text-green-700' : clr(residual)
@@ -6480,15 +6512,15 @@ export function UnifiedSimulator({
                   {usdCarry(cashCarry)}
                 </td>
                 <td className={`${tdBase} bg-purple-50 font-medium ${carryTone(swapCarry)}`}
-                  title={`Σ M1…MT funding-swap overlay on standing book (each month = annual overlay / 12). M1 can be 0 when the first cover lands later. FCY O/N · USD credit missed · CIP points.`}>
+                  title={`Cash Δr vs USD on the standing swap (no CIP points). Path Σ of monthly. ${usdCarry(swapCarry)}.`}>
                   {usdCarry(swapCarry)}
                 </td>
                 <td
                   className={`${tdBase} bg-purple-50 font-medium ${carryTone(hedgeCarry)}`}
                   title={
                     stagedHedgeCarryByCcyUsdM[r.ccy] !== undefined
-                      ? `Staged FX-hedge FWD-points carry — same $k as Hedging Decision Carry for ${r.ccy}`
-                      : 'FX hedge carry (USD) — table strategy overlay (no staged package)'
+                      ? `Predetermined cash impact of staged/booked forwards for ${r.ccy} — Decision FWD pts. CIP and option expected delivery are in FX HEDGE.`
+                      : 'No staged forward — predetermined hedge cash is 0. FX structure carry (CIP + locked fwd) is in FX HEDGE.'
                   }
                 >
                   {usdCarry(hedgeCarry)}
@@ -6499,7 +6531,7 @@ export function UnifiedSimulator({
                       ? 'text-gray-300'
                       : pnlTotalCarry >= 0 ? 'text-emerald-700' : 'text-red-600'
                   }`}
-                  title="Cash Carry + Swap Carry + Hedge Carry (staged FWD pts when a package is staged)"
+                  title="Cash Carry + Swap Carry + Hedge Cash (staged FWD pts only)"
                 >
                   {usdCarry(pnlTotalCarry)}
                 </td>
@@ -6518,6 +6550,12 @@ export function UnifiedSimulator({
                 const book = liquidityBookCycle(p, shape);
                 const binds = p.cycleIndex === (r.sizingCycleIndex ?? r.troughCycleIndex ?? 0);
                 const cycleHedge = p.hedgeSettle ?? 0;
+                const cycleCip = fundingSwapCipPointsUsdYr(
+                  p.standing_swap,
+                  CURRENCY_PARAMS[r.ccy]?.spot ?? 1,
+                  r.r_FCY,
+                  shared.r_USD,
+                ) / 12 * (hedgeDeltas[r.id] ?? 0.5);
                 return (
                   <tr key={`${r.id}·M${p.cycleIndex + 1}`} className="border-b border-gray-100">
                     <td className="sticky left-0 z-20 bg-white px-1.5 py-0.5 shadow-[2px_0_4px_-2px_rgba(0,0,0,0.08)]">
@@ -6634,7 +6672,7 @@ export function UnifiedSimulator({
                       title={
                         `This cycle's own leg ${f2(p.swap_needed)} · swap outstanding after it`
                         + ` ${f2(p.standing_swap)} (legs roll, they do not run off).`
-                        + (binds ? '' : ` The row above books ${f2(r.swapNear)} — the leg the H* cycle needs.`)
+                        + (binds ? '' : ` The row above books today's M1 near ${f2(r.swapNear)}.`)
                       }
                     >
                       {Math.abs(p.swap_needed) > 0.001 ? f2(p.swap_needed) : '—'}
@@ -6664,17 +6702,26 @@ export function UnifiedSimulator({
                     <td className={`${cycleTd} bg-emerald-100`} />
                     </>)}
 
-                    {showFxHedge && <td colSpan={5} className="bg-rose-50 border-l-2 border-rose-400" />}
+                    {showFxHedge && (<>
+                    <td className="bg-rose-50 border-l-2 border-rose-400" />
+                    <td className="bg-rose-50" />
+                    <td className="bg-rose-50" />
+                    <td
+                      className={`${cycleTd} bg-rose-100 font-medium ${carryTone(cycleCip)}`}
+                      title={`M${p.cycleIndex + 1} CIP P&L on standing ${f2(p.standing_swap)} × δ ${n((hedgeDeltas[r.id] ?? 0.5))} = ${usdCarry(cycleCip)}.`}
+                    >
+                      {usdCarry(cycleCip)}
+                    </td>
+                    <td className="bg-rose-100" />
+                    <td className="bg-rose-100" />
+                    </>)}
                     {showRiskMetrics && (
                       <td colSpan={riskMetricCols} className="bg-violet-50 border-l-2 border-violet-400" />
                     )}
                     {showPnl && (() => {
                       const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 1;
-                      const overlay = fundingSwapOverlayUsdYr(
-                        p.standing_swap, spot, r.r_FCY, shared.r_USD, r.r_OD,
-                      );
                       const swapNet = fundingSwapMonthCarryUsdM(
-                        p.standing_swap, spot, r.r_FCY, shared.r_USD, r.r_OD,
+                        p.standing_swap, spot, r.r_FCY, shared.r_USD, r.r_OD, 'cashDelta',
                       );
                       const monthCarry = stagedCarryByMonthByCcyUsdM[r.ccy]?.[p.cycleIndex];
                       const hasMonth = monthCarry != null;
@@ -6682,6 +6729,9 @@ export function UnifiedSimulator({
                       const monthCash = hasMonth ? monthCarry.cashUsdM : (m1 ? cashCarry : null);
                       const monthHedge = hasMonth ? monthCarry.fwdUsdM : (m1 ? hedgeCarry : null);
                       const monthTotal = (monthCash ?? 0) + swapNet + (monthHedge ?? 0);
+                      const cashDeltaYr = fundingSwapCashDeltaUsdYr(
+                        p.standing_swap, spot, r.r_FCY, shared.r_USD, r.r_OD,
+                      );
                       return (
                         <>
                           {!pnlCarryOnly && (
@@ -6707,7 +6757,7 @@ export function UnifiedSimulator({
                           </td>
                           <td
                             className={`${cycleTd} bg-purple-50 ${carryTone(swapNet)}`}
-                            title={`M${p.cycleIndex + 1} overlay on standing ${f2(p.standing_swap)} (month = annual overlay / 12). FCY O/N ${usdCarry(overlay.fcyOnUsdYr / 12)} · USD O/N ${usdCarry(overlay.usdOnUsdYr / 12)} · points ${usdCarry(overlay.pointsUsdYr / 12)}. Net ${usdCarry(swapNet)}.`}
+                            title={`M${p.cycleIndex + 1} cash Δr vs USD on standing ${f2(p.standing_swap)} = ${usdCarry(cashDeltaYr / 12)} (CIP points are in FX Hedge Carry × δ).`}
                           >
                             {usdCarry(swapNet)}
                           </td>
@@ -6717,10 +6767,10 @@ export function UnifiedSimulator({
                             }`}
                             title={
                               hasMonth
-                                ? `M${p.cycleIndex + 1} FWD-points accrual — Cash Carry forecast`
+                                ? `M${p.cycleIndex + 1} predetermined FWD-points cash — Cash Carry forecast`
                                 : m1
-                                  ? 'Staged FX-hedge FWD-points carry — path total, shown on M1'
-                                  : 'Hedge Carry is a path total, shown on M1'
+                                  ? 'Hedge Cash is staged FWD pts — path total, shown on M1'
+                                  : 'Hedge Cash is a path total, shown on M1'
                             }
                           >
                             {monthHedge == null ? '—' : usdCarry(monthHedge)}
@@ -6733,10 +6783,10 @@ export function UnifiedSimulator({
                             }`}
                             title={
                               hasMonth
-                                ? `M${p.cycleIndex + 1} Cash + Swap + Hedge Carry`
+                                ? `M${p.cycleIndex + 1} Cash + Swap + Hedge Cash`
                                 : m1
-                                  ? 'Cash + Swap + Hedge Carry — path total on M1 plus this month’s swap overlay'
-                                  : 'This month’s Swap Carry (Cash / Hedge are path totals on M1)'
+                                  ? 'Cash + Swap + Hedge Cash — path total on M1 plus this month’s swap overlay'
+                                  : 'This month’s Swap Carry (Cash / Hedge Cash are path totals on M1)'
                             }
                           >
                             {usdCarry(monthTotal)}
@@ -6999,6 +7049,8 @@ export function UnifiedSimulator({
                 {Math.abs(hedgeTotals.optUSD) < 0.005 ? '—' : fmtSwapUsd(-hedgeTotals.optUSD)}
               </td>
               <td className={`${tdBase} bg-rose-50 text-center text-gray-400`}>—</td>
+              <td className={`${tdBase} bg-rose-100 text-gray-400 text-xs`}
+                title="CIP P&L sits on each FCY far leg — USD is the funding offset">—</td>
               <td className={`${tdBase} bg-rose-100 font-bold ${carryTone(hedgeTotals.hedgeCarryUsdYr)}`}>
                 {usdCarry(hedgeTotals.hedgeCarryUsdYr)}
               </td>
@@ -7134,7 +7186,7 @@ export function UnifiedSimulator({
               </>)}
 
               {showFxHedge && (<>
-              {/* FX HEDGE totals — 5 cols: fwd, option, δ, hedge carry, residual */}
+              {/* FX HEDGE totals — 6 cols: fwd, option, δ, CIP, hedge carry, residual */}
               <td className={`${tdBase} bg-rose-50 border-l-2 border-rose-400 font-bold ${Math.abs(hedgeTotals.fwdUSD) < 0.005 ? 'text-gray-400 text-xs font-normal' : clr(hedgeTotals.fwdUSD)}`}
                 title="Σ forward notionals in $USD across all FCY rows">
                 {Math.abs(hedgeTotals.fwdUSD) < 0.005 ? '—' : fmtSwapUsd(hedgeTotals.fwdUSD)}
@@ -7143,9 +7195,13 @@ export function UnifiedSimulator({
                 title="Σ delta-effective option hedges (δ × written notional) in $USD across all FCY rows">
                 {Math.abs(hedgeTotals.optUSD) < 0.005 ? '—' : fmtSwapUsd(hedgeTotals.optUSD)}
               </td>
-              <td className={`${tdBase} bg-rose-50 text-gray-400 text-xs`}>—</td>
+              <td className={`${tdBase} bg-rose-50 text-center text-gray-400`}>—</td>
+              <td className={`${tdBase} bg-rose-100 font-bold ${carryTone(hedgeTotals.cipUsdYr)}`}
+                title="Σ CIP P&L across FCY rows ($k) — far-leg points × δ">
+                {usdCarry(hedgeTotals.cipUsdYr)}
+              </td>
               <td className={`${tdBase} bg-rose-100 font-bold ${carryTone(hedgeTotals.hedgeCarryUsdYr)}`}
-                title="Σ FX hedge carry across all rows ($k): fwd points + option δ-leg delivery points; gross option premium excluded (offsets expected exercise cost at fair value)">
+                title="Σ FX structure carry ($k): locked CIP + outright fwd points. Option delivery is contingent — not in this number.">
                 {usdCarry(hedgeTotals.hedgeCarryUsdYr)}
               </td>
               <td className={`${tdBase} bg-rose-100 font-bold ${Math.abs(hedgeTotals.residUSD) < 0.005 ? 'text-green-700' : clr(hedgeTotals.residUSD)}`}
@@ -7208,11 +7264,12 @@ export function UnifiedSimulator({
                 {usdCarry(pnlCashCarryTotal)}
               </td>
               <td className={`${tdBase} bg-purple-50 font-bold ${carryTone(swapCarryTotal)}`}
-                title="Σ path Swap Carry (monthly overlay on each cycle's standing book). M1 can be 0 when the first cover lands later. Covering shorts keep r_OD − r_FCY; deploying surplus CIP-nets to 0.">
+                title="Σ Swap Carry: cash Δr vs USD on the standing book. CIP far-leg points sit in FX HEDGE, scaled by δ."
+              >
                 {usdCarry(swapCarryTotal)}
               </td>
               <td className={`${tdBase} bg-purple-50 font-bold ${carryTone(pnlHedgeCarryTotal)}`}
-                title="Σ staged FX-hedge FWD-points carry (Hedging Decision Carry); table strategy if no package is staged">
+                title="Σ predetermined hedge cash — staged Decision FWD pts only. CIP / option expected delivery are in FX HEDGE.">
                 {usdCarry(pnlHedgeCarryTotal)}
               </td>
               <td className={`${tdBase} bg-purple-100 font-bold border border-purple-200 ${
@@ -7220,7 +7277,7 @@ export function UnifiedSimulator({
                   ? 'text-gray-300'
                   : totalCarryUsd >= 0 ? 'text-emerald-700' : 'text-red-600'
               }`}
-                title="Cash Carry + Swap Carry + staged Hedge Carry">
+                title="Cash Carry + Swap Carry + Hedge Cash (staged FWD pts only)">
                 {usdCarry(totalCarryUsd)}
               </td>
               </>)}

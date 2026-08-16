@@ -6,7 +6,7 @@
  * Otherwise square off fully on spot or forward.
  */
 
-import { fcyToUsdM } from './fx-buffer';
+import { fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
 
 export type HedgeMode = 'AUTO' | 'SPOT' | 'FWD' | 'OPTION' | 'NONE';
 export type ActiveHedgeMode = Exclude<HedgeMode, 'AUTO'>;
@@ -424,6 +424,11 @@ export interface StrategyHedgeInput {
    * cancel the near out of this basis.
    */
   swapNear?: number;
+  /**
+   * Outstanding book the far leg is on (M FCY). CIP points accrue here.
+   * Defaults to `swapNear` when the path has not split M1 from later legs.
+   */
+  swapStanding?: number;
   optDelta: number;
   horizonDays: number;
   r_FCY: number;
@@ -452,6 +457,17 @@ export interface StrategyHedgeResult {
    *  only; at fair value it offsets the expected exercise cost, so it is NOT
    *  part of hedgeCarryUsdYr. */
   optPremiumUsdYr: number;
+  /**
+   * Funding-swap CIP points booked here, scaled by δ.
+   * δ = 0 → none (delta-neutral, no extra greeks).
+   * δ ≠ 0 → harvest the points as hedge carry; residual FX / greeks open with δ.
+   */
+  cipCarryUsdYr: number;
+  /**
+   * Locked FX-structure carry: CIP + outright fwd points.
+   * Option delivery-leg points stay in `optCarryUsdYr` — a short option is
+   * not assumed exercised at strike, so that leg is contingent, not P&L.
+   */
   hedgeCarryUsdYr: number;
 }
 
@@ -533,12 +549,22 @@ export function resolveStrategyHedge(
   // floor of 0.05 to avoid degenerate pricing on the written notional.
   const optionDelta = Math.min(1, Math.max(inp.optDelta, 0));
   const carryDelta = Math.min(1, Math.max(inp.optDelta, 0.05));
+  const swapNear = inp.swapNear ?? 0;
+  const swapStanding = inp.swapStanding ?? swapNear;
+  // δ scales CIP P&L on every strategy. On SWAP_FWD_OPT the same δ also
+  // opens the option residual / greeks. δ = 0 → no CIP harvest.
+  const cipDelta = optionDelta;
 
-  const fwdCarryUsdYr = fwdHedgeCarryUsdYr(fwdNotional, inp.ccy, inp.r_FCY, inp.r_USD);
-  // Fair-value option carry: ONLY the δ-weighted delivery-leg forward points.
-  // The premium harvested ≈ expected exercise cost (a fairly-priced short
-  // option has expected P&L ≈ 0), so premium is reported separately as gross
-  // income and NEVER added to carry.
+  const fwdCarryUsdYr = fwdHedgeCarryUsdYr(
+    fwdNotional === 0 ? 0 : fwdNotional + swapNear,
+    inp.ccy, inp.r_FCY, inp.r_USD,
+  );
+  const cipCarryUsdYr = fundingSwapCipPointsUsdYr(
+    swapStanding, fcyToUsdM(1, inp.ccy), inp.r_FCY, inp.r_USD,
+  ) * cipDelta;
+  // Fair-value option overlay is CONTINGENT: you do not necessarily exercise
+  // at strike, so delivery-leg points are reported on `optCarryUsdYr` and
+  // never booked into locked structure carry. Premium is informational only.
   const shortOpt = shortOptionCarryUsdYr(
     optNotional, carryDelta, inp.horizonDays, inp.ccy, inp.r_FCY, inp.r_USD, inp.σ_daily,
   );
@@ -559,7 +585,8 @@ export function resolveStrategyHedge(
     fwdCarryUsdYr,
     optCarryUsdYr,
     optPremiumUsdYr: shortOpt.premiumEarnedUsdYr,
-    hedgeCarryUsdYr: fwdCarryUsdYr + optCarryUsdYr,
+    cipCarryUsdYr,
+    hedgeCarryUsdYr: fwdCarryUsdYr + cipCarryUsdYr,
   };
 }
 

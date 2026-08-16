@@ -988,16 +988,22 @@ describe('sizing basis picks which funded cycle H* and the swap fund', () => {
     expect(worst.lp_peak_cash).toBeLessThan(near.lp_peak_cash);
     expect(worst.troughCycleIndex).toBeGreaterThan(0);
     expect(worst.nearCycleTrough).toBeCloseTo(near.lp_peak_cash, 8);
-    expect(worst.swapNear).toBeGreaterThan(near.swapNear);
+    // Collapsed Swap Near is M1 book-now on both bases; the horizon's extra cover
+    // is the H* increment against the deeper trough, not a bigger M1 cell.
+    const hStarInc = (g: typeof worst) =>
+      g.cash_threshold_pre_swap - (g.liquidityPlan![g.sizingCycleIndex ?? 0]!.forecasted_cash);
+    expect(hStarInc(worst)).toBeGreaterThan(hStarInc(near));
     // Funded to the cushion at that deepest point, not merely to zero.
     expect(worst.lp_after_swap_trough!).toBeCloseTo(worst.cash_threshold_pre_swap, 8);
   });
 
   it('settles at the standing leg the structural drain needs', () => {
     const worst = gbpFor('horizon');
-    // −30 a cycle has to be replaced every cycle: the rolling near leg is 30,
-    // not the cumulative burn an unfunded path would report.
-    expect(worst.swapNear).toBeCloseTo(30, 6);
+    const plan = worst.liquidityPlan!;
+    // Collapsed Swap Near is today's M1 trade, not the H* cycle's incremental.
+    expect(worst.swapNear).toBeCloseTo(plan[0]!.swap_needed, 6);
+    // −30 a cycle has to be replaced every cycle on the rolling book.
+    expect(plan[plan.length - 1]!.swap_needed).toBeCloseTo(30, 6);
   });
 
   it('does not grow the swap with the horizon once the path has settled', () => {

@@ -4,6 +4,8 @@ import {
   fundingSwapOverlayUsdYr,
   fundingSwapMonthCarryUsdM,
   fundingSwapPathCarryUsdM,
+  fundingSwapCashDeltaUsdYr,
+  fundingSwapCarryViewFor,
   makeSimRow,
   usdToFcyM,
   type LayerId,
@@ -83,6 +85,24 @@ describe('fundingSwapOverlayUsdYr', () => {
     expect(path).toBeCloseTo(later * 2, 12);
     expect(Math.abs(path ?? 0)).toBeGreaterThan(0);
   });
+
+  it('cashDelta Swap Carry is Δr on the book — CIP-zero deploy still has P&L', () => {
+    const spot = 1.1701;
+    const N = -40;
+    const cip = fundingSwapOverlayUsdYr(N, spot, 1.78, 3.50, 2.21);
+    expect(cip.netUsdYr).toBeCloseTo(0, 12);
+    const cash = fundingSwapCashDeltaUsdYr(N, spot, 1.78, 3.50, 2.21);
+    expect(cash).toBeCloseTo(N * ((2.21 - 3.50) / 100) * spot, 12);
+    expect(Math.abs(cash)).toBeGreaterThan(0.01);
+    const month = fundingSwapMonthCarryUsdM(N, spot, 1.78, 3.50, 2.21, 'cashDelta');
+    expect(month).toBeCloseTo(cash / 12, 12);
+  });
+
+  it('selects cashDelta only while a carry target is live on the carry layer', () => {
+    expect(fundingSwapCarryViewFor(0.462, true)).toBe('cashDelta');
+    expect(fundingSwapCarryViewFor(0.462, false)).toBe('cip');
+    expect(fundingSwapCarryViewFor(undefined, true)).toBe('cip');
+  });
 });
 
 describe('computeLayeredBuffer CFaR cover', () => {
@@ -116,10 +136,10 @@ describe('CFaR cover layer on the desk', () => {
     expect(on.floatNim).toBeCloseTo(off.floatNim, 8);
     expect(on.swapNear).toBeCloseTo(off.swapNear + coverFcy, 4);
     const spot = CURRENCY_PARAMS.EUR?.spot ?? 1.1701;
-    expect(on.swapCarryUsdYr).toBeCloseTo(
-      on.swapNear * ((EUR.r_OD - EUR.r_FCY) / 100) * spot,
-      6,
-    );
+    const cash = on.swapNear * ((
+      on.swapNear < 0 ? EUR.r_OD : EUR.r_FCY
+    ) - 3.50) / 100 * spot;
+    expect(on.swapCarryUsdYr).toBeCloseTo(cash, 6);
     expect(on.swapOnUsdYr + on.swapPointsUsdYr).not.toBe(0);
   });
 

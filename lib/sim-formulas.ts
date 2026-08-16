@@ -40,7 +40,8 @@ export const SIM_FIELDS: SimFieldDef[] = [
   { key: 'cycleNetFlow',  label: 'Cycle Net Flow',     section: 'liquidity', defaultFormula: 'modelCycleFlow' },
   { key: 'totalCashUSD',  label: 'Closing Balance $USD', section: 'liquidity', defaultFormula: 'totalCash * spotRate' },
   { key: 'swapNear',      label: 'Swap Near',          section: 'swap',      defaultFormula: '' },
-  { key: 'targetLpCash',  label: 'Target LP Cash',     section: 'carry',     defaultFormula: 'cash + swapNear' },
+  // Layer / carry-target H* — not `cash + swapNear`, which is LP+Swap (today's M1).
+  { key: 'targetLpCash',  label: 'Target LP Cash',     section: 'carry',     defaultFormula: 'modelTarget' },
   { key: 'targetLpCashUSD', label: 'Target LP Cash $USD', section: 'carry',  defaultFormula: 'targetLpCash * spotRate' },
   { key: 'swapUSD',       label: 'Swap $USD',          section: 'swap',      defaultFormula: 'swapNear * spotRate' },
   { key: 'lpSwap',        label: 'LP+Swap',            section: 'swap',      defaultFormula: 'cash + swapNear' },
@@ -145,6 +146,7 @@ export const AVAILABLE_REFS: { name: string; desc: string }[] = [
   { name: 'modelCycleNet',  desc: 'Model closing balance — cycle-1 close across all forecast lines, before the swap (M FCY)' },
   { name: 'modelCycleEnd',  desc: 'Model cycle-end cash — last close on the dated path after hedge settlement and the term far-leg repayment (M FCY)' },
   { name: 'modelCycleFlow', desc: 'Model cycle net flow — payins − payouts inside one cycle (M FCY)' },
+  { name: 'modelTarget',    desc: 'Model Target LP Cash — layer / carry-target H* (M FCY), not Opening + M1 swap' },
   { name: 'troughCash',     desc: 'Trough cash (resolved)' },
   { name: 'totalCash',      desc: 'Closing balance (resolved)' },
   { name: 'swapNear',       desc: 'Swap near leg (resolved)' },

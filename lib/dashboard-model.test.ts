@@ -140,19 +140,15 @@ describe('computeDashboardModel', () => {
     expect(t20).toBeLessThan(cadCarry);    // 20M: sell amplified beyond carry optimum
   });
 
-  it('CIP: deploying surplus nets to 0; covering a short keeps r_OD − r_FCY', () => {
+  it('CIP: Swap Carry is cash Δr; points are not on this line', () => {
     const m = computeDashboardModel({ ...input, policyVAR: 10 });
     for (const r of m.fcyComputed) {
       const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 0;
       expect(r.swapInterestUsdYr).toBeCloseTo(r.swapOnUsdYr + r.usdOnUsdYr, 9);
-      if (r.swapNear > 1e-6) {
-        expect(r.swapCarryUsdYr).toBeCloseTo(
-          r.swapNear * ((r.r_OD - r.r_FCY) / 100) * spot,
-          6,
-        );
-      } else {
-        expect(r.swapCarryUsdYr).toBeCloseTo(0, 9);
-      }
+      const cash = r.swapNear * ((
+        r.swapNear < 0 ? r.r_OD : r.r_FCY
+      ) - input.shared.r_USD) / 100 * spot;
+      expect(r.swapCarryUsdYr).toBeCloseTo(cash, 6);
       if (Math.abs(r.swapNear) > 0.01) {
         expect(Math.abs(r.swapInterestUsdYr)).toBeGreaterThan(0);
       }
@@ -171,16 +167,12 @@ describe('computeDashboardModel', () => {
       * (CURRENCY_PARAMS.EUR?.spot ?? 0);
     // Unfunded cash carry stays on the opening path; the swap is a separate line.
     expect(eur.floatNim).toBeCloseTo(openingNaive, 6);
-    // Overlay sits on top — CIP-zero only when deploying surplus (sell FCY).
-    if (eur.swapNear > 1e-6) {
-      const spot = CURRENCY_PARAMS.EUR?.spot ?? 0;
-      expect(eur.swapCarryUsdYr).toBeCloseTo(
-        eur.swapNear * ((eur.r_OD - eur.r_FCY) / 100) * spot,
-        6,
-      );
-    } else {
-      expect(eur.swapCarryUsdYr).toBeCloseTo(0, 9);
-    }
+    // Swap Carry is cash Δr; CIP points moved to FX hedge carry.
+    const spot = CURRENCY_PARAMS.EUR?.spot ?? 0;
+    const cash = eur.swapNear * ((
+      eur.swapNear < 0 ? eur.r_OD : eur.r_FCY
+    ) - input.shared.r_USD) / 100 * spot;
+    expect(eur.swapCarryUsdYr).toBeCloseTo(cash, 6);
   });
 
   it('per-row overlay carry sums to the aggregate portfolio figure', () => {

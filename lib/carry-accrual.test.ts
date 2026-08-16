@@ -15,6 +15,10 @@ import {
   CURRENCY_PARAMS,
   INITIAL_ROWS,
   INITIAL_USD_PARAMS,
+  fundingSwapOverlayUsdYr,
+  fundingSwapCashDeltaUsdYr,
+  fundingSwapPathCarryUsdM,
+  fundingSwapCipPointsUsdYr,
   type LayerId,
   type RowState,
 } from './fx-buffer';
@@ -182,6 +186,78 @@ describe('manual carry target drives the book', () => {
     expect(eur.cash_threshold).toBeCloseTo(eur.cash + eur.swapNear, 4);
   });
 
+  it('selling EUR to a Carry target CIP-nets Swap Carry — USD O/N + far-leg points offset FCY', () => {
+    const target = 150;
+    const rows = INITIAL_ROWS.map(r => (r.ccy === 'EUR' ? { ...r, carry_target: target } : r));
+    const eur = computeDashboardModel({
+      ...baseInput(rows),
+      forecastProfile: DEFAULT_FORECAST_PROFILE,
+    }).fcyComputed.find(r => r.ccy === 'EUR')!;
+    const spot = CURRENCY_PARAMS.EUR?.spot ?? 1.1701;
+    const n = eur.liquidityPlan?.[0]?.swap_needed ?? eur.swapNear;
+    expect(n).toBeCloseTo(eur.swapNear, 6);
+    if ((eur.sizingCycleIndex ?? 0) > 0) {
+      const hStar = eur.liquidityPlan![eur.sizingCycleIndex!]!.swap_needed;
+      expect(Math.abs(hStar - n)).toBeGreaterThan(0.01);
+    }
+    if (n < 0) {
+      const cip = fundingSwapOverlayUsdYr(n, spot, eur.r_FCY, SHARED.r_USD, eur.r_OD);
+      expect(cip.netUsdYr).toBeCloseTo(0, 8);
+      expect(cip.usdOnUsdYr).toBeGreaterThan(0);
+      expect(cip.pointsUsdYr).not.toBeCloseTo(0, 8);
+    }
+  });
+
+  it('keeps a small carry target on the collapsed row and books M1 near, not the H* increment', () => {
+    const target = 0.462;
+    const rows = INITIAL_ROWS.map(r => (
+      r.ccy === 'EUR'
+        ? { ...r, carry_target: target, payout: -40, collections: 10 }
+        : r
+    ));
+    const eur = computeDashboardModel({
+      ...baseInput(rows),
+      forecastProfile: {
+        ...DEFAULT_FORECAST_PROFILE,
+        liquidity: { ...DEFAULT_LIQUIDITY_TIMING, sizingBasis: 'horizon', granularity: 'week' },
+      },
+      shared: { ...SHARED, forecastMonths: 12 },
+    }).fcyComputed.find(r => r.ccy === 'EUR')!;
+    const m1 = eur.liquidityPlan![0]!.swap_needed;
+    const sized = eur.sizingCycleIndex ?? 0;
+    expect(sized).toBeGreaterThan(0);
+    const hStar = eur.liquidityPlan![sized]!.swap_needed;
+    // Collapsed SWAP is today's M1 trade (the −24.48), never the H* increment (the 4.44).
+    expect(eur.swapNear).toBeCloseTo(m1, 6);
+    expect(Math.abs(hStar - m1)).toBeGreaterThan(0.01);
+    // Collapsed CARRY is the 462k ask, not Opening + H* increment (which printed 0).
+    expect(eur.cash_threshold).toBeCloseTo(target, 2);
+    expect(eur.postSwapCash).toBeCloseTo(eur.cash + m1, 6);
+  });
+
+  it('prices Swap Carry as cash Δr when a carry target is on — CIP would print 0', () => {
+    const target = 0.462;
+    const rows = INITIAL_ROWS.map(r => (
+      r.ccy === 'EUR' ? { ...r, carry_target: target } : r
+    ));
+    const eur = computeDashboardModel({
+      ...baseInput(rows),
+      forecastProfile: DEFAULT_FORECAST_PROFILE,
+    }).fcyComputed.find(r => r.ccy === 'EUR')!;
+    const spot = CURRENCY_PARAMS.EUR?.spot ?? 1.1701;
+    expect(eur.swapNear).toBeLessThan(-1);
+    const cip = fundingSwapOverlayUsdYr(eur.swapNear, spot, eur.r_FCY, SHARED.r_USD, eur.r_OD);
+    expect(cip.netUsdYr).toBeCloseTo(0, 6);
+    const cash = fundingSwapCashDeltaUsdYr(eur.swapNear, spot, eur.r_FCY, SHARED.r_USD, eur.r_OD);
+    expect(Math.abs(cash)).toBeGreaterThan(0.01);
+    expect(eur.swapCarryUsdYr).toBeCloseTo(cash, 6);
+    const path = fundingSwapPathCarryUsdM(
+      eur.liquidityPlan, spot, eur.r_FCY, SHARED.r_USD, eur.r_OD, 'cashDelta',
+    );
+    expect(path).not.toBeNull();
+    expect(Math.abs(path!)).toBeGreaterThan(0.01);
+  });
+
   it('leaves every other currency untouched', () => {
     const plain = computeDashboardModel(baseInput(INITIAL_ROWS)).fcyComputed;
     const rows = INITIAL_ROWS.map(r => (r.ccy === 'EUR' ? { ...r, carry_target: 150 } : r));
@@ -246,6 +322,15 @@ describe('manual carry target drives the book', () => {
         .fcyComputed.find(r => r.ccy === 'EUR')!;
       expect(eur.cash_threshold).toBeCloseTo(short, 2);
       expect(eur.cash_threshold).toBeCloseTo(eur.cash + eur.swapNear, 4);
+      // Positive carry demand shorts PAY FCY → negative near → negative CIP points.
+      expect(eur.swapNear).toBeLessThan(0);
+      expect(eur.swapPointsUsdYr).toBeLessThan(0);
+      const farLeg = eur.liquidityPlan?.[0]?.standing_swap ?? eur.swapNear;
+      expect(farLeg).toBeLessThan(0);
+      const spot = CURRENCY_PARAMS.EUR?.spot ?? 1.1701;
+      const cip = fundingSwapCipPointsUsdYr(farLeg, spot, eur.r_FCY, SHARED.r_USD);
+      expect(cip).toBeLessThan(0);
+      expect(cip).toBeCloseTo(eur.swapPointsUsdYr, 6);
     }
   });
 
