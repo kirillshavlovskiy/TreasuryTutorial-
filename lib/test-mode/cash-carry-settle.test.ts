@@ -171,7 +171,7 @@ describe('buildSettleWamScenarios', () => {
     const m0 = rows.find(r => r.settleMonths === 0)!;
     const book = rows.find(r => r.isCurrentWam)!;
 
-    expect(m0.settleScheduleLabel).toBe('M0');
+    expect(m0.settleScheduleLabel).toBe('M0·start');
     expect(book.settleScheduleLabel).toBe('M3/M6/M9/M12');
     expect(book.fwdCarryUsdM).toBeGreaterThan(m0.fwdCarryUsdM);
     expect(book.settleScheduleLabel).toContain('M3');

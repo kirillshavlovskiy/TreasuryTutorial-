@@ -543,13 +543,12 @@ export function parseVarSetup(partial: {
     parseVarVolSource(partial.varVolSource) ?? DEFAULT_VAR_SETUP.volSource;
   const volOverrides = parseVolOverrides(partial);
   const rateVolOverrideBpYr = parseRateVolBpYr(partial.varRateVol);
-  const basis = exposureBasis === 'stock' ? 'simpleAvg' : exposureBasis;
   const averagingConvention =
     parseVarAveragingConvention(partial.varAveragingConvention) ??
     DEFAULT_VAR_SETUP.averagingConvention;
   return {
     confidencePct,
-    exposureBasis: basis,
+    exposureBasis,
     horizon,
     forecastMonths,
     forecastUncertainty1m,
