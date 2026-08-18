@@ -25,7 +25,7 @@ import {
   type ForecastProfileState,
   type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
-import type { LayerId, RowState } from '@/lib/fx-buffer';
+import type { BufferChipKey, LayerId, RowState, SharedGlobals } from '@/lib/fx-buffer';
 import {
   analyticsForwardsFromOverlays,
   retainedFundingPlanByCcy,
@@ -69,7 +69,6 @@ import {
   type StripForwardLeg,
 } from '@/lib/test-mode/rolling-hedge';
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
-import { AnalyticsHedgeSummary } from '@/components/test-mode/AnalyticsHedgeSummary';
 import { CashCarryAnalyticsView } from '@/components/test-mode/CashCarryAnalyticsView';
 import { CfarAnalysisView } from '@/components/test-mode/CfarAnalysisView';
 import { LiquidityAnalyticsView } from '@/components/test-mode/LiquidityAnalyticsView';
@@ -170,12 +169,25 @@ interface VarAnalyticsPanelProps {
   ) => void;
   /** Desk layers — Liquidity Analytics sizes counterfactuals on the same stack. */
   activeLayers?: Set<LayerId>;
+  /** Toggle the same buffer-layer stack from Liquidity Analytics. */
+  onLayerToggle?: (id: LayerId) => void;
+  /** Same desk layer-settings dialog the Liquidity tab gears open. */
+  layerPanel?: BufferChipKey | null;
+  onLayerPanelChange?: (id: BufferChipKey | null) => void;
   /** Desk-computed funded plan per CCY. Live strategy uses this strip as-is. */
   livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
   /** FX-hedge Net CFaR per CCY — sizes the CFaR cover layer on Liquidity Analytics. */
   cfarNetByCcyUsd?: Record<string, number>;
   /** Desk Swap+Fwd replacement overlays (Analytics / CFaR / Cash Carry). */
   swapForwardOverlayByCcy?: Record<string, SwapForwardOverlay>;
+  /** Desk globals — Liquidity Analytics prices the swap book on r_USD / σ_P. */
+  deskShared?: SharedGlobals;
+  /** Desk Hedge carry per CCY ($M p.a.) — reused rather than recomputed. */
+  deskHedgeCarryByCcyUsdM?: Record<string, number>;
+  /** Desk Cash Carry per CCY ($M) — staged dual-book cash when a hedge is on. */
+  deskCashCarryByCcyUsdM?: Record<string, number>;
+  /** Desk FX HEDGE CIP per CCY ($M) — already Δ-scaled. */
+  deskCipByCcyUsdM?: Record<string, number>;
 }
 
 function fmtVarK(usdM: number): string {
@@ -350,9 +362,16 @@ export function VarAnalyticsPanel({
   marketRatesByCcy = EMPTY_MARKET_RATES_BY_CCY,
   onMarketRatesByCcyChange,
   activeLayers,
+  onLayerToggle,
+  layerPanel,
+  onLayerPanelChange,
   livePlanByCcy,
   cfarNetByCcyUsd,
   swapForwardOverlayByCcy,
+  deskShared,
+  deskHedgeCarryByCcyUsdM,
+  deskCashCarryByCcyUsdM,
+  deskCipByCcyUsdM,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -1240,7 +1259,7 @@ export function VarAnalyticsPanel({
 
   /**
    * Live funding programme — same evaluator as the Liquidity tab, so the
-   * summary strip, tab-rail cost, and regime table cannot drift.
+   * tab-rail cost and regime table cannot drift.
    */
   const liveFunding = useMemo(() => {
     const timing =
@@ -1260,7 +1279,12 @@ export function VarAnalyticsPanel({
         marketRatesByCcy,
         activeLayers,
         livePlanByCcy,
+        swapForwardOverlayByCcy,
         cfarNetByCcyUsd,
+        deskShared,
+        deskHedgeCarryByCcyUsdM,
+        deskCashCarryByCcyUsdM,
+        deskCipByCcyUsdM,
       }),
     );
     return results.find(r => r.strategy.id === live.id) ?? results[0] ?? null;
@@ -1274,7 +1298,12 @@ export function VarAnalyticsPanel({
     marketRatesByCcy,
     activeLayers,
     livePlanByCcy,
+    swapForwardOverlayByCcy,
     cfarNetByCcyUsd,
+    deskShared,
+    deskHedgeCarryByCcyUsdM,
+    deskCashCarryByCcyUsdM,
+    deskCipByCcyUsdM,
   ]);
   const liquidityCostUsdYrM = liveFunding?.netCostUsdYrM ?? 0;
 
@@ -1331,18 +1360,6 @@ export function VarAnalyticsPanel({
         }
       />
 
-      {liveFunding && (
-        <AnalyticsHedgeSummary
-          regimeLabel={liveFunding.strategy.label}
-          regimeDetail={liveFunding.strategy.summary}
-          constraint={liveFunding.constraint}
-          constraintDetail={liveFunding.constraintDetail}
-          defaultCarryUsdYrM={liveFunding.cashCarryUsdYrM}
-          swapCarryUsdYrM={liveFunding.swapCarryUsdYrM}
-          finalCfarUsdM={liveFunding.finalCfarUsdM}
-        />
-      )}
-
       {perspective === 'cashCarry' ? (
         <CashCarryAnalyticsView
           risk={risk}
@@ -1384,8 +1401,17 @@ export function VarAnalyticsPanel({
           ratesScopeId={ratesScopeId}
           marketRatesByCcy={marketRatesByCcy}
           activeLayers={activeLayers}
-          livePlanByCcy={retainedLivePlanByCcy ?? livePlanByCcy}
+          onLayerToggle={onLayerToggle}
+          layerPanel={layerPanel}
+          onLayerPanelChange={onLayerPanelChange}
+          livePlanByCcy={livePlanByCcy}
+          swapForwardOverlayByCcy={swapForwardOverlayByCcy}
           cfarNetByCcyUsd={cfarNetByCcyUsd}
+          deskShared={deskShared}
+          deskHedgeCarryByCcyUsdM={deskHedgeCarryByCcyUsdM}
+          deskCashCarryByCcyUsdM={deskCashCarryByCcyUsdM}
+          deskCipByCcyUsdM={deskCipByCcyUsdM}
+          onSetupChange={onSetupChange}
         />
       ) : perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">

@@ -25,8 +25,12 @@ import {
   type UsdParams,
   type SharedGlobals,
   type LayerId,
+  type BufferChipKey,
+  FORECAST_ACCURACY_LAYERS,
+  forecastAccuracyLayerOn,
+  toggleLayerGroup,
   fundingSwapMonthCarryUsdM,
-  fundingSwapPathCarryUsdM,
+  fundingSwapCarryLegs,
   fundingSwapCashDeltaUsdYr,
   fundingSwapCipPointsUsdYr,
   fundingSwapFarSettleMonths,
@@ -40,17 +44,17 @@ import {
   type PortfolioSummary,
 } from '@/lib/dashboard-model';
 import {
-  canEarnPositiveCarry,
   carryBasisLabel,
+  pathBufferCarry,
   projectCarryLifecycle,
-  targetForCarry,
+  targetForBufferCarry,
   type CarryPeriod,
 } from '@/lib/carry-accrual';
 import {
   resolveStrategyHedge,
   allocateSwapForwardOverlay,
   clampHedgeDelta,
-  fwdHedgeCarryUsdYr,
+  fwdHedgeCarryFromMarketUsd,
   HEDGE_STRATEGIES,
   type HedgeStrategy,
   type SwapForwardOverlay,
@@ -297,6 +301,11 @@ function usdK(v: number, dust = 0.0005): string {
   return `${v < 0 ? '-' : '+'}$${Math.abs(v * 1000).toFixed(0)}k`;
 }
 
+function usdKAlways(v: number): string {
+  if (!Number.isFinite(v)) return '+$0k';
+  return `${v < 0 ? '−' : '+'}$${Math.abs(v * 1000).toFixed(0)}k`;
+}
+
 function carryTone(v: number, mutedBelow = 5e-8): string {
   if (Math.abs(v) < mutedBelow) return 'text-gray-300';
   return v >= 0 ? 'text-green-700' : 'text-red-600';
@@ -331,7 +340,11 @@ function pnlCashCarryUsdM(
   return typeof v === 'number' && Number.isFinite(v) ? v : floatNim;
 }
 
-/** P&L Swap Carry: path Σ of cash Δr on the standing book. CIP points sit in FX hedge carry. */
+/**
+ * P&L Buffer Carry: path Σ of cash Δr on the standing funding-swap book.
+ * Sized by Buffer Carry target (Target LP Cash → standing swap).
+ * CIP far-leg points sit in FX hedge carry.
+ */
 function pnlSwapCarryUsdM(
   r: {
     liquidityPlan?: { standing_swap: number }[];
@@ -342,10 +355,14 @@ function pnlSwapCarryUsdM(
   },
   r_USD: number,
 ): number {
-  const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 1;
-  return fundingSwapPathCarryUsdM(
-    r.liquidityPlan, spot, r.r_FCY, r_USD, r.r_OD, 'cashDelta',
-  ) ?? r.swapCarryUsdYr;
+  return fundingSwapCarryLegs({
+    ccy: r.ccy,
+    plan: r.liquidityPlan,
+    r_FCY: r.r_FCY,
+    r_USD,
+    r_OD: r.r_OD,
+    fallbackCashUsdM: r.swapCarryUsdYr,
+  }).cashUsdM;
 }
 
 /** Far-leg CIP from Market data swap points (term tenor or rolling 1M path). */
@@ -442,7 +459,8 @@ const groupThBase = 'px-2 py-1 text-center text-xs font-semibold tracking-wide';
  * segmented track — the two families must never read alike.
  */
 const BUFFER_LAYER_CHIPS: {
-  id: LayerId;
+  id: BufferChipKey;
+  layers: readonly LayerId[];
   label: string;
   band: string;
   hue: 'amber' | 'emerald' | 'violet' | 'sky';
@@ -450,19 +468,16 @@ const BUFFER_LAYER_CHIPS: {
   /** Gear tooltip — what the layer's own settings dialog controls. */
   settingsLabel: string;
 }[] = [
-  { id: 'floorH', label: 'Min floor', band: '→ BUFFER', hue: 'amber',
+  { id: 'floorH', layers: ['floorH'], label: 'Min floor', band: '→ BUFFER', hue: 'amber',
     hint: 'Hard minimum cash per currency',
     settingsLabel: 'Minimum liquidity buffer per currency — hard cash floor (M FCY)' },
-  { id: 'sigmaP', label: 'Payout σ buffer', band: '→ BUFFER', hue: 'amber',
-    hint: 'Safety margin on uncovered payout deficit (prefunded payout → σ = 0)',
-    settingsLabel: 'Forecast uncertainty σ — default and per-currency payout overrides' },
-  { id: 'cfarCover', label: 'CFaR cover', band: '→ BUFFER · SWAP', hue: 'sky',
-    hint: 'Fund a liquidity swap from FX-only Net CFaR (size + timing). Displayed CFaR then includes this swap\'s rate-diff bridge.',
-    settingsLabel: 'Net CFaR cover — FX-hedge cash-at-risk per currency, converted to FCY' },
-  { id: 'carryOptim', label: 'Carry target', band: '→ BUFFER · SWAP', hue: 'emerald',
-    hint: 'Rate-driven buffer shift (PAY sell / EARN buy)',
-    settingsLabel: 'Carry target inputs — overdraft rate r_OD and Δr per currency' },
-  { id: 'portfolioDiv', label: 'Portfolio VAR', band: '→ RISK', hue: 'violet',
+  { id: 'forecastAccuracy', layers: FORECAST_ACCURACY_LAYERS, label: 'Forecast accuracy', band: '→ BUFFER · SWAP', hue: 'sky',
+    hint: 'Payout-σ sizes Swap Near. FX Net CFaR is a readout, not extra FCY',
+    settingsLabel: 'Forecast accuracy — payout σ and Net CFaR cover per currency' },
+  { id: 'carryOptim', layers: ['carryOptim'], label: 'Buffer Carry target', band: '→ BUFFER · SWAP', hue: 'emerald',
+    hint: 'Steer Target LP Cash so Buffer Carry (swap cash Δr vs USD) hits the ask',
+    settingsLabel: 'Buffer Carry target — standing-swap cash Δr ask, r_OD and Δr per currency' },
+  { id: 'portfolioDiv', layers: ['portfolioDiv'], label: 'Portfolio VAR', band: '→ RISK', hue: 'violet',
     hint: 'Cross-currency rebalance with VAR / USD budget limits',
     settingsLabel: 'Portfolio VAR — notional sensitivity limit' },
 ];
@@ -1656,6 +1671,8 @@ export function UnifiedSimulator({
   onForecastProfileChange,
   forecastProfileOpen: forecastProfileOpenControlled,
   onForecastProfileOpenChange,
+  layerPanel: layerPanelControlled,
+  onLayerPanelChange,
   /** When true, portaled modals keep the `.sim-dark` skin (body portal escapes the tree). */
   simDark = false,
   formulas,
@@ -1674,6 +1691,7 @@ export function UnifiedSimulator({
   optionDeltaByCcy: optionDeltaByCcyProp,
   onOptionDeltaByCcyChange,
   onSwapForwardOverlayByCcyChange,
+  onDeskCipByCcyChange,
   marketRatesByCcy,
   ratesScopeId,
 }: {
@@ -1736,6 +1754,9 @@ export function UnifiedSimulator({
   /** Controlled open state for the Forecast profile modal (e.g. from Analytics). */
   forecastProfileOpen?: boolean;
   onForecastProfileOpenChange?: (open: boolean) => void;
+  /** Controlled buffer-layer settings dialog (Analytics gears share this). */
+  layerPanel?: BufferChipKey | null;
+  onLayerPanelChange?: (id: BufferChipKey | null) => void;
   /** Apply `.sim-dark` to body-portaled modals (Task Mode / embedded). */
   simDark?: boolean;
   /** Per-cell formula overrides keyed `${ccy}::${fieldKey}`. */
@@ -1762,6 +1783,8 @@ export function UnifiedSimulator({
   onSwapForwardOverlayByCcyChange?: (
     next: Record<string, SwapForwardOverlay>,
   ) => void;
+  /** Notify parent of the P&L CIP column ($M, already Δ-scaled). */
+  onDeskCipByCcyChange?: (next: Record<string, number>) => void;
   /** Per-CCY swap-points / deposit curves — far-leg CIP. */
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   ratesScopeId?: string | null;
@@ -2808,7 +2831,17 @@ export function UnifiedSimulator({
   );
   /** Gear next to the Min floor layer: per-currency minimum cash thresholds. */
   /** Which buffer layer's settings strip is open (one at a time). */
-  const [layerPanel, setLayerPanel] = useState<LayerId | null>(null);
+  const [layerPanelLocal, setLayerPanelLocal] = useState<BufferChipKey | null>(null);
+  const layerPanel = layerPanelControlled !== undefined
+    ? layerPanelControlled
+    : layerPanelLocal;
+  const setLayerPanel = (
+    next: BufferChipKey | null | ((p: BufferChipKey | null) => BufferChipKey | null),
+  ) => {
+    const resolved = typeof next === 'function' ? next(layerPanel) : next;
+    onLayerPanelChange?.(resolved);
+    if (layerPanelControlled === undefined) setLayerPanelLocal(resolved);
+  };
   const tableScrollRef = useRef<HTMLDivElement | null>(null);
   const [activeBand, setActiveBand] = useState<BandId>('rates');
   const [colCount, setColCount] = useState(0);
@@ -2842,7 +2875,7 @@ export function UnifiedSimulator({
 
   // ── Carry desk (carryOptim gear) ───────────────────────────────────────────
   /** Which column the desk steers on: the rate, the cash target, or the P&L target. */
-  const [carryDrive, setCarryDrive] = useState<'rate' | 'cash' | 'pnl'>('rate');
+  const [carryDrive, setCarryDrive] = useState<'rate' | 'cash' | 'pnl'>('pnl');
   /** Months of forecast lifecycle to project the target and its accrual over. */
   const [carryHorizon, setCarryHorizon] = useState(() =>
     Math.min(12, Math.max(1, forecastMonths || 1)),
@@ -2893,14 +2926,62 @@ export function UnifiedSimulator({
     }
   }, [clearCarryDrafts, setCarryTarget, ensureCarryLayer]);
 
+  const carryLive = activeLayers.has('carryOptim');
   /**
-   * Typed carry ($k for the near period) inverts into the cash target that earns
-   * it. Flows come from the projected near period, not the row, so a custom
-   * forecast profile inverts against the same numbers the projection shows.
+   * This panel is the layer's setup, so it always reads as if the layer were on.
+   * Otherwise every figure you dial in would show the plain trough back at you
+   * until the layer is switched on, and nothing here could be tuned.
+   */
+  const carryPreviewLayers = useMemo(() => {
+    if (carryLive) return activeLayers;
+    const next = new Set(activeLayers);
+    next.add('carryOptim');
+    return next;
+  }, [activeLayers, carryLive]);
+
+  /**
+   * The ask is quoted over the forecast period, not the panel's lifecycle toggle —
+   * that is the window the desk Buffer Carry column sums, so the number typed here
+   * is the number that lands there.
+   */
+  const carryAskMonths = Math.max(1, forecastMonths || 1);
+
+  /**
+   * The desk's own funded plan for a trial row, so the lifecycle prices the same
+   * standing book the Buffer Carry column reads. A bare cycle projection misses
+   * the ladder shape, the booking convention, the portfolio book-target trim and
+   * the CFaR cover, and the ask would then land somewhere the column never shows.
+   */
+  const deskPlanFor = useCallback(
+    (row: RowState, months: number): LiquidityCycleProjection[] | null => {
+      if (!liquidityTiming.enabled) return null;
+      const hedgeSettle = hedgeSettleByCcy[row.ccy];
+      const ladder = buildLiquidityLadder(row, forecastProfile, { months, hedgeSettle });
+      if (!ladder) return null;
+      // No book target here on purpose. It pins every cycle to the level the
+      // portfolio pass already reached, which makes the plan ignore the trial
+      // carry target entirely and leaves the solve with nothing to bisect. The
+      // book still applies its VAR cap / USD trim afterwards; `offBook` says so.
+      return fundedPlanFor(
+        row, shared, carryPreviewLayers, ladder, forecastProfile, hedgeSettle,
+        undefined,
+        undefined,
+        usdToFcyM(cfarNetByCcyUsd[row.ccy] ?? 0, row.ccy),
+      );
+    },
+    [
+      liquidityTiming.enabled, hedgeSettleByCcy, forecastProfile, shared,
+      carryPreviewLayers, cfarNetByCcyUsd,
+    ],
+  );
+
+  /**
+   * Typed Buffer Carry ($k over the forecast period) inverts into the Target LP Cash
+   * whose standing path earns it. An ask past the reachable range clamps to the
+   * extreme the book can actually hold.
    */
   const commitCarryPnl = useCallback((
     row: FcyComputedRow,
-    near: CarryPeriod | undefined,
     raw: string,
   ) => {
     setCarryNotes(prev => {
@@ -2915,35 +2996,36 @@ export function UnifiedSimulator({
     }
     const k = parseFloat(raw);
     if (!Number.isFinite(k)) return clearCarryDrafts(row.id);
-    const solve = {
-      ccy: row.ccy,
-      r_FCY: row.r_FCY,
-      r_OD: row.r_OD,
-      r_USD: shared.r_USD,
-      payout: near?.payout ?? row.payout,
-      collections: near?.collections ?? row.collections,
-      invoiceFcast: row.fcastFX,
-      hedgeSettle: hedgeSettleByCcy[row.ccy]?.[0] ?? 0,
-      liquidity: liquidityTiming,
-    };
-    const target = targetForCarry(k / 1000, solve);
-    if (target === null) {
-      // Keep what was typed on screen — clearing it is what made the field look
-      // like it was ignoring the entry rather than unable to reach it.
+    const askUsd = k / 1000;
+    const solved = targetForBufferCarry(
+      askUsd, row, shared, carryPreviewLayers, carryAskMonths, forecastProfile,
+      { hedgeSettle: hedgeSettleByCcy[row.ccy], planFor: deskPlanFor },
+    );
+    setDrafts(prev => {
+      const next = { ...prev };
+      delete next[`${row.id}.carry_target`];
+      delete next[`${row.id}.carry_pnl`];
+      return next;
+    });
+    if (solved === null) {
       setCarryNotes(prev => ({
         ...prev,
-        [row.id]: k > 0 && !canEarnPositiveCarry(solve)
-          ? `${row.ccy} cannot earn against USD — ${f2(row.r_FCY)}% long, ${f2(row.r_OD)}% short, both losing vs ${f2(shared.r_USD)}%. Ask for a loss, or steer on cash.`
-          : `No target reaches ${usdK(k / 1000)} on ${row.ccy} — steer on cash instead.`,
+        [row.id]: `${row.ccy} Buffer Carry does not move vs USD at these rates.`,
       }));
       return;
     }
-    clearCarryDrafts(row.id);
     ensureCarryLayer();
-    setCarryTarget(row.id, target);
+    setCarryTarget(row.id, solved.target);
+    if (solved.exact) return;
+    const bound = askUsd > solved.carryUsd ? 'max' : 'min';
+    setCarryNotes(prev => ({
+      ...prev,
+      [row.id]: `${carryAskMonths}m ${bound} ${usdK(solved.carryUsd)} on ${row.ccy}`,
+    }));
   }, [
-    clearCarryDrafts, setCarryTarget, ensureCarryLayer, shared.r_USD, liquidityTiming,
-    hedgeSettleByCcy,
+    clearCarryDrafts, setCarryTarget, ensureCarryLayer, shared,
+    carryPreviewLayers, carryAskMonths, forecastProfile, hedgeSettleByCcy,
+    deskPlanFor,
   ]);
 
   /**
@@ -2951,34 +3033,29 @@ export function UnifiedSimulator({
    * Each period reruns the same layer stack on that cycle's opening balance, so
    * the path is the buffer model rolled forward rather than a parallel model.
    */
-  const carryLive = activeLayers.has('carryOptim');
-  /**
-   * This panel is the layer's setup, so it always reads as if the layer were on.
-   * Otherwise every figure you dial in would show the plain trough back at you
-   * until the layer is switched on, and nothing here could be tuned.
-   */
-  const carryPreviewLayers = useMemo(() => {
-    if (carryLive) return activeLayers;
-    const next = new Set(activeLayers);
-    next.add('carryOptim');
-    return next;
-  }, [activeLayers, carryLive]);
-
   const carryProjection = useMemo(() => {
     if (layerPanel !== 'carryOptim') return [];
     const from = new Date();
     return carryRows.map(row => {
       const periods = projectCarryLifecycle(
         row, shared, carryPreviewLayers, carryHorizon, forecastProfile,
-        { from, hedgeSettle: hedgeSettleByCcy[row.ccy] },
+        { from, hedgeSettle: hedgeSettleByCcy[row.ccy], planFor: deskPlanFor },
       );
       const target = periods[0]?.targetCash ?? row.cash_threshold;
       return {
         row,
         periods,
         target,
-        nearCarry: periods[0]?.carryVsUsd ?? 0,
-        horizonCarry: periods.reduce((s, p) => s + p.carryVsUsd, 0),
+        nearCarry: periods[0]?.bufferCarryUsd ?? 0,
+        horizonCarry: periods.reduce((s, p) => s + p.bufferCarryUsd, 0),
+        // What the ask steers: Buffer Carry over the forecast period, the window the
+        // desk column sums. Equals horizonCarry whenever the lifecycle toggle agrees.
+        askCarry: carryAskMonths === carryHorizon
+          ? periods.reduce((s, p) => s + p.bufferCarryUsd, 0)
+          : pathBufferCarry(
+              row, shared, carryPreviewLayers, carryAskMonths, forecastProfile,
+              { from, hedgeSettle: hedgeSettleByCcy[row.ccy], planFor: deskPlanFor },
+            ),
         // The projection runs the per-currency stack; once live, the book target can
         // still be trimmed by the portfolio VAR cap or the USD stress rebalance.
         offBook: carryLive && Math.abs(target - row.cash_threshold) > 0.01,
@@ -2986,7 +3063,7 @@ export function UnifiedSimulator({
     });
   }, [
     layerPanel, carryRows, shared, carryPreviewLayers, carryLive, carryHorizon,
-    forecastProfile, hedgeSettleByCcy,
+    carryAskMonths, forecastProfile, hedgeSettleByCcy, deskPlanFor,
   ]);
 
   /**
@@ -3010,21 +3087,22 @@ export function UnifiedSimulator({
     (acc, c) => ({
       targetUsd: acc.targetUsd + fcyToUsdM(c.target, c.row.ccy),
       near: acc.near + c.nearCarry,
-      horizon: acc.horizon + c.horizonCarry,
+      horizon: acc.horizon + c.askCarry,
     }),
     { targetUsd: 0, near: 0, horizon: 0 },
   ), [carryProjection]);
 
   /** Gear badge: how much of the layer is configured, at a glance. */
-  const layerBadge = (id: LayerId): string => {
+  const layerBadge = (id: BufferChipKey): string => {
     if (id === 'floorH') return floorsSetCount > 0 ? String(floorsSetCount) : '';
-    if (id === 'sigmaP') return sigmaOverrideCount > 0 ? String(sigmaOverrideCount) : '';
-    if (id === 'carryOptim') return carryTargetCount > 0 ? String(carryTargetCount) : '';
-    if (id === 'portfolioDiv') return `$${n(policyVAR)}M`;
-    if (id === 'cfarCover') {
+    if (id === 'forecastAccuracy') {
       const total = Object.values(cfarNetByCcyUsd).reduce((s, v) => s + v, 0);
+      if (sigmaOverrideCount > 0 && total > 0.001) return `${sigmaOverrideCount}·$${n(total)}M`;
+      if (sigmaOverrideCount > 0) return String(sigmaOverrideCount);
       return total > 0.001 ? `$${n(total)}M` : '';
     }
+    if (id === 'carryOptim') return carryTargetCount > 0 ? String(carryTargetCount) : '';
+    if (id === 'portfolioDiv') return `$${n(policyVAR)}M`;
     return '';
   };
 
@@ -3237,6 +3315,16 @@ export function UnifiedSimulator({
     swapForwardDeltas,
   ]);
 
+  useEffect(() => {
+    if (!onDeskCipByCcyChange) return;
+    const next: Record<string, number> = {};
+    for (const r of computedWithHedge) {
+      if (r.ccy === 'USD') continue;
+      next[r.ccy] = r.cipCarryUsdYr;
+    }
+    onDeskCipByCcyChange(next);
+  }, [computedWithHedge, onDeskCipByCcyChange]);
+
   const hedgeTotals = useMemo(() => ({
     fwdUSD: computedWithHedge.reduce((s, r) => s + swapNearUsd(r.ccy, r.fwdNotional), 0),
     // Delta-effective option amounts (δ × written notional) — matches the per-row display.
@@ -3293,19 +3381,27 @@ export function UnifiedSimulator({
         const pathCip = pnlFarCipUsdM(
           r, shared.r_USD, forecastMonths, marketRatesByCcy, ratesScopeId,
         );
+        const bundle = resolveMarketRatesForCcy(
+          marketRatesByCcy, r.ccy, ratesScopeId,
+        );
+        const farMonths = fundingSwapFarSettleMonths(
+          r.liquidityPlan, forecastMonths,
+        );
         if (strategy === 'SWAP_FWD') {
           const delta = clampHedgeDelta(r.swapForwardDelta ?? 1);
           residualFx = r.netFxForecast + r.swapNear + fwdNotionalRes;
           hedgeCarryUsdYr =
-            fwdHedgeCarryUsdYr(fwdNotionalRes, r.ccy, r.r_FCY, shared.r_USD)
+            fwdHedgeCarryFromMarketUsd(
+              fwdNotionalRes, r.ccy, r.r_FCY, shared.r_USD, farMonths, bundle,
+            )
             + pathCip * (1 - delta);
         } else {
           residualFx = r.netFxForecast + r.swapNear + fwdNotionalRes + optEffectiveRes;
           const cipDelta = strategy === 'SWAP_FWD_OPT' ? r.optDelta : 1;
           hedgeCarryUsdYr =
-            fwdHedgeCarryUsdYr(
+            fwdHedgeCarryFromMarketUsd(
               fwdNotionalRes === 0 ? 0 : fwdNotionalRes + r.swapNear,
-              r.ccy, r.r_FCY, shared.r_USD,
+              r.ccy, r.r_FCY, shared.r_USD, farMonths, bundle,
             )
             + pathCip * cipDelta;
         }
@@ -4852,7 +4948,7 @@ export function UnifiedSimulator({
           <span className={toolCaption}>Buffer layers</span>
           <div className="flex flex-wrap items-center gap-1.5">
             {BUFFER_LAYER_CHIPS.map(l => {
-              const on = activeLayers.has(l.id);
+              const on = l.layers.some(id => activeLayers.has(id));
               const panelOpen = layerPanel === l.id;
               const badge = layerBadge(l.id);
               return (
@@ -4865,7 +4961,7 @@ export function UnifiedSimulator({
                   <button
                     type="button"
                     onClick={() => {
-                      onLayerToggle(l.id);
+                      toggleLayerGroup(l.layers, activeLayers, onLayerToggle);
                       // Switching a layer off takes its settings dialog with it.
                       if (on && panelOpen) setLayerPanel(null);
                     }}
@@ -5078,22 +5174,26 @@ export function UnifiedSimulator({
           </LayerModal>
         )}
 
-        {showAdvancedBook && layerPanel === 'sigmaP' && (
+        {showAdvancedBook && layerPanel === 'forecastAccuracy' && (
           <LayerModal
-            hue="amber"
-            title="Forecast uncertainty σ"
-            subtitle={`δσ = σ × z₉₅ × |payout| — a prefunded payout carries no σ${
-              activeLayers.has('sigmaP')
+            hue="sky"
+            title="Forecast accuracy buffer"
+            subtitle={`Payout-σ safety margin and FX Net CFaR cover — one limit${
+              forecastAccuracyLayerOn(activeLayers)
                 ? ''
-                : ' — turn the Payout σ buffer layer on to apply these'
+                : ' — turn Forecast accuracy on to apply'
             }`}
-            readout="z₉₅ 1.645"
-            footnote="% of the payout line · blank = default · overrides write the payout σ on the forecast profile"
+            readout={`z₉₅ 1.645 · Σ CFaR ${f2(Object.values(cfarNetByCcyUsd).reduce((s, v) => s + v, 0))} $USD`}
+            footnote="% of the payout line · blank σ = default · Net CFaR is FX P&L (USD) shown in FCY — it does not size Swap Near"
             simDark={simDark}
             onClose={() => setLayerPanel(null)}
           >
-            <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
-              <label className="grid grid-cols-[minmax(0,1fr)_60px_16px] items-center gap-2 rounded-md border border-amber-300 bg-white px-2 py-1">
+            <div className="space-y-3">
+              <div className="font-mono text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                Payout σ
+              </div>
+              <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
+              <label className="grid grid-cols-[minmax(0,1fr)_60px_16px] items-center gap-2 rounded-md border border-sky-300 bg-white px-2 py-1">
                 <span className="text-[10px] font-semibold text-gray-700">Default · all CCY</span>
                 <input
                   type="number"
@@ -5105,7 +5205,7 @@ export function UnifiedSimulator({
                     const v = parseFloat(e.target.value);
                     if (Number.isFinite(v)) onSharedChange('σ_P', Math.max(0, v) / 100);
                   }}
-                  className="w-full rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-amber-400"
+                  className="w-full rounded border border-sky-300 bg-sky-50 px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-sky-400"
                 />
                 <span className="font-mono text-[10px] text-gray-400">%</span>
               </label>
@@ -5133,8 +5233,8 @@ export function UnifiedSimulator({
                           setSigmaDrafts(d => ({ ...d, [r.ccy]: e.target.value }))
                         }
                         onBlur={e => commitSigma(r.ccy, e.target.value)}
-                        className={`w-full rounded border px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-amber-400 ${
-                          override > 0 ? 'border-amber-300 bg-amber-50' : 'border-gray-200 bg-gray-50'
+                        className={`w-full rounded border px-1.5 py-0.5 text-right font-mono text-[11px] tabular-nums text-gray-700 outline-none focus:ring-1 focus:ring-sky-400 ${
+                          override > 0 ? 'border-sky-300 bg-sky-50' : 'border-gray-200 bg-gray-50'
                         }`}
                       />
                       <span className="text-right font-mono text-[10px] tabular-nums text-gray-400">
@@ -5143,23 +5243,11 @@ export function UnifiedSimulator({
                     </label>
                   );
                 })}
-            </div>
-          </LayerModal>
-        )}
-
-        {showAdvancedBook && layerPanel === 'cfarCover' && (
-          <LayerModal
-            hue="sky"
-            title="CFaR cover — Net CFaR only"
-            subtitle={`Liquidity swap sized from FX-only Net CFaR — size and timing, not gap × σ (no loop). Displayed CFaR then adds this swap's rate-diff bridge in parallel with the FX hedge${
-              activeLayers.has('cfarCover') ? '' : ' — turn the CFaR cover layer on to apply'
-            }`}
-            readout={`Σ ${f2(Object.values(cfarNetByCcyUsd).reduce((s, v) => s + v, 0))} $USD`}
-            footnote="USD Net CFaR → FCY at spot · additive to other buffers · funding-swap O/N + points sit on top of unfunded cash carry"
-            simDark={simDark}
-            onClose={() => setLayerPanel(null)}
-          >
-            <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
+              </div>
+              <div className="font-mono text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+                Net CFaR cover
+              </div>
+              <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2 lg:grid-cols-3">
               {floorRows.map(r => {
                 const netUsd = cfarNetByCcyUsd[r.ccy] ?? 0;
                 const coverFcy = netUsd > 0.001 ? usdToFcyM(netUsd, r.ccy) : 0;
@@ -5178,6 +5266,7 @@ export function UnifiedSimulator({
                   </div>
                 );
               })}
+              </div>
             </div>
           </LayerModal>
         )}
@@ -5185,12 +5274,12 @@ export function UnifiedSimulator({
         {showAdvancedBook && layerPanel === 'carryOptim' && (
           <LayerModal
             hue="emerald"
-            title="Carry target inputs"
-            subtitle="steer the carry leg on the rate, the cash target, or the P&L target"
-            readout={`r_USD ${f2(shared.r_USD)}% · ${carryHorizon}m ${usdK(carryTotals.horizon)}`}
+            title="Buffer Carry target"
+            subtitle="steer Target LP Cash so Buffer Carry (standing-swap cash Δr vs USD) hits the ask"
+            readout={`r_USD ${f2(shared.r_USD)}% · ${carryAskMonths}m ${usdK(carryTotals.horizon)}`}
             footnote={carryLive
-              ? 'Setup for the carry layer — a positive P&L ask on a PAY currency shorts FCY (sell near), which prints negative CIP points in FX Hedge Carry. Accrual on the time-weighted post-swap balance with flows mid-cycle · ACT/360 or ACT/365 per currency · carry vs USD = (r_FCY − r_USD). Targets still clamp to floors and the portfolio VAR cap'
-              : 'Preview only until you commit a cash or P&L target — that turns this layer on so Target LP Cash, Swap Near and CIP points land in the main table. A positive P&L ask on a PAY currency shorts FCY and prints negative CIP in FX Hedge Carry'}
+              ? 'Setup for the Buffer Carry target layer — a positive P&L ask on a PAY currency shorts FCY (sell near). Buffer Carry = cash Δr on the standing funding-swap book (same as the desk Buffer Carry column). CIP points sit in FX HEDGE. Targets still clamp to floors and the portfolio VAR cap'
+              : 'Preview only until you commit a cash or Buffer Carry ask — that turns this layer on so Target LP Cash and Swap Near land in the main table. Buffer Carry is standing-swap cash Δr, not TWA LP cash carry'}
             simDark={simDark}
             size="lg"
             onClose={() => setLayerPanel(null)}
@@ -5202,7 +5291,7 @@ export function UnifiedSimulator({
                   {([
                     ['rate', 'Rate r_OD', 'Size the leg from z_opt = Φ⁻¹(1 − Δr / r_OD)'],
                     ['cash', 'Cash target', 'Type the Target LP Cash you want to hold (M FCY)'],
-                    ['pnl', 'Carry P&L', 'Type the near-period carry you want to earn ($k) — solves back to the cash target'],
+                    ['pnl', 'Buffer Carry', 'Type Buffer Carry over the forecast ($k)'],
                   ] as const).map(([id, label, hint]) => (
                     <button
                       key={id}
@@ -5248,10 +5337,10 @@ export function UnifiedSimulator({
                     <th className={carryTh} title="Δr = r_USD − r_FCY">Δr</th>
                     <th className={`${carryTh} text-center`}>Dir</th>
                     <th className={carryTh} title="Money-market day count used for the accrual">Basis</th>
-                    <th className={carryTh} title="Target LP Cash = opening LP + swap (M FCY) — the cash exposure the carry leg holds">Target M FCY</th>
+                    <th className={carryTh} title="Target LP Cash = opening LP + swap (M FCY) — sizes the standing book Buffer Carry accrues on">Target M FCY</th>
                     <th className={carryTh}>Target $USD</th>
-                    <th className={carryTh} title="Carry vs USD accrued over the near period">M1 carry</th>
-                    <th className={carryTh} title={`Cumulative carry vs USD over ${carryHorizon} month${carryHorizon > 1 ? 's' : ''}`}>{carryHorizon}m carry</th>
+                    <th className={carryTh}>M1 $k</th>
+                    <th className={carryTh}>{carryAskMonths}m $k</th>
                     <th className={carryTh} aria-label="Expand" />
                   </tr>
                 </thead>
@@ -5327,8 +5416,22 @@ export function UnifiedSimulator({
                                 )}
                               </div>
                             ) : (
-                              <span className={manual ? 'font-semibold text-emerald-700' : clr(c.target)}>
+                              <span
+                                className={manual ? 'font-semibold text-emerald-700' : clr(c.target)}
+                                title={manual
+                                  ? `Manual ask — Target LP Cash ${f2(c.target)} M ${r.ccy}`
+                                  : Math.abs(r.cash_floor) > 0.0001
+                                    ? `Default = Min floor ${f2(r.cash_floor)} M ${r.ccy}`
+                                    : `No Min floor set for ${r.ccy} — read as floor 0, so the carry`
+                                      + ' layer adds nothing. Enter a Min floor to anchor this level.'}
+                              >
                                 {f2(c.target)}
+                                {!manual && Math.abs(r.cash_floor) > 0.0001 && (
+                                  <span className="ml-1 text-[9px] text-amber-700">floor</span>
+                                )}
+                                {!manual && Math.abs(r.cash_floor) <= 0.0001 && (
+                                  <span className="ml-1 text-[9px] text-gray-400">floor 0</span>
+                                )}
                               </span>
                             )}
                           </td>
@@ -5344,32 +5447,36 @@ export function UnifiedSimulator({
                             )}
                           </td>
                           <td className={carryTd}>
-                            {carryDrive === 'pnl' ? (
-                              <input
-                                type="text"
-                                inputMode="decimal"
-                                placeholder={(c.nearCarry * 1000).toFixed(0)}
-                                value={
-                                  drafts[`${r.id}.carry_pnl`] ??
-                                  (manual ? (c.nearCarry * 1000).toFixed(0) : '')
-                                }
-                                onChange={e =>
-                                  setDrafts(d => ({
-                                    ...d,
-                                    [`${r.id}.carry_pnl`]: e.target.value,
-                                  }))
-                                }
-                                onBlur={e => commitCarryPnl(r, c.periods[0], e.target.value)}
-                                onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
-                                title="Carry vs USD to earn over the near period ($k) — solves back to the cash target"
-                                className={`${carryIn} ${note ? 'border-amber-400 bg-amber-50' : ''}`}
-                              />
-                            ) : (
-                              <span className={carryPnl(c.nearCarry)}>{usdK(c.nearCarry)}</span>
-                            )}
+                            <span className={carryPnl(c.nearCarry)}>{usdK(c.nearCarry)}</span>
                           </td>
-                          <td className={`${carryTd} font-semibold ${carryPnl(c.horizonCarry)}`}>
-                            {usdK(c.horizonCarry)}
+                          <td className={carryTd}>
+                            {carryDrive === 'pnl' ? (
+                              <div className="flex items-center justify-end gap-0.5">
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  placeholder={(c.askCarry * 1000).toFixed(0)}
+                                  value={
+                                    drafts[`${r.id}.carry_pnl`] ??
+                                    (manual ? (c.askCarry * 1000).toFixed(0) : '')
+                                  }
+                                  onChange={e =>
+                                    setDrafts(d => ({
+                                      ...d,
+                                      [`${r.id}.carry_pnl`]: e.target.value,
+                                    }))
+                                  }
+                                  onBlur={e => commitCarryPnl(r, e.target.value)}
+                                  onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                                  className={`${carryIn} ${note ? 'border-amber-400 bg-amber-50' : ''}`}
+                                />
+                                <span className="text-[9px] text-gray-400">$k</span>
+                              </div>
+                            ) : (
+                              <span className={`font-semibold ${carryPnl(c.askCarry)}`}>
+                                {usdK(c.askCarry)}
+                              </span>
+                            )}
                           </td>
                           <td className="px-1 py-1 text-right">
                             <button
@@ -5398,6 +5505,10 @@ export function UnifiedSimulator({
                                 <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                                   <span className={toolCaption}>
                                     {r.ccy} lifecycle · {carryBasisLabel(r.ccy)}
+                                    {' · '}
+                                    {carryAskMonths}m Buffer Carry {usdKAlways(c.askCarry)}
+                                    {' at Target '}
+                                    {f2(c.target)}
                                   </span>
                                   {c.offBook && (
                                     <span className="font-mono text-[9px] text-amber-700">
@@ -5417,9 +5528,9 @@ export function UnifiedSimulator({
                                       <th className={carryTh} title="Target LP Cash for this cycle (M FCY)">Target</th>
                                       <th className={carryTh} title="Time-weighted balance the interest accrues on">TWA bal</th>
                                       <th className={carryTh} title="LP credit rate when long, debit rate when overdrawn">Rate</th>
-                                      <th className={carryTh} title="Interest earned on the balance at the applied rate">Accrual</th>
-                                      <th className={carryTh} title="Accrual net of the USD opportunity cost">vs USD</th>
-                                      <th className={carryTh}>Cum</th>
+                                      <th className={carryTh} title="Interest on TWA LP cash (unfunded view — not the layer target)">Accrual</th>
+                                      <th className={carryTh} title="Buffer Carry — cash Δr vs USD on this cycle's standing swap">Buffer Carry</th>
+                                      <th className={carryTh} title="Cumulative Buffer Carry">Cum</th>
                                     </tr>
                                   </thead>
                                   <tbody>
@@ -5462,11 +5573,11 @@ export function UnifiedSimulator({
                                           )}
                                         </td>
                                         <td className={carryTd}>{usdK(p.grossAccrualUsd)}</td>
-                                        <td className={`${carryTd} ${carryPnl(p.carryVsUsd)}`}>
-                                          {usdK(p.carryVsUsd)}
+                                        <td className={`${carryTd} ${carryPnl(p.bufferCarryUsd)}`}>
+                                          {usdK(p.bufferCarryUsd)}
                                         </td>
-                                        <td className={`${carryTd} font-semibold ${carryPnl(p.cumCarryVsUsd)}`}>
-                                          {usdK(p.cumCarryVsUsd)}
+                                        <td className={`${carryTd} font-semibold ${carryPnl(p.cumBufferCarryUsd)}`}>
+                                          {usdK(p.cumBufferCarryUsd)}
                                         </td>
                                       </tr>
                                     ))}
@@ -6009,9 +6120,9 @@ export function UnifiedSimulator({
               </th>
               <th
                 className={`${thBase} bg-purple-50 min-w-[76px]`}
-                title="Funding-swap cash Δr vs USD on the standing book (FCY O/N vs USD O/N). CIP far-leg points sit in FX HEDGE CIP / Hedge Carry, scaled by δ. $k."
+                title="Buffer Carry — cash Δr vs USD on the standing funding-swap book (FCY O/N vs USD O/N). Sized by Buffer Carry target (Target LP Cash → standing). CIP far-leg points sit in FX HEDGE CIP / Hedge Carry, scaled by δ. $k."
               >
-                Swap Carry $k
+                Buffer Carry $k
               </th>
               <th
                 className={`${thBase} bg-purple-50 min-w-[76px]`}
@@ -6021,7 +6132,7 @@ export function UnifiedSimulator({
               </th>
               <th
                 className={`${thBase} bg-purple-100 min-w-[80px]`}
-                title="Cash Carry + Swap Carry + Hedge Cash (staged FWD pts only) ($k)"
+                title="Cash Carry + Buffer Carry + Hedge Cash (staged FWD pts only) ($k)"
               >
                 Total Carry $k
               </th>
@@ -6728,7 +6839,7 @@ export function UnifiedSimulator({
                   {usdCarry(cashCarry)}
                 </td>
                 <td className={`${tdBase} bg-purple-50 font-medium ${carryTone(swapCarry)}`}
-                  title={`Cash Δr vs USD on the standing swap (no CIP points). Path Σ of monthly. ${usdCarry(swapCarry)}.`}>
+                  title={`Buffer Carry — cash Δr vs USD on the standing swap (no CIP points). Path Σ of monthly. Sized by Buffer Carry target. ${usdCarry(swapCarry)}.`}>
                   {usdCarry(swapCarry)}
                 </td>
                 <td
@@ -6747,7 +6858,7 @@ export function UnifiedSimulator({
                       ? 'text-gray-300'
                       : pnlTotalCarry >= 0 ? 'text-emerald-700' : 'text-red-600'
                   }`}
-                  title="Cash Carry + Swap Carry + Hedge Cash (staged FWD pts only)"
+                  title="Cash Carry + Buffer Carry + Hedge Cash (staged FWD pts only)"
                 >
                   {usdCarry(pnlTotalCarry)}
                 </td>
@@ -6781,8 +6892,14 @@ export function UnifiedSimulator({
                 const optScale = strategy === 'SWAP_FWD_OPT'
                   ? clampHedgeDelta(optionDeltas[r.id] ?? 0.5)
                   : 1;
+                // Term cover settles its points once, at the far date. Spread that
+                // single cash flow straight-line over the cycles the leg is alive
+                // for, so the monthly column reads as an accrual, not a lump on M1.
+                const farMonths = fundingSwapFarSettleMonths(
+                  r.liquidityPlan, forecastMonths,
+                );
                 const cycleCip = termFar
-                  ? (p.cycleIndex === 0 ? r.cipCarryUsdYr : 0)
+                  ? (p.cycleIndex < farMonths ? r.cipCarryUsdYr / farMonths : 0)
                   : fundingSwapFarLegCipUsdM({
                       standingLocalM: retainedStanding,
                       settleMonths: 1,
@@ -6883,7 +7000,7 @@ export function UnifiedSimulator({
                         + ` ${f2(p.opening_cash)} opening + ${f2(p.swap_needed)} near leg,`
                         + ` funding this cycle's requirement of ${f2(p.cash_threshold)}`
                         + (p.layered.carry_target_applied
-                          ? ` — the carry target drives it${p.layered.carry_target_binding
+                          ? ` — the Buffer Carry target drives it${p.layered.carry_target_binding
                             ? ', trimmed by a floor clamp' : ''}.`
                           : `. Carry shift ${f2(p.layered.delta_carry)} at`
                             + ` Δr ${p.layered.delta_r.toFixed(2)}%,`
@@ -6953,7 +7070,12 @@ export function UnifiedSimulator({
                     <td className="bg-rose-50" />
                     <td
                       className={`${cycleTd} bg-rose-100 font-medium ${carryTone(cycleCip)}`}
-                      title={`M${p.cycleIndex + 1} far-leg swap points on standing ${f2(retainedStanding)} M ${r.ccy} = ${usdCarry(cycleCip)}.`}
+                      title={termFar
+                        ? `M${p.cycleIndex + 1} accrual of the ${farMonths}m far-leg swap points`
+                          + ` on standing ${f2(retainedStanding)} M ${r.ccy}:`
+                          + ` ${usdCarry(r.cipCarryUsdYr)} ÷ ${farMonths} = ${usdCarry(cycleCip)}.`
+                          + ' The points settle as one cash flow at the far date.'
+                        : `M${p.cycleIndex + 1} far-leg swap points on standing ${f2(retainedStanding)} M ${r.ccy} = ${usdCarry(cycleCip)}.`}
                     >
                       {usdCarry(cycleCip)}
                     </td>
@@ -7028,10 +7150,10 @@ export function UnifiedSimulator({
                             }`}
                             title={
                               hasMonth
-                                ? `M${p.cycleIndex + 1} Cash + Swap + Hedge Cash`
+                                ? `M${p.cycleIndex + 1} Cash + Buffer + Hedge Cash`
                                 : m1
-                                  ? 'Cash + Swap + Hedge Cash — path total on M1 plus this month’s swap overlay'
-                                  : 'This month’s Swap Carry (Cash / Hedge Cash are path totals on M1)'
+                                  ? 'Cash + Buffer + Hedge Cash — path total on M1 plus this month’s buffer overlay'
+                                  : 'This month’s Buffer Carry (Cash / Hedge Cash are path totals on M1)'
                             }
                           >
                             {usdCarry(monthTotal)}
@@ -7509,7 +7631,7 @@ export function UnifiedSimulator({
                 {usdCarry(pnlCashCarryTotal)}
               </td>
               <td className={`${tdBase} bg-purple-50 font-bold ${carryTone(swapCarryTotal)}`}
-                title="Σ Swap Carry: cash Δr vs USD on the standing book. CIP far-leg points sit in FX HEDGE, scaled by δ."
+                title="Σ Buffer Carry: cash Δr vs USD on the standing book sized by Buffer Carry target. CIP far-leg points sit in FX HEDGE, scaled by δ."
               >
                 {usdCarry(swapCarryTotal)}
               </td>
@@ -7522,7 +7644,7 @@ export function UnifiedSimulator({
                   ? 'text-gray-300'
                   : totalCarryUsd >= 0 ? 'text-emerald-700' : 'text-red-600'
               }`}
-                title="Cash Carry + Swap Carry + Hedge Cash (staged FWD pts only)">
+                title="Cash Carry + Buffer Carry + Hedge Cash (staged FWD pts only)">
                 {usdCarry(totalCarryUsd)}
               </td>
               </>)}

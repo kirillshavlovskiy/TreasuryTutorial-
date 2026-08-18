@@ -8,6 +8,7 @@
 
 import { fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
 import {
+  fwdCarryFromSwapPointsUsdM,
   fundingSwapFarLegCipUsdM,
   type FxMarketRatesBundle,
 } from './fx-market-rates';
@@ -170,12 +171,40 @@ export function suggestCarryHedge(inp: HedgeSuggestionInput): HedgeSuggestion {
 // ─── Hedge overlay carry measures (on top of the swap book) ─────────────────
 
 /**
+ * Outright forward carry: prefer uploaded Market data swap points for the
+ * settle tenor; fall back to deposit-rate CIP annualised over that tenor.
+ */
+export function fwdHedgeCarryFromMarketUsd(
+  notional: number,
+  ccy: string,
+  r_FCY: number,
+  r_USD: number,
+  settleMonths: number,
+  bundle?: FxMarketRatesBundle | null,
+): number {
+  if (Math.abs(notional) < 0.001) return 0;
+  const months = Math.max(1e-9, settleMonths);
+  if (bundle) {
+    const pts = fwdCarryFromSwapPointsUsdM({
+      notionalLocalM: notional,
+      settleMonths: months,
+      bundle,
+    });
+    if (pts) return pts.fwdCarryUsdM;
+  }
+  return fwdHedgeCarryUsdYr(notional, ccy, r_FCY, r_USD) * (months / 12);
+}
+
+/**
  * Annual USD carry impact of squaring the same-maturity FX exposure with an
  * outright FORWARD. Covered interest parity: F = S(1+r_USD)/(1+r_FCY), so
  * selling a PAY FCY forward (notional < 0, r_FCY < r_USD) locks F > S and
  * EARNS the differential; selling an EARN FCY forward locks F < S and gives
  * its yield up.
  *   carry = −notional × spot × (r_USD − r_FCY)/100   ($M/yr)
+ *
+ * Prefer {@link fwdHedgeCarryFromMarketUsd} whenever a swap-points curve is
+ * available — this is the deposit-rate fallback only.
  */
 export function fwdHedgeCarryUsdYr(
   notional: number,
@@ -623,8 +652,8 @@ export function resolveStrategyHedge(
     const fwdNotional = overlay.forwardLocalM;
     const retainedStanding = (1 - delta) * swapStanding;
     const cipCarryUsdYr = cipOn(retainedStanding);
-    const fwdCarryUsdYr = fwdHedgeCarryUsdYr(
-      fwdNotional, inp.ccy, inp.r_FCY, inp.r_USD,
+    const fwdCarryUsdYr = fwdHedgeCarryFromMarketUsd(
+      fwdNotional, inp.ccy, inp.r_FCY, inp.r_USD, settleMonths, inp.marketRates,
     );
     return {
       fwdNotional,
@@ -674,9 +703,9 @@ export function resolveStrategyHedge(
         ? fullCip * optionDelta
         : 0;
 
-  const fwdCarryUsdYr = fwdHedgeCarryUsdYr(
+  const fwdCarryUsdYr = fwdHedgeCarryFromMarketUsd(
     fwdNotional === 0 ? 0 : fwdNotional + swapNear,
-    inp.ccy, inp.r_FCY, inp.r_USD,
+    inp.ccy, inp.r_FCY, inp.r_USD, settleMonths, inp.marketRates,
   );
   const shortOpt = shortOptionCarryUsdYr(
     optNotional, carryDelta, inp.horizonDays, inp.ccy, inp.r_FCY, inp.r_USD, inp.σ_daily,

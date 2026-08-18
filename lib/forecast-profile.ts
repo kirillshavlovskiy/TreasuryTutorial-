@@ -1342,7 +1342,7 @@ function runLiquidityCycles(
       ? layered.cash_threshold
       : roundMoney(Math.max(
         layered.cash_threshold + targetShift,
-        layered.floor_contrib + layered.delta_sigma + layered.delta_cfar,
+        layered.floor_contrib + layered.delta_sigma,
       ));
 
     const swap_needed = nearLeg(k, { opening, forecasted_cash, cash_threshold });
@@ -1451,9 +1451,14 @@ export function projectLiquidityCycles(
   // Term booking: one leg today, big enough that every cycle on the path still
   // clears its own H*. The rolling pass already prices that — its outstanding
   // book at cycle k is exactly what cycle k needs funded by then — so its peak
-  // is the opening size. H* moves a little once the cover is on (the layer
-  // formula reads opening cash), so re-solve against any residual shortfall.
-  let leg = rolling.reduce((m, p) => Math.max(m, p.standing_swap), 0);
+  // |standing| is the opening size (PAY shorts are negative; do not floor at 0).
+  // H* moves a little once the cover is on (the layer formula reads opening
+  // cash), so re-solve against any residual shortfall.
+  let leg = rolling.reduce(
+    (best, p) =>
+      (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
+    0,
+  );
   let projection = rolling;
   for (let pass = 0; pass < 4; pass++) {
     const booked = leg;

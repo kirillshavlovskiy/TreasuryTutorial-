@@ -63,6 +63,12 @@ export function fundingSwapBridgeBands(input: {
   confidencePct: number;
   termSettles?: boolean;
   steps?: number;
+  /**
+   * Cumulative Buffer Carry through each month (USD M). Gross swap VaR
+   * scales with |S|·√t; carry accrues with S·t. Net CFaR is the peak of
+   * (gross − carry) — not linear in standing or in carry paid.
+   */
+  carryScheduleUsdM?: readonly number[];
 }): CfarBandsResult | null {
   const knots = fundingSwapKnotsFromOutstanding(
     input.outstandingM,
@@ -76,6 +82,7 @@ export function fundingSwapBridgeBands(input: {
     sigmaMonthly: input.sigmaMonthly,
     confidencePct: input.confidencePct,
     steps: input.steps,
+    carryScheduleUsdM: input.carryScheduleUsdM,
   });
 }
 

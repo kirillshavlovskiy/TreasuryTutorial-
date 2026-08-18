@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { makeSimRow } from '@/lib/fx-buffer';
 import {
+  displayedCfarUsdMFromFxNet,
   fxHedgeMcCfarByCcy,
   fxHedgeNetCfarByCcyUsdM,
 } from '@/lib/test-mode/cfar-net-by-ccy';
@@ -114,5 +115,36 @@ describe('fxHedgeNetCfarByCcyUsdM — cover vs displayed', () => {
     expect(at50.EUR ?? 0).toBeGreaterThanOrEqual(at100.EUR ?? 0);
     // Δ=1 cancels the funding bridge — displayed ≈ FX-only cover.
     expect(at100.EUR ?? 0).toBeCloseTo(coverOnly.EUR ?? 0, 3);
+  });
+});
+
+describe('displayedCfarUsdMFromFxNet — swap Net, not linear in carry', () => {
+  const plan = (standing: number) =>
+    Array.from({ length: 12 }, () => ({ standing_swap: standing, far_leg: -standing }));
+  const carryRamp = (totalUsdM: number) =>
+    Array.from({ length: 12 }, (_, i) => (totalUsdM * (i + 1)) / 12);
+
+  it('RSS with the FX-only section is not a linear map from standing or from carry paid', () => {
+    const fx = 0.36;
+    const atBook = displayedCfarUsdMFromFxNet(
+      fx, 'EUR', plan(-317.5), SETUP, carryRamp(4.773),
+    );
+    const doubled = displayedCfarUsdMFromFxNet(
+      fx, 'EUR', plan(-635), SETUP, carryRamp(9.546),
+    );
+    expect(doubled).toBeGreaterThan(atBook);
+    expect(doubled).not.toBeCloseTo(2 * atBook, 2);
+    expect(atBook).not.toBeCloseTo(fx + 4.773, 1);
+  });
+
+  it('Buffer Carry cuts swap-net CFaR vs the same standing with no carry', () => {
+    const fx = 0.36;
+    const standing = plan(-317.5);
+    const noCarry = displayedCfarUsdMFromFxNet(fx, 'EUR', standing, SETUP);
+    const withCarry = displayedCfarUsdMFromFxNet(
+      fx, 'EUR', standing, SETUP, carryRamp(4.773),
+    );
+    expect(withCarry).toBeLessThan(noCarry);
+    expect(withCarry).toBeGreaterThan(fx);
   });
 });

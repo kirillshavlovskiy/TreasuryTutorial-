@@ -78,9 +78,10 @@ describe('layer-by-layer stacking audit', () => {
     expect(table['+sigma']!.target).toBeCloseTo(100 + expectedSigma, 1);
     expect(table['+sigma']!.lpSwap).toBeCloseTo(100 + expectedSigma, 1);
 
-    // Carry subtracts for PAY (negative delta_carry)
-    expect(table['+carry']!.carry).toBeLessThan(0);
-    expect(table['+carry']!.hPre).toBeLessThan(table['+sigma']!.hPre);
+    // No Min floor on this row, so the carry layer has nothing to anchor on and
+    // leaves the sigma stack exactly where it was.
+    expect(table['+carry']!.carry).toBeCloseTo(0, 6);
+    expect(table['+carry']!.hPre).toBeCloseTo(table['+sigma']!.hPre, 6);
 
     // Portfolio without carry must not inject carry-like δ
     const portOnly = rowSnapshot(
@@ -102,14 +103,14 @@ describe('layer-by-layer stacking audit', () => {
     })));
   });
 
-  it('HUF EARN zero payout: carry adds on opening stock', () => {
+  it('HUF EARN zero payout: carry with no Min floor leaves the stock alone', () => {
     const base = rowSnapshot(modelFor('HUF', 0, layers('floorH', 'sigmaP')), 'HUF');
     const withCarry = rowSnapshot(
       modelFor('HUF', 0, layers('floorH', 'sigmaP', 'carryOptim')),
       'HUF',
     );
-    expect(withCarry.carry).toBeGreaterThan(0);
-    expect(withCarry.hPre).toBeGreaterThan(base.hPre);
+    expect(withCarry.carry).toBeCloseTo(0, 6);
+    expect(withCarry.hPre).toBeCloseTo(base.hPre, 6);
   });
 
   it('portfolio limiter: policyVAR drives optimizePortfolioCarry constraint', () => {

@@ -46,6 +46,30 @@ describe('fundingSwapKnotsFromOutstanding', () => {
   });
 });
 
+describe('fundingSwapBridgeBands — net of Buffer Carry', () => {
+  it('Net CFaR is peak(gross |S|·√t − carry(t)), not total carry paid', () => {
+    const base = {
+      T: 12,
+      spotUsd: 1.17,
+      sigmaMonthly: 0.01,
+      confidencePct: 95 as const,
+    };
+    const outstandingM = Array.from({ length: 12 }, () => 80);
+    // Large enough that net peaks before T (√t vs linear carry) — not gross − Σcarry.
+    const carryScheduleUsdM = Array.from({ length: 12 }, (_, i) => 4 * (i + 1) / 12);
+    const grossOnly = fundingSwapBridgeBands({ ...base, outstandingM })!;
+    const withCarry = fundingSwapBridgeBands({
+      ...base, outstandingM, carryScheduleUsdM,
+    })!;
+    expect(withCarry.netCriticalCashUsdM).toBeLessThan(grossOnly.criticalCashUsdM);
+    expect(withCarry.peakMonth).toBeLessThan(withCarry.grossPeakMonth);
+    expect(withCarry.netCriticalCashUsdM).not.toBeCloseTo(
+      grossOnly.criticalCashUsdM - 4,
+      2,
+    );
+  });
+});
+
 describe('applyFundingSwapBridge', () => {
   it('RSS-combines the funding peak into Gross and Net', () => {
     const fx = {

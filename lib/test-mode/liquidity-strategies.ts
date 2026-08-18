@@ -6,14 +6,23 @@
 // swap today. This module runs each of those over the same path and charges
 // them on the same interest ledger, so the comparison is like for like.
 //
-// The carry ledger matches the desk: unfunded cash carry (FX path only) plus
-// the funding-swap overlay (FCY O/N + USD O/N + CIP mid points). The overlay
-// nets to 0 at mid, so strategies differ in the book they put on — peak, trips,
-// the gap vs H* — not in a second cash-carry number that loops back into CFaR.
+// The carry ledger matches the desk P&L. Strategies differ in the book they
+// put on — peak, trips, the gap vs H* — not in a second cash-carry number.
 //
-//   Cash Carry  = unfunded path × (r_actual − r_USD)     same on every strategy
-//   Swap Carry  = overlay on that strategy's avg book    0 at CIP mid
-//   net cost    = −(Cash Carry + Swap Carry)
+//   Cash Carry  = desk Cash Carry $k: staged dual-book cash when a hedge is
+//                 on, else cycle-1 unfunded LP NIM (`floatNim`). Same on every
+//                 strategy — the funding swap lives in Swap cash.
+//   Hedge Cash  = desk FWD pts / Hedge Cash $k (Cash Carry tab FWD). Same on
+//                 every strategy. Cash + Hedge = desk Total without the
+//                 funding-swap overlay.
+//   Swap cash   = Σ cycle cash Δr on the standing book   desk Buffer Carry
+//   Swap points = Market data far-leg CIP on that book   desk CIP
+//                 Live regime uses the desk CIP map when provided (already Δ-scaled).
+//   Swap Carry  = Swap cash + Swap points                ~0 when points are mid
+//   net cost    = −(Cash + Hedge + Swap Carry)
+//
+// Both swap legs come from the same helpers the Liquidity tab prints, so the two
+// views cannot drift apart on rate convention or on averaging.
 //
 // Note `sizingBasis` never reaches `projectLiquidityCycles` — only `bookingMode`
 // does — so rolling-on-cycle and rolling-on-horizon book identical notional.
@@ -25,17 +34,28 @@
 
 import { fundedPlanFor } from '@/lib/dashboard-model';
 import {
+  analyticsForwardsFromOverlays,
+  clampHedgeDelta,
+  type SwapForwardOverlay,
+} from '@/lib/fx-hedge';
+import {
   swapLegSchedule,
   type ForecastProfileState,
   type LiquidityCycleProjection,
   type SwapLegScheduleRow,
 } from '@/lib/forecast-profile';
 import {
+  fundingSwapFarLegCipUsdM,
+  fundingSwapPathFarCipUsdM,
   resolveMarketRatesForCcy,
   resolveOvernightCashRates,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
-import { hedgeCashFlowsByMonth, withNonCashFxConversion } from '@/lib/test-mode/cash-carry-analytics';
+import {
+  cashForecastCarrySplitByCcyUsdM,
+  hedgeCashFlowsByMonth,
+  withNonCashFxConversion,
+} from '@/lib/test-mode/cash-carry-analytics';
 import {
   displayedCfarNetByCcyUsdM,
   fxHedgeMcCfarByCcy,
@@ -46,16 +66,25 @@ import type { VarSetup } from '@/lib/test-mode/var-setup';
 import {
   ccySpotRate,
   computeLayeredBuffer,
+  fundingSwapCarryLegs,
+  fundingSwapCashDeltaUsdYr,
+  fundingSwapCashFcyRate,
+  fundingSwapCipPointsUsdYr,
+  fundingSwapFarSettleMonths,
   fundingSwapOverlayUsdYr,
+  fxBookNetLocalM,
   roundMoney,
+  swapFarLegNotional,
   usdToFcyM,
   type LayerId,
+  type BufferChipKey,
   type RowState,
   type SharedGlobals,
 } from '@/lib/fx-buffer';
 import {
   buildLiquidityLadder,
   carrySplitFromBalances,
+  cycleCarrySplit,
   monthFlowSeriesForRow,
   resolveLiquidityTiming,
   type HedgeSettleByCcy,
@@ -157,7 +186,7 @@ export function resolveBufferConstraint(
   active: Set<LayerId> | undefined,
 ): BufferConstraint {
   const a = active ?? new Set<LayerId>();
-  if (a.has('cfarCover') || a.has('portfolioDiv') || a.has('sigmaP')) return 'var';
+  if (a.has('portfolioDiv')) return 'var';
   if (a.has('carryOptim')) return 'carry';
   return 'balance';
 }
@@ -173,12 +202,224 @@ export function bufferConstraintDetail(
 ): string {
   const a = active ?? new Set<LayerId>();
   const bits: string[] = [];
-  if (a.has('cfarCover')) bits.push('CFaR cover');
+  if (a.has('cfarCover') || a.has('sigmaP')) bits.push('Forecast accuracy');
   if (a.has('portfolioDiv')) bits.push('Portfolio VaR');
-  if (a.has('sigmaP')) bits.push('Payout σ');
-  if (a.has('carryOptim')) bits.push('Carry target');
+  if (a.has('carryOptim')) bits.push('Buffer Carry target');
   if (a.has('floorH')) bits.push('Min floor');
   return bits.length > 0 ? bits.join(' · ') : 'Unfunded trough (no layer)';
+}
+
+/**
+ * Tail mass at a VaR/CFaR confidence chip: 90% → 10%, 95% → 5%, 99% → 1%.
+ * Ranking score for E[return] on standing CFaR. Not E[max(0,−X)] of the
+ * implied normal — that is ~24% of standing at 95% and flips the open arm.
+ */
+export function cfarTailProbability(confidencePct: number): number {
+  if (!Number.isFinite(confidencePct)) return 0;
+  return Math.max(0, Math.min(1, (100 - confidencePct) / 100));
+}
+
+/** Same as the confidence chip tail — used by E[loss] on standing CFaR. */
+export function cfarExpectedLossWeight(confidencePct: number): number {
+  return cfarTailProbability(confidencePct);
+}
+
+/**
+ * Standing / hedgeable CFaR orthogonal to the residual floor.
+ * Frontier (and displayed Net) RSS the section with the S-leg:
+ *   X = √(floor² + standing²)  →  standing = √(max(0, X² − floor²)).
+ * Origin / fully flattened: X = floor → standing = 0. Do not invert σ
+ * from the total quantile — that haircuts unhedgeable cash-path CFaR.
+ */
+export function hedgeableCfarUsdM(
+  cfarUsdM: number,
+  floorCfarUsdM = 0,
+): number {
+  const x = Number.isFinite(cfarUsdM) ? Math.max(0, cfarUsdM) : 0;
+  const floor = Number.isFinite(floorCfarUsdM) ? Math.max(0, floorCfarUsdM) : 0;
+  if (x <= floor + 1e-12) return 0;
+  return Math.sqrt(x * x - floor * floor);
+}
+
+export function expectedCfarLossUsdM(
+  cfarUsdM: number,
+  confidencePct: number,
+  floorCfarUsdM = 0,
+): number {
+  return hedgeableCfarUsdM(cfarUsdM, floorCfarUsdM)
+    * cfarExpectedLossWeight(confidencePct);
+}
+
+/**
+ * Ranking score: certain carry minus tail × standing CFaR.
+ * Origin / flattened: standing = 0 → E[return] = carry.
+ * One-sided E[max(0,−X)] = σ/√(2π) scales with |S| like open cash and
+ * mirrors the green arm below zero — do not use it here.
+ */
+export function probabilityWeightedReturnUsdM(
+  carryUsdM: number,
+  cfarUsdM: number,
+  confidencePct: number,
+  floorCfarUsdM = 0,
+): number {
+  const carry = Number.isFinite(carryUsdM) ? carryUsdM : 0;
+  return carry - expectedCfarLossUsdM(cfarUsdM, confidencePct, floorCfarUsdM);
+}
+
+/**
+ * Residual FX Δ: 0 = book flattened (hedged), 1 = book left open.
+ * Certain carry is Cash + FWD + Swap cash + CIP × (1−Δ). Expected return nets
+ * E[loss] on standing CFaR above the flattened floor, not the residual
+ * quantile itself.
+ */
+export interface ResidualWeightedReturn {
+  delta: 0 | 1;
+  carryUsdM: number;
+  cfarUsdM: number;
+  weightedUsdM: number;
+}
+
+export function certainCarryAtResidualUsdM(
+  c: Pick<
+    LiquidityStrategyCcy,
+    | 'cashCarryUsdYrM'
+    | 'hedgeCarryUsdYrM'
+    | 'swapInterestUsdYrM'
+    | 'cipFullUsdYrM'
+  >,
+  delta: number,
+): number {
+  const hedged = 1 - clampHedgeDelta(delta);
+  return (
+    usdMToCarryK(c.cashCarryUsdYrM)
+    + usdMToCarryK(c.hedgeCarryUsdYrM)
+    + usdMToCarryK(c.swapInterestUsdYrM)
+    + usdMToCarryK(c.cipFullUsdYrM * hedged)
+  ) / 1000;
+}
+
+function residualRiskOverlay(
+  row: RowState,
+  plan: readonly LiquidityCycleProjection[],
+  delta: number,
+): SwapForwardOverlay {
+  const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
+  const residual = clampHedgeDelta(delta);
+  const E = fxBookNetLocalM(row);
+  const S = plan[0]?.swap_needed ?? 0;
+  const standing = plan.reduce(
+    (best, p) => (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
+    0,
+  );
+  const net = E + S;
+  return {
+    delta: residual,
+    exposureLocalM: E,
+    swapNearLocalM: S,
+    swapStandingLocalM: standing,
+    forwardLocalM: dust(-(1 - residual) * net),
+    remainingFarLocalM: dust(-residual * S),
+    residualNearLocalM: dust(residual * S),
+    finalNetLocalM: dust(residual * net),
+  };
+}
+
+function displayedCfarAtResidual(
+  result: LiquidityStrategyResult,
+  input: LiquidityStrategyInput,
+  delta: number,
+): Record<string, number> {
+  if (!input.setup) {
+    return Object.fromEntries(result.byCcy.map(c => [c.ccy, c.cfarUsdM]));
+  }
+  const rowByCcy = new Map(input.rows.map(r => [r.ccy, r]));
+  const overlays: Record<string, SwapForwardOverlay> = {};
+  const planByCcy = Object.fromEntries(result.byCcy.map(c => [c.ccy, c.plan]));
+  for (const c of result.byCcy) {
+    const row = rowByCcy.get(c.ccy);
+    if (!row) continue;
+    overlays[c.ccy] = residualRiskOverlay(row, c.plan, delta);
+  }
+  const fx = fxHedgeMcCfarByCcy({
+    rows: input.rows,
+    setup: input.setup,
+    forecastProfile: input.forecastProfile,
+    bookedHedges: input.bookedHedges,
+    preparedByCcy: input.preparedByCcy,
+    marketRatesByCcy: input.marketRatesByCcy,
+    ratesScopeId: input.ratesScopeId,
+    swapForwardOverlayByCcy: overlays,
+  });
+  return displayedCfarNetByCcyUsdM(fx, {
+    setup: input.setup,
+    fundingPlanByCcy: planByCcy,
+    swapForwardOverlayByCcy: overlays,
+  });
+}
+
+function residualSlice(
+  result: LiquidityStrategyResult,
+  cfarByCcy: Record<string, number>,
+  delta: 0 | 1,
+  confidencePct: number,
+  floorCfarUsdM: number,
+): ResidualWeightedReturn {
+  const carryUsdM = result.byCcy.reduce(
+    (s, c) => s + certainCarryAtResidualUsdM(c, delta),
+    0,
+  );
+  const cfarUsdM = result.byCcy.reduce(
+    (s, c) => s + (cfarByCcy[c.ccy] ?? 0),
+    0,
+  );
+  return {
+    delta,
+    carryUsdM,
+    cfarUsdM,
+    weightedUsdM: probabilityWeightedReturnUsdM(
+      carryUsdM, cfarUsdM, confidencePct, floorCfarUsdM,
+    ),
+  };
+}
+
+/** Certain carry + CFaR tail at residual Δ=0 (hedged) and Δ=1 (open). */
+export function weightedReturnByResidualDelta(
+  result: LiquidityStrategyResult,
+  input: LiquidityStrategyInput,
+  confidencePct: number,
+): {
+  hedged: ResidualWeightedReturn;
+  open: ResidualWeightedReturn;
+  cfarHedgedByCcy: Record<string, number>;
+  cfarOpenByCcy: Record<string, number>;
+} {
+  const cfarHedgedByCcy = displayedCfarAtResidual(result, input, 0);
+  const cfarOpenByCcy = displayedCfarAtResidual(result, input, 1);
+  const floorCfarUsdM = result.byCcy.reduce(
+    (s, c) => s + (cfarHedgedByCcy[c.ccy] ?? 0),
+    0,
+  );
+  return {
+    hedged: residualSlice(result, cfarHedgedByCcy, 0, confidencePct, floorCfarUsdM),
+    open: residualSlice(result, cfarOpenByCcy, 1, confidencePct, floorCfarUsdM),
+    cfarHedgedByCcy,
+    cfarOpenByCcy,
+  };
+}
+
+export function rowWeightedReturnAtResidualUsdM(
+  c: LiquidityStrategyCcy,
+  cfarUsdM: number,
+  delta: number,
+  confidencePct: number,
+  floorCfarUsdM = 0,
+): number {
+  return probabilityWeightedReturnUsdM(
+    certainCarryAtResidualUsdM(c, delta),
+    cfarUsdM,
+    confidencePct,
+    floorCfarUsdM,
+  );
 }
 
 export interface LiquidityStrategyInput {
@@ -204,6 +445,25 @@ export interface LiquidityStrategyInput {
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   ratesScopeId?: string;
+  /**
+   * Desk Swap+Fwd overlays. Live CIP scales by (1−Δ) (or the desk CIP map);
+   * `livePlanByCcy` stays the unscaled standing book.
+   */
+  swapForwardOverlayByCcy?: Readonly<Record<string, SwapForwardOverlay>>;
+  /** Desk Hedge carry per CCY ($M p.a.) — the map the P&L row already prints. */
+  deskHedgeCarryByCcyUsdM?: Record<string, number>;
+  /**
+   * Desk Cash Carry per CCY ($M) — staged dual-book cash when a hedge is on.
+   * Unhedged names fall through to cycle-1 LP NIM, the same `floatNim` the
+   * Liquidity P&L prints.
+   */
+  deskCashCarryByCcyUsdM?: Record<string, number>;
+  /**
+   * Desk FX HEDGE CIP per CCY ($M) — already Δ-scaled. Live regime prints this
+   * instead of re-deriving far-leg points, so Analytics cannot drift from the
+   * Liquidity CIP column.
+   */
+  deskCipByCcyUsdM?: Record<string, number>;
 }
 
 /** Desk `liquidityPlan` keyed by currency — the strip Analytics / Decision consume. */
@@ -244,15 +504,22 @@ export interface LiquidityStrategyCcy {
   odPaidUsdYrM: number;
   /** Unfunded cash carry vs USD — FX path only, no funding swap ($M p.a. P&L). */
   cashCarryUsdYrM: number;
-  /** FCY O/N on the funding-swap notional ($M p.a. P&L). */
+  /** Desk Hedge Cash / FWD pts ($M p.a.) — same on every strategy. */
+  hedgeCarryUsdYrM: number;
+  /** FCY O/N on the funding-swap standing book ($M p.a. P&L). */
   swapOnUsdYrM: number;
-  /** CIP mid swap points on that notional ($M p.a. P&L). */
+  /** Funding-swap far-leg CIP from Market data swap points ($M). */
   swapPointsUsdYrM: number;
-  /** Rate-diff carry = FCY O/N + USD O/N (= −points). The number the strip shows. */
+  /** Funding-swap cash leg: Σ cycle cash Δr vs USD. Desk Swap Carry column. */
   swapInterestUsdYrM: number;
-  /** Funding-swap overlay = FCY O/N + USD O/N + points. 0 at CIP mid. */
+  /**
+   * Unscaled CIP / FWD pts ($M p.a.) — residual Δ=0 (fully hedged).
+   * Displayed CIP is this × (1−Δ_live).
+   */
+  cipFullUsdYrM: number;
+  /** Swap cash + Swap points. ~0 when the far leg prices at CIP mid. */
   swapCarryUsdYrM: number;
-  /** −(cashCarry + swapCarry). Cost framing for the cards and the tab rail. */
+  /** −(cash + hedge + swapCarry). Cost framing for the cards and the tab rail. */
   netCostUsdYrM: number;
   /** Deepest low on the funded dated path (M FCY). */
   trough: number;
@@ -264,9 +531,11 @@ export interface LiquidityStrategyCcy {
   marketTrips: number;
   plan: readonly LiquidityCycleProjection[];
   schedule: readonly LiquiditySwapLegRow[];
+  /** Displayed Net CFaR (USD M) — FX hedge + this strategy's funding-swap bridge. */
+  cfarUsdM: number;
 }
 
-/** Funding-strip leg plus the CIP overlay on that trade (not the running book). */
+/** Funding-strip cycle: cash Δr + CIP on the standing book (same basis as the row). */
 export interface LiquiditySwapLegRow extends SwapLegScheduleRow {
   fcyOnUsdYr: number;
   usdOnUsdYr: number;
@@ -278,23 +547,77 @@ export interface LiquiditySwapLegRow extends SwapLegScheduleRow {
   netUsdYr: number;
 }
 
+/** Display $k — same integer rounding the Liquidity P&L uses for |k| ≥ 10. */
+export function usdMToCarryK(usdM: number): number {
+  const k = usdM * 1000;
+  if (!Number.isFinite(k) || Math.abs(k) < 0.5) return 0;
+  return Math.round(k);
+}
+
+export function strategyBookCarryK(
+  byCcy: readonly Pick<
+    LiquidityStrategyCcy,
+    | 'cashCarryUsdYrM'
+    | 'hedgeCarryUsdYrM'
+    | 'swapInterestUsdYrM'
+    | 'swapPointsUsdYrM'
+  >[],
+): { cash: number; hedge: number; swap: number; cip: number; total: number } {
+  const cash = byCcy.reduce((s, c) => s + usdMToCarryK(c.cashCarryUsdYrM), 0);
+  const hedge = byCcy.reduce((s, c) => s + usdMToCarryK(c.hedgeCarryUsdYrM), 0);
+  const swap = byCcy.reduce((s, c) => s + usdMToCarryK(c.swapInterestUsdYrM), 0);
+  const cip = byCcy.reduce((s, c) => s + usdMToCarryK(c.swapPointsUsdYrM), 0);
+  return { cash, hedge, swap, cip, total: cash + hedge + swap + cip };
+}
+
 export function swapLegScheduleWithCarry(
   schedule: readonly SwapLegScheduleRow[],
   spot: number,
   r_FCY: number,
   r_USD: number,
   r_OD?: number,
+  opts?: {
+    bundle?: FxMarketRatesBundle | null;
+    /** Far-leg tenor — term uses the horizon on the first cycle only; rolling is 1M each. */
+    farSettleMonths?: number;
+    /** Live Swap+Fwd Δ retention — same scale as the desk CIP column. */
+    cipScale?: number;
+  },
 ): LiquiditySwapLegRow[] {
-  return schedule.map(l => {
-    const o = fundingSwapOverlayUsdYr(l.newLeg, spot, r_FCY, r_USD, r_OD);
+  const farMonths = Math.max(1, opts?.farSettleMonths ?? 1);
+  const cipScale = opts?.cipScale ?? 1;
+  const monthFrac = 1 / 12;
+  const term = farMonths > 1;
+  return schedule.map((l, i) => {
+    const standing = l.outstanding;
+    const fcyRate = fundingSwapCashFcyRate(standing, r_FCY, r_OD);
+    const fcyOnUsdYr = standing * (fcyRate / 100) * spot * monthFrac;
+    const usdOnUsdYr = -standing * (r_USD / 100) * spot * monthFrac;
+    const interestUsdYr = fundingSwapCashDeltaUsdYr(
+      standing, spot, r_FCY, r_USD, r_OD,
+    ) * monthFrac;
+    const settleMonths = term ? (i === 0 ? farMonths : 0) : 1;
+    const fallbackPts = settleMonths === 0
+      ? 0
+      : fundingSwapOverlayUsdYr(
+          standing, spot, r_FCY, r_USD, r_OD,
+        ).pointsUsdYr * (settleMonths / 12);
+    const pointsUsdYr = settleMonths === 0
+      ? 0
+      : fundingSwapFarLegCipUsdM({
+          standingLocalM: standing,
+          settleMonths,
+          bundle: opts?.bundle,
+          fallbackUsdM: fallbackPts,
+        }) * cipScale;
     return {
       ...l,
-      fcyOnUsdYr: o.fcyOnUsdYr,
-      usdOnUsdYr: o.usdOnUsdYr,
-      pointsUsdYr: o.pointsUsdYr,
-      hasPoints: true,
-      interestUsdYr: o.fcyOnUsdYr + o.usdOnUsdYr,
-      netUsdYr: o.netUsdYr,
+      fcyOnUsdYr,
+      usdOnUsdYr,
+      pointsUsdYr,
+      hasPoints: settleMonths > 0,
+      interestUsdYr,
+      netUsdYr: interestUsdYr + pointsUsdYr,
     };
   });
 }
@@ -312,6 +635,7 @@ export interface LiquidityStrategyResult {
   fcyEarnedUsdYrM: number;
   odPaidUsdYrM: number;
   cashCarryUsdYrM: number;
+  hedgeCarryUsdYrM: number;
   swapOnUsdYrM: number;
   swapPointsUsdYrM: number;
   swapInterestUsdYrM: number;
@@ -345,14 +669,69 @@ function cfarCoverFcyFor(ccy: string, netByCcy?: Record<string, number>): number
   return usdToFcyM(usd, ccy);
 }
 
+/**
+ * Funding-swap overlay for one currency:
+ *   cash  — `fundingSwapCarryLegs` (same call as the desk P&L Buffer Carry)
+ *   points — Market data far-leg CIP via `fundingSwapPathFarCipUsdM`
+ *            (rolling = Σ 1M; term = one far tenor on M1 standing)
+ *            Live regime scales by (1−Δ), same as the desk CIP column.
+ */
+function liveCipRetention(
+  ccy: string,
+  strategy: LiquidityStrategy,
+  liveStrategyId: LiquidityStrategyId,
+  overlays?: Readonly<Record<string, SwapForwardOverlay>>,
+): number {
+  if (strategy.id !== liveStrategyId) return 1;
+  const overlay = overlays?.[ccy];
+  if (!overlay) return 1;
+  return 1 - clampHedgeDelta(overlay.delta);
+}
+
+function deskSwapOverlay(
+  row: RowState,
+  input: LiquidityStrategyInput,
+  plan: readonly LiquidityCycleProjection[],
+  cipScale = 1,
+): { fcyOnUsdYr: number; pointsUsdYr: number; interestUsdYr: number; netUsdYr: number } {
+  const legs = fundingSwapCarryLegs({
+    ccy: row.ccy,
+    plan,
+    r_FCY: row.r_FCY,
+    r_USD: input.shared.r_USD,
+    r_OD: row.r_OD,
+  });
+  const spot = ccySpotRate(row.ccy);
+  const standingFallback = swapFarLegNotional(
+    plan,
+    plan[0]?.swap_needed ?? 0,
+  );
+  const pointsUsdYr = fundingSwapPathFarCipUsdM({
+    plan,
+    standingFallback,
+    forecastMonths: input.shared.forecastMonths ?? input.months,
+    bundle: resolveMarketRatesForCcy(
+      input.marketRatesByCcy, row.ccy, input.ratesScopeId,
+    ),
+    fallbackAnnualUsdYr: S =>
+      fundingSwapCipPointsUsdYr(S, spot, row.r_FCY, input.shared.r_USD),
+  }) * cipScale;
+  return {
+    fcyOnUsdYr: legs.fcyOnUsdM,
+    pointsUsdYr,
+    interestUsdYr: legs.cashUsdM,
+    netUsdYr: legs.cashUsdM + pointsUsdYr,
+  };
+}
+
 function unfundedCashCarryUsdYr(
-  stats: PathStats,
+  split: { avgCredit: number; avgDebit: number },
   spot: number,
   r_FCY: number,
   r_OD: number,
   r_USD: number,
 ): number {
-  return (stats.avgCredit * (r_FCY - r_USD) + stats.avgDebit * (r_OD - r_USD)) / 100 * spot;
+  return (split.avgCredit * (r_FCY - r_USD) + split.avgDebit * (r_OD - r_USD)) / 100 * spot;
 }
 
 /**
@@ -467,12 +846,26 @@ function evaluateCcy(
             strategy.regime.bookingMode,
             cfarCoverFcy,
           );
+  const farSettleMonths =
+    strategy.regime?.bookingMode === 'term'
+      ? fundingSwapFarSettleMonths(plan, input.shared.forecastMonths ?? input.months)
+      : 1;
+  const cipScale = liveCipRetention(
+    row.ccy, strategy, liveStrategyId, input.swapForwardOverlayByCcy,
+  );
   const schedule = swapLegScheduleWithCarry(
     plan.length > 0 ? swapLegSchedule(plan) : [],
     spot,
     row.r_FCY,
     input.shared.r_USD,
     row.r_OD,
+    {
+      bundle: resolveMarketRatesForCcy(
+        input.marketRatesByCcy, row.ccy, input.ratesScopeId,
+      ),
+      farSettleMonths,
+      cipScale,
+    },
   );
 
   // A leg lands before the cycle's first payout, so the whole cycle sits that
@@ -484,22 +877,52 @@ function evaluateCcy(
   const stats = pathStats(ladder, shiftByCycle, ladder.floor);
 
   const book = plan.map(p => p.standing_swap);
-  const peakBook = book.reduce((m, v) => Math.max(m, v), 0);
+  const peakBook = book.reduce(
+    (best, v) => (Math.abs(v) > Math.abs(best) ? v : best),
+    0,
+  );
   const avgBook = book.length > 0 ? book.reduce((s, v) => s + v, 0) / book.length : 0;
 
   const usdGiveUpUsdYrM = avgBook * spot * (input.shared.r_USD / 100);
   const fcyEarnedUsdYrM = stats.avgCredit * spot * (row.r_FCY / 100);
   const odPaidUsdYrM = -stats.avgDebit * spot * (row.r_OD / 100);
 
-  // Cash Carry is the unfunded path (same number on every strategy). Swap Carry
-  // is the funding-swap overlay — CIP-zero when deploying surplus; covering a
-  // short keeps r_OD − r_FCY (OD saved vs market credit).
-  const unfunded = pathStats(ladder, ladder.cycles.map(() => 0), ladder.floor);
-  const cashCarryUsdYrM = unfundedCashCarryUsdYr(
-    unfunded, spot, row.r_FCY, row.r_OD, input.shared.r_USD,
-  );
-  const overlay = fundingSwapOverlayUsdYr(
-    avgBook, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
+  // Cash Carry is the desk P&L number: staged dual-book cash when a hedge is
+  // on, otherwise cycle-1 unfunded LP NIM (`floatNim`). Same on every strategy
+  // — the funding swap is Swap cash, not a second cash-carry figure.
+  const deskCash = input.deskCashCarryByCcyUsdM?.[row.ccy];
+  const cashCarryUsdYrM =
+    typeof deskCash === 'number' && Number.isFinite(deskCash)
+      ? deskCash
+      : unfundedCashCarryUsdYr(
+          cycleCarrySplit(ladder, 0),
+          spot, row.r_FCY, row.r_OD, input.shared.r_USD,
+        );
+  const deskHedge = input.deskHedgeCarryByCcyUsdM?.[row.ccy];
+  const hedgeCarryUsdYrM =
+    typeof deskHedge === 'number' && Number.isFinite(deskHedge) ? deskHedge : 0;
+  const overlayFull = deskSwapOverlay(row, input, plan, 1);
+  const overlay = cipScale === 1
+    ? overlayFull
+    : deskSwapOverlay(row, input, plan, cipScale);
+  const deskCip = input.deskCipByCcyUsdM?.[row.ccy];
+  let cipFullUsdYrM = overlayFull.pointsUsdYr;
+  let pointsUsdYr = overlay.pointsUsdYr;
+  if (
+    strategy.id === liveStrategyId
+    && typeof deskCip === 'number'
+    && Number.isFinite(deskCip)
+  ) {
+    pointsUsdYr = deskCip;
+    if (cipScale > 1e-9) cipFullUsdYrM = deskCip / cipScale;
+  }
+  const cashCarryRounded = roundMoney(cashCarryUsdYrM);
+  const hedgeCarryRounded = roundMoney(hedgeCarryUsdYrM);
+  const swapInterestUsdYrM = roundMoney(overlayFull.interestUsdYr);
+  const swapPointsUsdYrM = roundMoney(pointsUsdYr);
+  cipFullUsdYrM = roundMoney(cipFullUsdYrM);
+  const totalCarryUsdYrM = roundMoney(
+    cashCarryRounded + hedgeCarryRounded + swapInterestUsdYrM + swapPointsUsdYrM,
   );
 
   const gapToThreshold =
@@ -528,6 +951,32 @@ function evaluateCcy(
       ? (schedule[0]?.newLeg ?? 0)
       : schedule.reduce((s, l) => s + l.newLeg, 0);
 
+  const rawSchedulePts = schedule.reduce((s, l) => s + l.pointsUsdYr, 0);
+  const legs =
+    schedule.length === 0
+      ? schedule
+      : Math.abs(rawSchedulePts) > 1e-12
+        ? schedule.map(l => {
+            const factor = swapPointsUsdYrM / rawSchedulePts;
+            return {
+              ...l,
+              pointsUsdYr: l.pointsUsdYr * factor,
+              netUsdYr: l.interestUsdYr + l.pointsUsdYr * factor,
+            };
+          })
+        : Math.abs(swapPointsUsdYrM) < 1e-12
+          ? schedule
+          : schedule.map((l, i) =>
+              i === 0
+                ? {
+                    ...l,
+                    pointsUsdYr: swapPointsUsdYrM,
+                    hasPoints: true,
+                    netUsdYr: l.interestUsdYr + swapPointsUsdYrM,
+                  }
+                : l,
+            );
+
   return {
     ccy: row.ccy,
     spot,
@@ -541,18 +990,21 @@ function evaluateCcy(
     usdGiveUpUsdYrM: roundMoney(usdGiveUpUsdYrM),
     fcyEarnedUsdYrM: roundMoney(fcyEarnedUsdYrM),
     odPaidUsdYrM: roundMoney(odPaidUsdYrM),
-    cashCarryUsdYrM: roundMoney(cashCarryUsdYrM),
-    swapOnUsdYrM: roundMoney(overlay.fcyOnUsdYr),
-    swapPointsUsdYrM: roundMoney(overlay.pointsUsdYr),
-    swapInterestUsdYrM: roundMoney(overlay.fcyOnUsdYr + overlay.usdOnUsdYr),
-    swapCarryUsdYrM: roundMoney(overlay.netUsdYr),
-    netCostUsdYrM: roundMoney(-(cashCarryUsdYrM + overlay.netUsdYr)),
+    cashCarryUsdYrM: cashCarryRounded,
+    hedgeCarryUsdYrM: hedgeCarryRounded,
+    swapOnUsdYrM: roundMoney(overlayFull.fcyOnUsdYr),
+    swapPointsUsdYrM,
+    cipFullUsdYrM,
+    swapInterestUsdYrM,
+    swapCarryUsdYrM: roundMoney(swapInterestUsdYrM + swapPointsUsdYrM),
+    netCostUsdYrM: roundMoney(-totalCarryUsdYrM),
     trough: stats.trough,
     floorBreaches: stats.floorBreaches,
     gapToThreshold,
     marketTrips,
     plan,
-    schedule,
+    schedule: legs,
+    cfarUsdM: 0,
   };
 }
 
@@ -597,6 +1049,7 @@ export function evaluateLiquidityStrategies(
         preparedByCcy: input.preparedByCcy,
         marketRatesByCcy: input.marketRatesByCcy,
         ratesScopeId: input.ratesScopeId,
+        swapForwardOverlayByCcy: input.swapForwardOverlayByCcy,
       })
     : {};
 
@@ -610,16 +1063,22 @@ export function evaluateLiquidityStrategies(
       roundMoney(byCcy.reduce((s, c) => s + pick(c), 0));
 
     const planByCcy = Object.fromEntries(byCcy.map(c => [c.ccy, c.plan]));
-    const finalCfarUsdM = input.setup
-      ? sumNetCfarUsdM(displayedCfarNetByCcyUsdM(fxCfarByCcy, {
+    const cfarByCcy = input.setup
+      ? displayedCfarNetByCcyUsdM(fxCfarByCcy, {
           setup: input.setup,
           fundingPlanByCcy: planByCcy,
-        }))
-      : 0;
+          swapForwardOverlayByCcy: input.swapForwardOverlayByCcy,
+        })
+      : {};
+    const byCcyWithCfar = byCcy.map(c => ({
+      ...c,
+      cfarUsdM: cfarByCcy[c.ccy] ?? 0,
+    }));
+    const finalCfarUsdM = input.setup ? sumNetCfarUsdM(cfarByCcy) : 0;
 
     return {
       strategy,
-      byCcy,
+      byCcy: byCcyWithCfar,
       committedTodayUsdM: sumUsd(c => c.committedToday),
       bookNowUsdM: sumUsd(c => c.bookNow),
       peakBookUsdM: sumUsd(c => c.peakBook),
@@ -627,6 +1086,7 @@ export function evaluateLiquidityStrategies(
       fcyEarnedUsdYrM: sum(c => c.fcyEarnedUsdYrM),
       odPaidUsdYrM: sum(c => c.odPaidUsdYrM),
       cashCarryUsdYrM: sum(c => c.cashCarryUsdYrM),
+      hedgeCarryUsdYrM: sum(c => c.hedgeCarryUsdYrM),
       swapOnUsdYrM: sum(c => c.swapOnUsdYrM),
       swapPointsUsdYrM: sum(c => c.swapPointsUsdYrM),
       swapInterestUsdYrM: sum(c => c.swapInterestUsdYrM),
@@ -666,10 +1126,31 @@ export interface LiquidityAnalyticsSource {
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   /** Desk layers — counterfactuals size H* on the same stack the book is running. */
   activeLayers?: Set<LayerId>;
+  /** Toggle the same buffer-layer stack used by the Liquidity tab. */
+  onLayerToggle?: (id: LayerId) => void;
+  /** Open the desk settings dialog for a buffer chip (gear). */
+  layerPanel?: BufferChipKey | null;
+  onLayerPanelChange?: (id: BufferChipKey | null) => void;
   /** Desk-computed funded plan per CCY. Live strategy uses this strip as-is. */
   livePlanByCcy?: Readonly<Record<string, readonly LiquidityCycleProjection[]>>;
   /** FX-hedge Net CFaR per CCY (USD M) — sizes the CFaR cover layer. */
   cfarNetByCcyUsd?: Record<string, number>;
+  /** Desk Swap+Fwd overlays — retention is applied inside the CFaR bridge only. */
+  swapForwardOverlayByCcy?: Readonly<Record<string, SwapForwardOverlay>>;
+  /**
+   * The desk's own globals. `r_USD` prices the carry differential and `σ_P`
+   * sizes the payout cushion that sets `standing_swap`, so re-deriving them
+   * here would price a different book than the Liquidity tab is running.
+   */
+  deskShared?: SharedGlobals;
+  /** Desk Hedge carry per CCY ($M p.a.) — the map the P&L row already prints. */
+  deskHedgeCarryByCcyUsdM?: Record<string, number>;
+  /** Desk Cash Carry per CCY ($M) — staged dual-book cash when a hedge is on. */
+  deskCashCarryByCcyUsdM?: Record<string, number>;
+  /** Desk FX HEDGE CIP per CCY ($M) — already Δ-scaled. */
+  deskCipByCcyUsdM?: Record<string, number>;
+  /** Shared VaR/CFaR setup editor — confidence chips on Liquidity Analytics. */
+  onSetupChange?: (setup: VarSetup) => void;
 }
 
 /**
@@ -708,16 +1189,49 @@ export function liquidityStrategyInputFrom(
       if (flows.some(f => Math.abs(f) > 1e-9)) hedgeSettleByCcy[row.ccy] = flows;
     }
   }
+  const deskCashCarryByCcyUsdM: Record<string, number> = {
+    ...(src.deskCashCarryByCcyUsdM ?? {}),
+  };
+  const deskHedgeCarryByCcyUsdM: Record<string, number> = {
+    ...(src.deskHedgeCarryByCcyUsdM ?? {}),
+  };
+  if (months > 0 && (src.bookRows?.length ?? 0) > 0) {
+    const split = cashForecastCarrySplitByCcyUsdM({
+      rows: src.bookRows ?? [],
+      forecastProfile: src.forecastProfile,
+      forecastMonths: months,
+      bookedHedges: src.bookedHedges,
+      preparedByCcy: src.preparedByCcy,
+      setup: src.setup,
+      marketRatesByCcy: src.marketRatesByCcy,
+      ratesScopeId: src.ratesScopeId,
+      extraForwards: analyticsForwardsFromOverlays({
+        overlayByCcy: src.swapForwardOverlayByCcy,
+        planByCcy: src.livePlanByCcy,
+        forecastMonths: months,
+      }),
+    });
+    for (const [ccy, legs] of Object.entries(split)) {
+      if (deskCashCarryByCcyUsdM[ccy] === undefined) {
+        deskCashCarryByCcyUsdM[ccy] = legs.cashUsdM;
+      }
+      if (deskHedgeCarryByCcyUsdM[ccy] === undefined) {
+        deskHedgeCarryByCcyUsdM[ccy] = legs.fwdUsdM;
+      }
+    }
+  }
   return {
     rows: src.bookRows ?? [],
     forecastProfile: src.forecastProfile,
     months,
-    shared: {
-      r_USD: resolveOvernightCashRates(usdBundle, 'USD').usd.creditPct,
-      σ_P: src.setup.forecastUncertainty1m ?? 0,
-      days: 3,
-      forecastMonths: months,
-    },
+    shared: src.deskShared
+      ? { ...src.deskShared, forecastMonths: months }
+      : {
+          r_USD: resolveOvernightCashRates(usdBundle, 'USD').usd.creditPct,
+          σ_P: src.setup.forecastUncertainty1m ?? 0,
+          days: 3,
+          forecastMonths: months,
+        },
     hedgeSettleByCcy,
     activeLayers: src.activeLayers,
     livePlanByCcy: src.livePlanByCcy,
@@ -727,5 +1241,9 @@ export function liquidityStrategyInputFrom(
     preparedByCcy: src.preparedByCcy,
     marketRatesByCcy: src.marketRatesByCcy,
     ratesScopeId: src.ratesScopeId,
+    swapForwardOverlayByCcy: src.swapForwardOverlayByCcy,
+    deskHedgeCarryByCcyUsdM,
+    deskCashCarryByCcyUsdM,
+    deskCipByCcyUsdM: src.deskCipByCcyUsdM,
   };
 }

@@ -6,12 +6,12 @@ import {
   fundingSwapPathCarryUsdM,
   fundingSwapCashDeltaUsdYr,
   fundingSwapCarryViewFor,
+  INITIAL_USD_PARAMS,
   makeSimRow,
   usdToFcyM,
   type LayerId,
 } from '@/lib/fx-buffer';
 import { computeDashboardModel } from '@/lib/dashboard-model';
-import { INITIAL_USD_PARAMS, CURRENCY_PARAMS } from '@/lib/fx-buffer';
 import { fxHedgeNetCfarByCcyUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
 import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
@@ -114,8 +114,18 @@ describe('computeLayeredBuffer CFaR cover', () => {
     const on = computeLayeredBuffer(0, -6.6, 0.1, 3.5, 1.78, 2.21, 0, cover, 2.5, undefined, 1.71);
     expect(off.delta_cfar).toBe(0);
     expect(on.delta_cfar).toBeCloseTo(1.71, 8);
-    // PAY with no other hold: stack cover on the unfunded trough so swap = cover.
-    expect(on.cash_threshold).toBeCloseTo(-6.6 + 1.71, 8);
+    // FX P&L cover is not FCY liquidity — H* / Swap Near stay on the unfunded trough.
+    expect(on.cash_threshold).toBeCloseTo(off.cash_threshold, 8);
+  });
+
+  it('does not change H* when CFaR cover is stacked on payout-σ', () => {
+    const sigma = new Set<LayerId>(['sigmaP']);
+    const both = new Set<LayerId>(['sigmaP', 'cfarCover']);
+    const a = computeLayeredBuffer(10, 5, 0.1, 3.5, 1.78, 2.21, 0, sigma, 10, undefined, 1.71);
+    const b = computeLayeredBuffer(10, 5, 0.1, 3.5, 1.78, 2.21, 0, both, 10, undefined, 1.71);
+    expect(a.delta_sigma).toBeGreaterThan(0);
+    expect(b.delta_cfar).toBeCloseTo(1.71, 8);
+    expect(b.cash_threshold).toBeCloseTo(a.cash_threshold, 8);
   });
 
   it('does not use Gross — omitted cover is zero even if the layer is on', () => {
@@ -128,19 +138,13 @@ describe('CFaR cover layer on the desk', () => {
   const netUsd = 2.4;
   const coverFcy = usdToFcyM(netUsd, 'EUR');
 
-  it('sizes the funding swap from Net CFaR and leaves trough / unfunded carry unchanged', () => {
+  it('does not size the funding swap from Net CFaR', () => {
     const off = model([], { EUR: netUsd }).fcyComputed[0]!;
     const on = model(['cfarCover'], { EUR: netUsd }).fcyComputed[0]!;
 
     expect(on.lp_peak_cash).toBeCloseTo(off.lp_peak_cash, 8);
     expect(on.floatNim).toBeCloseTo(off.floatNim, 8);
-    expect(on.swapNear).toBeCloseTo(off.swapNear + coverFcy, 4);
-    const spot = CURRENCY_PARAMS.EUR?.spot ?? 1.1701;
-    const cash = on.swapNear * ((
-      on.swapNear < 0 ? EUR.r_OD : EUR.r_FCY
-    ) - 3.50) / 100 * spot;
-    expect(on.swapCarryUsdYr).toBeCloseTo(cash, 6);
-    expect(on.swapOnUsdYr + on.swapPointsUsdYr).not.toBe(0);
+    expect(on.swapNear).toBeCloseTo(off.swapNear, 4);
   });
 
   it('does not loop — cover sizing is FX-hedge only and ignores the funding swap', () => {
@@ -179,10 +183,10 @@ describe('CFaR cover layer on the desk', () => {
     expect(b.EUR ?? 0).toBeGreaterThan(a.EUR ?? 0);
   });
 
-  it('stacks additively with another buffer', () => {
+  it('does not add CFaR to Swap Near when stacked with another buffer', () => {
     const floorOnly = model(['floorH'], { EUR: netUsd }).fcyComputed[0]!;
     const both = model(['floorH', 'cfarCover'], { EUR: netUsd }).fcyComputed[0]!;
-    expect(both.swapNear).toBeGreaterThan(floorOnly.swapNear);
+    expect(both.swapNear).toBeCloseTo(floorOnly.swapNear, 4);
     expect(both.floatNim).toBeCloseTo(floorOnly.floatNim, 8);
   });
 });

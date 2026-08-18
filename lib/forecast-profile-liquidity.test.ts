@@ -229,6 +229,28 @@ describe('projectLiquidityCycles — term booking', () => {
     // Same path, same total cover — bought up front instead of cycle by cycle.
     expect(term[0]!.swap_needed).toBeCloseTo(rolling[T - 1]!.standing_swap, 2);
   });
+
+  it('books a PAY short as one term leg — peak standing is not floored at 0', () => {
+    const pay = row({
+      cash: 40, payout: -2, collections: 2, cash_floor: 0, carry_target: -15,
+    });
+    const layers = new Set<LayerId>(['carryOptim']);
+    const rolling = projectLiquidityCycles(
+      pay, SHARED, layers, 6, flatGrowthProfile(0),
+    );
+    const term = projectLiquidityCycles(
+      pay, SHARED, layers, 6, flatGrowthProfile(0),
+      undefined, undefined, 'term',
+    );
+    const peak = rolling.reduce(
+      (best, p) => (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
+      0,
+    );
+    expect(peak).toBeLessThan(-0.5);
+    expect(term[0]!.swap_needed).toBeCloseTo(peak, 1);
+    expect(swapLegSchedule(term)).toHaveLength(1);
+    expect(term.slice(1).every(p => p.swap_needed === 0)).toBe(true);
+  });
 });
 
 describe('projectLiquidityCycles — custom mode month series', () => {

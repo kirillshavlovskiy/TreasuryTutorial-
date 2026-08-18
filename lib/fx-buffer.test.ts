@@ -43,6 +43,7 @@ import {
   computePortfolioVAR,
   optimizePortfolioCarry,
   computeEffectiveUsdBudget,
+  toggleLayerGroup,
   type PortfolioCarryInput,
   type LayerId,
   CURRENCY_PARAMS,
@@ -477,19 +478,32 @@ describe('computeLayeredBuffer', () => {
     expect(r.cash_threshold).toBeCloseTo(trough + expected_sigma, 6);
   });
 
-  it('PAY carry: additive layers on scale; negative H* without payout gap', () => {
+  it('PAY carry with no Min floor: layer is neutral, nothing to anchor on', () => {
     const rCheap = computeLayeredBuffer(0, P, σ_P, r_USD, EUR.r_FCY, 1.0, 0, carry);
     expect(rCheap.P_contrib).toBe(0);
-    expect(rCheap.delta_carry).toBeLessThan(0);
-    expect(rCheap.cash_threshold).toBeCloseTo(rCheap.delta_carry, 4);
-    expect(rCheap.cash_threshold).toBeLessThan(0);
+    expect(rCheap.delta_carry).toBe(0);
+    expect(rCheap.cash_threshold).toBe(0);
   });
 
-  it('carry EARN only (HUF): positive delta_carry → cash_threshold > 0', () => {
+  it('PAY carry anchored on a Min floor: the floor is the carry level', () => {
+    const r = computeLayeredBuffer(0, P, σ_P, r_USD, EUR.r_FCY, 1.0, 3.0, carry);
+    // Floor VALUE drives the default even with the floorH layer off.
+    expect(r.floor_contrib).toBe(0);
+    expect(r.cash_threshold).toBeCloseTo(3.0, 6);
+  });
+
+  it('carry EARN only (HUF) with no Min floor: neutral, direction still reported', () => {
     const r = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, 0, carry);
-    expect(r.delta_carry).toBeGreaterThan(0);
-    expect(r.cash_threshold).toBeGreaterThan(0);
+    expect(r.delta_carry).toBe(0);
     expect(r.carry_dir).toBe('earn');
+  });
+
+  it('carry EARN (HUF) anchored on a Min floor lands on it', () => {
+    const ask = 12.0;
+    const r = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, ask, carry);
+    // The ask states Target LP Cash pre-payout; the cushion carries it net of |payout|.
+    expect(r.cash_threshold).toBeCloseTo(ask - P, 6);
+    expect(r.carry_target_applied).toBe(true);
   });
 
   it('floor + PAY carry: enabled floor is a hard minimum (carry cannot sell through it)', () => {
@@ -526,20 +540,21 @@ describe('computeLayeredBuffer', () => {
     );
   });
 
-  it('safety + carry (EARN): carry shifts z from neutral (1.645) to optimal', () => {
+  it('safety + carry with no Min floor: the carry layer leaves safety untouched', () => {
     const rSafety = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, 0, safety);
     const rBoth   = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, 0,
       new Set(['sigmaP', 'carryOptim']));
-    expect(rBoth.z_opt).toBeGreaterThan(Z_NEUTRAL);
-    expect(rBoth.cash_threshold).toBeGreaterThan(rSafety.cash_threshold);
+    expect(rBoth.delta_carry).toBe(0);
+    expect(rBoth.cash_threshold).toBeCloseTo(rSafety.cash_threshold, 10);
   });
 
-  it('safety + EARN carry: carry shifts z up → cash_threshold > safety alone', () => {
-    const rSafety = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, 0, safety);
-    const rBoth   = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, 0,
+  it('safety + carry anchored on a Min floor overrides the safety stack', () => {
+    const ask = 400;
+    const rBoth = computeLayeredBuffer(P, P, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, ask,
       new Set(['sigmaP', 'carryOptim']));
-    expect(rBoth.z_opt).toBeGreaterThan(Z_NEUTRAL);
-    expect(rBoth.cash_threshold).toBeGreaterThan(rSafety.cash_threshold);
+    // δ_carry absorbs σ so the book lands on the stated floor, not floor + σ.
+    expect(rBoth.delta_sigma).toBeGreaterThan(0);
+    expect(rBoth.cash_threshold).toBeCloseTo(ask - P, 6);
   });
 
   it('neutral carry: z_opt ≈ Z_NEUTRAL, delta_carry ≈ 0', () => {
@@ -600,24 +615,32 @@ describe('computeLayeredBuffer', () => {
     }
   });
 
-  it('zero payout PAY CAD: additive H* below zero (sell excess stock)', () => {
+  it('zero payout PAY CAD with no Min floor: carry stays neutral', () => {
     const CAD = { r_FCY: 1.49, r_OD: 2.39 };
     const trough = 95.1;
     const r = computeLayeredBuffer(0, trough, σ_P, r_USD, CAD.r_FCY, CAD.r_OD, 0, all3, trough);
     expect(r.P_contrib).toBe(0);
     expect(r.delta_sigma).toBe(0);
-    expect(r.delta_carry).toBeLessThan(0);
-    expect(r.cash_threshold).toBeCloseTo(r.floor_contrib + r.delta_carry, 4);
-    expect(r.cash_threshold).toBeLessThan(0);
+    expect(r.delta_carry).toBe(0);
+    expect(r.cash_threshold).toBeCloseTo(r.floor_contrib, 4);
   });
 
-  it('zero payout EARN: carry on trough adds to opening stock', () => {
+  it('zero payout PAY CAD anchored on a Min floor sells the stock down to it', () => {
+    const CAD = { r_FCY: 1.49, r_OD: 2.39 };
+    const trough = 95.1;
+    const floorAsk = 10;
+    const r = computeLayeredBuffer(0, trough, σ_P, r_USD, CAD.r_FCY, CAD.r_OD, floorAsk,
+      new Set(['carryOptim']), trough);
+    expect(r.cash_threshold).toBeCloseTo(floorAsk, 6);
+    expect(r.cash_threshold).toBeLessThan(trough);
+  });
+
+  it('zero payout EARN with no Min floor: carry adds nothing to the stock', () => {
     const trough = 238;
     const r = computeLayeredBuffer(0, trough, σ_P, r_USD, HUF.r_FCY, HUF.r_OD, 0,
       new Set(['carryOptim']), trough);
-    expect(r.delta_carry).toBeGreaterThan(0);
-    expect(r.cash_threshold).toBeCloseTo(trough + r.delta_carry, 4);
-    expect(r.cash_threshold).toBeGreaterThan(trough);
+    expect(r.delta_carry).toBe(0);
+    expect(r.cash_threshold).toBeCloseTo(trough, 4);
   });
 
   it('zero payout: enabled floor caps the PAY sell-down (hard minimum)', () => {
@@ -1392,5 +1415,20 @@ describe('computeEffectiveUsdBudget', () => {
 
   it('positive USD payout does not increase collateral budget', () => {
     expect(computeEffectiveUsdBudget(303.9, 50)).toBeCloseTo(303.9);
+  });
+});
+
+describe('toggleLayerGroup', () => {
+  it('turns payout σ and CFaR cover on or off together', () => {
+    const active = new Set<LayerId>(['sigmaP']);
+    const flip = (id: LayerId) => {
+      if (active.has(id)) active.delete(id);
+      else active.add(id);
+    };
+    toggleLayerGroup(['sigmaP', 'cfarCover'], active, flip);
+    expect([...active]).toEqual([]);
+    toggleLayerGroup(['sigmaP', 'cfarCover'], active, flip);
+    expect(active.has('sigmaP')).toBe(true);
+    expect(active.has('cfarCover')).toBe(true);
   });
 });

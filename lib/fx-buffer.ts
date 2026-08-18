@@ -350,20 +350,43 @@ export function calcMultiCcyTable(
 //   1. Floor    (floor_contrib = cash_floor if floorH on, else 0) — hard minimum
 //   2. Safety   (+delta_sigma = P × σ_P × z_neutral)             — forecast uncertainty margin
 //   3. Carry    (±delta_carry = P × σ_P × Δz)                    — rate-differential adjustment
-//   4. CFaR     (+delta_cfar = Net CFaR in FCY)                  — FX-hedge residual cash at risk
+//   4. CFaR     (delta_cfar = Net CFaR in FCY) — FX-hedge residual readout.
+//                 Not FCY liquidity: a USD CFaR event does not change how much
+//                 AUD you need to pay AUD invoices. Do not size Swap Near from it.
 // P is the expected outflow volume scale — it sizes the safety and carry deltas only.
 
 export const Z_NEUTRAL = 1.645; // 95% confidence neutral z-score
 
 export type LayerId = 'sigmaP' | 'carryOptim' | 'floorH' | 'portfolioDiv' | 'cfarCover';
 
+/** Chip groups on the buffer-layer rail — each gear opens that group's settings. */
+export type BufferChipKey = 'floorH' | 'forecastAccuracy' | 'carryOptim' | 'portfolioDiv';
+
+/** Payout-σ and Net CFaR cover — one forecast-accuracy buffer in the desk UI. */
+export const FORECAST_ACCURACY_LAYERS: readonly LayerId[] = ['sigmaP', 'cfarCover'];
+
+export function forecastAccuracyLayerOn(active: Set<LayerId> | undefined): boolean {
+  return FORECAST_ACCURACY_LAYERS.some(id => active?.has(id) === true);
+}
+
+/** Flip a layer group to a single on/off so mixed leftover state collapses. */
+export function toggleLayerGroup(
+  layers: readonly LayerId[],
+  active: Set<LayerId> | undefined,
+  toggle: (id: LayerId) => void,
+): void {
+  const next = !layers.some(id => active?.has(id) === true);
+  for (const id of layers) {
+    if (Boolean(active?.has(id)) !== next) toggle(id);
+  }
+}
+
 /** True when any liquidity-funding layer is on — no layer selected means no swap. */
 export function liquidityFormulaLayersActive(active: Set<LayerId>): boolean {
   return active.has('floorH')
     || active.has('sigmaP')
     || active.has('carryOptim')
-    || active.has('portfolioDiv')
-    || active.has('cfarCover');
+    || active.has('portfolioDiv');
 }
 
 export interface LayeredBufferResult {
@@ -371,9 +394,9 @@ export interface LayeredBufferResult {
   floor_contrib: number;  // per-currency floor contribution (cash_floor if floorH on, else 0)
   delta_sigma: number;   // always ≥ 0 — safety margin for outflow forecast uncertainty
   delta_carry: number;   // can be negative (PAY carry) or positive (EARN carry)
-  /** Net CFaR converted to FCY — 0 unless the CFaR cover layer is on. */
+  /** FX-hedge Net CFaR in FCY — 0 unless the CFaR cover layer is on. Not Swap Near. */
   delta_cfar: number;
-  raw_sum: number;       // P_contrib + floor_contrib + delta_sigma + delta_carry + delta_cfar
+  raw_sum: number;       // floor_contrib + delta_sigma + delta_carry (no CFaR)
   cash_threshold: number; // PRE-PAYOUT target (may be floored at 0 when r_OD > r_FCY)
   floor_binding: boolean; // display indicator: true when (delta_sigma + delta_carry) < 0
   z_opt: number;         // optimal z used (= Z_NEUTRAL when carryOptim is off)
@@ -497,11 +520,11 @@ const FUNDING_SWAP_MONTHS_PA = 12;
  *   `cip`       — FCY O/N + USD O/N + swap-market points (covering OD leftover;
  *                 deploying surplus CIP-nets to 0).
  *   `cashDelta` — cash-market carry vs USD on the standing book, no points.
- *                 Carry target steers on this number.
+ *                 Buffer Carry target steers on this number.
  */
 export type FundingSwapCarryView = 'cip' | 'cashDelta';
 
-/** Carry target is a cash-vs-USD ask — CIP would print 0 on the deploy that funds it. */
+/** Buffer Carry target is a cash-vs-USD ask — CIP would print 0 on the deploy that funds it. */
 export function fundingSwapCarryViewFor(
   carryTarget: number | undefined,
   carryLayerOn = true,
@@ -525,7 +548,7 @@ export function fundingSwapCarryUsdYr(
 }
 
 /**
- * Carry vs USD on the funding-swap book (the leg Carry target sizes).
+ * Carry vs USD on the funding-swap book (the leg Buffer Carry target sizes).
  * Long FCY earns/pays r_FCY − r_USD; a short book uses r_OD (borrow FCY).
  * CIP points are excluded — they belong to the swap market, not this P&L.
  */
@@ -574,6 +597,48 @@ export function fundingSwapPathCarryUsdM(
 }
 
 /** Path CIP P&L lives in fx-market-rates (`fundingSwapPathFarCipUsdM`) — far-leg swap points. */
+
+/** Funding-swap carry legs for one currency ($M p.a.). */
+export interface FundingSwapCarryLegs {
+  /** Cash Δr vs USD on the standing book, Σ over the plan's cycles. */
+  cashUsdM: number;
+  /** FCY O/N component of that cash leg. */
+  fcyOnUsdM: number;
+}
+
+/**
+ * The single funding-swap carry calculation. Desk P&L (`pnlSwapCarryUsdM`) and
+ * Liquidity Analytics both call this — never re-derive the legs at a call site,
+ * or the two views drift on spot, on the O/N rate rule, or on annualisation.
+ */
+export function fundingSwapCarryLegs(input: {
+  ccy: string;
+  plan: readonly { standing_swap: number }[] | null | undefined;
+  r_FCY: number;
+  r_USD: number;
+  r_OD?: number;
+  /** Used when the row carries no funded strip. */
+  fallbackCashUsdM?: number;
+}): FundingSwapCarryLegs {
+  const fallback = input.fallbackCashUsdM ?? 0;
+  const plan = input.plan;
+  if (!plan?.length) return { cashUsdM: fallback, fcyOnUsdM: 0 };
+
+  const spot = ccySpotRate(input.ccy);
+  const cashUsdM = fundingSwapPathCarryUsdM(
+    plan, spot, input.r_FCY, input.r_USD, input.r_OD, 'cashDelta',
+  ) ?? fallback;
+  const fcyOnUsdM = plan.reduce(
+    (s, p) =>
+      s
+      + p.standing_swap
+        * (fundingSwapCashFcyRate(p.standing_swap, input.r_FCY, input.r_OD) / 100)
+        * spot
+        / FUNDING_SWAP_MONTHS_PA,
+    0,
+  );
+  return { cashUsdM, fcyOnUsdM };
+}
 
 /**
  * Layered buffer + swap bridge (see also optimizePortfolioCarry when portfolioDiv is on).
@@ -640,16 +705,31 @@ export function computeLayeredBuffer(
   // A manual carry target states the Target LP Cash directly; the layer stack is
   // expressed at the trough, so it enters as the δ_carry that reaches that target.
   // It is setup for the carry layer, so it only reaches the book once that is on.
-  const carry_target_applied =
+  const manual_carry_target =
     active.has('carryOptim') && typeof carry_target_M === 'number' && Number.isFinite(carry_target_M);
+  // No ask typed: the default carry level IS the Min floor stated for this currency.
+  // An unset floor reads as a 0 carry tilt — the layer stays neutral and the other
+  // layers stand as they are, rather than the book taking whatever z_opt prices.
+  // The floor VALUE drives this on its own; the floorH toggle only controls whether
+  // the floor also binds as a hard minimum further down.
+  const default_carry_target =
+    !manual_carry_target
+    && active.has('carryOptim')
+    && Math.abs(cash_floor) > 0.0001
+      ? cash_floor
+      : null;
+  const carry_layer_neutral =
+    !manual_carry_target && active.has('carryOptim') && default_carry_target === null;
+  const carry_target_applied = manual_carry_target || default_carry_target !== null;
   if (carry_target_applied) {
     delta_carry = carryTargetDelta(
-      carry_target_M!, payoutScale, trough, floor_contrib, delta_sigma, payCarry,
+      manual_carry_target ? carry_target_M! : default_carry_target!,
+      payoutScale, trough, floor_contrib, delta_sigma, payCarry,
     );
     z_opt = stockScale > 0.001 && σ_P > 0
       ? Z_NEUTRAL + delta_carry / (stockScale * σ_P)
       : Z_NEUTRAL;
-  } else if (active.has('carryOptim') && σ_P > 0 && stockScale > 0.001) {
+  } else if (!carry_layer_neutral && active.has('carryOptim') && σ_P > 0 && stockScale > 0.001) {
     const raw_ratio = (Δr / 100) / ((r_OD || 0.01) / 100);
     const shortfall_prob = Math.max(0.001, Math.min(0.999, raw_ratio));
     z_opt = normInv(1 - shortfall_prob);
@@ -657,15 +737,15 @@ export function computeLayeredBuffer(
   }
 
   const P_contrib = active.has('sigmaP') && payoutScale > 0.001 && !payCarry ? payoutScale : 0;
-  // Cover only Net CFaR (never Gross). Input is FX-hedge CFaR — no funding-swap loop.
-  // Stacked on the other-layer hold (or the unfunded trough when that hold is 0)
-  // so the swap increment equals the cover, PAY and EARN alike.
+  // FX-hedge residual in FCY — a readout, never a funding-swap increment.
+  // USD CFaR is P&L; FCY payment capacity is volume. Mixing them prints a
+  // bogus Swap Near (and a Swap+Fwd overlay then hedges that extra S).
   const delta_cfar = active.has('cfarCover') && (cfarCoverFcy ?? 0) > 0.001
     ? cfarCoverFcy!
     : 0;
   const layerSum = floor_contrib + delta_sigma + delta_carry;
   const hold = payCarry ? layerSum : Math.max(trough, 0) + layerSum;
-  const raw_sum = (Math.abs(hold) < 0.001 && delta_cfar > 0.001 ? trough : hold) + delta_cfar;
+  const raw_sum = hold;
 
   const noNeg = applyNoNegativeLpFloor(raw_sum, r_OD, r_USD);
   // Hard minimum: with the floor layer on, the trough cushion never drops below cash_floor.
@@ -939,9 +1019,9 @@ export function payoutLiquidityMinimum(
   delta_sigma: number,
   r_OD: number,
   r_USD: number,
-  delta_cfar = 0,
+  _delta_cfar = 0,
 ): number {
-  const raw = P_contrib + floor_contrib + delta_sigma + delta_cfar;
+  const raw = P_contrib + floor_contrib + delta_sigma;
   return applyNoNegativeLpFloor(raw, r_OD, r_USD).cash_threshold;
 }
 
@@ -1367,7 +1447,7 @@ export interface PortfolioCarryInput {
   forecasted_cash: number;  // trough = lp_cash + payout (anchor for H*)
   floor_contrib: number;    // floor contribution already computed (floorH layer)
   delta_sigma: number;      // safety margin already computed (sigmaP layer)
-  /** Net CFaR cover — part of the hold-the-book base, not the overlay. */
+  /** FX-hedge Net CFaR — readout only; not part of the FCY hold-the-book base. */
   delta_cfar?: number;
   r_FCY: number;            // % p.a.
   r_OD: number;             // % p.a.
@@ -1559,7 +1639,7 @@ export function optimizePortfolioCarry(
     const Δr = r_USD - inp.r_FCY;
     const payCarry = isPayCarry(r_USD, inp.r_FCY);
     const trough = inp.forecasted_cash;
-    const base = Math.max(trough, 0) + inp.floor_contrib + inp.delta_sigma + (inp.delta_cfar ?? 0);
+    const base = Math.max(trough, 0) + inp.floor_contrib + inp.delta_sigma;
     let dir = 0, z_opt = Z_NEUTRAL;
     let manual = false;
     if (payoutCarry && p) {

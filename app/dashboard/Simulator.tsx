@@ -33,6 +33,7 @@ import {
   type RowState,
   type UsdParams,
   type LayerId,
+  type BufferChipKey,
 } from '@/lib/fx-buffer';
 import type {
   HedgeStrategy,
@@ -315,6 +316,9 @@ export function Simulator({
   const [swapForwardOverlayByCcy, setSwapForwardOverlayByCcy] = useState<
     Record<string, SwapForwardOverlay>
   >({});
+  const [deskCipByCcyUsdM, setDeskCipByCcyUsdM] = useState<
+    Record<string, number>
+  >({});
 
   const liquidityTiming =
     resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
@@ -355,6 +359,7 @@ export function Simulator({
       else next.add(id);
       return next;
     });
+  const [layerPanel, setLayerPanel] = useState<BufferChipKey | null>(null);
 
   const onSharedChange = (key: keyof SharedGlobals, value: number) =>
     setShared(s => ({ ...s, [key]: value }));
@@ -377,65 +382,6 @@ export function Simulator({
     () => hedgePositionOffsetsByCcy(bookedHedges, preparedByCcy),
     [bookedHedges, preparedByCcy],
   );
-  const analyticsExtraForwards = useMemo(
-    () =>
-      analyticsForwardsFromOverlays({
-        overlayByCcy: swapForwardOverlayByCcy,
-        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
-      }),
-    [
-      swapForwardOverlayByCcy,
-      shared.forecastMonths,
-      varSetup.forecastMonths,
-    ],
-  );
-
-  const cashForecastCarryByCcy = useMemo(
-    () =>
-      cashForecastCarrySplitByCcyUsdM({
-        rows,
-        forecastProfile,
-        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
-        bookedHedges,
-        preparedByCcy,
-        setup: varSetup,
-        marketRatesByCcy,
-        ratesScopeId,
-        extraForwards: analyticsExtraForwards,
-      }),
-    [
-      rows,
-      forecastProfile,
-      shared.forecastMonths,
-      varSetup,
-      bookedHedges,
-      preparedByCcy,
-      marketRatesByCcy,
-      ratesScopeId,
-      analyticsExtraForwards,
-    ],
-  );
-  const stagedCashCarryByCcyUsdM = useMemo(() => {
-    const map: Record<string, number> = {};
-    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
-      map[ccy] = split.cashUsdM;
-    }
-    return map;
-  }, [cashForecastCarryByCcy]);
-  const stagedHedgeCarryByCcyUsdM = useMemo(() => {
-    const map = stagedFxHedgeCarryByCcyUsdM(preparedByCcy);
-    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
-      map[ccy] = split.fwdUsdM;
-    }
-    return map;
-  }, [preparedByCcy, cashForecastCarryByCcy]);
-  const stagedCarryByMonthByCcyUsdM = useMemo(() => {
-    const map: Record<string, { cashUsdM: number; fwdUsdM: number }[]> = {};
-    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
-      map[ccy] = split.byMonth;
-    }
-    return map;
-  }, [cashForecastCarryByCcy]);
 
   // Booked + staged FCY legs — the same schedule the cash path and SWAP
   // band answer. Buffer layers size H* / Swap near against this path.
@@ -498,6 +444,68 @@ export function Simulator({
     () => livePlanByCcyFrom(dashboard.fcyComputed),
     [dashboard.fcyComputed],
   );
+
+  const analyticsExtraForwards = useMemo(
+    () =>
+      analyticsForwardsFromOverlays({
+        overlayByCcy: swapForwardOverlayByCcy,
+        planByCcy: livePlanByCcy,
+        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
+      }),
+    [
+      swapForwardOverlayByCcy,
+      livePlanByCcy,
+      shared.forecastMonths,
+      varSetup.forecastMonths,
+    ],
+  );
+
+  const cashForecastCarryByCcy = useMemo(
+    () =>
+      cashForecastCarrySplitByCcyUsdM({
+        rows,
+        forecastProfile,
+        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
+        bookedHedges,
+        preparedByCcy,
+        setup: varSetup,
+        marketRatesByCcy,
+        ratesScopeId,
+        extraForwards: analyticsExtraForwards,
+      }),
+    [
+      rows,
+      forecastProfile,
+      shared.forecastMonths,
+      varSetup,
+      bookedHedges,
+      preparedByCcy,
+      marketRatesByCcy,
+      ratesScopeId,
+      analyticsExtraForwards,
+    ],
+  );
+  const stagedCashCarryByCcyUsdM = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
+      map[ccy] = split.cashUsdM;
+    }
+    return map;
+  }, [cashForecastCarryByCcy]);
+  const stagedHedgeCarryByCcyUsdM = useMemo(() => {
+    const map = stagedFxHedgeCarryByCcyUsdM(preparedByCcy);
+    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
+      map[ccy] = split.fwdUsdM;
+    }
+    return map;
+  }, [preparedByCcy, cashForecastCarryByCcy]);
+  const stagedCarryByMonthByCcyUsdM = useMemo(() => {
+    const map: Record<string, { cashUsdM: number; fwdUsdM: number }[]> = {};
+    for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
+      map[ccy] = split.byMonth;
+    }
+    return map;
+  }, [cashForecastCarryByCcy]);
 
   const riskMetricsByCcy = useMemo(() => {
     if (!showRiskMetrics) return {};
@@ -651,6 +659,13 @@ export function Simulator({
               // Both tabs stay mounted — only the active one owns the modal.
               forecastProfileOpen={forecastProfileOpen && activeTab === 'simulator'}
               onForecastProfileOpenChange={setForecastProfileOpen}
+              layerPanel={
+                activeTab === 'simulator'
+                || (activeTab === 'analytics' && effectiveHiddenTabs.includes('liquidity'))
+                  ? layerPanel
+                  : null
+              }
+              onLayerPanelChange={setLayerPanel}
               simDark={embedded}
               formulas={formulas}
               onFormulaChange={onFormulaChange}
@@ -662,6 +677,7 @@ export function Simulator({
               optionDeltaByCcy={optionDeltaByRowId}
               onOptionDeltaByCcyChange={setOptionDeltaByRowId}
               onSwapForwardOverlayByCcyChange={setSwapForwardOverlayByCcy}
+              onDeskCipByCcyChange={setDeskCipByCcyUsdM}
               marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={ratesScopeId}
             />
@@ -782,11 +798,18 @@ export function Simulator({
                     ) => void;
                     onOpenForecastProfile?: () => void;
                     activeLayers?: Set<LayerId>;
+                    onLayerToggle?: (id: LayerId) => void;
+                    layerPanel?: BufferChipKey | null;
+                    onLayerPanelChange?: (id: BufferChipKey | null) => void;
                     livePlanByCcy?: Readonly<
                       Record<string, readonly LiquidityCycleProjection[]>
                     >;
                     cfarNetByCcyUsd?: Record<string, number>;
                     swapForwardOverlayByCcy?: Record<string, SwapForwardOverlay>;
+                    deskShared?: SharedGlobals;
+                    deskHedgeCarryByCcyUsdM?: Record<string, number>;
+                    deskCashCarryByCcyUsdM?: Record<string, number>;
+                    deskCipByCcyUsdM?: Record<string, number>;
                   }>,
                   {
                     bookRows: rows,
@@ -794,9 +817,16 @@ export function Simulator({
                     onForecastProfileChange: setForecastProfile,
                     onOpenForecastProfile: () => setForecastProfileOpen(true),
                     activeLayers,
+                    onLayerToggle,
+                    layerPanel,
+                    onLayerPanelChange: setLayerPanel,
                     livePlanByCcy,
                     cfarNetByCcyUsd,
                     swapForwardOverlayByCcy,
+                    deskShared: shared,
+                    deskHedgeCarryByCcyUsdM: stagedHedgeCarryByCcyUsdM,
+                    deskCashCarryByCcyUsdM: stagedCashCarryByCcyUsdM,
+                    deskCipByCcyUsdM,
                   },
                 )
               : (analyticsPanel ?? (
@@ -851,6 +881,13 @@ export function Simulator({
               onForecastProfileChange={setForecastProfile}
               forecastProfileOpen={forecastProfileOpen && activeTab === 'liquidity'}
               onForecastProfileOpenChange={setForecastProfileOpen}
+              layerPanel={
+                activeTab === 'liquidity'
+                || (activeTab === 'analytics' && !effectiveHiddenTabs.includes('liquidity'))
+                  ? layerPanel
+                  : null
+              }
+              onLayerPanelChange={setLayerPanel}
               simDark={embedded}
               formulas={formulas}
               onFormulaChange={onFormulaChange}
@@ -862,6 +899,7 @@ export function Simulator({
               optionDeltaByCcy={optionDeltaByRowId}
               onOptionDeltaByCcyChange={setOptionDeltaByRowId}
               onSwapForwardOverlayByCcyChange={setSwapForwardOverlayByCcy}
+              onDeskCipByCcyChange={setDeskCipByCcyUsdM}
               marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={ratesScopeId}
             />

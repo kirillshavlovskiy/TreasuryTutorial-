@@ -1,20 +1,18 @@
-// Carry accrual — day-count conventions and the per-period lifecycle projection
-// behind the Carry target layer.
+// Buffer Carry target — day-count conventions and the per-period lifecycle
+// projection behind the carryOptim layer.
 //
-// The buffer model (fx-buffer / dashboard-model) sizes ONE cycle and reports carry
-// as an annualised run rate. The carry desk needs the other view: what the target
-// cash position actually accrues, month by month, on the money-market convention of
-// each currency, across the whole forecast lifecycle.
+// The layer steers Target LP Cash so the funding-swap standing book earns a
+// Buffer Carry (cash Δr vs USD). The desk column and this lifecycle both price
+// that same leg:
 //
-//   accrual_m = TWA_m × spot × rate/100 × days_m / basis_ccy
+//   buffer_carry_m = standing_m × spot × (r_FCY|r_OD − r_USD) / 100 / 12
 //
-// where TWA_m is the time-weighted balance over month m (target funded by the swap,
-// then payouts leave and collections arrive) and `rate` is the LP credit rate when
-// the balance is long and the debit rate when it is overdrawn — the same r_actual
-// switch `floatNim` uses, so the two views reconcile.
+// TWA LP cash accrual (float NIM) is a separate unfunded view — not what this
+// layer targets.
 
 import {
   CURRENCY_PARAMS,
+  fundingSwapMonthCarryUsdM,
   type LayerId,
   type RowState,
   type SharedGlobals,
@@ -22,6 +20,7 @@ import {
 import {
   projectLiquidityCycles,
   type ForecastProfileState,
+  type LiquidityCycleProjection,
 } from './forecast-profile';
 import {
   carrySplitFromBalances,
@@ -106,14 +105,21 @@ export interface CarryPeriod {
   creditDays?: number;
   /** Days of the cycle spent overdrawn — only set when the path is dated. */
   debitDays?: number;
-  /** Interest earned on the balance at `rateApplied` ($USD M). */
+  /** Interest earned on the TWA LP cash balance at `rateApplied` ($USD M). */
   grossAccrualUsd: number;
-  /** Carry vs holding the same value in USD ($USD M) — what the layer optimises. */
+  /** TWA LP cash carry vs USD ($USD M) — unfunded view; not the layer target. */
   carryVsUsd: number;
   /** Running sum of `carryVsUsd` through this period ($USD M). */
   cumCarryVsUsd: number;
   /** Running sum of `grossAccrualUsd` ($USD M). */
   cumGrossAccrualUsd: number;
+  /**
+   * Buffer Carry this cycle ($USD M) — cash Δr vs USD on `standing_swap`.
+   * Same basis as the desk Buffer Carry column (one month of the path Σ).
+   */
+  bufferCarryUsd: number;
+  /** Running sum of `bufferCarryUsd` through this period ($USD M). */
+  cumBufferCarryUsd: number;
 }
 
 export interface CarryLifecycleOptions {
@@ -122,6 +128,16 @@ export interface CarryLifecycleOptions {
   from?: Date;
   /** FCY leg of hedges settling in each cycle (signed, + = received). */
   hedgeSettle?: readonly number[];
+  /**
+   * The book's own funded plan for a trial row, when the caller has one.
+   *
+   * `projectLiquidityCycles` alone cannot see the ladder shape, the booking
+   * convention, the portfolio book-target rebalance or the CFaR cover, so a
+   * projection built here would price a different standing book than the desk
+   * Buffer Carry column reads off `liquidityPlan`. Injecting the desk builder
+   * keeps the ask and the column on one engine. Return null to fall back.
+   */
+  planFor?: (row: RowState, months: number) => LiquidityCycleProjection[] | null;
 }
 
 /** Time-weighted balance for a cycle: target funded up front, then flows land. */
@@ -202,12 +218,14 @@ export function projectCarryLifecycle(
 ): CarryPeriod[] {
   const timing = options.timing ?? MID_CYCLE_TIMING;
   const spot = CURRENCY_PARAMS[row.ccy]?.spot ?? 0;
-  const cycles = projectLiquidityCycles(
-    row, shared, activeLayers, months, forecastProfile, options.hedgeSettle,
-  );
+  const cycles = options.planFor?.(row, months)
+    ?? projectLiquidityCycles(
+      row, shared, activeLayers, months, forecastProfile, options.hedgeSettle,
+    );
 
   let cumCarry = 0;
   let cumGross = 0;
+  let cumBuffer = 0;
 
   const resolved = resolveLiquidityTiming(forecastProfile);
   const dated = resolved?.enabled ? resolved : null;
@@ -237,8 +255,12 @@ export function projectCarryLifecycle(
     const carryVsUsd = split
       ? splitAccrual(split, row.r_FCY, row.r_OD, shared.r_USD) * spot * dcf
       : twaCash * spot * ((rateApplied - shared.r_USD) / 100) * dcf;
+    const bufferCarryUsd = fundingSwapMonthCarryUsdM(
+      c.standing_swap, spot, row.r_FCY, shared.r_USD, row.r_OD, 'cashDelta',
+    );
     cumCarry += carryVsUsd;
     cumGross += grossAccrualUsd;
+    cumBuffer += bufferCarryUsd;
 
     return {
       monthIndex: c.cycleIndex,
@@ -260,6 +282,8 @@ export function projectCarryLifecycle(
       carryVsUsd,
       cumCarryVsUsd: cumCarry,
       cumGrossAccrualUsd: cumGross,
+      bufferCarryUsd,
+      cumBufferCarryUsd: cumBuffer,
     };
   });
 }
@@ -419,6 +443,164 @@ export function targetForCarry(carryUsd: number, input: CarrySolveInput): number
     const twa = carryUsd / (spot * spread * dcf);
     const consistent = twa >= 0 ? rate === input.r_FCY : rate === input.r_OD;
     if (consistent) return twa - flowOffset;
+  }
+  return null;
+}
+
+/** Path Σ Buffer Carry over the horizon — the desk Buffer Carry column ($USD M). */
+export function pathBufferCarry(
+  row: RowState,
+  shared: SharedGlobals,
+  activeLayers: Set<LayerId>,
+  months: number,
+  forecastProfile?: ForecastProfileState | null,
+  options: CarryLifecycleOptions = {},
+): number {
+  const periods = projectCarryLifecycle(
+    row, shared, activeLayers, months, forecastProfile, options,
+  );
+  return periods.length ? periods[periods.length - 1]!.cumBufferCarryUsd : 0;
+}
+
+/** Target LP Cash that produces a Buffer Carry path — exact hit or the reachable extreme. */
+export interface BufferCarrySolve {
+  /** Target LP Cash (M FCY). */
+  target: number;
+  /** Path Buffer Carry that target actually earns ($USD M). */
+  carryUsd: number;
+  /** False when the ask sat outside the reachable range and we took the extreme. */
+  exact: boolean;
+}
+
+/**
+ * Inverse of {@link pathBufferCarry}: the Target LP Cash whose standing path earns
+ * `carryUsd` over the horizon.
+ *
+ * Buffer Carry is the Σ across every cycle's standing book, and standing chains
+ * forward through the plan under the live layer stack (floors, σ, VAR clamps).
+ * There is no closed form through that, so the target is found numerically.
+ * Solving one month instead would miss by the number of cycles — M1 standing is
+ * only the first leg of the book.
+ *
+ * The curve is not continuous: clamps hold the book flat and then jump, and an
+ * isolated target can read differently from its neighbours. Bisecting a raw
+ * outer bracket converges onto those jumps and returns a target whose carry is
+ * nothing like the ask, so this sweeps a grid first, takes an adjacent pair that
+ * genuinely straddles the ask, and only bisects inside that smooth interval.
+ *
+ * When no standing path reaches the ask, the extreme that gets closest is
+ * returned with `exact: false` — the desk still gets a book, not a lecture.
+ */
+export function targetForBufferCarry(
+  carryUsd: number,
+  row: RowState,
+  shared: SharedGlobals,
+  activeLayers: Set<LayerId>,
+  months: number,
+  forecastProfile?: ForecastProfileState | null,
+  options: CarryLifecycleOptions = {},
+): BufferCarrySolve | null {
+  const at = (target: number) => pathBufferCarry(
+    { ...row, carry_target: target }, shared, activeLayers, months,
+    forecastProfile, options,
+  );
+
+  // Tighter than the $k the column rounds to, so an accepted solve and the
+  // displayed Buffer Carry read as the same number.
+  const tolerance = Math.max(1e-6, Math.abs(carryUsd) * 1e-5);
+  const STEPS = 32;
+  // Holding exactly nothing switches the funding path off, so a zero target sits
+  // well off the curve its own neighbours trace. It is a legitimate ask but not a
+  // point the book passes through on the way anywhere, and sampling it invents a
+  // sign change that no root lives in. Step over it.
+  const isolated = (t: number) => Math.abs(t) < 1e-9;
+  const hit = (target: number, carry: number): BufferCarrySolve | null =>
+    Math.abs(carry - carryUsd) <= tolerance
+      ? { target, carryUsd: carry, exact: true }
+      : null;
+
+  let lo = 0;
+  let hi = 0;
+  let fLo = 0;
+  let bracketed = false;
+  let maxCarry = -Infinity;
+  let targetAtMax = 0;
+  let minCarry = Infinity;
+  let targetAtMin = 0;
+  let sampled = false;
+
+  const consider = (t: number, f: number) => {
+    if (isolated(t) || !Number.isFinite(f)) return;
+    sampled = true;
+    if (f > maxCarry) {
+      maxCarry = f;
+      targetAtMax = t;
+    }
+    if (f < minCarry) {
+      minCarry = f;
+      targetAtMin = t;
+    }
+  };
+
+  for (let w = 0; w < 6 && !bracketed; w += 1) {
+    const span = Math.max(Math.abs(row.cash), 1) * 4 * 2 ** w;
+    const from = row.cash - span;
+    const step = (2 * span) / STEPS;
+    let prev = from;
+    let fPrev = at(prev);
+    consider(prev, fPrev);
+    const exactPrev = hit(prev, fPrev);
+    if (exactPrev) return exactPrev;
+    for (let i = 1; i <= STEPS; i += 1) {
+      const t = from + step * i;
+      if (isolated(t)) continue;
+      const f = at(t);
+      consider(t, f);
+      const exact = hit(t, f);
+      if (exact) return exact;
+      if ((carryUsd - fPrev) * (carryUsd - f) <= 0) {
+        lo = prev;
+        hi = t;
+        fLo = fPrev;
+        bracketed = true;
+        break;
+      }
+      prev = t;
+      fPrev = f;
+    }
+  }
+
+  if (bracketed) {
+    for (let i = 0; i < 60; i += 1) {
+      const mid = (lo + hi) / 2;
+      if (isolated(mid)) break;
+      const fMid = at(mid);
+      const exact = hit(mid, fMid);
+      if (exact) return exact;
+      if ((carryUsd - fLo) * (carryUsd - fMid) <= 0) {
+        hi = mid;
+      } else {
+        lo = mid;
+        fLo = fMid;
+      }
+    }
+    const solved = (lo + hi) / 2;
+    const landed = at(solved);
+    const exact = hit(solved, landed);
+    if (exact) return exact;
+  }
+
+  if (!sampled || !Number.isFinite(maxCarry) || !Number.isFinite(minCarry)) {
+    return null;
+  }
+  // Rates too flat to move carry — only succeed if we are already there.
+  if (maxCarry - minCarry <= tolerance) return null;
+
+  if (carryUsd >= maxCarry) {
+    return { target: targetAtMax, carryUsd: maxCarry, exact: false };
+  }
+  if (carryUsd <= minCarry) {
+    return { target: targetAtMin, carryUsd: minCarry, exact: false };
   }
   return null;
 }

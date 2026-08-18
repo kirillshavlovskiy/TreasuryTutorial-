@@ -288,3 +288,36 @@ export function sumNetCfarUsdM(byCcy: Record<string, number> | undefined): numbe
   if (!byCcy) return 0;
   return Object.values(byCcy).reduce((s, v) => s + (Number.isFinite(v) ? v : 0), 0);
 }
+
+/**
+ * Displayed Net CFaR when only the FX-only scalar is known.
+ * Swap leg is Net CFaR on the standing path (gross |S|·√t minus Buffer
+ * Carry accrued to t) — not a linear scale on carry or on |S|.
+ * RSS with FX-only Net.
+ */
+export function displayedCfarUsdMFromFxNet(
+  fxNetUsdM: number,
+  ccy: string,
+  plan: readonly { standing_swap: number; far_leg?: number }[] | undefined,
+  setup: VarSetup,
+  carryScheduleUsdM?: readonly number[],
+): number {
+  const fx = Math.max(0, Number.isFinite(fxNetUsdM) ? fxNetUsdM : 0);
+  const T = setup.forecastMonths > 0
+    ? setup.forecastMonths
+    : horizonMonths(setup.horizon);
+  const funding = fundingSwapOutstandingByMonth(plan, T);
+  if (funding.outstandingM.length === 0) return fx;
+  const bridge = fundingSwapBridgeBands({
+    outstandingM: funding.outstandingM,
+    T,
+    spotUsd: NORDTECH_VAR.spotUsd[ccy] ?? 1,
+    sigmaMonthly: rateVolBpYrFor(ccy, setup) / 10000 / Math.sqrt(12),
+    confidencePct: setup.confidencePct,
+    termSettles: funding.termSettles,
+    carryScheduleUsdM,
+  });
+  const swapNet = Math.max(0, bridge?.netCriticalCashUsdM ?? 0);
+  if (swapNet < 1e-12) return fx;
+  return Math.sqrt(fx * fx + swapNet * swapNet);
+}

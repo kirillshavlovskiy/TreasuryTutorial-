@@ -8,7 +8,17 @@ import {
   analyticsForwardsFromOverlays,
   resolveStrategyHedge,
 } from '@/lib/fx-hedge';
-import { fcyToUsdM, fundingSwapCipPointsUsdYr, makeSimRow } from '@/lib/fx-buffer';
+import {
+  ccySpotRate,
+  fcyToUsdM,
+  fundingSwapCarryLegs,
+  fundingSwapCipPointsUsdYr,
+  makeSimRow,
+} from '@/lib/fx-buffer';
+import {
+  fundingSwapPathFarCipUsdM,
+  resolveMarketRatesForCcy,
+} from '@/lib/fx-market-rates';
 import {
   buildCashForecastCarryComparison,
 } from '@/lib/test-mode/cash-carry-analytics';
@@ -21,13 +31,39 @@ import {
 import {
   DEFAULT_FORECAST_PROFILE,
   type ForecastProfileState,
+  type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
+import {
+  evaluateLiquidityStrategies,
+  liquidityStrategyInputFrom,
+  strategyForRegime,
+} from '@/lib/test-mode/liquidity-strategies';
 
 function profileWithTiming(): ForecastProfileState {
   return {
     ...DEFAULT_FORECAST_PROFILE,
     liquidity: { ...DEFAULT_LIQUIDITY_TIMING, granularity: 'month' },
   };
+}
+
+/** Only the fields the funding-carry path reads — `layered` is not one of them. */
+function planCycle(cycleIndex: number, standing: number): LiquidityCycleProjection {
+  return {
+    cycleIndex,
+    opening_cash: 0,
+    payout: 0,
+    collections: 0,
+    invoiceFcast: 0,
+    hedgeSettle: 0,
+    forecasted_cash: 0,
+    drawdown: 0,
+    cash_threshold: 0,
+    swap_needed: standing,
+    incremental_swap: 0,
+    standing_swap: standing,
+    post_swap_cash: 0,
+    cycle_end_cash: 0,
+  } as unknown as LiquidityCycleProjection;
 }
 
 describe('Swap+Fwd Δ — carry reallocation', () => {
@@ -97,6 +133,104 @@ describe('Swap+Fwd Δ — carry reallocation', () => {
     const f0 = fwdAt(0);
     const f1 = fwdAt(1);
     expect(Math.abs(f1)).toBeGreaterThan(Math.abs(f0));
+  });
+});
+
+describe('Swap+Fwd Δ — Analytics funding carry reports the desk book', () => {
+  it('swap cash carry and CIP carry are both invariant to Δ on the desk plan', () => {
+    const row = makeSimRow('1', 'EUR', 5, 0, 0, 10, -4, 3, 0);
+    const profile = profileWithTiming();
+    const setup = { ...DEFAULT_VAR_SETUP, forecastMonths: 6 };
+    const livePlanByCcy = {
+      EUR: Array.from({ length: 6 }, (_, i) => planCycle(i, 6)),
+    };
+    const live = strategyForRegime(
+      DEFAULT_LIQUIDITY_TIMING.sizingBasis ?? 'horizon',
+      DEFAULT_LIQUIDITY_TIMING.bookingMode ?? 'rolling',
+    );
+
+    const legsAt = (delta: number) => {
+      const results = evaluateLiquidityStrategies(
+        liquidityStrategyInputFrom({
+          setup,
+          bookRows: [row],
+          forecastProfile: profile,
+          bookedHedges: [],
+          preparedByCcy: {},
+          livePlanByCcy,
+          swapForwardOverlayByCcy: {
+            EUR: allocateSwapForwardOverlay({
+              exposureLocalM: 10,
+              swapNearLocalM: 6,
+              delta,
+            }),
+          },
+        }),
+      );
+      const result = results.find(r => r.strategy.id === live.id)!;
+      return { cash: result.swapInterestUsdYrM, cip: result.swapPointsUsdYrM };
+    };
+
+    const flat = legsAt(0);
+    const half = legsAt(0.5);
+    const full = legsAt(1);
+
+    // Swap cash is the unscaled standing book. CIP on the live regime follows
+    // the desk: retained far = (1−Δ).
+    expect(Math.abs(flat.cash)).toBeGreaterThan(0);
+    expect(half.cash).toBeCloseTo(flat.cash, 9);
+    expect(full.cash).toBeCloseTo(flat.cash, 9);
+    expect(Math.abs(flat.cip)).toBeGreaterThan(0);
+    expect(half.cip).toBeCloseTo(flat.cip * 0.5, 9);
+    expect(full.cip).toBeCloseTo(0, 9);
+  });
+
+  it('Analytics swap cash carry and CIP match the desk helpers exactly', () => {
+    const row = makeSimRow('1', 'EUR', 5, 0, 0, 10, -4, 3, 0);
+    const profile = profileWithTiming();
+    const setup = { ...DEFAULT_VAR_SETUP, forecastMonths: 6 };
+    const deskShared = { r_USD: 4.15, σ_P: 0.1, days: 3, forecastMonths: 6 };
+    const plan = Array.from({ length: 6 }, (_, i) => planCycle(i, 6));
+    const spot = ccySpotRate('EUR');
+
+    const deskSwapCarry = fundingSwapCarryLegs({
+      ccy: 'EUR',
+      plan,
+      r_FCY: row.r_FCY,
+      r_USD: deskShared.r_USD,
+      r_OD: row.r_OD,
+    }).cashUsdM;
+    const deskCip = fundingSwapPathFarCipUsdM({
+      plan,
+      standingFallback: 6,
+      forecastMonths: 6,
+      bundle: resolveMarketRatesForCcy(undefined, 'EUR'),
+      fallbackAnnualUsdYr: S =>
+        fundingSwapCipPointsUsdYr(S, spot, row.r_FCY, deskShared.r_USD),
+    });
+
+    const results = evaluateLiquidityStrategies(
+      liquidityStrategyInputFrom({
+        setup,
+        bookRows: [row],
+        forecastProfile: profile,
+        bookedHedges: [],
+        preparedByCcy: {},
+        livePlanByCcy: { EUR: plan },
+        deskShared,
+      }),
+    );
+    const live = strategyForRegime(
+      DEFAULT_LIQUIDITY_TIMING.sizingBasis ?? 'horizon',
+      DEFAULT_LIQUIDITY_TIMING.bookingMode ?? 'rolling',
+    );
+    const eur = results
+      .find(r => r.strategy.id === live.id)!
+      .byCcy.find(c => c.ccy === 'EUR')!;
+
+    expect(Math.abs(deskSwapCarry)).toBeGreaterThan(0);
+    expect(eur.swapInterestUsdYrM).toBeCloseTo(deskSwapCarry, 8);
+    expect(eur.swapPointsUsdYrM).toBeCloseTo(deskCip, 8);
   });
 });
 

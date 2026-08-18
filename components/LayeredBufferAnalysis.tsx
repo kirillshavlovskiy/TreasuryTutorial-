@@ -9,6 +9,8 @@ import {
   usdToFcyM,
   normInv,
   Z_NEUTRAL,
+  FORECAST_ACCURACY_LAYERS,
+  toggleLayerGroup,
   type LayerId,
   type PortfolioVARInput,
   type RowState,
@@ -20,7 +22,8 @@ import { DeskStepper } from '@/components/DeskStepper';
 // ─── Layer definitions ────────────────────────────────────────────────────────
 
 interface LayerDef {
-  id: LayerId;
+  id: string;
+  layers: readonly LayerId[];
   label: string;
   formula: string;
   hint: string;
@@ -31,16 +34,18 @@ interface LayerDef {
 
 const LAYER_DEFS: LayerDef[] = [
   {
-    id: 'sigmaP',
-    label: 'Safety Margin',
-    formula: 'Forecast uncertainty buffer',
-    hint: 'Adds safety margin for outflow forecast error. Uses 95% confidence — you hold enough to cover outflows even if they come in 64% higher than forecast.',
-    activeColor: '#3b82f6',
-    textColor: 'text-blue-700',
-    bg: 'bg-blue-50 border-blue-200',
+    id: 'forecastAccuracy',
+    layers: FORECAST_ACCURACY_LAYERS,
+    label: 'Forecast accuracy',
+    formula: 'Payout σ → H*',
+    hint: 'Payout-σ sizes the funding swap. FX Net CFaR is USD P&L — not Swap Near.',
+    activeColor: '#0ea5e9',
+    textColor: 'text-sky-700',
+    bg: 'bg-sky-50 border-sky-200',
   },
   {
     id: 'carryOptim',
+    layers: ['carryOptim'],
     label: 'Carry Adjustment',
     formula: 'Rate-driven buffer shift',
     hint: 'EARN carry (LP rate > USD rate): holding more FCY earns money — buffer grows. PAY carry: holding FCY costs money — buffer shrinks to reduce opportunity cost.',
@@ -50,6 +55,7 @@ const LAYER_DEFS: LayerDef[] = [
   },
   {
     id: 'floorH',
+    layers: ['floorH'],
     label: 'Minimum Floor',
     formula: 'Hard cash minimum',
     hint: 'Enforces a minimum cash level regardless of carry calculation. Prevents buffer going to zero even for extreme PAY carry currencies.',
@@ -59,21 +65,13 @@ const LAYER_DEFS: LayerDef[] = [
   },
   {
     id: 'portfolioDiv',
+    layers: ['portfolioDiv'],
     label: 'Portfolio VAR',
     formula: 'Cross-currency USD risk',
     hint: 'Carry overlay on |lp_cash|: PAY (CAD, JPY) → negative target (sell), EARN (MXN, GBP) → positive (buy). One scale factor sizes every currency to fill the portfolio VAR limit.',
     activeColor: '#8b5cf6',
     textColor: 'text-violet-700',
     bg: 'bg-violet-50 border-violet-200',
-  },
-  {
-    id: 'cfarCover',
-    label: 'CFaR cover',
-    formula: 'Net CFaR → FCY buffer',
-    hint: 'Sizes a funding swap from FX-only Net CFaR (size + timing, not gap × σ) so the swap cannot resize itself. Displayed CFaR then RSS-combines this swap\'s rate-diff bridge with the FX hedge.',
-    activeColor: '#0ea5e9',
-    textColor: 'text-sky-700',
-    bg: 'bg-sky-50 border-sky-200',
   },
 ];
 
@@ -280,11 +278,11 @@ export function LayeredBufferAnalysis({
               Calc Steps
             </button>
             {LAYER_DEFS.map(ld => {
-              const on = activeLayers.has(ld.id);
+              const on = ld.layers.some(id => activeLayers.has(id));
               return (
                 <button
                   key={ld.id}
-                  onClick={() => onLayerToggle(ld.id)}
+                  onClick={() => toggleLayerGroup(ld.layers, activeLayers, onLayerToggle)}
                   title={ld.hint}
                   className={`
                     flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium transition-all
@@ -530,7 +528,7 @@ export function LayeredBufferAnalysis({
                   }`}
                     title={noLayers
                       ? `No layers active.`
-                      : `P(${f2(Math.abs(r.payout))}) + floor(${f2(r.floor_contrib)}) + safety(${f2(r.delta_sigma)}) + cfar(${f2(r.delta_cfar)}) + carry(${f2(r.delta_carry)}) + portfolio(${f2(r.delta_portfolio)}) = ${f2(r.cash_threshold)} M FCY = ${fM(r.cash_threshold * r.spot)} $M USD (PRE-PAYOUT target)${r.floor_binding ? ' ⌊carry < 0⌋' : ''}${(r as { usd_stress_trim?: boolean }).usd_stress_trim ? ` — USD stress trim from ${f2((r as { stress_trim_from?: number }).stress_trim_from ?? r.cash_threshold)}` : ''}`}
+                      : `P(${f2(Math.abs(r.payout))}) + floor(${f2(r.floor_contrib)}) + safety(${f2(r.delta_sigma)}) + carry(${f2(r.delta_carry)}) + portfolio(${f2(r.delta_portfolio)}) = ${f2(r.cash_threshold)} M FCY = ${fM(r.cash_threshold * r.spot)} $M USD (PRE-PAYOUT target)${r.delta_cfar > 0.001 ? ` · CFaR ${f2(r.delta_cfar)} FCY (FX P&L, not in H*)` : ''}${r.floor_binding ? ' ⌊carry < 0⌋' : ''}${(r as { usd_stress_trim?: boolean }).usd_stress_trim ? ` — USD stress trim from ${f2((r as { stress_trim_from?: number }).stress_trim_from ?? r.cash_threshold)}` : ''}`}
                   >
                     {noLayers ? '—' : fM(r.cash_threshold)}
                     {!noLayers && (r as { usd_stress_trim?: boolean }).usd_stress_trim && (
@@ -1049,13 +1047,16 @@ export function LayeredBufferAnalysis({
                 <span className="text-sm font-bold text-gray-900">Calculation Log</span>
                 <span className="text-xs text-gray-400">—</span>
                 <div className="flex gap-1.5 flex-wrap">
-                  {LAYER_DEFS.map(ld => (
+                  {LAYER_DEFS.map(ld => {
+                    const on = ld.layers.some(id => activeLayers.has(id));
+                    return (
                     <span key={ld.id} className={`px-2 py-0.5 rounded text-xs font-medium border ${
-                      activeLayers.has(ld.id) ? `${ld.bg} ${ld.textColor}` : 'bg-gray-50 text-gray-300 border-gray-200'
+                      on ? `${ld.bg} ${ld.textColor}` : 'bg-gray-50 text-gray-300 border-gray-200'
                     }`}>
-                      {activeLayers.has(ld.id) ? '✓' : '○'} {ld.label}
+                      {on ? '✓' : '○'} {ld.label}
                     </span>
-                  ))}
+                    );
+                  })}
                 </div>
                 <span className="text-xs text-gray-500 ml-2">
                   Path: <span className="font-semibold">

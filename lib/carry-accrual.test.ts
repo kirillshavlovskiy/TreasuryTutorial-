@@ -6,7 +6,9 @@ import {
   carryBasisLabel,
   carryForTarget,
   monthAccrualDays,
+  pathBufferCarry,
   projectCarryLifecycle,
+  targetForBufferCarry,
   targetForCarry,
   twaBalance,
   type CarrySolveInput,
@@ -22,7 +24,8 @@ import {
   type LayerId,
   type RowState,
 } from './fx-buffer';
-import { computeDashboardModel } from './dashboard-model';
+import { computeDashboardModel, fundedPlanFor } from './dashboard-model';
+import { buildLiquidityLadder } from './liquidity-ladder';
 import { DEFAULT_FORECAST_PROFILE, type ForecastProfileState } from './forecast-profile';
 import { DEFAULT_LIQUIDITY_TIMING, type LiquidityTiming } from './liquidity-ladder';
 
@@ -74,6 +77,97 @@ describe('carry P&L ↔ cash target inversion', () => {
     const target = 180;
     const carry = carryForTarget(target, solve);
     expect(targetForCarry(carry, solve)).toBeCloseTo(target, 6);
+  });
+
+  it('inverts a path Buffer Carry ask back to the target that earns it', () => {
+    // The desk column is the Σ across every cycle's standing book, so the ask has
+    // to round-trip on that path — not on M1's leg alone.
+    const row = rowFor('EUR');
+    const layers = new Set<LayerId>(['floorH', 'sigmaP', 'carryOptim']);
+    const ask = 2.0;
+
+    const solved = targetForBufferCarry(
+      ask, row, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    expect(solved).not.toBeNull();
+    expect(solved!.exact).toBe(true);
+
+    const landed = pathBufferCarry(
+      { ...row, carry_target: solved!.target }, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    // The solver accepts within a relative tolerance finer than the $k displayed.
+    expect(Math.abs(landed - ask)).toBeLessThan(ask * 1e-5);
+  });
+
+  it('inverts against the caller\'s own plan engine, not a parallel projection', () => {
+    // The desk column reads carry off the funded ladder plan, which carries the
+    // booking convention and FX-hedge settlement. Solving on a bare cycle
+    // projection lands the ask on a different standing book, so the ask has to
+    // round-trip through whatever plan the caller injects.
+    const row = rowFor('EUR');
+    const layers = new Set<LayerId>(['floorH', 'sigmaP', 'carryOptim']);
+    const profile: ForecastProfileState = {
+      ...DEFAULT_FORECAST_PROFILE,
+      liquidity: { ...DEFAULT_LIQUIDITY_TIMING, enabled: true } as LiquidityTiming,
+    };
+    const ask = 2.0;
+    const hedgeSettle = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    const planFor = (r: RowState, months: number) => {
+      const ladder = buildLiquidityLadder(r, profile, { months, hedgeSettle });
+      return ladder
+        ? fundedPlanFor(r, SHARED, layers, ladder, profile, hedgeSettle)
+        : null;
+    };
+
+    const solved = targetForBufferCarry(
+      ask, row, SHARED, layers, 12, profile, { planFor },
+    );
+    expect(solved).not.toBeNull();
+    expect(solved!.exact).toBe(true);
+
+    const landed = fundingSwapPathCarryUsdM(
+      planFor({ ...row, carry_target: solved!.target }, 12) ?? undefined,
+      CURRENCY_PARAMS.EUR!.spot, row.r_FCY, SHARED.r_USD, row.r_OD, 'cashDelta',
+    );
+    // Inside the solver's accept tolerance, which is finer than the $k displayed.
+    expect(Math.abs(landed! - ask)).toBeLessThan(ask * 1e-5);
+
+    // And the bare projection would have missed — that is the bug this guards.
+    const naive = pathBufferCarry(
+      { ...row, carry_target: solved!.target }, SHARED, layers, 12, profile,
+    );
+    expect(Math.abs(naive - ask)).toBeGreaterThan(1e-3);
+  });
+
+  it('clamps an unreachable Buffer Carry ask to the standing-path extreme', () => {
+    // Small EUR book: M1 Buffer Carry is a few $k, so a $5M ask (typing 5000 in
+    // the $k field) cannot land — the solver must still return a book.
+    const row = { ...rowFor('EUR'), cash: 2.5, payout: 0, collections: 0, fcastFX: 0 };
+    const layers = new Set<LayerId>(['floorH', 'sigmaP', 'carryOptim']);
+    const solved = targetForBufferCarry(
+      50, row, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    expect(solved).not.toBeNull();
+    expect(solved!.exact).toBe(false);
+    expect(solved!.carryUsd).toBeLessThan(50);
+    const landed = pathBufferCarry(
+      { ...row, carry_target: solved!.target }, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    expect(landed).toBeCloseTo(solved!.carryUsd, 6);
+  });
+
+  it('path Buffer Carry is the Σ of the per-cycle legs, not one month', () => {
+    const row = rowFor('EUR');
+    const layers = new Set<LayerId>(['floorH', 'sigmaP', 'carryOptim']);
+    const periods = projectCarryLifecycle(
+      row, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    const sum = periods.reduce((s, p) => s + p.bufferCarryUsd, 0);
+    expect(pathBufferCarry(row, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE))
+      .toBeCloseTo(sum, 9);
+    // The whole point of the fix: M1 alone is nowhere near the path total.
+    expect(Math.abs(sum)).toBeGreaterThan(Math.abs(periods[0]!.bufferCarryUsd) * 2);
   });
 
   it('round-trips an overdrawn target on the debit rate', () => {

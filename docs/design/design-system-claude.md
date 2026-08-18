@@ -173,6 +173,8 @@ CCY violet · CP orange · refinement only · no marketing UI
 | FX Simulator desk (main component) | `docs/design/fx-simulator-desk-claude-design.md` |
 | Entity onboarding | `docs/design/entity-onboarding-claude-design.md` |
 | CFaR analysis | `docs/design/cfar-analysis-claude-design.md` |
+| Liquidity analytics | `docs/design/liquidity-analytics-claude-design.md` |
+| Liquidity frontier modal | `docs/design/liquidity-frontier-modal-claude-design.md` |
 | Cash Carry · All CCY | `docs/design/cash-carry-all-currencies-claude-design.md` |
 | Hedge carry profile modal | `docs/design/hedge-carry-profile-modal-claude-design.md` |
 | Shape search optimal strip | `docs/design/shape-search-optimal-strip-claude-design.md` |
