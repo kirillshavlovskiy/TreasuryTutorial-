@@ -320,6 +320,18 @@ function buildCoverPlan(
 /**
  * Δ on this chart is residual risk: 0 = book flattened (low VAR, left),
  * 1 = book left open (high VAR, right). That is the positive-carry tail.
+ *
+ * `delta` (the parameter) is this chart convention throughout — every field
+ * below (forwardLocalM, remainingFarLocalM, etc.) is computed from it and
+ * stays exactly as-is; that's the real notional math the chart renders and
+ * it is correct. But the RETURNED `delta:` field feeds fxHedgeMcCfarByCcy
+ * → displayedCfarNetByCcyUsdM → retainedFundingPlanByCcy, which is proven
+ * (see its own test) to expect the OPPOSITE hedge-coverage convention
+ * (Δ=1 = fully hedged). Storing `residual` there directly made a
+ * fully-open chart point (nothing hedged) read as fully hedged downstream,
+ * retaining ZERO of its real funding-swap CFaR bridge instead of all of
+ * it. Invert only that one stored field — see overlayDeltaStub's matching
+ * fix for the chart's residual-picker path.
  */
 function overlayFor(
   row: RowState,
@@ -336,7 +348,7 @@ function overlayFor(
   );
   const net = E + S;
   return {
-    delta: residual,
+    delta: 1 - residual,
     exposureLocalM: E,
     swapNearLocalM: S,
     swapStandingLocalM: standing,
@@ -383,6 +395,7 @@ function pricePoint(
     r_FCY: trial.r_FCY,
     r_USD: input.shared.r_USD,
     r_OD: trial.r_OD,
+    forecastMonths: input.shared.forecastMonths ?? input.months,
   });
   const standingFallback = swapFarLegNotional(plan, plan[0]?.swap_needed ?? 0);
   const cipUsdYrM = plan.length === 0
@@ -448,6 +461,7 @@ function pricePoint(
     totalCarryUsdYrM,
     finalCfarUsdM,
     peakBook: roundMoney(peakBook),
+    levered: false,
   };
 }
 
@@ -669,13 +683,20 @@ export function frontierOpenCashUsdYr(cashUsdYr: number): number {
   return Math.abs(cashUsdYr);
 }
 
-/** CIP on the far arm: cost below +cash when the raw cash Δr was a pay. */
+/**
+ * CIP add-on from open Y → far Y.
+ * Open arm is always |cash|; far arm is signed cash + market points
+ * (design: Y_far = cash + points). When cash pays (PLN) and CIP earns,
+ * far sits near / above $0 — do not force −|points| (that was the old
+ * deposit-CIP offset, and it flips corrected USDPLN CIP back to a cost).
+ */
 export function frontierFarPointsUsdYr(
   cashUsdYr: number,
   pointsUsdYr: number,
 ): number {
-  if (cashUsdYr < -1e-12) return -Math.abs(pointsUsdYr);
-  return pointsUsdYr;
+  const openY = Math.abs(cashUsdYr);
+  const farY = cashUsdYr + pointsUsdYr;
+  return farY - openY;
 }
 
 /** Default asinh linear band (~$12K). Overridden per plot from the open-cash arm. */
@@ -986,6 +1007,7 @@ function priceResidualDelta(
     r_FCY: row.r_FCY,
     r_USD: input.shared.r_USD,
     r_OD: row.r_OD,
+    forecastMonths: input.shared.forecastMonths ?? input.months,
   });
   const standingFallback = swapFarLegNotional(
     residualPlan, residualPlan[0]?.swap_needed ?? 0,
@@ -1191,6 +1213,91 @@ export function isoSSlicePoints(
   );
 }
 
+export type LiquidityStandingPriceInput = Pick<
+  LiquidityFrontierInput,
+  | 'row'
+  | 'months'
+  | 'shared'
+  | 'setup'
+  | 'marketRatesByCcy'
+  | 'ratesScopeId'
+  | 'cfarNetByCcyUsd'
+>;
+
+export interface LiquidityStandingPrice {
+  sectionUsdM: number;
+  cashUsdYr: number;
+  pointsUsdYr: number;
+  cfarOpenUsdM: number;
+  cfarFarUsdM: number;
+  open: LiquidityFrontierPoint;
+  far: LiquidityFrontierPoint;
+}
+
+/**
+ * Price open-cash and far-on at an arbitrary signed standing.
+ * CFaR is RSS(section, swap bands) — a curve in |S|, not a linear VAR chord.
+ */
+export function priceLiquidityStanding(
+  input: LiquidityStandingPriceInput,
+  standing: number,
+  liveBookCashK = 0,
+): LiquidityStandingPrice {
+  const row = input.row;
+  const months = Math.floor(input.months);
+  const spot = ccySpotRate(row.ccy);
+  const horizon = input.setup
+    ? (input.setup.forecastMonths > 0 ? input.setup.forecastMonths : months)
+    : months;
+  const section = sectionCfarUsdM(input.cfarNetByCcyUsd, row.ccy);
+  if (!(months > 0) || !Number.isFinite(standing) || Math.abs(standing) < 1e-9) {
+    const origin = leftEndOriginPoint(section);
+    return {
+      sectionUsdM: section,
+      cashUsdYr: 0,
+      pointsUsdYr: 0,
+      cfarOpenUsdM: section,
+      cfarFarUsdM: section,
+      open: origin,
+      far: origin,
+    };
+  }
+  const plan = farSettlePlan(standing, horizon);
+  const cashUsdYr = fundingSwapCashDeltaUsdYr(
+    standing, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
+  );
+  const pointsUsdYr = fundingSwapPathFarCipUsdM({
+    plan,
+    standingFallback: standing,
+    forecastMonths: input.shared.forecastMonths ?? horizon,
+    bookingMode: 'term',
+    bundle: resolveMarketRatesForCcy(
+      input.marketRatesByCcy, row.ccy, input.ratesScopeId,
+    ),
+    fallbackAnnualUsdYr: S =>
+      fundingSwapCipPointsUsdYr(S, spot, row.r_FCY, input.shared.r_USD),
+  }) * (12 / Math.max(1, horizon));
+  const cfarOpenUsdM = input.setup
+    ? farSettleExposureCfarUsdM(standing, horizon, row.ccy, input.setup, section)
+    : section;
+  const cfarFarUsdM = input.setup
+    ? farSettleUnwindCfarUsdM(standing, horizon, row.ccy, input.setup, section)
+    : section;
+  const cashK = bookCashCarryK(standing, spot, row.r_FCY, input.shared.r_USD, row.r_OD);
+  const levered = liveBookCashK > 0.5 && cashK > liveBookCashK + 0.5;
+  const openCashUsdYr = frontierOpenCashUsdYr(cashUsdYr);
+  const farPointsUsdYr = frontierFarPointsUsdYr(cashUsdYr, pointsUsdYr);
+  return {
+    sectionUsdM: section,
+    cashUsdYr,
+    pointsUsdYr,
+    cfarOpenUsdM,
+    cfarFarUsdM,
+    open: priceCarryPair(row, standing, openCashUsdYr, farPointsUsdYr, 0, cfarOpenUsdM, levered),
+    far: priceCarryPair(row, standing, openCashUsdYr, farPointsUsdYr, 1, cfarFarUsdM, levered),
+  };
+}
+
 export function buildLiquidityLeftEndFrontier(
   input: LiquidityFrontierInput,
 ): LiquidityLeftEndResult {
@@ -1219,10 +1326,6 @@ export function buildLiquidityLeftEndFrontier(
 
   const row = input.row;
   const spot = ccySpotRate(row.ccy);
-  const horizon = input.setup
-    ? (input.setup.forecastMonths > 0 ? input.setup.forecastMonths : months)
-    : months;
-  const section = originCfar;
   const targetS = typeof row.carry_target === 'number' && Number.isFinite(row.carry_target)
     ? row.carry_target
     : null;
@@ -1242,27 +1345,13 @@ export function buildLiquidityLeftEndFrontier(
   ).filter(k => Number.isFinite(k) && k > 0).sort((a, b) => a - b);
 
   const priceStanding = (standing: number) => {
-    const plan = farSettlePlan(standing, horizon);
-    const cashUsdYr = fundingSwapCashDeltaUsdYr(
-      standing, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
-    );
-    const pointsUsdYr = fundingSwapPathFarCipUsdM({
-      plan,
-      standingFallback: standing,
-      forecastMonths: input.shared.forecastMonths ?? horizon,
-      bundle: resolveMarketRatesForCcy(
-        input.marketRatesByCcy, row.ccy, input.ratesScopeId,
-      ),
-      fallbackAnnualUsdYr: S =>
-        fundingSwapCipPointsUsdYr(S, spot, row.r_FCY, input.shared.r_USD),
-    }) * (12 / Math.max(1, horizon));
-    const cfarOpenUsdM = input.setup
-      ? farSettleExposureCfarUsdM(standing, horizon, row.ccy, input.setup, section)
-      : section;
-    const cfarFarUsdM = input.setup
-      ? farSettleUnwindCfarUsdM(standing, horizon, row.ccy, input.setup, section)
-      : section;
-    return { cashUsdYr, pointsUsdYr, cfarOpenUsdM, cfarFarUsdM };
+    const priced = priceLiquidityStanding(input, standing, bookCashK);
+    return {
+      cashUsdYr: priced.cashUsdYr,
+      pointsUsdYr: priced.pointsUsdYr,
+      cfarOpenUsdM: priced.cfarOpenUsdM,
+      cfarFarUsdM: priced.cfarFarUsdM,
+    };
   };
 
   const upper: LiquidityFrontierPoint[] = [];

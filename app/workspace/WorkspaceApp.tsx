@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { BrandMark } from '@/components/BrandMark';
 import { ModeNav } from '@/components/ModeNav';
 import {
@@ -24,17 +24,22 @@ import { INITIAL_ROWS } from '@/lib/fx-buffer';
 import { WorkbenchFxDesk } from '@/components/workbench/WorkbenchFxDesk';
 import { WorkbenchGroupDesk } from '@/components/workbench/WorkbenchGroupDesk';
 import { mirrorStructureToCurriculumSandbox } from '@/lib/workspace-curriculum-bridge';
+import { loadWorkspacePersistent, saveWorkspacePersistent, WORKSPACE_SANDBOX_TASK_ID } from '@/lib/workspace-client';
 import type { ForecastProfileState } from '@/lib/forecast-profile';
 import {
   DEFAULT_VAR_SETUP,
   emptyHedgeBook,
+  hedgeBookHasContent,
+  hedgeBookLooksLikeAccidentalWipe,
+  hedgeLedgerChanged,
+  mergeHedgeBooksPreservingPrepared,
+  pickHedgeBooksForWrite,
   normalizeVarSetup,
+  subscribeSandboxPersist,
   type EntityHedgeBook,
   type VarSetup,
 } from '@/lib/test-mode';
 import {
-  loadWorkspaceDetailed,
-  saveWorkspace,
   createEntity,
   createDashboardFromWizard,
   updateDashboardFromWizard,
@@ -62,6 +67,7 @@ import {
   OPT_METRICS,
   DECISION_LAYERS,
   ANALYTICAL_LAYERS,
+  loadWorkspaceDetailed,
   type Workspace,
   type Entity,
   type Dashboard,
@@ -108,6 +114,7 @@ export function WorkspaceApp({
     tone: 'ok' | 'error' | 'warn';
     message: string;
   } | null>(null);
+  const [dbPersistent, setDbPersistent] = useState<boolean | null>(null);
 
   const [entityId, setEntityId] = useState<string | null>(null);
   const [dashboardId, setDashboardId] = useState<string | null>(null);
@@ -121,23 +128,140 @@ export function WorkspaceApp({
     Record<string, EntityHedgeBook>
   >({});
 
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
+  const hedgesRef = useRef(hedgesByEntityId);
+  if (
+    hedgeBookHasContent(hedgesByEntityId)
+    || !hedgeBookHasContent(hedgesRef.current)
+  ) {
+    hedgesRef.current = hedgesByEntityId;
+  }
+  const varSetupRef = useRef(varSetup);
+  varSetupRef.current = varSetup;
+  const hedgesUpdatedAtRef = useRef<string | undefined>(undefined);
+
+  const flushBook = (
+    nextWorkspace: Workspace = workspaceRef.current,
+    hedges: Record<string, EntityHedgeBook> = hedgesRef.current,
+    setup: VarSetup = varSetupRef.current,
+    hedgesUpdatedAt: string | undefined = hedgesUpdatedAtRef.current,
+  ) =>
+    saveWorkspacePersistent(userKey, {
+      workspace: nextWorkspace,
+      hedgesByEntityId: hedges,
+      varSetup: setup,
+      hedgesUpdatedAt,
+    });
+
   useEffect(() => {
-    const { workspace: ws, loadWarning } = loadWorkspaceDetailed(userKey);
-    setWorkspace(ws);
-    setLoaded(true);
-    if (loadWarning) {
-      setSaveStatus({ tone: 'warn', message: loadWarning });
+    let cancelled = false;
+    const local = loadWorkspaceDetailed(userKey);
+    setWorkspace(local.workspace);
+    hedgesRef.current = local.hedgesByEntityId;
+    setHedgesByEntityId(local.hedgesByEntityId);
+    hedgesUpdatedAtRef.current = local.hedgesUpdatedAt;
+    if (local.varSetup) {
+      const setup = normalizeVarSetup(local.varSetup);
+      varSetupRef.current = setup;
+      setVarSetup(setup);
     }
+    setLoaded(true);
+    if (local.loadWarning) {
+      setSaveStatus({ tone: 'warn', message: local.loadWarning });
+    }
+
+    void (async () => {
+      const { book, persistent, error } = await loadWorkspacePersistent(userKey);
+      if (cancelled) return;
+      if (error) {
+        setDbPersistent(false);
+        setSaveStatus({
+          tone: error.startsWith('Sign in') ? 'error' : 'warn',
+          message: error,
+        });
+      } else if (!persistent) {
+        setDbPersistent(false);
+        setSaveStatus({
+          tone: 'warn',
+          message: 'Hedges saved in this browser — database sync is off.',
+        });
+      } else {
+        setDbPersistent(true);
+      }
+      setWorkspace(book.workspace);
+      setHedgesByEntityId(prev => {
+        const merged = mergeHedgeBooksPreservingPrepared(
+          prev,
+          book.hedgesByEntityId,
+        );
+        hedgesRef.current = merged;
+        if (
+          (Date.parse(book.hedgesUpdatedAt ?? '') || 0)
+          > (Date.parse(hedgesUpdatedAtRef.current ?? '') || 0)
+        ) {
+          hedgesUpdatedAtRef.current = book.hedgesUpdatedAt;
+        }
+        return merged;
+      });
+      if (book.varSetup) {
+        const setup = normalizeVarSetup(book.varSetup);
+        varSetupRef.current = setup;
+        setVarSetup(setup);
+      }
+      if (book.loadWarning) {
+        setSaveStatus({ tone: 'warn', message: book.loadWarning });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [userKey]);
 
   useEffect(() => {
-    if (!saveStatus || saveStatus.tone === 'error') return;
+    return subscribeSandboxPersist(event => {
+      if (event.taskId !== WORKSPACE_SANDBOX_TASK_ID) return;
+      if (event.ok && event.persistent) {
+        setDbPersistent(true);
+        return;
+      }
+      if (event.status === 401) {
+        setDbPersistent(false);
+        setSaveStatus({
+          tone: 'error',
+          message: 'Sign in to save hedges to the database.',
+        });
+        return;
+      }
+      if (event.status === 503) {
+        setDbPersistent(false);
+        setSaveStatus({
+          tone: 'warn',
+          message: 'Database not configured — hedges stay in this browser.',
+        });
+        return;
+      }
+      if (!event.ok) {
+        setDbPersistent(false);
+        setSaveStatus({
+          tone: 'error',
+          message: event.error
+            ? `Database save failed — ${event.error}`
+            : 'Database save failed — hedges stay in this browser.',
+        });
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!saveStatus || saveStatus.tone !== 'ok') return;
     const t = window.setTimeout(() => setSaveStatus(null), 4000);
     return () => window.clearTimeout(t);
   }, [saveStatus]);
 
   const persist = (resolved: Workspace, okMessage = 'Workspace saved') => {
-    const result = saveWorkspace(userKey, resolved);
+    if (!loaded) return { ok: true as const };
+    const result = flushBook(resolved);
     if (result.ok) {
       setSaveStatus({ tone: 'ok', message: okMessage });
     } else {
@@ -149,6 +273,47 @@ export function WorkspaceApp({
       });
     }
     return result;
+  };
+
+  const commitVarSetup = (setup: VarSetup) => {
+    const next = normalizeVarSetup(setup);
+    varSetupRef.current = next;
+    setVarSetup(next);
+    if (loaded) flushBook(workspaceRef.current, hedgesRef.current, next);
+  };
+
+  const commitHedges = (
+    next:
+      | Record<string, EntityHedgeBook>
+      | ((prev: Record<string, EntityHedgeBook>) => Record<string, EntityHedgeBook>),
+  ) => {
+    setHedgesByEntityId(prev => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      const prevClock = hedgesUpdatedAtRef.current;
+      const wipe = hedgeBookLooksLikeAccidentalWipe(resolved, prev);
+      const nextClock =
+        hedgeLedgerChanged(prev, resolved) && !wipe
+          ? new Date().toISOString()
+          : prevClock;
+      const picked = pickHedgeBooksForWrite(
+        resolved,
+        prev,
+        nextClock,
+        prevClock,
+      );
+      const hedges = picked.hedgesByEntityId;
+      hedgesRef.current = hedges;
+      hedgesUpdatedAtRef.current = picked.hedgesUpdatedAt ?? nextClock;
+      if (loaded) {
+        flushBook(
+          workspaceRef.current,
+          hedges,
+          varSetupRef.current,
+          hedgesUpdatedAtRef.current,
+        );
+      }
+      return hedges;
+    });
   };
 
   const update = (
@@ -205,6 +370,14 @@ export function WorkspaceApp({
                 {saveStatus.message}
               </span>
             )}
+            {!saveStatus && dbPersistent === true && (
+              <span className="text-[11px] text-slate-500">Saved to database</span>
+            )}
+            {!saveStatus && dbPersistent === false && (
+              <span className="rounded-full bg-amber-900/40 px-3 py-1 text-xs text-amber-100">
+                Browser only — database sync is off
+              </span>
+            )}
             <ModeNav sandboxEnabled={sandboxEnabled} />
             {accountMenu}
           </div>
@@ -232,9 +405,9 @@ export function WorkspaceApp({
             group={workspace.group}
             entities={groupEntities}
             varSetup={varSetup}
-            onVarSetupChange={setup => setVarSetup(normalizeVarSetup(setup))}
+            onVarSetupChange={commitVarSetup}
             hedgesByEntityId={hedgesByEntityId}
-            onHedgesByEntityIdChange={setHedgesByEntityId}
+            onHedgesByEntityIdChange={commitHedges}
           />
         ) : !entity ? (
           <EntitiesView
@@ -310,10 +483,10 @@ export function WorkspaceApp({
               )
             }
             varSetup={varSetup}
-            onVarSetupChange={setup => setVarSetup(normalizeVarSetup(setup))}
+            onVarSetupChange={commitVarSetup}
             hedgeBook={hedgesByEntityId[entity.id] ?? emptyHedgeBook()}
             onHedgeBookChange={updater =>
-              setHedgesByEntityId(prev => ({
+              commitHedges(prev => ({
                 ...prev,
                 [entity.id]: updater(prev[entity.id] ?? emptyHedgeBook()),
               }))
@@ -332,7 +505,12 @@ export function WorkspaceApp({
             if (save.ok) {
               // Mirroring into the curriculum sandbox is a background sync —
               // only worth surfacing when it fails.
-              const mirror = mirrorStructureToCurriculumSandbox(userKey, next, '01');
+              const mirror = mirrorStructureToCurriculumSandbox(
+                userKey,
+                next,
+                '01',
+                hedgesRef.current,
+              );
               if (!mirror.ok) {
                 setSaveStatus({
                   tone: 'warn',

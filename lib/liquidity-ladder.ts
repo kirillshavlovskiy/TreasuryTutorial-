@@ -97,8 +97,13 @@ export const SIZING_BASIS_OPTIONS: {
  *   `term`    — one swap today, near leg sized to the deepest requirement on the
  *               whole horizon and the far leg at its end. No rollover risk and
  *               one set of points, at the cost of carrying cover before it bites.
+ *   `stripTerm` — a leg per cycle, same as rolling (each starts on its own date
+ *               as the requirement arises), but none of them roll monthly — every
+ *               leg's far date is the SAME point, the forecast horizon's end. One
+ *               shared maturity, staggered trade dates, priced per leg at that
+ *               leg's own remaining tenor to the horizon (not a flat 1M knot).
  */
-export type LiquidityBookingMode = 'rolling' | 'term';
+export type LiquidityBookingMode = 'rolling' | 'term' | 'stripTerm';
 
 export const BOOKING_MODE_OPTIONS: {
   id: LiquidityBookingMode;
@@ -106,14 +111,14 @@ export const BOOKING_MODE_OPTIONS: {
   hint: string;
 }[] = [
   {
-    id: 'rolling',
-    label: 'Rolling legs',
-    hint: 'A near leg per cycle, each rolled at maturity — nothing sits idle, but a repeating drain leaves an outstanding book growing by a leg every cycle',
-  },
-  {
     id: 'term',
     label: 'One term swap',
     hint: 'One swap booked today covering the deepest requirement on the whole horizon — no rollover risk and one set of points, at the cost of carrying cover before it bites',
+  },
+  {
+    id: 'stripTerm',
+    label: 'Strip to term',
+    hint: 'A leg per cycle, each starting at its own future date as the requirement arises — but none of them roll monthly. Every leg settles together at the forecast horizon’s end, priced at its own remaining tenor to that date',
   },
 ];
 
@@ -154,7 +159,7 @@ export const DEFAULT_LIQUIDITY_TIMING: LiquidityTiming = {
   enabled: true,
   granularity: 'week',
   sizingBasis: 'horizon',
-  bookingMode: 'rolling',
+  bookingMode: 'stripTerm',
   defaults: { ...WORST_CASE_TIMING },
   byField: {},
   byCcy: {},

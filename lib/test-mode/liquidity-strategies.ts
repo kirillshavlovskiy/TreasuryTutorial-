@@ -45,10 +45,13 @@ import {
   type SwapLegScheduleRow,
 } from '@/lib/forecast-profile';
 import {
+  cipTenorProfile,
   fundingSwapFarLegCipUsdM,
   fundingSwapPathFarCipUsdM,
+  fwdCarryFromSwapPointsUsdM,
   resolveMarketRatesForCcy,
   resolveOvernightCashRates,
+  type CipTenorBucket,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
 import {
@@ -58,7 +61,9 @@ import {
 } from '@/lib/test-mode/cash-carry-analytics';
 import {
   displayedCfarNetByCcyUsdM,
+  displayedCfarUsdMFromFxNet,
   fxHedgeMcCfarByCcy,
+  fxOnlyNetByCcyUsdM,
   sumNetCfarUsdM,
 } from '@/lib/test-mode/cfar-net-by-ccy';
 import type { HedgeTicket, PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
@@ -97,7 +102,8 @@ export type LiquidityStrategyId =
   | 'unfunded'
   | 'nearCycle'
   | 'rollingProgramme'
-  | 'termSwap';
+  | 'termSwap'
+  | 'stripToTerm';
 
 export interface LiquidityStrategy {
   id: LiquidityStrategyId;
@@ -149,6 +155,14 @@ export const LIQUIDITY_STRATEGIES: readonly LiquidityStrategy[] = [
       'One trade, one set of points and no rollover risk, paid for by carrying the deepest cycle’s cover from day one — before it bites.',
     regime: { sizingBasis: 'horizon', bookingMode: 'term' },
   },
+  {
+    id: 'stripToTerm',
+    label: 'Strip to term',
+    summary: 'A leg per cycle as the requirement arises, each forward-starting — but none of them roll. Every leg settles together at the horizon’s end.',
+    tradeoff:
+      'Each leg is priced once, at its own remaining tenor to the shared maturity, instead of the whole book being re-marked to a 1-month roll every cycle — no rollover risk and no repeated near-tenor pricing on money that’s really outstanding much longer.',
+    regime: { sizingBasis: 'horizon', bookingMode: 'stripTerm' },
+  },
 ];
 
 export function liquidityStrategyMeta(id: LiquidityStrategyId): LiquidityStrategy {
@@ -165,17 +179,18 @@ export function strategyForRegime(
   bookingMode: LiquidityBookingMode,
 ): LiquidityStrategy {
   if (bookingMode === 'term') return liquidityStrategyMeta('termSwap');
+  if (bookingMode === 'stripTerm') return liquidityStrategyMeta('stripToTerm');
   return liquidityStrategyMeta(
     sizingBasis === 'cycle' ? 'nearCycle' : 'rollingProgramme',
   );
 }
 
 /**
- * Layers the comparison sizes H* on. The floor and the payout-uncertainty
- * cushion are the non-discretionary part of the requirement; carry and
- * portfolio optimisation settle across the whole book's budget, which the
- * Analytics view does not own, so leaving them out keeps every strategy sized
- * on the same policy rather than on a budget verdict this module invented.
+ * Default H* stack when the desk has not passed `activeLayers`.
+ * Floor + payout-σ are the non-discretionary cushion. Carry / portfolio
+ * mix is owned by the desk: when `portfolioDiv` is on, comparison regimes
+ * inherit that book’s H* (`livePlanByCcy` cycle-0 `cash_threshold`) rather
+ * than inventing a second mix.
  */
 export const FUNDING_POLICY_LAYERS: readonly LayerId[] = ['floorH', 'sigmaP'];
 
@@ -203,7 +218,7 @@ export function bufferConstraintDetail(
   const a = active ?? new Set<LayerId>();
   const bits: string[] = [];
   if (a.has('cfarCover') || a.has('sigmaP')) bits.push('Forecast accuracy');
-  if (a.has('portfolioDiv')) bits.push('Portfolio VaR');
+  if (a.has('portfolioDiv')) bits.push('Portfolio level · Policy VAR');
   if (a.has('carryOptim')) bits.push('Buffer Carry target');
   if (a.has('floorH')) bits.push('Min floor');
   return bits.length > 0 ? bits.join(' · ') : 'Unfunded trough (no layer)';
@@ -304,6 +319,16 @@ function residualRiskOverlay(
   delta: number,
 ): SwapForwardOverlay {
   const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
+  // `delta` here is the frontier's own convention (1 = open/nothing hedged,
+  // 0 = far/fully hedged). forwardLocalM/remainingFarLocalM etc. below are
+  // self-consistent with THAT convention and stay unchanged — they're the
+  // real notional amounts. But the stored `delta:` field feeds
+  // retainedFundingPlanByCcy (via displayedCfarAtResidual →
+  // displayedNetFromFx), which is proven (see its own test) to expect the
+  // OPPOSITE hedge-coverage convention (Δ=1 = fully hedged). Storing
+  // `residual` there directly made a fully-open position (nothing hedged)
+  // read as fully hedged, retaining ZERO of its real funding-swap CFaR
+  // bridge instead of all of it — see overlayDeltaStub's matching fix.
   const residual = clampHedgeDelta(delta);
   const E = fxBookNetLocalM(row);
   const S = plan[0]?.swap_needed ?? 0;
@@ -313,7 +338,7 @@ function residualRiskOverlay(
   );
   const net = E + S;
   return {
-    delta: residual,
+    delta: 1 - residual,
     exposureLocalM: E,
     swapNearLocalM: S,
     swapStandingLocalM: standing,
@@ -510,6 +535,8 @@ export interface LiquidityStrategyCcy {
   swapOnUsdYrM: number;
   /** Funding-swap far-leg CIP from Market data swap points ($M). */
   swapPointsUsdYrM: number;
+  /** Mid swap-points curve (3W+) on M1 standing — CIP breakdown by tenor. */
+  cipTenorProfile: readonly CipTenorBucket[];
   /** Funding-swap cash leg: Σ cycle cash Δr vs USD. Desk Swap Carry column. */
   swapInterestUsdYrM: number;
   /**
@@ -540,6 +567,8 @@ export interface LiquiditySwapLegRow extends SwapLegScheduleRow {
   fcyOnUsdYr: number;
   usdOnUsdYr: number;
   pointsUsdYr: number;
+  midPoints: number | null;
+  settleMonths: number;
   /** Every funding leg is a swap (near + far) — points always apply. */
   hasPoints: boolean;
   /** FCY O/N + USD O/N — the rate-diff carry. Points offset this at CIP mid. */
@@ -582,21 +611,49 @@ export function swapLegScheduleWithCarry(
     farSettleMonths?: number;
     /** Live Swap+Fwd Δ retention — same scale as the desk CIP column. */
     cipScale?: number;
+    /**
+     * Strip to term: every leg settles at this fixed horizon (months from today)
+     * instead of a flat 1M roll or a single first-cycle far leg. Each leg is
+     * priced at its OWN remaining tenor — horizon minus its own trade date.
+     */
+    stripToHorizonMonths?: number;
   },
 ): LiquiditySwapLegRow[] {
   const farMonths = Math.max(1, opts?.farSettleMonths ?? 1);
   const cipScale = opts?.cipScale ?? 1;
-  const monthFrac = 1 / 12;
   const term = farMonths > 1;
+  const stripHorizon = opts?.stripToHorizonMonths;
   return schedule.map((l, i) => {
-    const standing = l.outstanding;
+    // Strip to term: each leg is its OWN forward-starting tranche, held to the
+    // shared maturity and priced ONCE on its own incremental notional (newLeg).
+    // Pricing the cumulative `outstanding` here would re-price every earlier
+    // tranche again at each later cycle's tenor too — the same balance counted
+    // once at 12M, again at 11M, again at 10M... — which is the rolling/term
+    // convention (mark the whole book fresh each period), not a buy-and-hold strip.
+    const standing = stripHorizon != null ? l.newLeg : l.outstanding;
+    const settleMonths = stripHorizon != null
+      ? Math.max(0, stripHorizon - l.cycleIndex)
+      : term ? (i === 0 ? farMonths : 0) : 1;
+    // Every leg but a `term` bullet's single M1 trade is forward-starting once
+    // its own cycleIndex > 0 — price it off the forward-forward window from
+    // ITS OWN start date, not the curve's spot-to-tenor knot (wrong window the
+    // moment the curve has any slope, even though the duration looks the same).
+    const startMonths = term ? 0 : l.cycleIndex;
+    const tenorFrac = settleMonths / 12;
     const fcyRate = fundingSwapCashFcyRate(standing, r_FCY, r_OD);
-    const fcyOnUsdYr = standing * (fcyRate / 100) * spot * monthFrac;
-    const usdOnUsdYr = -standing * (r_USD / 100) * spot * monthFrac;
+    const fcyOnUsdYr = standing * (fcyRate / 100) * spot * tenorFrac;
+    const usdOnUsdYr = -standing * (r_USD / 100) * spot * tenorFrac;
     const interestUsdYr = fundingSwapCashDeltaUsdYr(
       standing, spot, r_FCY, r_USD, r_OD,
-    ) * monthFrac;
-    const settleMonths = term ? (i === 0 ? farMonths : 0) : 1;
+    ) * tenorFrac;
+    const marketPts = settleMonths === 0 || !opts?.bundle
+      ? null
+      : fwdCarryFromSwapPointsUsdM({
+          notionalLocalM: standing,
+          settleMonths,
+          startMonths,
+          bundle: opts.bundle,
+        });
     const fallbackPts = settleMonths === 0
       ? 0
       : fundingSwapOverlayUsdYr(
@@ -604,17 +661,21 @@ export function swapLegScheduleWithCarry(
         ).pointsUsdYr * (settleMonths / 12);
     const pointsUsdYr = settleMonths === 0
       ? 0
-      : fundingSwapFarLegCipUsdM({
-          standingLocalM: standing,
-          settleMonths,
-          bundle: opts?.bundle,
-          fallbackUsdM: fallbackPts,
-        }) * cipScale;
+      : (marketPts?.fwdCarryUsdM
+          ?? fundingSwapFarLegCipUsdM({
+            standingLocalM: standing,
+            settleMonths,
+            startMonths,
+            bundle: opts?.bundle,
+            fallbackUsdM: fallbackPts,
+          })) * cipScale;
     return {
       ...l,
       fcyOnUsdYr,
       usdOnUsdYr,
       pointsUsdYr,
+      midPoints: marketPts?.points ?? null,
+      settleMonths,
       hasPoints: settleMonths > 0,
       interestUsdYr,
       netUsdYr: interestUsdYr + pointsUsdYr,
@@ -674,15 +735,13 @@ function cfarCoverFcyFor(ccy: string, netByCcy?: Record<string, number>): number
  *   cash  — `fundingSwapCarryLegs` (same call as the desk P&L Buffer Carry)
  *   points — Market data far-leg CIP via `fundingSwapPathFarCipUsdM`
  *            (rolling = Σ 1M; term = one far tenor on M1 standing)
- *            Live regime scales by (1−Δ), same as the desk CIP column.
+ *            Residual Δ (1 = open, 0 = far) scales CIP by (1−Δ) on every
+ *            priced programme so the Book table matches the mix the desk picked.
  */
-function liveCipRetention(
+function overlayCipRetention(
   ccy: string,
-  strategy: LiquidityStrategy,
-  liveStrategyId: LiquidityStrategyId,
   overlays?: Readonly<Record<string, SwapForwardOverlay>>,
 ): number {
-  if (strategy.id !== liveStrategyId) return 1;
   const overlay = overlays?.[ccy];
   if (!overlay) return 1;
   return 1 - clampHedgeDelta(overlay.delta);
@@ -693,13 +752,17 @@ function deskSwapOverlay(
   input: LiquidityStrategyInput,
   plan: readonly LiquidityCycleProjection[],
   cipScale = 1,
+  bookingMode: 'rolling' | 'term' | 'stripTerm' = 'rolling',
 ): { fcyOnUsdYr: number; pointsUsdYr: number; interestUsdYr: number; netUsdYr: number } {
+  const forecastMonths = input.shared.forecastMonths ?? input.months;
   const legs = fundingSwapCarryLegs({
     ccy: row.ccy,
     plan,
     r_FCY: row.r_FCY,
     r_USD: input.shared.r_USD,
     r_OD: row.r_OD,
+    forecastMonths,
+    bookingMode,
   });
   const spot = ccySpotRate(row.ccy);
   const standingFallback = swapFarLegNotional(
@@ -709,7 +772,8 @@ function deskSwapOverlay(
   const pointsUsdYr = fundingSwapPathFarCipUsdM({
     plan,
     standingFallback,
-    forecastMonths: input.shared.forecastMonths ?? input.months,
+    forecastMonths,
+    bookingMode,
     bundle: resolveMarketRatesForCcy(
       input.marketRatesByCcy, row.ccy, input.ratesScopeId,
     ),
@@ -829,6 +893,12 @@ function evaluateCcy(
     && strategy.id === liveStrategyId
     && deskPlan != null
     && deskPlan.length > 0;
+  const deskHStar = deskPlan?.[0]?.cash_threshold;
+  const bookTarget = activeLayers.has('portfolioDiv')
+    && typeof deskHStar === 'number'
+    && Number.isFinite(deskHStar)
+    ? deskHStar
+    : undefined;
 
   const plan: LiquidityCycleProjection[] =
     strategy.regime === null
@@ -842,7 +912,7 @@ function evaluateCcy(
             ladder,
             input.forecastProfile,
             hedgeSettle,
-            undefined,
+            bookTarget,
             strategy.regime.bookingMode,
             cfarCoverFcy,
           );
@@ -850,8 +920,15 @@ function evaluateCcy(
     strategy.regime?.bookingMode === 'term'
       ? fundingSwapFarSettleMonths(plan, input.shared.forecastMonths ?? input.months)
       : 1;
-  const cipScale = liveCipRetention(
-    row.ccy, strategy, liveStrategyId, input.swapForwardOverlayByCcy,
+  const stripToHorizonMonths =
+    strategy.regime?.bookingMode === 'stripTerm'
+      ? Math.max(1, input.shared.forecastMonths ?? input.months)
+      : undefined;
+  const cipScale = overlayCipRetention(
+    row.ccy, input.swapForwardOverlayByCcy,
+  );
+  const marketBundle = resolveMarketRatesForCcy(
+    input.marketRatesByCcy, row.ccy, input.ratesScopeId,
   );
   const schedule = swapLegScheduleWithCarry(
     plan.length > 0 ? swapLegSchedule(plan) : [],
@@ -860,11 +937,10 @@ function evaluateCcy(
     input.shared.r_USD,
     row.r_OD,
     {
-      bundle: resolveMarketRatesForCcy(
-        input.marketRatesByCcy, row.ccy, input.ratesScopeId,
-      ),
+      bundle: marketBundle,
       farSettleMonths,
       cipScale,
+      stripToHorizonMonths,
     },
   );
 
@@ -901,10 +977,14 @@ function evaluateCcy(
   const deskHedge = input.deskHedgeCarryByCcyUsdM?.[row.ccy];
   const hedgeCarryUsdYrM =
     typeof deskHedge === 'number' && Number.isFinite(deskHedge) ? deskHedge : 0;
-  const overlayFull = deskSwapOverlay(row, input, plan, 1);
+  const overlayFull = deskSwapOverlay(
+    row, input, plan, 1, strategy.regime?.bookingMode ?? 'rolling',
+  );
   const overlay = cipScale === 1
     ? overlayFull
-    : deskSwapOverlay(row, input, plan, cipScale);
+    : deskSwapOverlay(
+      row, input, plan, cipScale, strategy.regime?.bookingMode ?? 'rolling',
+    );
   const deskCip = input.deskCipByCcyUsdM?.[row.ccy];
   let cipFullUsdYrM = overlayFull.pointsUsdYr;
   let pointsUsdYr = overlay.pointsUsdYr;
@@ -994,6 +1074,12 @@ function evaluateCcy(
     hedgeCarryUsdYrM: hedgeCarryRounded,
     swapOnUsdYrM: roundMoney(overlayFull.fcyOnUsdYr),
     swapPointsUsdYrM,
+    cipTenorProfile: cipTenorProfile({
+      notionalLocalM: plan[0]?.standing_swap ?? 0,
+      bundle: marketBundle,
+      bookedMonths: strategy.regime === null ? undefined : farSettleMonths,
+      maxMonths: input.shared.forecastMonths ?? input.months,
+    }),
     cipFullUsdYrM,
     swapInterestUsdYrM,
     swapCarryUsdYrM: roundMoney(swapInterestUsdYrM + swapPointsUsdYrM),
@@ -1014,6 +1100,25 @@ function evaluateCcy(
  * USD rows are skipped: the swap funds an FCY position out of USD, so USD is
  * the funding side of the trade rather than a book that needs covering.
  */
+/** CFaR-tab FX-only Net for the names on this book. Null if the tab has none. */
+function tabFxOnlyByCcy(
+  tab: Record<string, number> | undefined,
+  ccys: readonly string[],
+): Record<string, number> | null {
+  if (!tab) return null;
+  const out: Record<string, number> = {};
+  let n = 0;
+  for (const ccy of ccys) {
+    if (ccy === 'USD') continue;
+    const v = tab[ccy];
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
+      out[ccy] = v;
+      n += 1;
+    }
+  }
+  return n > 0 ? out : null;
+}
+
 export function evaluateLiquidityStrategies(
   input: LiquidityStrategyInput,
 ): LiquidityStrategyResult[] {
@@ -1040,7 +1145,13 @@ export function evaluateLiquidityStrategies(
     }));
   if (paths.length === 0) return [];
 
-  const fxCfarByCcy = input.setup
+  const tabFxOnly = tabFxOnlyByCcy(
+    input.cfarNetByCcyUsd,
+    paths.map(p => p.row.ccy),
+  );
+  // CFaR-tab / portfolio FX-only Net is the source of truth. Do not rerun MC
+  // with overlay forwards — that invents a second Overdraft CFaR.
+  const fxCfarByCcy = input.setup && !tabFxOnly
     ? fxHedgeMcCfarByCcy({
         rows: input.rows,
         setup: input.setup,
@@ -1063,13 +1174,26 @@ export function evaluateLiquidityStrategies(
       roundMoney(byCcy.reduce((s, c) => s + pick(c), 0));
 
     const planByCcy = Object.fromEntries(byCcy.map(c => [c.ccy, c.plan]));
-    const cfarByCcy = input.setup
-      ? displayedCfarNetByCcyUsdM(fxCfarByCcy, {
-          setup: input.setup,
-          fundingPlanByCcy: planByCcy,
-          swapForwardOverlayByCcy: input.swapForwardOverlayByCcy,
-        })
-      : {};
+    const setup = input.setup;
+    const cfarByCcy = !setup
+      ? {}
+      : strategy.id === 'unfunded'
+        ? (tabFxOnly ?? fxOnlyNetByCcyUsdM(fxCfarByCcy))
+        : tabFxOnly
+          ? Object.fromEntries(byCcy.map(c => [
+            c.ccy,
+            displayedCfarUsdMFromFxNet(
+              tabFxOnly[c.ccy] ?? 0,
+              c.ccy,
+              c.plan,
+              setup,
+            ),
+          ]))
+          : displayedCfarNetByCcyUsdM(fxCfarByCcy, {
+            setup,
+            fundingPlanByCcy: planByCcy,
+            swapForwardOverlayByCcy: input.swapForwardOverlayByCcy,
+          });
     const byCcyWithCfar = byCcy.map(c => ({
       ...c,
       cfarUsdM: cfarByCcy[c.ccy] ?? 0,
@@ -1149,8 +1273,34 @@ export interface LiquidityAnalyticsSource {
   deskCashCarryByCcyUsdM?: Record<string, number>;
   /** Desk FX HEDGE CIP per CCY ($M) — already Δ-scaled. */
   deskCipByCcyUsdM?: Record<string, number>;
+  /** Stage a residual-Δ funding strip into FX Risk / Carry / Decision. */
+  onPreparedByCcyChange?: (
+    next:
+      | Record<string, PreparedHedgeProfile>
+      | ((
+          prev: Record<string, PreparedHedgeProfile>,
+        ) => Record<string, PreparedHedgeProfile>),
+  ) => void;
   /** Shared VaR/CFaR setup editor — confidence chips on Liquidity Analytics. */
   onSetupChange?: (setup: VarSetup) => void;
+  /**
+   * Policy VAR overlay cap ($M). Portfolio level writes this; the Liquidity
+   * tab’s optimizer (`optimizePortfolioCarry`) is what consumes it.
+   */
+  policyVAR?: number;
+  onPolicyVARChange?: (usdM: number) => void;
+  /**
+   * Shared overlay earn ask ($K/yr). Blank fills Policy VAR on the Σ⁻¹μ ray.
+   * Typed here and on the Liquidity Portfolio VAR modal.
+   */
+  portfolioCarryK?: number;
+  onPortfolioCarryKChange?: (k: number | undefined) => void;
+  /** Live residual Δ keyed by CCY — persisted on the hedge-book desk overlay. */
+  residualByCcy?: Record<string, number>;
+  onResidualByCcyChange?: (next: Record<string, number>) => void;
+  /** Overlay sweet-spot chip — persisted on the hedge-book desk. */
+  portfolioScenarioId?: string | null;
+  onPortfolioScenarioIdChange?: (id: string | null) => void;
 }
 
 /**

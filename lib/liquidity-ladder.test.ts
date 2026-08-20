@@ -965,8 +965,11 @@ describe('sizing basis picks which funded cycle H* and the swap fund', () => {
     activeLayers: new Set(['sigmaP'] as const),
     policyVAR: 5.0,
   };
+  // This block specifically tests rolling-book mechanics (leg growing every
+  // cycle on a repeating drain) — pin it explicitly so it stays correct
+  // regardless of what the platform default is.
   const on = (basis: 'cycle' | 'horizon'): ForecastProfileState =>
-    profileWith({ granularity: 'week', sizingBasis: basis });
+    profileWith({ granularity: 'week', sizingBasis: basis, bookingMode: 'rolling' });
 
   const gbpFor = (basis: 'cycle' | 'horizon', months = 12) =>
     computeDashboardModel({

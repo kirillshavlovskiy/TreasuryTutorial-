@@ -9,6 +9,9 @@ import {
   type SharedGlobals,
 } from '@/lib/fx-buffer';
 import {
+  emptyMarketRatesForCcy,
+} from '@/lib/fx-market-rates';
+import {
   DEFAULT_FORECAST_PROFILE,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
@@ -39,6 +42,11 @@ import {
   type LiquidityStrategyId,
   type LiquidityStrategyResult,
 } from '@/lib/test-mode/liquidity-strategies';
+import {
+  fxHedgeMcCfarByCcy,
+  fxOnlyNetByCcyUsdM,
+  sumNetCfarUsdM,
+} from '@/lib/test-mode/cfar-net-by-ccy';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
 
 const gbp = INITIAL_ROWS.find(r => r.ccy === 'GBP')!;
@@ -208,6 +216,41 @@ describe('the term swap commits its cover up front', () => {
     expect(termPay.bookNow).toBeLessThan(-0.5);
     expect(termPay.schedule).toHaveLength(1);
     expect(termPay.peakBook).toBeCloseTo(termPay.bookNow, 6);
+  });
+
+  it('EUR Book CIP still reads the bundled EURUSD curve when the map has an empty EUR shell', () => {
+    const eur = INITIAL_ROWS.find(r => r.ccy === 'EUR')!;
+    const pay = {
+      ...eur,
+      cash: 40,
+      payout: -2,
+      collections: 2,
+      cash_floor: 0,
+      carry_target: -15,
+      fcastFX: 0,
+      nonLpCash: 0,
+    };
+    const input = {
+      rows: [pay],
+      forecastProfile: profileWith(),
+      months: 6,
+      shared,
+      activeLayers: new Set<LayerId>(['carryOptim']),
+    };
+    const seeded = pick(
+      evaluateLiquidityStrategies(input),
+      'termSwap',
+    ).byCcy[0]!;
+    const shadowed = pick(
+      evaluateLiquidityStrategies({
+        ...input,
+        marketRatesByCcy: { EUR: emptyMarketRatesForCcy('EUR') },
+      }),
+      'termSwap',
+    ).byCcy[0]!;
+    expect(Math.abs(seeded.swapPointsUsdYrM)).toBeGreaterThan(0.001);
+    expect(shadowed.swapPointsUsdYrM).toBeCloseTo(seeded.swapPointsUsdYrM, 6);
+    expect(shadowed.schedule.some(l => l.midPoints != null)).toBe(true);
   });
 });
 
@@ -410,6 +453,48 @@ describe('regime summary — constraint and final CFaR', () => {
     expect(results[0]!.constraintDetail).toContain('Buffer Carry target');
   });
 
+  it('portfolio level anchors every funded regime to the desk H*', () => {
+    const gbp = row({ cash: 20, payout: -90, collections: 40, cash_floor: 5 });
+    const profile = profileWith({ sizingBasis: 'horizon', bookingMode: 'rolling' });
+    const bare = evaluateLiquidityStrategies({
+      rows: [gbp],
+      forecastProfile: profile,
+      months: 3,
+      shared,
+      activeLayers: new Set(['floorH']),
+    });
+    const livePlan = pick(bare, 'rollingProgramme').byCcy[0]!.plan;
+    expect(livePlan.length).toBeGreaterThan(0);
+    const deskH = 42;
+    const deskPlan = livePlan.map(p => ({ ...p, cash_threshold: deskH }));
+    const results = evaluateLiquidityStrategies({
+      rows: [gbp],
+      forecastProfile: profile,
+      months: 3,
+      shared,
+      activeLayers: new Set(['floorH', 'portfolioDiv']),
+      livePlanByCcy: { [gbp.ccy]: deskPlan },
+    });
+    expect(pick(results, 'rollingProgramme').constraint).toBe('var');
+    expect(pick(results, 'rollingProgramme').constraintDetail).toContain('Portfolio level');
+    expect(pick(results, 'rollingProgramme').byCcy[0]!.plan[0]!.cash_threshold)
+      .toBeCloseTo(deskH, 6);
+
+    const nearestH = (plan: readonly { cash_threshold: number }[]) =>
+      plan.reduce(
+        (best, p) =>
+          Math.abs(p.cash_threshold - deskH) < Math.abs(best - deskH)
+            ? p.cash_threshold
+            : best,
+        plan[0]!.cash_threshold,
+      );
+    expect(nearestH(pick(results, 'termSwap').byCcy[0]!.plan)).toBeCloseTo(deskH, 4);
+    expect(nearestH(pick(results, 'nearCycle').byCcy[0]!.plan)).toBeCloseTo(deskH, 4);
+    expect(
+      Math.abs(nearestH(pick(bare, 'termSwap').byCcy[0]!.plan) - deskH),
+    ).toBeGreaterThan(1);
+  });
+
   it('turns payout σ and CFaR cover on or off as one forecast-accuracy limit', () => {
     const active = new Set<LayerId>(['sigmaP']);
     const flip = (id: LayerId) => {
@@ -422,6 +507,43 @@ describe('regime summary — constraint and final CFaR', () => {
     toggleLayerGroup(['sigmaP', 'cfarCover'], active, flip);
     expect(active.has('sigmaP')).toBe(true);
     expect(active.has('cfarCover')).toBe(true);
+  });
+
+  it('overdraft Final CFaR is the CFaR-tab FX-only Net — no funding-swap bridge', () => {
+    const rows = [row()];
+    const forecastProfile = profileWith();
+    const setup = { ...DEFAULT_VAR_SETUP, forecastMonths: 3 };
+    const unfunded = pick(evaluateLiquidityStrategies({
+      rows,
+      forecastProfile,
+      months: 3,
+      shared,
+      setup,
+      activeLayers: new Set(['floorH', 'sigmaP']),
+    }), 'unfunded');
+    const fx = fxHedgeMcCfarByCcy({ rows, setup, forecastProfile });
+    expect(unfunded.finalCfarUsdM).toBeCloseTo(
+      sumNetCfarUsdM(fxOnlyNetByCcyUsdM(fx)),
+      8,
+    );
+    expect(unfunded.byCcy[0]!.plan).toEqual([]);
+  });
+
+  it('Overdraft Sum CFaR uses the CFaR-tab map when the desk already computed it', () => {
+    const eur = INITIAL_ROWS.find(r => r.ccy === 'EUR')!;
+    const tab = { EUR: 0.334, GBP: 0.3 };
+    const unfunded = pick(evaluateLiquidityStrategies({
+      rows: [row({ ...eur, ccy: 'EUR' }), row()],
+      forecastProfile: profileWith(),
+      months: 3,
+      shared,
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 3 },
+      cfarNetByCcyUsd: tab,
+      activeLayers: new Set(['floorH', 'sigmaP']),
+    }), 'unfunded');
+    expect(unfunded.finalCfarUsdM).toBeCloseTo(0.634, 8);
+    expect(unfunded.byCcy.find(c => c.ccy === 'EUR')!.cfarUsdM).toBeCloseTo(0.334, 8);
+    expect(unfunded.byCcy.find(c => c.ccy === 'GBP')!.cfarUsdM).toBeCloseTo(0.3, 8);
   });
 
   it('keeps Default Carry the same and raises Final CFaR when a funding book is on', () => {

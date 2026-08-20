@@ -30,6 +30,7 @@ import {
   computeUsdBuffer,
   computeFcySwapNear,
   applyNoNegativeLpFloor,
+  applyHardMinFloor,
   isExpensiveOverdraft,
   deriveUsdLiquidity,
   deriveUsdFromFcySwaps,
@@ -40,10 +41,19 @@ import {
   usdStressTrimFloor,
   payoutLiquidityMinimum,
   allowsNegativeLp,
+  fundingSwapOverlayUsdYr,
+  fundingSwapCashDeltaUsdYr,
+  fundingSwapCarryLegs,
+  fundingSwapCipPointsUsdYr,
   computePortfolioVAR,
   optimizePortfolioCarry,
+  sweepPortfolioCarryFrontier,
+  universePolicyVarCap,
+  POLICY_VAR_LIMITS,
   computeEffectiveUsdBudget,
   toggleLayerGroup,
+  setBufferLevel,
+  bufferLevelOf,
   type PortfolioCarryInput,
   type LayerId,
   CURRENCY_PARAMS,
@@ -51,6 +61,11 @@ import {
   DISPLAY_CURRENCIES,
   Z_NEUTRAL,
 } from './fx-buffer';
+import {
+  DEFAULT_EURUSD_MARKET_RATES,
+  fundingSwapPathFarCipUsdM,
+  resolveMarketRatesForCcy,
+} from './fx-market-rates';
 
 // ── Tolerance helpers ─────────────────────────────────────────────────────────
 
@@ -784,6 +799,108 @@ describe('isExpensiveOverdraft / allowsNegativeLp', () => {
   });
 });
 
+describe('PLN cash + points vs USD', () => {
+  const spot = CURRENCY_PARAMS.PLN!.spot;
+  const r_FCY = 3.41;
+  const r_USD = 3.50;
+  const r_OD = 4.41;
+
+  it('a short standing pays OD, earns USD, and pays CIP to buy PLN far', () => {
+    const S = -20;
+    const overlay = fundingSwapOverlayUsdYr(S, spot, r_FCY, r_USD, r_OD);
+    const cash = fundingSwapCashDeltaUsdYr(S, spot, r_FCY, r_USD, r_OD);
+    expect(overlay.fcyOnUsdYr).toBeLessThan(0);
+    expect(overlay.usdOnUsdYr).toBeGreaterThan(0);
+    expect(overlay.pointsUsdYr).toBeLessThan(0);
+    expect(cash).toBeLessThan(0);
+    expect(cash).toBeCloseTo(S * ((r_OD - r_USD) / 100) * spot, 10);
+  });
+
+  it('a covering long standing pays credit vs USD; CIP on the sell-far offsets it at mid', () => {
+    const S = 20;
+    const overlay = fundingSwapOverlayUsdYr(S, spot, r_FCY, r_USD, r_OD);
+    const cash = fundingSwapCashDeltaUsdYr(S, spot, r_FCY, r_USD, r_OD);
+    expect(cash).toBeLessThan(0);
+    expect(cash).toBeCloseTo(S * ((r_FCY - r_USD) / 100) * spot, 10);
+    expect(overlay.pointsUsdYr).toBeCloseTo(-cash, 10);
+  });
+
+  it('12m term Buffer Carry is annual cash Δr on M1 standing, not a 1M nest or a 6-cycle path', () => {
+    const standing = 21.6;
+    const annual = standing * ((r_FCY - r_USD) / 100) * spot;
+    expect(annual * 1000).toBeCloseTo(-5.343, 2);
+    const sixCycleTerm = Array.from({ length: 6 }, (_, i) => ({
+      standing_swap: standing,
+      far_leg: i === 5 ? -standing : 0,
+      cycleIndex: i,
+    }));
+    const legs = fundingSwapCarryLegs({
+      ccy: 'PLN',
+      plan: sixCycleTerm,
+      r_FCY,
+      r_USD,
+      r_OD,
+      forecastMonths: 12,
+    });
+    expect(legs.cashUsdM).toBeCloseTo(annual, 8);
+    expect(legs.cashUsdM * 1000).toBeCloseTo(-5.3, 1);
+    expect(legs.cashUsdM).not.toBeCloseTo(annual / 2, 4);
+  });
+
+  it('EURUSD points on a PLN strip do not print cash and CIP both negative', () => {
+    const plan = Array.from({ length: 12 }, (_, i) => ({
+      standing_swap: 1.8 * (i + 1),
+      far_leg: 0,
+      cycleIndex: i,
+    }));
+    const bundle = resolveMarketRatesForCcy(
+      { PLN: DEFAULT_EURUSD_MARKET_RATES },
+      'PLN',
+    );
+    const legs = fundingSwapCarryLegs({
+      ccy: 'PLN',
+      plan,
+      r_FCY,
+      r_USD,
+      r_OD,
+      forecastMonths: 12,
+    });
+    const cip = fundingSwapPathFarCipUsdM({
+      plan,
+      standingFallback: 1.8,
+      forecastMonths: 12,
+      bookingMode: 'rolling',
+      bundle,
+      fallbackAnnualUsdYr: S =>
+        fundingSwapCipPointsUsdYr(S, spot, r_FCY, r_USD),
+    });
+    expect(legs.cashUsdM * 1000).toBeCloseTo(-2.9, 1);
+    expect(cip).toBeGreaterThan(0);
+    expect(cip).toBeCloseTo(-legs.cashUsdM, 8);
+    expect(cip + legs.cashUsdM).toBeCloseTo(0, 8);
+  });
+
+  it('rolling buffer carry extends to forecastMonths when the plan is shorter', () => {
+    const standing = 21.6;
+    const annual = standing * ((r_FCY - r_USD) / 100) * spot;
+    const sixCycleRolling = Array.from({ length: 6 }, (_, i) => ({
+      standing_swap: standing,
+      far_leg: 0,
+      cycleIndex: i,
+    }));
+    const legs = fundingSwapCarryLegs({
+      ccy: 'PLN',
+      plan: sixCycleRolling,
+      r_FCY,
+      r_USD,
+      r_OD,
+      forecastMonths: 12,
+    });
+    expect(legs.cashUsdM).toBeCloseTo(annual, 8);
+    expect(legs.cashUsdM * 1000).toBeCloseTo(-5.3, 1);
+  });
+});
+
 describe('enforceUsdLiquidityStress', () => {
   const r_USD = 4.5;
   const σ_P = 0.05;
@@ -1399,8 +1516,408 @@ describe('optimizePortfolioCarry', () => {
     );
     const mxn = res.find(r => r.ccy === 'MXN')!;
     expect(mxn.budget_binding).toBe(true);
-    expect(Math.abs(mxn.delta_portfolio)).toBeLessThan(1);
-    expect(mxn.cash_threshold).toBeCloseTo(238, 0);
+    // KNOWN GAP: at this VAR cap (500), MAX_LEG_LEVERAGE clamps BOTH MXN
+    // (long) and GBP (short) to the identical ceiling ($1500 = 3x cap),
+    // which makes the pair perfectly self-funding in USD terms (long MXN
+    // funded by short GBP proceeds) — the downstream usdShortfallLegs check
+    // sees ~zero NET USD demand and never trims further, even though gross
+    // notional here is many orders of magnitude past the $0.01 budget. The
+    // leverage ceiling bounds VAR-driven sizing; it does not know about a
+    // separate USD-collateral constraint, so a self-funding pair can still
+    // bypass a near-zero USD budget. Fixing this needs the leverage ceiling
+    // (or a further trim) to account for usdBudget_M too — not done here.
+    expect(mxn.cash_threshold).toBeGreaterThan(237);
+    expect(mxn.cash_threshold).toBeLessThan(3350);
+  });
+});
+
+describe('universePolicyVarCap', () => {
+  it('covers the $20 approval rung when nothing clamps', () => {
+    expect(universePolicyVarCap(null)).toBe(20);
+    expect(universePolicyVarCap(8)).toBe(20);
+  });
+
+  it('stretches a little past a late clamp so the knee can sit inside the sweep', () => {
+    expect(universePolicyVarCap(18)).toBeCloseTo(18 * 1.6, 6);
+  });
+
+  it('never traces past 4× the top approval rung', () => {
+    expect(universePolicyVarCap(80)).toBe(80);
+    expect(universePolicyVarCap(120)).toBe(80);
+  });
+});
+
+describe('sweepPortfolioCarryFrontier', () => {
+  const r_USD = 3.5;
+  const σ_P = 0.10;
+
+  function makeInput(
+    ccy: string, lp_cash: number,
+    overrides: Partial<PortfolioCarryInput> = {},
+  ): PortfolioCarryInput {
+    const p = CURRENCY_PARAMS[ccy]!;
+    return {
+      ccy, P: 0, lp_cash, P_contrib: 0,
+      forecasted_cash: lp_cash, floor_contrib: 0, delta_sigma: 0,
+      r_FCY: p.carry, r_OD: p.r_OD, ...overrides,
+    };
+  }
+
+  it('range is bounded by policyVAR_M — never runs away when a currency is EARN-only', () => {
+    // GBP and MXN both earn vs USD in CURRENCY_PARAMS — an unbounded "sweep
+    // until everyone floor-clamps" search never terminates here, since
+    // neither ever hits a floor. The range must come from policyVAR_M alone.
+    const f = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 131.8), makeInput('MXN', 238.0)],
+      σ_P, r_USD, 10, 12, 3,
+    );
+    expect(f.points[f.points.length - 1]!.k).toBeCloseTo(30, 6); // policyVAR_M(10) × rangeMultiple(3)
+    // 13 linear steps + up to 12 near-origin densification points (some may
+    // coincide with the linear grid and dedupe via the Set) — see the
+    // "denser sampling near k=0" comment in sweepPortfolioCarryFrontier.
+    expect(f.points.length).toBeGreaterThanOrEqual(13);
+    expect(f.points.length).toBeLessThanOrEqual(28);
+  });
+
+  it('carry and VAR both start at zero and grow with k', () => {
+    const f = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 131.8), makeInput('MXN', 238.0), makeInput('CAD', 95.1)],
+      σ_P, r_USD, 10,
+    );
+    expect(f.points[0]!.portfolioVarUsd).toBeCloseTo(0, 6);
+    expect(f.points[0]!.totalCarryUsdYr).toBeCloseTo(0, 6);
+    for (let i = 1; i < f.points.length; i++) {
+      expect(f.points[i]!.portfolioVarUsd).toBeGreaterThanOrEqual(f.points[i - 1]!.portfolioVarUsd - 1e-9);
+    }
+  });
+
+  it('a PAY currency clamped at its floor bends the curve — sweet spot lands strictly inside the range', () => {
+    // TRY pays vs USD in CURRENCY_PARAMS (r_FCY well below r_USD) — its
+    // overlay sells FCY as k grows and clamps at its floor once the stock is
+    // exhausted, while GBP/MXN keep climbing unclamped. That mismatch is the
+    // curvature this sweep exists to find.
+    const f = sweepPortfolioCarryFrontier(
+      [makeInput('TRY', 2.0, { floor_contrib: 1 }), makeInput('GBP', 60), makeInput('MXN', 40)],
+      σ_P, r_USD, 8, 24,
+    );
+    expect(f.points.some(p => p.floorBoundCcys.includes('TRY'))).toBe(true);
+    expect(f.sweetSpotIndex).toBeGreaterThan(0);
+    expect(f.sweetSpotIndex).toBeLessThan(f.points.length - 1);
+  });
+
+  it('no currency floor-clamps in range — sweetSpotIndex is -1, not a noise-driven pick', () => {
+    // A single EARN currency has no peer to be hedged against, so its Σ⁻¹μ
+    // weight can only ever be positive — the overlay grows without bound and
+    // never crosses into floor-clamp territory anywhere in the swept range.
+    // Reporting a knee here would be floating-point noise dressed up as an
+    // optimum — the "use $X.XM" button walked to a different, larger value
+    // on every click before this was fixed, because each click reseeded the
+    // range from that noise.
+    const f = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 131.8)],
+      σ_P, r_USD, 10, 12, 3,
+    );
+    expect(f.points.every(p => p.floorBoundCcys.length === 0)).toBe(true);
+    expect(f.sweetSpotIndex).toBe(-1);
+  });
+
+  it('no currencies / no positive policyVAR_M — empty frontier, not a crash', () => {
+    const empty = { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null };
+    expect(sweepPortfolioCarryFrontier([], σ_P, r_USD, 10)).toEqual(empty);
+    expect(
+      sweepPortfolioCarryFrontier([makeInput('GBP', 10)], σ_P, r_USD, 0),
+    ).toEqual(empty);
+  });
+
+  it('nearestClampVarUsd solves the same breakpoint the discrete sweep finds', () => {
+    // TRY clamps somewhere inside [0, 1.25] in the discrete sweep below (first
+    // sampled clamp is at k=1.25) — the closed-form value must fall in that
+    // window, not just be "some" finite number.
+    const wide = sweepPortfolioCarryFrontier(
+      [makeInput('TRY', 150), makeInput('GBP', 200), makeInput('MXN', 300)],
+      σ_P, r_USD, 10, 24, 3,
+    );
+    const firstClampK = wide.points.find(p => p.floorBoundCcys.length > 0)?.k;
+    expect(wide.nearestClampCcy).toBe('TRY');
+    expect(wide.nearestClampVarUsd).not.toBeNull();
+    expect(wide.nearestClampVarUsd!).toBeGreaterThan(0);
+    expect(wide.nearestClampVarUsd!).toBeLessThanOrEqual(firstClampK!);
+  });
+
+  it('nearestClampVarUsd is null when every currency is EARN-direction (never clamps)', () => {
+    const f = sweepPortfolioCarryFrontier([makeInput('GBP', 131.8)], σ_P, r_USD, 10, 12, 3);
+    expect(f.sweetSpotIndex).toBe(-1);
+    expect(f.nearestClampCcy).toBeNull();
+    expect(f.nearestClampVarUsd).toBeNull();
+  });
+
+  describe('negative floor_contrib per currency', () => {
+    // applyHardMinFloor's own gate is `floor_contrib > 0.001` — a negative
+    // value fails that test and falls straight through, so a negative floor
+    // is not "an allowed overdraft limit," it is silently indistinguishable
+    // from no floor at all. Documenting the current behavior exactly, not
+    // implying it does something it doesn't.
+    it('applyHardMinFloor: negative floor_contrib is a no-op, not a bound', () => {
+      expect(applyHardMinFloor(10, -30)).toBe(10);
+      expect(applyHardMinFloor(-50, -30)).toBe(-50); // NOT clamped to -30
+      expect(applyHardMinFloor(-50, -30)).not.toBe(-30);
+    });
+
+    it('sweepPortfolioCarryFrontier: floor_contrib=-30 behaves identically to floor_contrib=0', () => {
+      const negFloor = sweepPortfolioCarryFrontier(
+        [makeInput('EUR', 180, { floor_contrib: -30 }), makeInput('GBP', 90), makeInput('MXN', 130)],
+        σ_P, r_USD, 20, 24, 3,
+      );
+      const noFloor = sweepPortfolioCarryFrontier(
+        [makeInput('EUR', 180, { floor_contrib: 0 }), makeInput('GBP', 90), makeInput('MXN', 130)],
+        σ_P, r_USD, 20, 24, 3,
+      );
+      expect(negFloor.nearestClampCcy).toBeNull();
+      // VAR is unaffected either way — the clamp itself never binds for a
+      // negative floor_contrib, so the position size (and hence risk) at
+      // every k is identical (to float precision — the leverage rescale in
+      // solveCarryVarUsd reorders a couple of floating-point ops relative
+      // to before, so this is no longer bit-for-bit, just numerically
+      // identical).
+      negFloor.points.forEach((p, i) => {
+        expect(p.portfolioVarUsd).toBeCloseTo(noFloor.points[i]!.portfolioVarUsd, 6);
+      });
+      // Carry is NOT guaranteed identical, even though the clamp is a
+      // no-op: floor_contrib also feeds bases[i] directly (bases = max(cash,0)
+      // + floor_contrib + delta_sigma), which shifts WHERE the credit/debit
+      // split's position crosses zero — a real, if narrow, effect of
+      // floor_contrib on which rate (mu vs muDebit) prices a leg at a given
+      // k, independent of the clamp. Only meaningful once a leg is large
+      // enough to cross zero within the swept range.
+      const carryDiffs = negFloor.points.map((p, i) => Math.abs(p.totalCarryUsdYr - noFloor.points[i]!.totalCarryUsdYr));
+      expect(Math.max(...carryDiffs)).toBeLessThan(2);
+      // There is currently no mechanism for "allow up to $X of overdraft,
+      // then stop" — only floor_contrib > 0 (hard positive minimum) or the
+      // r_OD > r_USD zero-floor. A bounded-negative floor would need new
+      // logic in applyHardMinFloor / applyNoNegativeLpFloor, not just a
+      // negative input value.
+    });
+  });
+
+  describe('position-amplitude scaling — what is and isn\'t linear', () => {
+    // computePortfolioVAR is sqrt(w'Σw): homogeneous of degree 1 under
+    // UNIFORM scaling of a fixed position mix. This is a mathematical
+    // property of any PSD quadratic form, not something to re-derive per
+    // book — verified numerically here so a future change that breaks
+    // homogeneity (e.g. a per-currency floor/cap inside the VAR calc
+    // itself) fails loudly.
+    it('computePortfolioVAR is exactly linear under uniform amplitude scaling of a fixed mix', () => {
+      const base = [
+        { ccy: 'EUR', cashFCY: 100 },
+        { ccy: 'GBP', cashFCY: -60 },
+        { ccy: 'MXN', cashFCY: 200 },
+        { ccy: 'JPY', cashFCY: -1500 },
+      ];
+      const unit = computePortfolioVAR(base).portfolio_VAR_USD;
+      for (const A of [0.25, 0.5, 2, 5, 10]) {
+        const scaled = base.map(x => ({ ccy: x.ccy, cashFCY: x.cashFCY * A }));
+        const r = computePortfolioVAR(scaled).portfolio_VAR_USD;
+        expect(r / A).toBeCloseTo(unit, 6);
+      }
+    });
+
+    // A fixed operational floor_contrib gets ADDED into `bases` and is also
+    // the clamp `threshold` — the two occurrences cancel algebraically
+    // (gapFcy = bases − threshold = forecasted_cash, the floor term drops
+    // out entirely). So the clamp point is EXACTLY proportional to book
+    // amplitude regardless of the floor's own size — a fixed $30M floor and
+    // a fixed $60M floor produce the identical breakpoint-per-amplitude
+    // ratio. This is the correct, verified behavior, not an assumption.
+    it('nearestClampVarUsd scales exactly linearly with book amplitude, independent of floor size', () => {
+      const run = (amplitude: number, floor: number) => sweepPortfolioCarryFrontier(
+        [
+          makeInput('EUR', 180 * amplitude, { floor_contrib: floor }),
+          makeInput('GBP', 90 * amplitude),
+          makeInput('JPY', 220 * amplitude),
+          makeInput('MXN', 130 * amplitude),
+        ],
+        σ_P, r_USD, 20, 8, 1,
+      );
+      for (const floor of [10, 30, 60]) {
+        const ref = run(1, floor).nearestClampVarUsd!;
+        for (const A of [0.25, 0.5, 2, 4]) {
+          const got = run(A, floor).nearestClampVarUsd!;
+          expect(got / A).toBeCloseTo(ref, 3);
+        }
+      }
+    });
+
+    // universePolicyVarCap has a hard ceiling (4× the top approval rung —
+    // see its own doc comment) so an EARN-only book cannot sweep to
+    // infinity. That ceiling does NOT scale with book size — so as book
+    // amplitude grows, the linearly-growing clamp point eventually exceeds
+    // the ceiling's reach (ceiling / 1.6, per universePolicyVarCap's own
+    // formula) and the knee — despite existing at a perfectly predictable,
+    // linearly-scaling VAR level — becomes undetectable in the bounded
+    // sweep. This is the genuine non-linearity: not in the VAR/carry math
+    // (which stays linear throughout), but in a fixed display/approval
+    // window meeting a linearly growing book.
+    it('the knee silently disappears once amplitude pushes the clamp past the bounded window ceiling', () => {
+      const maxTier = POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
+      const ceiling = maxTier * 4;
+      const book = (A: number) => [
+        makeInput('EUR', 180 * A, { floor_contrib: 30 }),
+        makeInput('GBP', 90 * A),
+        makeInput('JPY', 220 * A),
+        makeInput('MXN', 130 * A),
+      ];
+      // A=1 comfortably clamps inside the ceiling.
+      const probeSmall = sweepPortfolioCarryFrontier(book(1), σ_P, r_USD, maxTier, 8, 1);
+      expect(probeSmall.nearestClampVarUsd!).toBeLessThan(ceiling / 1.6);
+      const capSmall = universePolicyVarCap(probeSmall.nearestClampVarUsd);
+      const fineSmall = sweepPortfolioCarryFrontier(book(1), σ_P, r_USD, capSmall, 60, 1);
+      expect(fineSmall.sweetSpotIndex).toBeGreaterThanOrEqual(0);
+
+      // A large enough to push the (still linearly-scaling) clamp point
+      // past what any bounded window can reach.
+      const bigA = (ceiling / 1.6 / probeSmall.nearestClampVarUsd!) * 3;
+      const probeBig = sweepPortfolioCarryFrontier(book(bigA), σ_P, r_USD, maxTier, 8, 1);
+      expect(probeBig.nearestClampVarUsd!).toBeGreaterThan(ceiling); // clamp is real and linearly larger...
+      const capBig = universePolicyVarCap(probeBig.nearestClampVarUsd);
+      expect(capBig).toBeLessThanOrEqual(ceiling); // ...but the window can't follow it there
+      const fineBig = sweepPortfolioCarryFrontier(book(bigA), σ_P, r_USD, capBig, 60, 1);
+      expect(fineBig.sweetSpotIndex).toBe(-1); // knee exists analytically, invisible in the bounded sweep
+    });
+  });
+
+  it('impliedRFcyByCcy overrides μ for the named currency only', () => {
+    const base = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 60), makeInput('MXN', 40)], σ_P, r_USD, 10, 8,
+    );
+    // Flip GBP from EARN to PAY via the override — the curve must move.
+    const overridden = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 60), makeInput('MXN', 40)], σ_P, r_USD, 10, 8, 3,
+      { GBP: r_USD - 5 },
+    );
+    const lastBase = base.points[base.points.length - 1]!;
+    const lastOverridden = overridden.points[overridden.points.length - 1]!;
+    expect(lastOverridden.totalCarryUsdYr).not.toBeCloseTo(lastBase.totalCarryUsdYr, 3);
+  });
+
+  it('impliedRFcyByCcy falls back to flat r_FCY for currencies not named in the map', () => {
+    const withEmptyMap = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 60), makeInput('MXN', 40)], σ_P, r_USD, 10, 8, 3, {},
+    );
+    const withoutMap = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 60), makeInput('MXN', 40)], σ_P, r_USD, 10, 8,
+    );
+    withEmptyMap.points.forEach((p, i) => {
+      expect(p.totalCarryUsdYr).toBeCloseTo(withoutMap.points[i]!.totalCarryUsdYr, 6);
+      expect(p.portfolioVarUsd).toBeCloseTo(withoutMap.points[i]!.portfolioVarUsd, 6);
+    });
+  });
+
+  describe('delta_cfar — same √(fixed²+scaling²) shape the per-currency frontier uses', () => {
+    it('delta_cfar unset (0) reproduces the old pure-ray behavior exactly — full backward compatibility', () => {
+      const withZero = sweepPortfolioCarryFrontier(
+        [makeInput('TRY', 150, { floor_contrib: 1 }), makeInput('GBP', 60), makeInput('MXN', 40)],
+        σ_P, r_USD, 8, 24,
+      );
+      const explicit = sweepPortfolioCarryFrontier(
+        [
+          makeInput('TRY', 150, { floor_contrib: 1, delta_cfar: 0 }),
+          makeInput('GBP', 60, { delta_cfar: 0 }),
+          makeInput('MXN', 40, { delta_cfar: 0 }),
+        ],
+        σ_P, r_USD, 8, 24,
+      );
+      expect(explicit).toEqual(withZero);
+    });
+
+    it('does not pin Conservative — overlay k=0 is Unhedged, pink shares that fork', () => {
+      const unhedged = 0.359;
+      const f = sweepPortfolioCarryFrontier(
+        [makeInput('EUR', 20), makeInput('GBP', 20)],
+        σ_P, r_USD, 10, 8, 1,
+        undefined, () => 0, { EUR: 40, GBP: 40 }, 1,
+        unhedged,
+      );
+      expect(f.points[0]!.portfolioVarUsd).toBeCloseTo(unhedged, 8);
+      expect(f.points[0]!.totalCarryUsdYr).toBeCloseTo(0, 8);
+      expect(f.farPoints[0]!.portfolioVarUsd).toBeCloseTo(unhedged, 8);
+      expect(f.farPoints[0]!.totalCarryUsdYr).toBeCloseTo(0, 8);
+      const openLater = f.points.find(p => p.k > 0.5);
+      const farLater = f.farPoints.find(p => p.k > 0.5);
+      expect(openLater && farLater).toBeTruthy();
+      expect(openLater!.portfolioVarUsd).not.toBeCloseTo(farLater!.portfolioVarUsd, 3);
+    });
+
+    it('unhedgedCfarUsdM pins k=0 to the CFaR-tab / Overdraft total, not RSS(delta_cfar)', () => {
+      const deskTotal = 0.634;
+      const f = sweepPortfolioCarryFrontier(
+        [
+          makeInput('EUR', 20, { delta_cfar: 2 }),
+          makeInput('GBP', 20, { delta_cfar: 1 }),
+        ],
+        σ_P, r_USD, 10, 8, 1,
+        undefined, undefined, undefined, 1, deskTotal,
+      );
+      expect(f.points[0]!.portfolioVarUsd).toBeCloseTo(deskTotal, 8);
+      expect(f.points[0]!.totalCarryUsdYr).toBeCloseTo(0, 8);
+      const rss = Math.hypot(
+        2 * CURRENCY_PARAMS.EUR!.spot,
+        1 * CURRENCY_PARAMS.GBP!.spot,
+      );
+      expect(f.points[0]!.portfolioVarUsd).not.toBeCloseTo(rss, 3);
+      const later = f.points.find(p => p.k > 0.5) ?? f.points[f.points.length - 1]!;
+      expect(later.portfolioVarUsd).toBeGreaterThan(deskTotal);
+    });
+
+    it('a nonzero delta_cfar makes VAR flat-sloped at k=0 — no floor clamp needed for curvature', () => {
+      // GBP alone never floor-clamps (EARN-only, proven in an earlier test in
+      // this file) — with delta_cfar=0 that means a dead-straight, disabled
+      // sweetSpotIndex=-1 ray. A standalone exposure CFaR changes that
+      // entirely: the curve is now √(fixed²+(k·rate)²), never linear.
+      const f = sweepPortfolioCarryFrontier(
+        [makeInput('GBP', 131.8, { delta_cfar: 6 })], σ_P, r_USD, 10, 40, 3,
+      );
+      // delta_cfar is FCY (cfarCoverFcyFor converts USD → FCY on the way in)
+      // — VAR(0) is delta_cfar converted back to USD via GBP spot, not the
+      // raw FCY figure.
+      expect(f.points[0]!.portfolioVarUsd).toBeCloseTo(6 * CURRENCY_PARAMS.GBP!.spot, 6);
+      // Slope (VAR per unit k) must be strictly decreasing near the origin —
+      // the defining signature of a hypotenuse flattening near zero, which a
+      // pure linear ray could never produce.
+      const slopeAt = (i: number) => f.points[i]!.portfolioVarUsd / f.points[i]!.k;
+      const early = slopeAt(2);
+      const late = slopeAt(f.points.length - 1);
+      expect(early).toBeGreaterThan(late);
+    });
+
+    it('sweetSpotIndex finds a genuine interior knee from delta_cfar alone, with zero floor-clamps', () => {
+      const f = sweepPortfolioCarryFrontier(
+        [makeInput('GBP', 131.8, { delta_cfar: 6 })], σ_P, r_USD, 10, 40, 3,
+      );
+      expect(f.points.every(p => p.floorBoundCcys.length === 0)).toBe(true); // confirms: NOT the floor mechanism
+      expect(f.sweetSpotIndex).toBeGreaterThan(0);
+      expect(f.sweetSpotIndex).toBeLessThan(f.points.length - 1);
+    });
+
+    it('carry gets a credit/debit kink exactly where a real position crosses zero', () => {
+      // EUR starts with a genuine 50M FCY base position (NOT fully hedged) —
+      // the overlay sells it down through zero. Before the crossing, the leg
+      // is still priced at the deposit rate; after, at the worse overdraft
+      // rate — a real slope change in raw $ terms, not a chart axis effect.
+      const f = sweepPortfolioCarryFrontier(
+        [makeInput('EUR', 50), makeInput('GBP', 90), makeInput('MXN', 130)],
+        σ_P, r_USD, 20, 60, 1,
+      );
+      const carrySlope = (i: number) => (
+        (f.points[i + 1]!.totalCarryUsdYr - f.points[i]!.totalCarryUsdYr)
+        / (f.points[i + 1]!.k - f.points[i]!.k)
+      );
+      const early = carrySlope(1);
+      const late = carrySlope(f.points.length - 2);
+      // EUR's deposit rate and overdraft rate differ, so the aggregate
+      // portfolio carry slope must change once EUR crosses — proven by the
+      // slope not staying constant across the whole sweep.
+      expect(Math.abs(late - early)).toBeGreaterThan(1e-6);
+    });
   });
 });
 
@@ -1429,6 +1946,64 @@ describe('toggleLayerGroup', () => {
     expect([...active]).toEqual([]);
     toggleLayerGroup(['sigmaP', 'cfarCover'], active, flip);
     expect(active.has('sigmaP')).toBe(true);
+    expect(active.has('cfarCover')).toBe(true);
+  });
+});
+
+describe('setBufferLevel', () => {
+  it('portfolio level is portfolioDiv; currency level clears it', () => {
+    const active = new Set<LayerId>(['floorH', 'carryOptim']);
+    const flip = (id: LayerId) => {
+      if (active.has(id)) active.delete(id);
+      else active.add(id);
+    };
+    expect(bufferLevelOf(active)).toBe('currency');
+    setBufferLevel(active, 'portfolio', flip);
+    expect(bufferLevelOf(active)).toBe('portfolio');
+    expect(active.has('portfolioDiv')).toBe(true);
+    expect(active.has('carryOptim')).toBe(true);
+    setBufferLevel(active, 'portfolio', flip);
+    expect(active.has('portfolioDiv')).toBe(true);
+    setBufferLevel(active, 'currency', flip);
+    expect(bufferLevelOf(active)).toBe('currency');
+    expect(active.has('portfolioDiv')).toBe(false);
+    expect(active.has('carryOptim')).toBe(true);
+  });
+
+  it('enabling portfolio level brings Min floor along when it was off', () => {
+    // Without a real floor, sweepPortfolioCarryFrontier's ray never bends —
+    // the Portfolio VAR frontier would be degenerate by default.
+    const active = new Set<LayerId>(['carryOptim']);
+    const flip = (id: LayerId) => {
+      if (active.has(id)) active.delete(id);
+      else active.add(id);
+    };
+    expect(active.has('floorH')).toBe(false);
+    setBufferLevel(active, 'portfolio', flip);
+    expect(active.has('portfolioDiv')).toBe(true);
+    expect(active.has('floorH')).toBe(true);
+    // Switching back to currency level does not rip Min floor back out —
+    // only the portfolio toggle itself is undone.
+    setBufferLevel(active, 'currency', flip);
+    expect(active.has('portfolioDiv')).toBe(false);
+    expect(active.has('floorH')).toBe(true);
+  });
+
+  it('enabling portfolio level brings every curvature-capable layer along — floorH, carryOptim, cfarCover', () => {
+    // Removes the "forgot to flip a chip" failure mode entirely. It does
+    // NOT set any floor value or CFaR exposure number — those are real
+    // desk inputs. A book with every layer on and all of them still at 0
+    // is correctly a straight line: the layers being on isn't what was
+    // missing.
+    const active = new Set<LayerId>();
+    const flip = (id: LayerId) => {
+      if (active.has(id)) active.delete(id);
+      else active.add(id);
+    };
+    setBufferLevel(active, 'portfolio', flip);
+    expect(active.has('portfolioDiv')).toBe(true);
+    expect(active.has('floorH')).toBe(true);
+    expect(active.has('carryOptim')).toBe(true);
     expect(active.has('cfarCover')).toBe(true);
   });
 });

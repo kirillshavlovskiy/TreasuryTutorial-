@@ -73,7 +73,31 @@ export type FxHedgeCfarInput = {
   >;
   /** Desk Swap+Fwd replacement overlays — gross forward + retained-far scale. */
   swapForwardOverlayByCcy?: Readonly<Record<string, SwapForwardOverlay>>;
+  /**
+   * Same extra settle legs the CFaR tab uses (overlays + live plan tenor).
+   * When omitted, overlays are converted without the live plan settle month.
+   */
+  extraForwards?: readonly AnalyticsForwardLeg[];
+  /** CFaR-tab stock (bar.stockNetM). Overrides fxBookNetLocalM when set. */
+  stockNetByCcy?: Readonly<Record<string, number>>;
 };
+
+/** Same shape the CFaR tab uses — strip carry, not a flat ramp. */
+export function cumulativeCarrySchedule(
+  months: readonly { hedgeCarryUsdM: number }[] | undefined,
+  totalUsdM: number,
+): number[] | undefined {
+  if (!months || months.length === 0) return undefined;
+  const cum: number[] = [];
+  let acc = 0;
+  for (const m of months) {
+    acc += Number.isFinite(m.hedgeCarryUsdM) ? m.hedgeCarryUsdM : 0;
+    cum.push(acc);
+  }
+  const last = cum[cum.length - 1] ?? 0;
+  if (Math.abs(last) < 1e-12) return undefined;
+  return cum.map(c => c * (totalUsdM / last));
+}
 
 function hashSeedForCcy(ccy: string): number {
   let h = 0x5f3759df;
@@ -141,7 +165,10 @@ function mcInputForRow(
 ): McCfarInput | null {
   const ccy = row.ccy;
   if (!ccy || ccy === 'USD') return null;
-  const stockM = fxBookNetLocalM(row);
+  const tabStock = input.stockNetByCcy?.[ccy];
+  const stockM = typeof tabStock === 'number' && Number.isFinite(tabStock)
+    ? tabStock
+    : fxBookNetLocalM(row);
   const monthlyInflows = monthlyInflowSeriesLocalM(row, T, profile);
   const monthlyOutflows = monthlyOutflowSeriesLocalM(row, T, profile);
   if (
@@ -194,10 +221,14 @@ function mcInputForRow(
       T,
       extra,
     ),
-    hedgeCarryScheduleUsdM:
+    hedgeCarryScheduleUsdM: cumulativeCarrySchedule(
+      cmp?.hedged.months,
+      carryUsdM,
+    ) ?? (
       T > 0 && Number.isFinite(carryUsdM)
         ? Array.from({ length: T }, (_, k) => (carryUsdM * (k + 1)) / T)
-        : undefined,
+        : undefined
+    ),
     usdRatePctPa: CURRENCY_PARAMS.USD?.carry ?? 0,
     fcyRatePctPa: CURRENCY_PARAMS[ccy]?.carry ?? 0,
     rateVolPctPa: rateVolBpYrFor(ccy, input.setup) / 100,
@@ -214,10 +245,12 @@ export function fxHedgeMcCfarByCcy(
     : horizonMonths(input.setup.horizon);
   const profile = input.forecastProfile ?? DEFAULT_FORECAST_PROFILE;
   const bookedHedges = input.bookedHedges ?? [];
-  const extraForwards = analyticsForwardsFromOverlays({
-    overlayByCcy: input.swapForwardOverlayByCcy,
-    forecastMonths: T,
-  });
+  const extraForwards = input.extraForwards
+    ?? analyticsForwardsFromOverlays({
+      overlayByCcy: input.swapForwardOverlayByCcy,
+      planByCcy: input.fundingPlanByCcy,
+      forecastMonths: T,
+    });
   const out: Record<string, CfarBandsResult> = {};
   for (const row of input.rows) {
     const mc = mcInputForRow(
@@ -282,6 +315,21 @@ export function displayedCfarNetByCcyUsdM(
   >,
 ): Record<string, number> {
   return displayedNetFromFx(fxByCcy, input);
+}
+
+/**
+ * CFaR-tab FX-only Net per CCY — Monte Carlo reserve, no funding-swap bridge.
+ * Overdraft / cover sizing use this. Displayed Net RSS's the swap on after.
+ */
+export function fxOnlyNetByCcyUsdM(
+  fxByCcy: Record<string, CfarBandsResult>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [ccy, fx] of Object.entries(fxByCcy)) {
+    const net = fx.netCriticalCashUsdM;
+    if (Number.isFinite(net) && net > 0) out[ccy] = net;
+  }
+  return out;
 }
 
 export function sumNetCfarUsdM(byCcy: Record<string, number> | undefined): number {

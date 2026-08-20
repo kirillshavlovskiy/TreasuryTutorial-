@@ -147,7 +147,13 @@ interface VarAnalyticsPanelProps {
   onBookedHedgesChange?: (tickets: HedgeTicket[]) => void;
   /** Staged packages for Hedging Decision (Send books them). */
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
-  onPreparedByCcyChange?: (next: Record<string, PreparedHedgeProfile>) => void;
+  onPreparedByCcyChange?: (
+    next:
+      | Record<string, PreparedHedgeProfile>
+      | ((
+          prev: Record<string, PreparedHedgeProfile>,
+        ) => Record<string, PreparedHedgeProfile>),
+  ) => void;
   /** Shared with Hedging Decision — bullet vs rolling strip. */
   hedgeStructure?: ForecastHedgeStructure;
   onHedgeStructureChange?: (s: ForecastHedgeStructure) => void;
@@ -188,6 +194,15 @@ interface VarAnalyticsPanelProps {
   deskCashCarryByCcyUsdM?: Record<string, number>;
   /** Desk FX HEDGE CIP per CCY ($M) — already Δ-scaled. */
   deskCipByCcyUsdM?: Record<string, number>;
+  /** Policy VAR overlay cap — Portfolio level on Liquidity Analytics. */
+  policyVAR?: number;
+  onPolicyVARChange?: (usdM: number) => void;
+  portfolioCarryK?: number;
+  onPortfolioCarryKChange?: (k: number | undefined) => void;
+  residualByCcy?: Record<string, number>;
+  onResidualByCcyChange?: (next: Record<string, number>) => void;
+  portfolioScenarioId?: string | null;
+  onPortfolioScenarioIdChange?: (id: string | null) => void;
 }
 
 function fmtVarK(usdM: number): string {
@@ -372,6 +387,14 @@ export function VarAnalyticsPanel({
   deskHedgeCarryByCcyUsdM,
   deskCashCarryByCcyUsdM,
   deskCipByCcyUsdM,
+  policyVAR,
+  onPolicyVARChange,
+  portfolioCarryK,
+  onPortfolioCarryKChange,
+  residualByCcy,
+  onResidualByCcyChange,
+  portfolioScenarioId,
+  onPortfolioScenarioIdChange,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -1406,12 +1429,25 @@ export function VarAnalyticsPanel({
           onLayerPanelChange={onLayerPanelChange}
           livePlanByCcy={livePlanByCcy}
           swapForwardOverlayByCcy={swapForwardOverlayByCcy}
+          extraForwards={analyticsExtraForwards}
+          stockNetByCcy={Object.fromEntries(
+            risk.map(r => [r.bar.ccy, r.bar.stockNetM] as const),
+          )}
           cfarNetByCcyUsd={cfarNetByCcyUsd}
           deskShared={deskShared}
           deskHedgeCarryByCcyUsdM={deskHedgeCarryByCcyUsdM}
           deskCashCarryByCcyUsdM={deskCashCarryByCcyUsdM}
           deskCipByCcyUsdM={deskCipByCcyUsdM}
           onSetupChange={onSetupChange}
+          policyVAR={policyVAR}
+          onPolicyVARChange={onPolicyVARChange}
+          portfolioCarryK={portfolioCarryK}
+          onPortfolioCarryKChange={onPortfolioCarryKChange}
+          onPreparedByCcyChange={onPreparedByCcyChange}
+          residualByCcy={residualByCcy}
+          onResidualByCcyChange={onResidualByCcyChange}
+          portfolioScenarioId={portfolioScenarioId}
+          onPortfolioScenarioIdChange={onPortfolioScenarioIdChange}
         />
       ) : perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
@@ -2186,6 +2222,13 @@ export function VarAnalyticsPanel({
                           >
                             Carry
                           </span>
+                        ) : prep?.preparedFor === 'liquidity' ? (
+                          <span
+                            className="text-[9px] font-semibold uppercase tracking-wide text-violet-300/90"
+                            title="Staged from Liquidity Book — residual-Δ funding strip"
+                          >
+                            Liq
+                          </span>
                         ) : null}
                       </span>
                       {isHedged ? (
@@ -2193,7 +2236,13 @@ export function VarAnalyticsPanel({
                           className="text-[9px] font-semibold uppercase tracking-wide text-emerald-400/90"
                           title={
                             prep
-                              ? `Prepared ${prep.preparedFor === 'carry' ? 'Carry' : 'VaR'} package · Σ ${fmtSignedM(prep.coverLocalM)}`
+                              ? `Prepared ${
+                                  prep.preparedFor === 'carry'
+                                    ? 'Carry'
+                                    : prep.preparedFor === 'liquidity'
+                                      ? 'Liquidity'
+                                      : 'VaR'
+                                } package · Σ ${fmtSignedM(prep.coverLocalM)}`
                               : 'Hedging regime: Stock (Cash) · VaR-neutral · Total (Target)'
                           }
                         >

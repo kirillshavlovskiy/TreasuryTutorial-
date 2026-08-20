@@ -18,6 +18,9 @@ import {
   computeConsolidatedRisk,
   consolidateEntityBooks,
   emptyHedgeBook,
+  applyDeskPatch,
+  applyHedgeTicketsPatch,
+  applyPreparedHedgesPatch,
   GROUP_HEDGE_SCOPE,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
@@ -25,7 +28,8 @@ import {
   mergedEntityForecastProfile,
   type EntityHedgeBook,
   type HedgeTicket,
-  type PreparedHedgeProfile,
+  type HedgeTicketsPatch,
+  type PreparedHedgesPatch,
   type ForecastHedgeStructure,
   type VarSetup,
 } from '@/lib/test-mode';
@@ -102,29 +106,31 @@ export function WorkbenchGroupDesk({
     });
   };
 
-  const setBookedHedges = (tickets: HedgeTicket[]) => {
-    const stamped = tickets.map(t =>
-      t.entityId
-        ? t
-        : {
-            ...t,
-            entityId: GROUP_HEDGE_SCOPE,
-            entityName: group.dashboardName,
-          },
-    );
-    onHedgesByEntityIdChange(prev =>
-      applyConsolidatedBookedChange(stamped, entityIds, prev),
-    );
+  const setBookedHedges = (tickets: HedgeTicketsPatch) => {
+    onHedgesByEntityIdChange(prev => {
+      const current = aggregateBookedHedges(prev, entityIds, true);
+      const next = applyHedgeTicketsPatch(current, tickets);
+      const stamped = next.map(t =>
+        t.entityId
+          ? t
+          : {
+              ...t,
+              entityId: GROUP_HEDGE_SCOPE,
+              entityName: group.dashboardName,
+            },
+      );
+      return applyConsolidatedBookedChange(stamped, entityIds, prev);
+    });
   };
 
-  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+  const setPreparedByCcy = (next: PreparedHedgesPatch) => {
     onHedgesByEntityIdChange(prev => {
       const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
       return {
         ...prev,
         [GROUP_HEDGE_SCOPE]: {
           ...g,
-          preparedByCcy: next,
+          preparedByCcy: applyPreparedHedgesPatch(g.preparedByCcy, next),
           carrySessionsByCcy: g.carrySessionsByCcy ?? {},
           marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
@@ -149,15 +155,25 @@ export function WorkbenchGroupDesk({
 
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgesByEntityIdChange(prev => {
-      const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+      const current = aggregateBookedHedges(prev, entityIds, true);
+      const exists = current.some(t => t.id === ticket.id);
+      const nextTickets = exists
+        ? current
+        : [
+            {
+              ...ticket,
+              entityId: ticket.entityId ?? GROUP_HEDGE_SCOPE,
+              entityName: ticket.entityName ?? group.dashboardName,
+            },
+            ...current,
+          ];
+      const mapped = applyConsolidatedBookedChange(nextTickets, entityIds, prev);
+      const g = mapped[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
       return {
-        ...prev,
+        ...mapped,
         [GROUP_HEDGE_SCOPE]: {
           ...g,
           hedgeRatios: { ...g.hedgeRatios, [ticket.ccy]: 0 },
-          preparedByCcy: g.preparedByCcy ?? {},
-          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
-          marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
       };
     });
@@ -186,6 +202,16 @@ export function WorkbenchGroupDesk({
           onVarSetupChange={onVarSetupChange}
           bookedHedges={bookedHedges}
           preparedByCcy={preparedByCcy}
+          desk={groupBook.desk}
+          onDeskChange={next => {
+            onHedgesByEntityIdChange(prev => {
+              const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+              return {
+                ...prev,
+                [GROUP_HEDGE_SCOPE]: applyDeskPatch(g, next),
+              };
+            });
+          }}
           hedgeRatios={hedgeRatios}
           marketRatesByCcy={marketRatesByCcy}
           ratesScopeId={GROUP_HEDGE_SCOPE}

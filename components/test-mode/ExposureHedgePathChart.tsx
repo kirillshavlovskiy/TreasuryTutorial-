@@ -9,9 +9,8 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { DeskStepper } from '@/components/DeskStepper';
-import { stripHedgeLegCarryUsdM } from '@/lib/fx-hedge';
+import { stripHedgeLegCarryUsdM, fwdCarryForExposureCoverUsdM } from '@/lib/fx-hedge';
 import {
-  fwdCarryFromSwapPointsUsdM,
   getActiveMarketRates,
   resolveForwardDepositRates,
   resolveOvernightCashRates,
@@ -1837,13 +1836,16 @@ export function ExposureHedgePathChart({
     const carryOf = (notional: number, recognizeMonths: number, settle: number) => {
       const fwd = resolveForwardDepositRates(marketRates, ccy, settle);
       const cash = resolveOvernightCashRates(marketRates, ccy);
-      const pts = fwdCarryFromSwapPointsUsdM({
-        notionalLocalM: notional,
+      const priced = fwdCarryForExposureCoverUsdM({
+        coverLocalM: notional,
+        ccy,
         settleMonths: settle,
         bundle: marketRates,
+        r_FCY: cash.fcy.creditPct,
+        r_USD: cash.usd.creditPct,
       });
       return stripHedgeLegCarryUsdM({
-        notionalLocalM: notional,
+        notionalLocalM: -notional,
         ccy,
         recognizeMonths,
         settleMonths: settle,
@@ -1852,9 +1854,9 @@ export function ExposureHedgePathChart({
         usdFwdRates: fwd.usd,
         fcyCashRates: cash.fcy,
         usdCashRates: cash.usd,
-        swapPointsCarryUsdM: pts?.fwdCarryUsdM,
-        swapPoints: pts?.points,
-        swapPointsSide: pts?.side,
+        swapPointsCarryUsdM: priced.fwdCarryUsdM,
+        swapPoints: priced.points,
+        swapPointsSide: priced.side,
       });
     };
     const rows: Row[] = [];

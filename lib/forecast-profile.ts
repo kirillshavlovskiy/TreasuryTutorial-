@@ -1448,6 +1448,12 @@ export function projectLiquidityCycles(
   // zero — so it has to be gated here, not inside the solve.
   if (bookingMode === 'rolling' || !formulaLayersActive) return rolling;
 
+  // Strip to term: same incremental sizing as rolling — a leg per cycle, each
+  // starting on its own date as the requirement arises — but nothing rolls
+  // monthly. The whole accumulated book unwinds in one far leg at the horizon's
+  // end, exactly like the term solve's own maturity settlement.
+  if (bookingMode === 'stripTerm') return settleFarLegAtMaturity(rolling);
+
   // Term booking: one leg today, big enough that every cycle on the path still
   // clears its own H*. The rolling pass already prices that — its outstanding
   // book at cycle k is exactly what cycle k needs funded by then — so its peak

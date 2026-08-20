@@ -29,8 +29,18 @@ import {
   consolidateEntityBooks,
   defaultSandboxUi,
   emptyHedgeBook,
+  applyDeskPatch,
+  applyHedgeTicketsPatch,
+  applyPreparedHedgesPatch,
   entityHasLocalPositions,
+  hedgeBookHasContent,
+  hedgeBookLooksLikeAccidentalWipe,
+  hedgeLedgerChanged,
   loadSandboxPersistent,
+  loadSandbox,
+  mergeHedgeBooksPreservingPrepared,
+  newerSandboxState,
+  preferWorkspaceSetup,
   localReadinessByEntity,
   localsReadyForConsolidation,
   DEFAULT_VAR_SETUP,
@@ -49,6 +59,7 @@ import {
   parseVolOverrides,
   resetSandboxPersistent,
   saveSandboxPersistent,
+  subscribeSandboxPersist,
   scoreTask01,
   parseRateVolBpYr,
   serializeRateVolOverride,
@@ -64,7 +75,8 @@ import {
   type EntityHedgeBook,
   type ForecastHedgeStructure,
   type HedgeTicket,
-  type PreparedHedgeProfile,
+  type HedgeTicketsPatch,
+  type PreparedHedgesPatch,
   type SandboxUiState,
   type TaskAnswers,
   type TaskStepId,
@@ -262,11 +274,20 @@ export function Task01App({
     Record<string, EntityHedgeBook>
   >({});
   const [resumeReady, setResumeReady] = useState(false);
+  const [serverHydrated, setServerHydrated] = useState(false);
   const [serverPersistent, setServerPersistent] = useState(false);
+  const [dbSyncError, setDbSyncError] = useState<string | null>(null);
 
   /** Always-current hedges/UI for persist — avoids stale closures wiping prepared. */
   const hedgesRef = useRef(hedgesByEntityId);
-  hedgesRef.current = hedgesByEntityId;
+  if (
+    hedgeBookHasContent(hedgesByEntityId)
+    || !hedgeBookHasContent(hedgesRef.current)
+  ) {
+    hedgesRef.current = hedgesByEntityId;
+  }
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const uiRef = useRef<SandboxUiState>({
     view,
     entityId,
@@ -296,41 +317,101 @@ export function Task01App({
       },
       taskId,
     );
-    setState(saved);
-    hedgesRef.current = saved.hedgesByEntityId ?? {};
-    setHedgesByEntityId(hedgesRef.current);
-    return saved;
+    const savedHedges = saved.hedgesByEntityId ?? {};
+    const hedgesKept =
+      hedgeBookHasContent(hedges) && !hedgeBookHasContent(savedHedges)
+        ? hedges
+        : savedHedges;
+    const nextState = { ...saved, hedgesByEntityId: hedgesKept };
+    stateRef.current = nextState;
+    setState(nextState);
+    hedgesRef.current = hedgesKept;
+    setHedgesByEntityId(hedgesKept);
+    return nextState;
   };
 
   useEffect(() => {
     let cancelled = false;
-    setResumeReady(false);
+    const local = loadSandbox(storageKey);
+    const localHedges = local.hedgesByEntityId ?? {};
+    hedgesRef.current = localHedges;
+    setState(local);
+    setHedgesByEntityId(localHedges);
+    const localUi = local.ui ?? defaultSandboxUi();
+    setView(localUi.view);
+    setEntityId(localUi.entityId);
+    setDashboardId(localUi.dashboardId);
+    setActiveProfileId(localUi.activeProfileId);
+    setResumeReady(true);
+
     void (async () => {
-      const { state: loaded, persistent } = await loadSandboxPersistent(
-        storageKey,
-        taskId,
-      );
-      if (cancelled) return;
-      setServerPersistent(persistent);
-      const loadedHedges = loaded.hedgesByEntityId ?? {};
-      hedgesRef.current = loadedHedges;
-      setState(loaded);
-      setHedgesByEntityId(loadedHedges);
-      const ui = loaded.ui ?? defaultSandboxUi();
-      setView(ui.view);
-      setEntityId(ui.entityId);
-      setDashboardId(ui.dashboardId);
-      setActiveProfileId(ui.activeProfileId);
-      setResumeReady(true);
+      try {
+        const { state: loaded, persistent, error } = await loadSandboxPersistent(
+          storageKey,
+          taskId,
+        );
+        if (cancelled) return;
+        setServerPersistent(persistent);
+        setDbSyncError(error ?? null);
+        setHedgesByEntityId(prev => {
+          const merged = mergeHedgeBooksPreservingPrepared(
+            mergeHedgeBooksPreservingPrepared(prev, hedgesRef.current),
+            loaded.hedgesByEntityId,
+          );
+          hedgesRef.current = merged;
+          return merged;
+        });
+        setState(current => {
+          const live = current ?? loaded;
+          const setup = preferWorkspaceSetup(live, loaded);
+          const hedges = mergeHedgeBooksPreservingPrepared(
+            hedgesRef.current,
+            loaded.hedgesByEntityId,
+          );
+          hedgesRef.current = hedges;
+          const newer = newerSandboxState(live, loaded);
+          return {
+            ...newer,
+            workspace: setup.workspace,
+            group: setup.group,
+            hedgesByEntityId: hedges,
+            ui: live.ui ?? loaded.ui,
+          };
+        });
+      } finally {
+        if (!cancelled) setServerHydrated(true);
+      }
     })();
     return () => {
       cancelled = true;
     };
   }, [storageKey, taskId]);
 
+  useEffect(() => {
+    return subscribeSandboxPersist(event => {
+      if (event.taskId !== taskId) return;
+      if (event.ok && event.persistent) {
+        setServerPersistent(true);
+        setDbSyncError(null);
+        return;
+      }
+      if (event.status === 401) {
+        setDbSyncError('Sign in to save hedges to the database.');
+        return;
+      }
+      if (event.status === 503) {
+        setDbSyncError('Database is not configured — hedges stay in this browser only.');
+        return;
+      }
+      if (!event.ok) {
+        setDbSyncError(event.error ?? 'Could not save hedges to the database.');
+      }
+    });
+  }, [taskId]);
+
   // Persist navigation so the next login resumes the same screen.
   useEffect(() => {
-    if (!state || !resumeReady) return;
+    if (!state || !resumeReady || !serverHydrated) return;
     const ui = currentUi();
     const prev = state.ui ?? defaultSandboxUi();
     if (
@@ -343,7 +424,7 @@ export function Task01App({
     }
     persist(state, hedgesRef.current, ui);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional navigation snapshot
-  }, [view, entityId, dashboardId, activeProfileId, resumeReady]);
+  }, [view, entityId, dashboardId, activeProfileId, resumeReady, serverHydrated]);
 
   // If locals are incomplete, never stay on the consolidated view.
   useEffect(() => {
@@ -372,12 +453,17 @@ export function Task01App({
           },
           taskId,
         );
-        const hedges = saved.hedgesByEntityId ?? hedgesRef.current;
+        const intended = hedgesRef.current;
+        const savedHedges = saved.hedgesByEntityId ?? intended;
+        const hedges =
+          hedgeBookHasContent(intended) && !hedgeBookHasContent(savedHedges)
+            ? intended
+            : savedHedges;
         hedgesRef.current = hedges;
         // Keep React hedge state in lockstep — otherwise a later persist can
         // rewrite Neon/localStorage from a stale empty prepared book.
         setHedgesByEntityId(hedges);
-        return saved;
+        return { ...saved, hedgesByEntityId: hedges };
       });
       return;
     }
@@ -391,20 +477,39 @@ export function Task01App({
   ) => {
     setHedgesByEntityId(prev => {
       const resolved = typeof next === 'function' ? next(prev) : next;
-      hedgesRef.current = resolved;
-      setState(current => {
-        if (!current) return current;
-        return saveSandboxPersistent(
-          storageKey,
-          {
-            ...current,
-            hedgesByEntityId: resolved,
-            ui: uiRef.current,
-          },
-          taskId,
-        );
-      });
-      return resolved;
+      const current = stateRef.current;
+      if (!current) {
+        hedgesRef.current = resolved;
+        return resolved;
+      }
+      const wipe = hedgeBookLooksLikeAccidentalWipe(
+        resolved,
+        current.hedgesByEntityId,
+      );
+      const saved = saveSandboxPersistent(
+        storageKey,
+        {
+          ...current,
+          hedgesByEntityId: resolved,
+          hedgesUpdatedAt: wipe
+            ? current.hedgesUpdatedAt
+            : hedgeLedgerChanged(current.hedgesByEntityId, resolved)
+              ? new Date().toISOString()
+              : current.hedgesUpdatedAt,
+          ui: uiRef.current,
+        },
+        taskId,
+      );
+      const savedHedges = saved.hedgesByEntityId ?? resolved;
+      const hedges =
+        hedgeBookHasContent(resolved) && !hedgeBookHasContent(savedHedges)
+          ? resolved
+          : savedHedges;
+      hedgesRef.current = hedges;
+      const nextState = { ...saved, hedgesByEntityId: hedges };
+      stateRef.current = nextState;
+      setState(nextState);
+      return hedges;
     });
   };
 
@@ -603,11 +708,13 @@ export function Task01App({
               : 'Build entity dashboards → find the largest mismatch → configure VaR in Analytics (confidence · horizon · exposure) → read VaR at Δ = 1 for that setup.'}
           </p>
           <p className="mt-1 text-[11px] text-slate-600">
-            {serverPersistent
-              ? isPractice
-                ? 'Practice book syncs to your account (separate from curriculum Task 01).'
-                : 'Progress syncs to your account — continue on any device after sign-in.'
-              : 'Progress is saved in this browser for your Google account. Add DATABASE_URL for cross-device sync.'}
+            {dbSyncError
+              ? dbSyncError
+              : serverPersistent
+                ? isPractice
+                  ? 'Practice book syncs to your account (separate from curriculum Task 01).'
+                  : 'Progress and hedges sync to your account — continue on any device after sign-in.'
+                : 'Hedges are saved in this browser. Database sync is off until Postgres is reachable.'}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -627,6 +734,7 @@ export function Task01App({
             onClick={() => {
               void (async () => {
                 const next = await resetSandboxPersistent(storageKey, taskId);
+                hedgesRef.current = {};
                 setState(next);
                 setHedgesByEntityId({});
                 setView('home');
@@ -1181,26 +1289,28 @@ function GroupConsolidatedView({
     });
   };
 
-  const setBookedHedges = (tickets: HedgeTicket[]) => {
+  const setBookedHedges = (tickets: HedgeTicketsPatch) => {
     // New group-level tickets (no entityId) are stamped as group-scope.
-    const stamped = tickets.map(t =>
-      t.entityId
-        ? t
-        : { ...t, entityId: GROUP_HEDGE_SCOPE, entityName: groupDashboardName },
-    );
-    onHedgesByEntityIdChange(prev =>
-      applyConsolidatedBookedChange(stamped, entityIds, prev),
-    );
+    onHedgesByEntityIdChange(prev => {
+      const current = aggregateBookedHedges(prev, entityIds, true);
+      const next = applyHedgeTicketsPatch(current, tickets);
+      const stamped = next.map(t =>
+        t.entityId
+          ? t
+          : { ...t, entityId: GROUP_HEDGE_SCOPE, entityName: groupDashboardName },
+      );
+      return applyConsolidatedBookedChange(stamped, entityIds, prev);
+    });
   };
 
-  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+  const setPreparedByCcy = (next: PreparedHedgesPatch) => {
     onHedgesByEntityIdChange(prev => {
       const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
       return {
         ...prev,
         [GROUP_HEDGE_SCOPE]: {
           ...g,
-          preparedByCcy: next,
+          preparedByCcy: applyPreparedHedgesPatch(g.preparedByCcy, next),
           carrySessionsByCcy: g.carrySessionsByCcy ?? {},
           marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
@@ -1245,16 +1355,25 @@ function GroupConsolidatedView({
   /** Reset incremental hedge % after a book (ticket list updated via onBookedHedgesChange). */
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgesByEntityIdChange(prev => {
-      const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+      const current = aggregateBookedHedges(prev, entityIds, true);
+      const exists = current.some(t => t.id === ticket.id);
+      const nextTickets = exists
+        ? current
+        : [
+            {
+              ...ticket,
+              entityId: ticket.entityId ?? GROUP_HEDGE_SCOPE,
+              entityName: ticket.entityName ?? groupDashboardName,
+            },
+            ...current,
+          ];
+      const mapped = applyConsolidatedBookedChange(nextTickets, entityIds, prev);
+      const g = mapped[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
       return {
-        ...prev,
+        ...mapped,
         [GROUP_HEDGE_SCOPE]: {
           ...g,
-          bookedHedges: g.bookedHedges,
           hedgeRatios: { ...g.hedgeRatios, [ticket.ccy]: 0 },
-          preparedByCcy: g.preparedByCcy ?? {},
-          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
-          marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
       };
     });
@@ -1301,6 +1420,16 @@ function GroupConsolidatedView({
           onVarSetupChange={onVarSetupChange}
           bookedHedges={bookedHedges}
           preparedByCcy={preparedByCcy}
+          desk={groupBook.desk}
+          onDeskChange={next => {
+            onHedgesByEntityIdChange(prev => {
+              const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+              return {
+                ...prev,
+                [GROUP_HEDGE_SCOPE]: applyDeskPatch(g, next),
+              };
+            });
+          }}
           hedgeRatios={hedgeRatios}
           marketRatesByCcy={marketRatesByCcy}
           ratesScopeId={GROUP_HEDGE_SCOPE}
@@ -1989,10 +2118,10 @@ function DashboardView({
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
-  const setBookedHedges = (tickets: HedgeTicket[]) => {
+  const setBookedHedges = (tickets: HedgeTicketsPatch) => {
     onHedgeBookChange(prev => ({
       ...prev,
-      bookedHedges: tickets.map(t => ({
+      bookedHedges: applyHedgeTicketsPatch(prev.bookedHedges, tickets).map(t => ({
         ...t,
         entityId: entity.id,
         entityName: entity.name,
@@ -2001,10 +2130,10 @@ function DashboardView({
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
-  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+  const setPreparedByCcy = (next: PreparedHedgesPatch) => {
     onHedgeBookChange(prev => ({
       ...prev,
-      preparedByCcy: next,
+      preparedByCcy: applyPreparedHedgesPatch(prev.preparedByCcy, next),
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
@@ -2026,6 +2155,12 @@ function DashboardView({
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgeBookChange(prev => ({
       ...prev,
+      bookedHedges: prev.bookedHedges.some(t => t.id === ticket.id)
+        ? prev.bookedHedges
+        : [
+            { ...ticket, entityId: entity.id, entityName: entity.name },
+            ...prev.bookedHedges,
+          ],
       hedgeRatios: { ...prev.hedgeRatios, [ticket.ccy]: 0 },
       preparedByCcy: prev.preparedByCcy ?? {},
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
@@ -2186,6 +2321,10 @@ function DashboardView({
                     onVarSetupChange={onVarSetupChange}
                     bookedHedges={bookedHedges}
                     preparedByCcy={preparedByCcy}
+                    desk={hedgeBook.desk}
+                    onDeskChange={next =>
+                      onHedgeBookChange(prev => applyDeskPatch(prev, next))
+                    }
                     hedgeRatios={hedgeRatios}
                     marketRatesByCcy={marketRatesByCcy}
                     ratesScopeId={entity.id}

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { ccySpotRate, INITIAL_ROWS, type LayerId, type RowState, type SharedGlobals } from '@/lib/fx-buffer';
+import { ccySpotRate, CURRENCY_PARAMS, INITIAL_ROWS, type LayerId, type RowState, type SharedGlobals } from '@/lib/fx-buffer';
+import { fundingSwapPathFarCipUsdM, type FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import { DEFAULT_FORECAST_PROFILE, type ForecastProfileState } from '@/lib/forecast-profile';
 import { DEFAULT_LIQUIDITY_TIMING, type LiquidityTiming } from '@/lib/liquidity-ladder';
 import { liquidityStrategyMeta } from '@/lib/test-mode/liquidity-strategies';
@@ -30,6 +31,7 @@ import {
   isoSSlicePoints,
   ISO_S_SLICE_STEPS,
   priceIsoSSlice,
+  priceLiquidityStanding,
   rssMixCfarUsdM,
   liquidityFrontierBufferBand,
   liquidityFrontierDial,
@@ -317,10 +319,81 @@ describe('standingFromCashCarryUsdYr', () => {
     expect(built.upper.every(p => p.totalCarryUsdYrM > 0)).toBe(true);
   });
 
-  it('puts CIP below +cash when the cash Δr is a pay', () => {
-    expect(frontierFarPointsUsdYr(-0.005, 0.005)).toBe(-0.005);
-    expect(frontierFarPointsUsdYr(-0.005, -0.12)).toBe(-0.12);
+  it('far Y = cash + points; open is |cash| so pay-side CIP is not forced negative', () => {
+    // Deposit mid: points = −cash → far nets to $0 under open |cash|.
+    expect(frontierFarPointsUsdYr(-0.005, 0.005)).toBeCloseTo(-0.005, 10);
+    expect(0.005 + frontierFarPointsUsdYr(-0.005, 0.005)).toBeCloseTo(0, 10);
+    // Market CIP earn larger than cash pay → far above $0, below open.
+    expect(frontierFarPointsUsdYr(-0.005343, 0.009562)).toBeCloseTo(-0.001124, 5);
+    expect(0.005343 + frontierFarPointsUsdYr(-0.005343, 0.009562))
+      .toBeCloseTo(-0.005343 + 0.009562, 8);
+    // Earn-side open: add-on is raw points.
     expect(frontierFarPointsUsdYr(0.04, -0.02)).toBe(-0.02);
+    expect(frontierFarPointsUsdYr(-0.005, -0.12)).toBeCloseTo(-0.13, 10);
+  });
+});
+
+describe('USDPLN swap points on the frontier chart', () => {
+  const S = 1 / CURRENCY_PARAMS.PLN!.spot;
+  const ask = -80;
+  const bundle: FxMarketRatesBundle = {
+    pair: 'USDPLN',
+    baseCcy: 'USD',
+    quoteCcy: 'PLN',
+    sourceFile: 'test',
+    spot: { bid: S, ask: S, mid: S },
+    deposits: [{
+      tenor: '1Y',
+      months: 12,
+      eur: { creditPct: 3.41, debitPct: 4.41 },
+      usd: { creditPct: 3.50, debitPct: 3.89 },
+      swapPoints: { bid: -92, ask },
+    }],
+  };
+
+  it('prices the red arm from inverted USD/PLN points, not N × pts/10_000', () => {
+    const standing = 10;
+    const naive = standing * (ask / 10_000);
+    const priced = fundingSwapPathFarCipUsdM({
+      plan: [{ standing_swap: standing, far_leg: -standing, cycleIndex: 11 }],
+      standingFallback: standing,
+      forecastMonths: 12,
+      bookingMode: 'term',
+      bundle,
+      fallbackAnnualUsdYr: () => 0,
+    });
+    expect(priced).toBeGreaterThan(0);
+    expect(priced).not.toBeCloseTo(naive, 4);
+
+    const built = buildLiquidityLeftEndFrontier(input({
+      row: row({
+        ccy: 'PLN',
+        r_FCY: 3.41,
+        r_OD: 4.41,
+        cash_floor: 0,
+        carry_target: 0,
+      }),
+      shared: { r_USD: 3.50, σ_P: 0.1, days: 3, forecastMonths: 12 },
+      months: 12,
+      marketRatesByCcy: { PLN: bundle },
+      cfarNetByCcyUsd: { PLN: 0.22 },
+      carryUsdK: [5.3, 10, 20],
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 12, forecastUncertainty1m: 0.3 },
+    }));
+    expect(built.lower.length).toBeGreaterThan(0);
+    for (const far of built.lower) {
+      const naiveAtS = far.peakBook * (ask / 10_000);
+      // Stored cipUsdYrM is the open→far add-on, not N×pts/10_000.
+      expect(far.cipUsdYrM).not.toBeCloseTo(naiveAtS, 3);
+      expect(Math.abs(far.cipUsdYrM)).toBeLessThan(Math.abs(naiveAtS) * 0.5);
+      // Corrected CIP earns on a long → far Y = cash + points > $0 (not −$134k).
+      expect(far.totalCarryUsdYrM).toBeGreaterThan(0);
+      // Open is |cash|; far is cash+points — usually below open, can exceed when
+      // market CIP earns more than 2× the cash pay.
+      expect(far.totalCarryUsdYrM).toBeLessThan(
+        Math.abs(naiveAtS) * 0.5,
+      );
+    }
   });
 });
 
@@ -680,5 +753,28 @@ describe('liquidityFrontierSkyline', () => {
     const skyline = liquidityFrontierSkyline(all);
     expect(skyline).toHaveLength(1);
     expect(isDegenerateLiquidityFrontier(all, skyline)).toBe(true);
+  });
+});
+
+describe('priceLiquidityStanding', () => {
+  it('open CFaR vs |S| is RSS with the section, not a straight VAR ray', () => {
+    const base = input({
+      row: row({ cash_floor: 0, carry_target: 0 }),
+      cfarNetByCcyUsd: { GBP: 0.361 },
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, forecastUncertainty1m: 0.3 },
+    });
+    const s = standingFromCashCarryUsdYr(
+      0.04, ccySpotRate('GBP'), gbp.r_FCY, shared.r_USD, gbp.r_OD,
+    );
+    const a = priceLiquidityStanding(base, 0);
+    const b = priceLiquidityStanding(base, s / 2);
+    const c = priceLiquidityStanding(base, s);
+    expect(a.open.finalCfarUsdM).toBeCloseTo(0.361, 6);
+    expect(a.open.totalCarryUsdYrM).toBe(0);
+    const chordCfar = (a.open.finalCfarUsdM + c.open.finalCfarUsdM) / 2;
+    expect(c.open.finalCfarUsdM).toBeGreaterThan(a.open.finalCfarUsdM + 0.001);
+    expect(b.open.finalCfarUsdM).toBeLessThan(chordCfar - 1e-6);
+    expect(b.open.totalCarryUsdYrM).toBeGreaterThan(a.open.totalCarryUsdYrM);
+    expect(b.open.totalCarryUsdYrM).toBeLessThan(c.open.totalCarryUsdYrM);
   });
 });

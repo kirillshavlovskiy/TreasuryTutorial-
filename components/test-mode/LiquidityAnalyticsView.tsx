@@ -8,13 +8,50 @@
  * (Entity Dashboard Create UI-3 · Liquidity Analytics).
  */
 
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import {
+  Fragment,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent,
+  type ReactNode,
+} from 'react';
 import { LiquidityFrontierModal } from '@/components/test-mode/LiquidityFrontierModal';
 import {
+  carryAxisFromArms,
+  carryFwd,
   liquidityFrontierDial,
   liquidityFrontierDialLabel,
   signedPeakStanding,
 } from '@/lib/test-mode/liquidity-frontier';
+import {
+  buildPortfolioLiquidityFrontier,
+  portfolioCfarSnapshot,
+  regimePortfolioCfar,
+  toPortfolioCarryFrontier,
+  type DiversifiedUsdRisk,
+  type PortfolioFrontierPoint,
+  type PortfolioLiquidityFrontier,
+} from '@/lib/test-mode/portfolio-liquidity-frontier';
+import {
+  buildEfficientCarryVarFrontier,
+  joinOverlayStripWeights,
+  l1Weights,
+  overlayBookBaseFcyM,
+  type EfficientCarryLeg,
+  type EfficientCarryVarFrontier,
+  type OverlaySide,
+} from '@/lib/portfolio-alloc';
+import {
+  orderedLiquidityScenarioPoints,
+  pickConservativeFundingBook,
+} from '@/lib/test-mode/portfolio-modal-align';
+import {
+  computePortfolioCarryFrontier,
+  impliedPortfolioRFcyPct,
+} from '@/lib/dashboard-model';
 import {
   bufferConstraintLabel,
   cfarTailProbability,
@@ -36,15 +73,43 @@ import {
 } from '@/lib/liquidity-ladder';
 import {
   FORECAST_ACCURACY_LAYERS,
+  POLICY_VAR_LIMITS,
+  universePolicyVarCap,
+  CURRENCY_PARAMS,
+  bufferLevelOf,
+  setBufferLevel,
   toggleLayerGroup,
   type BufferChipKey,
   type LayerId,
+  type PortfolioCarryFrontier,
+  type PortfolioCarryFrontierPoint,
+  type RowState,
 } from '@/lib/fx-buffer';
 import {
   VAR_CONFIDENCE_OPTIONS,
 } from '@/lib/test-mode/var-confidence';
+import {
+  clearPreparedHedgeForCcy,
+  setPreparedHedgeForCcy,
+  type PreparedHedgeProfile,
+} from '@/lib/test-mode/hedge-var';
+import { resolveMarketRatesForCcy } from '@/lib/fx-market-rates';
+import { analyticsForwardsFromOverlays } from '@/lib/fx-hedge';
+import type { AnalyticsForwardLeg } from '@/lib/test-mode/cash-carry-analytics';
+import {
+  fundingStripPreparedProfile,
+  mergeResidualOverlays,
+  residualNeedsFxStage,
+} from '@/lib/test-mode/liquidity-strip-stage';
+import {
+  fxHedgeNetCfarByCcyUsdM,
+  sumNetCfarUsdM,
+} from '@/lib/test-mode/cfar-net-by-ccy';
 
-type LiquidityAnalyticsViewProps = LiquidityAnalyticsSource;
+type LiquidityAnalyticsViewProps = LiquidityAnalyticsSource & {
+  extraForwards?: readonly AnalyticsForwardLeg[];
+  stockNetByCcy?: Readonly<Record<string, number>>;
+};
 
 function fmtSignedK(usdM: number, decimals?: number): string {
   const k = usdM * 1000;
@@ -60,6 +125,13 @@ function fmtAbsK(usdM: number): string {
   return `$${k.toFixed(k < 10 ? 1 : 0)}K`;
 }
 
+function fmtK(usdM: number): string {
+  const k = usdM * 1000;
+  if (!Number.isFinite(k) || Math.abs(k) < 0.05) return '$0K';
+  const dec = Math.abs(k) < 10 ? 1 : 0;
+  return `${k >= 0 ? '' : '−'}$${Math.abs(k).toFixed(dec)}K`;
+}
+
 function fmtM(v: number): string {
   if (!Number.isFinite(v) || Math.abs(v) < 1e-12) return '—';
   return `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(2)}M`;
@@ -70,14 +142,37 @@ function moneyTone(usdM: number): string {
   return usdM >= 0 ? 'text-emerald-300' : 'text-rose-300';
 }
 
-function rowCarryUsdM(c: Pick<
+function fmtWeight(w: number): string {
+  if (!Number.isFinite(w) || Math.abs(w) < 0.005) return '—';
+  const pct = w * 100;
+  const sign = pct > 0 ? '+' : pct < 0 ? '−' : '';
+  return `${sign}${Math.abs(pct).toFixed(0)}%`;
+}
+
+/** What the overlay does on this CCY — long/short × EARN/PAY, or hold. */
+function overlayDoLabel(side: OverlaySide, mu: number): string {
+  if (side === 'flat') return 'hold';
+  const tilt = mu > 1e-6 ? 'EARN' : mu < -1e-6 ? 'PAY' : 'flat';
+  const hedge = (side === 'long' && tilt === 'PAY')
+    || (side === 'short' && tilt === 'EARN');
+  if (hedge) return `${side} ${tilt} hedge`;
+  if (tilt === 'flat') return side;
+  return `${side} ${tilt}`;
+}
+
+function stripOutstanding(c: LiquidityStrategyCcy): number {
+  return c.schedule.length > 0
+    ? c.schedule[c.schedule.length - 1]!.outstanding
+    : 0;
+}
+
+/** Funding-swap ledger only: Buffer Carry (cash Δr) + CIP. Not Cash Carry / Hedge FWD. */
+function swapCarryUsdM(c: Pick<
   LiquidityStrategyCcy,
-  'cashCarryUsdYrM' | 'hedgeCarryUsdYrM' | 'swapInterestUsdYrM' | 'swapPointsUsdYrM'
+  'swapInterestUsdYrM' | 'swapPointsUsdYrM'
 >): number {
   return (
-    usdMToCarryK(c.cashCarryUsdYrM)
-    + usdMToCarryK(c.hedgeCarryUsdYrM)
-    + usdMToCarryK(c.swapInterestUsdYrM)
+    usdMToCarryK(c.swapInterestUsdYrM)
     + usdMToCarryK(c.swapPointsUsdYrM)
   ) / 1000;
 }
@@ -110,24 +205,90 @@ function fundingStructLabel(
   return n > 0 ? `strip · ${n}` : 'strip';
 }
 
+/** Compact “i” — click opens a short explanation popover. Notes live here, not as grey captions. */
+function InfoTip({
+  label,
+  children,
+  align = 'left',
+}: {
+  label: string;
+  children: ReactNode;
+  align?: 'left' | 'right';
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+  return (
+    <div ref={rootRef} className="relative inline-flex shrink-0">
+      <button
+        type="button"
+        aria-label={label}
+        aria-expanded={open}
+        title={label}
+        onClick={e => {
+          e.stopPropagation();
+          setOpen(v => !v);
+        }}
+        className={`flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-bold leading-none transition-colors ${
+          open
+            ? 'border-sky-500/60 bg-sky-500/20 text-sky-100'
+            : 'border-slate-600 bg-slate-900 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+        }`}
+      >
+        i
+      </button>
+      {open && (
+        <div
+          role="dialog"
+          aria-label={label}
+          className={`absolute top-full z-30 mt-1.5 w-80 max-w-[min(20rem,calc(100vw-2rem))] rounded-lg border border-slate-600 bg-slate-900 p-3 text-left text-[10px] leading-relaxed text-slate-300 shadow-xl ${
+            align === 'right' ? 'right-0' : 'left-0'
+          }`}
+        >
+          <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+            {label}
+          </div>
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ChapterLabel({
   n,
   title,
-  hint,
+  info,
+  infoLabel,
 }: {
   n: number;
   title: string;
-  hint?: string;
+  info?: ReactNode;
+  infoLabel?: string;
 }) {
   return (
-    <div className="mb-1.5 flex items-baseline gap-2 px-0.5">
+    <div className="mb-1.5 flex items-center gap-2 px-0.5">
       <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.1em] text-slate-400">
         {n} · {title}
       </span>
-      <span className="h-px flex-1 bg-slate-800" />
-      {hint && (
-        <span className="font-mono text-[9px] text-slate-500">{hint}</span>
+      {info != null && (
+        <InfoTip label={infoLabel ?? title}>{info}</InfoTip>
       )}
+      <span className="h-px flex-1 bg-slate-800" />
     </div>
   );
 }
@@ -189,8 +350,8 @@ const BUFFER_LAYERS: readonly {
     layers: ['portfolioDiv'],
     label: 'Portfolio VAR',
     dial: 'Target VAR',
-    hint: 'Apply the cross-currency portfolio VaR constraint',
-    settingsLabel: 'Portfolio VAR — notional sensitivity limit',
+    hint: 'Cross-currency mix: Σ⁻¹μ overlay under the shared Policy VAR cap',
+    settingsLabel: 'Policy VAR — overlay sensitivity limit (portfolio level)',
     onClass: 'border-violet-400/45 bg-violet-500/15 text-violet-200',
     onDot: 'bg-violet-300',
     onDial: 'border-violet-400/45 text-slate-400',
@@ -217,6 +378,434 @@ function GearIcon({ className }: { className?: string }) {
   );
 }
 
+type PortfolioScenarioId = 'unhedged' | 'conservative' | 'balanced' | 'maxCarry' | 'maxReturn';
+
+function asPortfolioScenarioId(raw: string | null | undefined): PortfolioScenarioId | null {
+  if (
+    raw === 'unhedged'
+    || raw === 'conservative'
+    || raw === 'balanced'
+    || raw === 'maxCarry'
+    || raw === 'maxReturn'
+  ) {
+    return raw;
+  }
+  return null;
+}
+
+/**
+ * Scales every $-amount field on each row by `amplitude` — everything the
+ * book actually holds grows or shrinks together. Rates (r_FCY, r_OD, β_IR,
+ * σ_daily, ir_*_rate, ir_net_dur) are untouched: they describe the currency,
+ * not the position size. `cash_floor` is also left untouched on purpose —
+ * it is a fixed operational threshold set by ops, not a fraction of the
+ * book — that asymmetry (position scales, floor doesn't) is exactly what
+ * makes clamp timing a non-linear function of book size at fixed amplitude
+ * ratios (see fx-buffer.test.ts's "position-amplitude scaling" suite).
+ */
+function scaleRowsByAmplitude(rows: readonly RowState[], amplitude: number): RowState[] {
+  return rows.map(r => ({
+    ...r,
+    spot: r.spot * amplitude,
+    fwd: r.fwd * amplitude,
+    nonCash: r.nonCash * amplitude,
+    nonCashAsset: r.nonCashAsset != null ? r.nonCashAsset * amplitude : r.nonCashAsset,
+    cash: r.cash * amplitude,
+    payout: r.payout * amplitude,
+    collections: r.collections * amplitude,
+    fcastFX: r.fcastFX * amplitude,
+    nonLpCash: r.nonLpCash * amplitude,
+    carry_target: r.carry_target != null ? r.carry_target * amplitude : r.carry_target,
+    ir_asset_notional: r.ir_asset_notional * amplitude,
+    ir_liab_notional: r.ir_liab_notional * amplitude,
+    ir_invest_notional: r.ir_invest_notional != null ? r.ir_invest_notional * amplitude : r.ir_invest_notional,
+  }));
+}
+
+/**
+ * The point that maximizes risk-adjusted return: carry minus the
+ * confidence-tail-weighted VAR (same `carry − CFaR × tail%` objective as the
+ * Book's Weighted return column and `probabilityWeightedReturnUsdM`).
+ * Distinct from the "sweet spot" knee, which is a pure curvature signal (max
+ * distance from the chord) — this is an economic objective and can land
+ * anywhere on the curve, including past the knee if carry keeps outpacing
+ * the tail cost there, or short of it if the tail cost dominates early.
+ */
+function maxExpectedReturnFrontierPoint(
+  points: readonly PortfolioCarryFrontierPoint[],
+  tailProb: number,
+): PortfolioCarryFrontierPoint | null {
+  if (points.length === 0) return null;
+  let bestIdx = 0;
+  let bestScore = points[0]!.totalCarryUsdYr - points[0]!.portfolioVarUsd * tailProb;
+  points.forEach((p, i) => {
+    const score = p.totalCarryUsdYr - p.portfolioVarUsd * tailProb;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  });
+  // On an unclamped ray, carry-per-$-of-VAR is constant (fixed Σ⁻¹μ
+  // direction), so this objective is monotonic until a currency clamps —
+  // same root cause as the old "sweet spot" bug. If the winner sits at the
+  // far edge of whatever range happened to be swept, the objective is still
+  // improving there: reporting it would walk to a different, larger number
+  // every time Policy VAR (and hence the range) grows. k=0 is the one edge
+  // that IS trustworthy — it means the tail cost dominates everywhere, a
+  // stable answer regardless of range.
+  if (bestIdx === points.length - 1 && points.length > 1) return null;
+  return points[bestIdx]!;
+}
+
+interface PortfolioScenarioDef {
+  id: PortfolioScenarioId;
+  label: string;
+  point: PortfolioCarryFrontierPoint | null;
+  disabledHint?: string;
+  /**
+   * True when this point's VAR exceeds its own reference approval tier —
+   * NOT a sizing failure the overlay could fix. If frontier.points[0] (zero
+   * overlay) is already above the tier, the fixed standalone exposure
+   * (delta_cfar) alone breaches it — no amount of overlay discipline
+   * changes that. Never let a breached point be applied as if compliant.
+   */
+  breached: boolean;
+  breachTierUsd?: number;
+}
+
+/**
+ * The four named scenarios, all derived from the same limited-universe
+ * frontier — shared by the preset buttons, the Pareto plot's markers, and
+ * the per-currency modal, so the three surfaces can never drift apart on
+ * what "Balanced" etc. means.
+ */
+function portfolioScenarioDefs(
+  frontier: PortfolioCarryFrontier | null,
+  confidencePct: number,
+  conservativePoint?: PortfolioCarryFrontierPoint | null,
+  unhedgedOriginUsdM?: number | null,
+  policyCapUsd?: number | null,
+): PortfolioScenarioDef[] {
+  const pts = frontier?.points ?? [];
+  const minTier = POLICY_VAR_LIMITS[0]!.usd;
+  const maxTier = POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
+  const policyCap = typeof policyCapUsd === 'number'
+    && Number.isFinite(policyCapUsd)
+    && policyCapUsd > 0
+    ? policyCapUsd
+    : maxTier;
+  const sweet = frontier && frontier.sweetSpotIndex >= 0
+    ? frontier.points[frontier.sweetSpotIndex] ?? null
+    : null;
+  const tailProb = cfarTailProbability(confidencePct);
+  // VAR at zero overlay — the fixed standalone exposure (delta_cfar) alone.
+  // If THIS is already above a tier, every point on the curve is too (VAR
+  // only grows from here), so it's a base-book breach, not a bad pick.
+  const floorVarUsd = pts.length > 0
+    ? Math.min(...pts.map(p => p.portfolioVarUsd).filter(Number.isFinite))
+    : 0;
+  const breachOf = (tier: number) => floorVarUsd > tier + 1e-6;
+  const ordered = orderedLiquidityScenarioPoints({
+    points: pts,
+    conservative: conservativePoint,
+    policyCapUsd: policyCap,
+    originCfarUsd: pts[0]?.portfolioVarUsd ?? null,
+  });
+  const unhedgedPoint = ordered.origin;
+  const conservativeOnArm = ordered.conservative;
+  const balancedPoint = ordered.balanced ?? sweet;
+  const maxCarryPoint = ordered.maxCarry;
+  return [
+    {
+      // $0-carry origin on the open arm. Conservative / Balanced / Max Carry
+      // are required to sit to its right (more CFaR).
+      id: 'unhedged',
+      label: 'Unhedged',
+      point: unhedgedPoint,
+      breached: breachOf(minTier),
+      breachTierUsd: minTier,
+    },
+    {
+      // Live H* book (k = 1) when that CFaR is already past the $0-carry origin.
+      id: 'conservative',
+      label: 'Conservative',
+      point: conservativeOnArm,
+      disabledHint: conservativeOnArm
+        ? undefined
+        : 'no funded H* book to hold — run a liquidity programme first',
+      breached: false,
+    },
+    {
+      // Knee strictly past Conservative, before Max Carry.
+      id: 'balanced',
+      label: 'Balanced',
+      point: balancedPoint,
+      disabledHint: balancedPoint
+        ? undefined
+        : (frontier?.nearestClampVarUsd != null
+          ? `no knee in range yet — first clamp is ${frontier.nearestClampCcy} at $${frontier.nearestClampVarUsd.toFixed(1)}M CFaR`
+          : 'this book never clamps at any range — set a real Min floor on a PAY-tilted currency first'),
+      breached: balancedPoint != null && breachOf(maxTier),
+      breachTierUsd: maxTier,
+    },
+    {
+      // Highest open-arm CFaR still inside the active policy cap, and
+      // strictly past Balanced.
+      id: 'maxCarry',
+      label: 'Max Carry',
+      point: maxCarryPoint,
+      disabledHint: maxCarryPoint
+        ? undefined
+        : `no open-arm point at or below the $${policyCap.toFixed(0)}M policy cap`,
+      breached: breachOf(policyCap),
+      breachTierUsd: policyCap,
+    },
+    {
+      id: 'maxReturn',
+      label: 'Max E[Return]',
+      point: maxExpectedReturnFrontierPoint(pts, tailProb),
+      disabledHint: 'the risk-adjusted objective is still improving at the edge of the swept range — '
+        + 'raise Policy VAR (or set a Min floor) so a real optimum can appear inside it',
+      breached: floorVarUsd > 0 && breachOf(maxTier)
+        && maxExpectedReturnFrontierPoint(pts, tailProb) != null,
+      breachTierUsd: maxTier,
+    },
+  ];
+}
+
+function scenarioLabelForId(
+  id: PortfolioScenarioId | null,
+  frontier: PortfolioCarryFrontier | null,
+  confidencePct: number,
+  conservativePoint?: PortfolioCarryFrontierPoint | null,
+  unhedgedOriginUsdM?: number | null,
+  policyCapUsd?: number | null,
+): string | null {
+  if (!id) return null;
+  return portfolioScenarioDefs(
+    frontier, confidencePct, conservativePoint, unhedgedOriginUsdM, policyCapUsd,
+  ).find(s => s.id === id)?.label ?? null;
+}
+
+function roundPolicyVar(usdM: number): number {
+  return Math.round(usdM * 10) / 10;
+}
+
+
+/**
+ * X-window that frames the live book the way the per-CCY modal does:
+ * origin + Conservative/Balanced (and a selected preset). Max Carry / the
+ * $5–$20 approval tail clips — it does not zoom the plot out.
+ */
+function limitedUniverseWindow(
+  pts: readonly PortfolioCarryFrontierPoint[],
+  defs: readonly PortfolioScenarioDef[],
+  selectedId?: PortfolioScenarioId | null,
+): { xMin: number; xMax: number } | null {
+  const origin = pts[0]?.portfolioVarUsd;
+  const core: number[] = [];
+  if (typeof origin === 'number' && Number.isFinite(origin)) core.push(origin);
+  for (const d of defs) {
+    if (!d.point || !Number.isFinite(d.point.portfolioVarUsd)) continue;
+    if (d.id === 'conservative' || d.id === 'balanced') core.push(d.point.portfolioVarUsd);
+  }
+  const coreHi = core.length > 0 ? Math.max(...core) : 0;
+  for (const d of defs) {
+    if (!d.point || !Number.isFinite(d.point.portfolioVarUsd)) continue;
+    if (d.id === 'conservative' || d.id === 'balanced') continue;
+    const atEdge = pts.length > 1 && d.point === pts[pts.length - 1];
+    if (selectedId === d.id || (!atEdge && d.point.portfolioVarUsd <= coreHi * 1.25 + 1e-9)) {
+      core.push(d.point.portfolioVarUsd);
+    }
+  }
+  if (core.length === 0) return null;
+  const x0 = Math.max(0, typeof origin === 'number' && Number.isFinite(origin) ? origin : Math.min(...core));
+  const cfarHi = Math.max(x0, ...core);
+  const xMax = Math.max(cfarHi * 1.08, x0 + 0.025);
+  const xMin = Math.max(0, x0 - (xMax - x0) * 0.28);
+  return { xMin, xMax };
+}
+
+/** Modal-style frame: origin + live book. Overlay $5–$20 markers clip unless selected. */
+function liveBookWindow(
+  pts: readonly PortfolioCarryFrontierPoint[],
+  selectedX?: number,
+): { xMin: number; xMax: number } | null {
+  const origin = pts[0]?.portfolioVarUsd;
+  const core: number[] = [];
+  if (typeof origin === 'number' && Number.isFinite(origin)) core.push(origin);
+  for (const p of pts) {
+    if (p.levered) continue;
+    if (Number.isFinite(p.portfolioVarUsd)) core.push(p.portfolioVarUsd);
+  }
+  if (typeof selectedX === 'number' && Number.isFinite(selectedX)) core.push(selectedX);
+  if (core.length === 0) return null;
+  const x0 = Math.max(0, typeof origin === 'number' && Number.isFinite(origin) ? origin : Math.min(...core));
+  const cfarHi = Math.max(x0, ...core);
+  const xMax = Math.max(cfarHi * 1.08, x0 + 0.025);
+  const xMin = Math.max(0, x0 - (xMax - x0) * 0.28);
+  return { xMin, xMax };
+}
+
+/** Unclamped Σ⁻¹μ ray as a 2-point chord — any floor-clamp peels the live curve off it. */
+function unclampedRayChord(
+  pts: readonly PortfolioCarryFrontierPoint[],
+): { x: number; y: number }[] | null {
+  const free = pts.filter(p => p.floorBoundCcys.length === 0);
+  const a = (free.length >= 2 ? free[0] : pts[0])!;
+  const b = (free.length >= 2 ? free[free.length - 1] : pts[1])!;
+  if (!a || !b) return null;
+  const dx = b.portfolioVarUsd - a.portfolioVarUsd;
+  if (Math.abs(dx) < 1e-9) return null;
+  const slope = (b.totalCarryUsdYr - a.totalCarryUsdYr) / dx;
+  const x0 = pts[0]!.portfolioVarUsd;
+  const x1 = pts[pts.length - 1]!.portfolioVarUsd;
+  return [
+    { x: x0, y: a.totalCarryUsdYr + slope * (x0 - a.portfolioVarUsd) },
+    { x: x1, y: a.totalCarryUsdYr + slope * (x1 - a.portfolioVarUsd) },
+  ];
+}
+
+/**
+ * Named sweet-spot presets on the carry/VAR frontier:
+ *  - Conservative:   min overlay — fund the live H* buffer only (cash +
+ *                     swap interest), open arm, no far-leg hedge
+ *  - Balanced:       the frontier's open-arm knee (extra Σ⁻¹μ past the
+ *                     buffer) — disabled when sweepPortfolioCarryFrontier
+ *                     finds no genuine floor-clamp bend in range
+ *  - Max Carry:      max open-arm CFaR still inside the $20M policy cap
+ *                     (highest approval rung, filled to cap — never above)
+ *  - Max E[Return]:  the point maximizing carry − CFaR × tail% at the desk's
+ *                     confidence level — the actual risk-adjusted optimum,
+ *                     which need not be the knee or either fixed tier
+ */
+function PortfolioScenarioPresets({
+  frontier,
+  confidencePct,
+  selectedId,
+  conservativePoint,
+  unhedgedOriginUsdM,
+  policyCapUsd,
+  onApply,
+}: {
+  frontier: PortfolioCarryFrontier | null;
+  confidencePct: number;
+  selectedId: PortfolioScenarioId | null;
+  conservativePoint?: PortfolioCarryFrontierPoint | null;
+  unhedgedOriginUsdM?: number | null;
+  policyCapUsd?: number | null;
+  onApply: (id: PortfolioScenarioId, point: PortfolioCarryFrontierPoint) => void;
+}) {
+  const defs = portfolioScenarioDefs(
+    frontier, confidencePct, conservativePoint, unhedgedOriginUsdM, policyCapUsd,
+  );
+  const scenarios = defs.map(s => ({
+    id: s.id,
+    label: s.label,
+    hint: s.breached
+      ? `${s.label} — POLICY BREACH: base standalone exposure alone is above $${s.breachTierUsd?.toFixed(0)}M — no overlay sizing can fix this, escalate per fx-hedging-policy.md approval thresholds`
+      : (s.point
+        ? `${s.label} — ${fmtAbsK(s.point.portfolioVarUsd)} CFaR, ${fmtSignedK(s.point.totalCarryUsdYr)}/yr${
+            s.id === 'conservative' ? ' · H* buffer, open (no far hedge)' : ''
+          }${s.id === 'balanced' ? ' · open-arm knee' : ''}`
+        : `${s.label} — ${s.disabledHint ?? 'not available yet'}`),
+    // A breached point is not a valid scenario to apply — its VAR violates
+    // its own reference tier before any overlay decision is made. Disabled,
+    // same as "no point exists," but for a different, more serious reason.
+    disabled: !s.point || s.breached,
+    breached: s.breached,
+    on: selectedId === s.id && !!s.point && !s.breached,
+    apply: () => {
+      if (!s.point || s.breached) return;
+      onApply(s.id, s.point);
+    },
+  }));
+  return (
+    <div
+      className="inline-flex rounded-md border border-amber-400/45 bg-slate-950 p-0.5"
+      role="group"
+      aria-label="Overlay sweet spot"
+    >
+      {scenarios.map(s => (
+        <button
+          key={s.id}
+          type="button"
+          disabled={s.disabled}
+          aria-pressed={s.on}
+          title={s.hint}
+          onClick={s.apply}
+          className={`rounded px-2 py-1 font-mono text-[11px] font-semibold transition-colors ${
+            s.breached
+              ? 'cursor-not-allowed bg-rose-500/20 text-rose-300'
+              : s.on
+                ? 'bg-amber-500/25 text-amber-100'
+                : s.disabled
+                  ? 'cursor-not-allowed text-slate-700'
+                  : 'text-slate-500 hover:text-slate-300'
+          }`}
+        >
+          {s.breached ? '⚠ ' : ''}{s.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Shows the selected scenario's own point re-derived at other book sizes —
+ * amount fields scale, cash_floor doesn't, so this is NOT a straight-line
+ * readout: carry-per-VAR at a fixed amplitude ratio shifts as clamping
+ * timing shifts, and past some amplitude the point can vanish entirely
+ * (real clamp, past what the bounded universe window can reach). See
+ * `scaleRowsByAmplitude` and fx-buffer.test.ts's amplitude-scaling suite.
+ */
+function ScenarioAmplitudeSensitivity({
+  scenarioLabel,
+  points,
+}: {
+  scenarioLabel: string;
+  points: readonly { amplitude: number; point: PortfolioCarryFrontierPoint | null }[] | null;
+}) {
+  if (!points) return null;
+  const onePt = points.find(p => Math.abs(p.amplitude - 1) < 1e-9)?.point ?? null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-slate-800 bg-slate-950/60 px-2 py-1">
+      <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.08em] text-slate-500">
+        Amplitude sensitivity · {scenarioLabel}
+      </span>
+      {points.map(({ amplitude, point }) => {
+        // Non-linear tell: at a fixed amplitude ratio, VAR should scale
+        // exactly by that ratio if nothing has clamped differently — a
+        // ratio that drifts from `amplitude` itself is the floor's fixed
+        // size biting at a different point in the scaled book.
+        const ratio = point && onePt && onePt.portfolioVarUsd > 1e-6
+          ? point.portfolioVarUsd / (onePt.portfolioVarUsd * amplitude)
+          : null;
+        const offLinear = ratio != null && Math.abs(ratio - 1) > 0.03;
+        return (
+          <span
+            key={amplitude}
+            className="inline-flex items-center gap-1 font-mono text-[9px]"
+            title={point
+              ? `${amplitude}× book — $${point.portfolioVarUsd.toFixed(1)}M CFaR, ${fmtSignedK(point.totalCarryUsdYr)}/yr carry`
+              + (offLinear ? ` — off the ${amplitude}× line (fixed floor biting differently at this book size)` : '')
+              : `${amplitude}× book — unavailable: the clamp point at this size is real but past what the bounded window can reach`}
+          >
+            <span className="text-slate-500">{amplitude}×</span>
+            {point ? (
+              <span className={offLinear ? 'text-amber-300' : 'text-slate-300'}>
+                ${point.portfolioVarUsd.toFixed(1)}M
+              </span>
+            ) : (
+              <span className="text-rose-400/70">—</span>
+            )}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 export function LiquidityAnalyticsView({
   setup,
   bookRows,
@@ -237,6 +826,17 @@ export function LiquidityAnalyticsView({
   deskCashCarryByCcyUsdM,
   deskCipByCcyUsdM,
   onSetupChange,
+  policyVAR,
+  onPolicyVARChange,
+  portfolioCarryK,
+  onPortfolioCarryKChange,
+  onPreparedByCcyChange,
+  residualByCcy: residualByCcyProp,
+  onResidualByCcyChange,
+  portfolioScenarioId: portfolioScenarioIdProp,
+  onPortfolioScenarioIdChange,
+  extraForwards,
+  stockNetByCcy,
 }: LiquidityAnalyticsViewProps) {
   const months = setup.forecastMonths;
   const timing = resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
@@ -244,6 +844,109 @@ export function LiquidityAnalyticsView({
     timing.sizingBasis ?? 'horizon',
     timing.bookingMode ?? 'rolling',
   );
+  const [localResidualByCcy, setLocalResidualByCcy] = useState<Record<string, number>>(
+    () => residualByCcyProp ?? {},
+  );
+  const residualByCcy = residualByCcyProp ?? localResidualByCcy;
+  const setResidualByCcy = (next: Record<string, number>) => {
+    if (onResidualByCcyChange) onResidualByCcyChange(next);
+    else setLocalResidualByCcy(next);
+  };
+  const [lastMixResidual, setLastMixResidual] = useState<number | null>(null);
+  // Which currencies feed the portfolio Σ⁻¹μ overlay — null = all eligible
+  // (default, no behavior change). Diagnostic/verification toggle: forcing
+  // this down to a single currency should make the "Limited universe"
+  // frontier converge onto that currency's own per-currency frontier.
+  const [portfolioIncludedCcys, setPortfolioIncludedCcys] = useState<Set<string> | null>(null);
+  const portfolioEligibleCcys = useMemo(
+    () => Array.from(new Set(
+      (bookRows ?? []).filter(r => r.ccy !== 'USD' && CURRENCY_PARAMS[r.ccy]).map(r => r.ccy),
+    )),
+    [bookRows],
+  );
+  const isPortfolioCcyIncluded = (ccy: string) => !portfolioIncludedCcys || portfolioIncludedCcys.has(ccy);
+  const togglePortfolioCcy = (ccy: string) => {
+    setPortfolioIncludedCcys((prev) => {
+      const base = prev ?? new Set(portfolioEligibleCcys);
+      const next = new Set(base);
+      if (next.has(ccy)) next.delete(ccy); else next.add(ccy);
+      return next;
+    });
+  };
+  const soloPortfolioCcy = (ccy: string) => setPortfolioIncludedCcys(new Set([ccy]));
+  const resetPortfolioCcys = () => setPortfolioIncludedCcys(null);
+  const [localScenarioId, setLocalScenarioId] = useState<PortfolioScenarioId | null>(
+    () => asPortfolioScenarioId(portfolioScenarioIdProp),
+  );
+  const portfolioScenarioId = onPortfolioScenarioIdChange
+    ? asPortfolioScenarioId(portfolioScenarioIdProp)
+    : localScenarioId;
+  const setPortfolioScenarioId = (id: PortfolioScenarioId | null) => {
+    if (onPortfolioScenarioIdChange) onPortfolioScenarioIdChange(id);
+    else setLocalScenarioId(id);
+  };
+  const scenarioPolicyRef = useRef<number | null>(null);
+  const scenarioPolicySyncedRef = useRef(false);
+
+  useEffect(() => {
+    if (!portfolioScenarioId || scenarioPolicyRef.current != null) return;
+    if (typeof policyVAR === 'number') {
+      scenarioPolicyRef.current = policyVAR;
+      scenarioPolicySyncedRef.current = true;
+    }
+  }, [portfolioScenarioId, policyVAR]);
+
+  const modeledOverlays = useMemo(
+    () => mergeResidualOverlays(swapForwardOverlayByCcy, residualByCcy),
+    [swapForwardOverlayByCcy, residualByCcy],
+  );
+  // Same displayed Net per CCY as the CFaR tab (MC + funding-swap bridge).
+  // Cover-sizing `cfarNetByCcyUsd` is FX-only and is not this number.
+  const tabNetByCcyUsd = useMemo(
+    () => {
+      const T = setup.forecastMonths;
+      const forwards = extraForwards
+        ?? analyticsForwardsFromOverlays({
+          overlayByCcy: modeledOverlays,
+          planByCcy: livePlanByCcy,
+          forecastMonths: T,
+        });
+      return fxHedgeNetCfarByCcyUsdM({
+        rows: bookRows ?? [],
+        setup,
+        forecastProfile,
+        bookedHedges,
+        preparedByCcy,
+        marketRatesByCcy,
+        ratesScopeId,
+        fundingPlanByCcy: livePlanByCcy,
+        swapForwardOverlayByCcy: modeledOverlays,
+        extraForwards: forwards,
+        stockNetByCcy,
+      });
+    },
+    [
+      bookRows,
+      setup,
+      forecastProfile,
+      bookedHedges,
+      preparedByCcy,
+      marketRatesByCcy,
+      ratesScopeId,
+      livePlanByCcy,
+      modeledOverlays,
+      extraForwards,
+      stockNetByCcy,
+    ],
+  );
+  const modeledDeskCip = useMemo(() => {
+    if (!deskCipByCcyUsdM) return deskCipByCcyUsdM;
+    const picked = Object.keys(residualByCcy);
+    if (picked.length === 0) return deskCipByCcyUsdM;
+    const next = { ...deskCipByCcyUsdM };
+    for (const ccy of picked) delete next[ccy];
+    return next;
+  }, [deskCipByCcyUsdM, residualByCcy]);
 
   const input = useMemo(
     () =>
@@ -257,12 +960,12 @@ export function LiquidityAnalyticsView({
         marketRatesByCcy,
         activeLayers,
         livePlanByCcy,
-        swapForwardOverlayByCcy,
+        swapForwardOverlayByCcy: modeledOverlays,
         cfarNetByCcyUsd,
         deskShared,
         deskHedgeCarryByCcyUsdM,
         deskCashCarryByCcyUsdM,
-        deskCipByCcyUsdM,
+        deskCipByCcyUsdM: modeledDeskCip,
       }),
     [
       setup,
@@ -274,12 +977,12 @@ export function LiquidityAnalyticsView({
       marketRatesByCcy,
       activeLayers,
       livePlanByCcy,
-      swapForwardOverlayByCcy,
+      modeledOverlays,
       cfarNetByCcyUsd,
       deskShared,
       deskHedgeCarryByCcyUsdM,
       deskCashCarryByCcyUsdM,
-      deskCipByCcyUsdM,
+      modeledDeskCip,
     ],
   );
   const rUsd = input.shared.r_USD;
@@ -287,6 +990,20 @@ export function LiquidityAnalyticsView({
   const [selectedId, setSelectedId] = useState<LiquidityStrategyId>(
     liveStrategy.id,
   );
+  const conservativeBook = useMemo(
+    () => pickConservativeFundingBook(results, selectedId),
+    [results, selectedId],
+  );
+  const tabAllCcyNetUsdM = useMemo(() => {
+    const picked: Record<string, number> = {};
+    for (const [ccy, v] of Object.entries(tabNetByCcyUsd)) {
+      if (ccy === 'USD') continue;
+      if (!isPortfolioCcyIncluded(ccy)) continue;
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) picked[ccy] = v;
+    }
+    return sumNetCfarUsdM(picked);
+  }, [tabNetByCcyUsd, portfolioIncludedCcys]);
+  const unfundedPortCfarUsdM = tabAllCcyNetUsdM;
   const [inspectCcy, setInspectCcy] = useState<string | null>(null);
 
   useEffect(() => {
@@ -301,13 +1018,13 @@ export function LiquidityAnalyticsView({
       activeLayers: input.activeLayers,
       forecastProfile,
       hedgeSettleByCcy: input.hedgeSettleByCcy,
-      cfarNetByCcyUsd,
+      cfarNetByCcyUsd: tabNetByCcyUsd,
       setup,
       bookedHedges,
       preparedByCcy,
       marketRatesByCcy,
       ratesScopeId,
-      swapForwardOverlayByCcy,
+      swapForwardOverlayByCcy: modeledOverlays,
     }),
     [
       months,
@@ -315,15 +1032,251 @@ export function LiquidityAnalyticsView({
       input.activeLayers,
       input.hedgeSettleByCcy,
       forecastProfile,
-      cfarNetByCcyUsd,
+      tabNetByCcyUsd,
       setup,
       bookedHedges,
       preparedByCcy,
       marketRatesByCcy,
       ratesScopeId,
-      swapForwardOverlayByCcy,
+      modeledOverlays,
     ],
   );
+  // Same S(t) = t × S_book walk as the per-currency left-end. Conservative
+  // is t = 1 on that arm — one pricer, no shape break.
+  const universeFrontier = useMemo(() => {
+    if (bufferLevelOf(activeLayers) !== 'portfolio') return null;
+    const rows = (bookRows ?? [])
+      .filter(r => r.ccy !== 'USD' && CURRENCY_PARAMS[r.ccy] && isPortfolioCcyIncluded(r.ccy));
+    if (rows.length < 1) return null;
+    if (conservativeBook) {
+      const liq = buildPortfolioLiquidityFrontier({
+        result: conservativeBook,
+        strategy: conservativeBook.strategy,
+        rows: rows as RowState[],
+        engine: frontierEngineInput,
+      });
+      return toPortfolioCarryFrontier(liq);
+    }
+    const base = {
+      rows: rows as RowState[],
+      shared: input.shared,
+      activeLayers: activeLayers ?? new Set(),
+      forecastProfile,
+      hedgeSettleByCcy: input.hedgeSettleByCcy,
+      cfarNetByCcyUsd: tabNetByCcyUsd,
+      marketRatesByCcy,
+    };
+    const maxTier = POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
+    return computePortfolioCarryFrontier({
+      ...base,
+      policyVAR: maxTier,
+      unhedgedCfarUsdM: tabAllCcyNetUsdM,
+    }, 48, 1, true);
+  }, [
+    activeLayers,
+    bookRows,
+    conservativeBook,
+    frontierEngineInput,
+    input.shared,
+    input.hedgeSettleByCcy,
+    forecastProfile,
+    tabNetByCcyUsd,
+    tabAllCcyNetUsdM,
+    marketRatesByCcy,
+    portfolioIncludedCcys,
+  ]);
+  // CFaR-tab All CCY Net (Σ of Nets). Both arms leave this vertex.
+  const unhedgedOriginUsdM = (
+    universeFrontier?.points[0]?.portfolioVarUsd
+    && universeFrontier.points[0]!.portfolioVarUsd > 1e-9
+  )
+    ? universeFrontier.points[0]!.portfolioVarUsd
+    : tabAllCcyNetUsdM;
+  const conservativePoint = useMemo(() => {
+    const hold = universeFrontier?.points.find(p => Math.abs(p.k - 1) < 1e-6);
+    return hold ?? null;
+  }, [universeFrontier]);
+
+  const selectedScenario = useMemo(() => {
+    if (!portfolioScenarioId) return null;
+    return portfolioScenarioDefs(
+      universeFrontier, setup.confidencePct, conservativePoint, unhedgedOriginUsdM, policyVAR,
+    ).find(s => s.id === portfolioScenarioId) ?? null;
+  }, [portfolioScenarioId, universeFrontier, setup.confidencePct, conservativePoint, unhedgedOriginUsdM, policyVAR]);
+
+  // Re-derives the selected scenario's own point at other book sizes —
+  // amount fields scale with the book, but cash_floor does NOT (it is a
+  // fixed operational threshold, not proportional to position size). That
+  // asymmetry is exactly what makes the clamp point / knee availability a
+  // non-linear function of book size: see the fx-buffer.test.ts suite
+  // "position-amplitude scaling" for the proof this mirrors.
+  const scenarioAmplitudeSensitivity = useMemo(() => {
+    if (!portfolioScenarioId) return null;
+    const rows = (bookRows ?? [])
+      .filter(r => r.ccy !== 'USD' && CURRENCY_PARAMS[r.ccy] && isPortfolioCcyIncluded(r.ccy)) as RowState[];
+    if (rows.length < 1) return null;
+    const amplitudes = [0.5, 1, 2, 5, 10];
+    const base = {
+      shared: input.shared,
+      activeLayers: activeLayers ?? new Set(),
+      forecastProfile,
+      hedgeSettleByCcy: input.hedgeSettleByCcy,
+      cfarNetByCcyUsd,
+      marketRatesByCcy,
+    };
+    const maxTier = POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
+    // This is a diagnostic strip, not the plotted curve — it only needs the
+    // one scenario point per amplitude, not a smooth line. Low step counts
+    // (was 8/48, same as the main chart) cut 10 full portfolio computations
+    // down to a fraction of the cost; this was the actual page-overload
+    // source, not the far-leg addition.
+    return amplitudes.map((amplitude) => {
+      const scaledRows = scaleRowsByAmplitude(rows, amplitude);
+      const probe = computePortfolioCarryFrontier({ ...base, rows: scaledRows, policyVAR: maxTier }, 5, 1);
+      const cap = universePolicyVarCap(probe.nearestClampVarUsd);
+      const fine = computePortfolioCarryFrontier({ ...base, rows: scaledRows, policyVAR: cap }, 10, 1);
+      const point = portfolioScenarioDefs(
+        fine, setup.confidencePct, conservativePoint, unhedgedOriginUsdM, policyVAR,
+      ).find(s => s.id === portfolioScenarioId)?.point ?? null;
+      return { amplitude, point };
+    });
+  }, [
+    portfolioScenarioId,
+    bookRows,
+    input.shared,
+    activeLayers,
+    forecastProfile,
+    input.hedgeSettleByCcy,
+    cfarNetByCcyUsd,
+    marketRatesByCcy,
+    setup.confidencePct,
+    portfolioIncludedCcys,
+    conservativePoint,
+    unhedgedOriginUsdM,
+    policyVAR,
+  ]);
+
+  useEffect(() => {
+    if (portfolioScenarioId === 'maxCarry') return;
+    if (portfolioCarryK != null) {
+      setPortfolioScenarioId(null);
+      scenarioPolicyRef.current = null;
+      scenarioPolicySyncedRef.current = false;
+    }
+  }, [portfolioCarryK, portfolioScenarioId]);
+
+  useEffect(() => {
+    if (!portfolioScenarioId) return;
+    if (portfolioScenarioId === 'maxCarry') {
+      scenarioPolicyRef.current = policyVAR ?? 5;
+      scenarioPolicySyncedRef.current = true;
+      return;
+    }
+    const pinned = scenarioPolicyRef.current;
+    if (pinned == null) return;
+    if (Math.abs((policyVAR ?? 5) - pinned) < 0.05) {
+      scenarioPolicySyncedRef.current = true;
+      return;
+    }
+    if (!scenarioPolicySyncedRef.current) return;
+    setPortfolioScenarioId(null);
+    scenarioPolicyRef.current = null;
+    scenarioPolicySyncedRef.current = false;
+  }, [policyVAR, portfolioScenarioId]);
+
+  const applyPortfolioScenario = (id: PortfolioScenarioId, point: PortfolioCarryFrontierPoint) => {
+    const cap = typeof policyVAR === 'number' && policyVAR > 0
+      ? policyVAR
+      : POLICY_VAR_LIMITS[0]!.usd;
+    const v = id === 'maxCarry'
+      ? cap
+      : roundPolicyVar(point.portfolioVarUsd);
+    scenarioPolicyRef.current = v;
+    scenarioPolicySyncedRef.current = false;
+    setPortfolioScenarioId(id);
+    onPolicyVARChange?.(v);
+    onPortfolioCarryKChange?.(undefined);
+    if (id === 'conservative') {
+      const next = { ...residualByCcy };
+      for (const r of bookRows ?? []) {
+        if (r.ccy !== 'USD' && isPortfolioCcyIncluded(r.ccy)) next[r.ccy] = 1;
+      }
+      setResidualByCcy(next);
+      if (onLayerToggle && activeLayers?.has('carryOptim')) onLayerToggle('carryOptim');
+    } else if (onLayerToggle && !(activeLayers?.has('carryOptim') ?? false)) {
+      onLayerToggle('carryOptim');
+    }
+  };
+
+  const applyCustomFrontierPoint = (point: PortfolioCarryFrontierPoint) => {
+    const v = roundPolicyVar(point.portfolioVarUsd);
+    scenarioPolicyRef.current = v;
+    scenarioPolicySyncedRef.current = false;
+    setPortfolioScenarioId(null);
+    onPolicyVARChange?.(v);
+    onPortfolioCarryKChange?.(undefined);
+    if (onLayerToggle && !(activeLayers?.has('carryOptim') ?? false)) onLayerToggle('carryOptim');
+  };
+
+  const mvFrontier = useMemo((): EfficientCarryVarFrontier | null => {
+    if (bufferLevelOf(activeLayers) !== 'portfolio') return null;
+    const rows = (bookRows ?? [])
+      .filter(r => r.ccy !== 'USD' && CURRENCY_PARAMS[r.ccy] && isPortfolioCcyIncluded(r.ccy));
+    if (rows.length < 1) return null;
+    const rUsd = input.shared.r_USD;
+    const bookingMode = timing.bookingMode ?? 'rolling';
+    const tenorMonths = bookingMode === 'rolling'
+      ? 1
+      : Math.max(1, input.shared.forecastMonths ?? months);
+    const ccys = rows.map(r => r.ccy);
+    const mu = rows.map(r => (
+      impliedPortfolioRFcyPct(
+        r.ccy, r.r_FCY, rUsd, marketRatesByCcy, tenorMonths,
+      ) - rUsd
+    ) / 100);
+    const varCapUsdM = policyVAR ?? 5;
+    // Max Carry re-solves when the earn ask moves. Other named scenarios
+    // keep a leftover Liquidity-tab $K/yr from stealing their VAR fill.
+    const carryTargetUsdYrM = (
+      portfolioScenarioId == null || portfolioScenarioId === 'maxCarry'
+    )
+      ? (portfolioCarryK != null ? portfolioCarryK / 1000 : undefined)
+      : undefined;
+    // Approximation of buildPass1Fcy's forecasted_cash — this call site only
+    // has raw book rows, not the full ladder/forecast pipeline. cash+payout
+    // is the same trough proxy used elsewhere as the pre-ladder anchor.
+    const basesFcy = rows.map(r => overlayBookBaseFcyM(r));
+    const rOd = rows.map(r => r.r_OD);
+    // Same gate buildPass1Fcy uses for delta_cfar — only counts once the
+    // desk has turned on Forecast accuracy (cfarCover), so this stays fully
+    // backward compatible (flat μ carry, pure-ray VAR) until then.
+    const fixedCfarUsdM = activeLayers?.has('cfarCover')
+      ? rows.map(r => Math.abs(cfarNetByCcyUsd?.[r.ccy] ?? 0))
+      : undefined;
+    return buildEfficientCarryVarFrontier({
+      ccys,
+      mu,
+      varCapUsdM,
+      carryTargetUsdYrM,
+      basesFcy,
+      rOd,
+      r_USD: rUsd,
+      fixedCfarUsdM,
+    });
+  }, [
+    activeLayers,
+    bookRows,
+    cfarNetByCcyUsd,
+    input.shared.r_USD,
+    input.shared.forecastMonths,
+    timing.bookingMode,
+    months,
+    marketRatesByCcy,
+    portfolioCarryK,
+    policyVAR,
+    portfolioScenarioId,
+    portfolioIncludedCcys,
+  ]);
 
   const selected =
     results.find(r => r.strategy.id === selectedId)
@@ -347,11 +1300,30 @@ export function LiquidityAnalyticsView({
   const isLive = selected.strategy.id === liveStrategy.id;
   const book = strategyBookCarryK(selected.byCcy);
   const tailPct = (cfarTailProbability(setup.confidencePct) * 100).toFixed(0);
+  const overdraftCfarUsdM = unhedgedOriginUsdM > 1e-9
+    ? unhedgedOriginUsdM
+    : (unfunded?.finalCfarUsdM ?? 0);
+  const selectedPortRisk = regimePortfolioCfar(
+    selected.byCcy.map(c => ({
+      ccy: c.ccy,
+      cfarUsdM: c.cfarUsdM,
+      standing: signedPeakStanding(c.plan),
+    })),
+    bufferLevelOf(activeLayers) === 'portfolio'
+      && activeLayers?.has('carryOptim') === true
+      && mvFrontier
+      ? mvFrontier.legs
+      : undefined,
+    isPortfolioCcyIncluded,
+  );
+  const selectedCfarUsdM = selectedPortRisk.portfolioUsdM > 1e-9
+    ? selectedPortRisk.portfolioUsdM
+    : (selected.strategy.id === 'unfunded' ? overdraftCfarUsdM : selected.finalCfarUsdM);
   const weightedUsdM = probabilityWeightedReturnUsdM(
     book.total / 1000,
-    selected.finalCfarUsdM,
+    selectedCfarUsdM,
     setup.confidencePct,
-    unfunded?.finalCfarUsdM ?? 0,
+    overdraftCfarUsdM,
   );
   const dial = liquidityFrontierDial(input.activeLayers);
   const constraintHue =
@@ -360,6 +1332,101 @@ export function LiquidityAnalyticsView({
       : selected.constraint === 'carry'
         ? 'text-emerald-300'
         : 'text-slate-300';
+  const portfolioLevel = bufferLevelOf(activeLayers) === 'portfolio';
+  const carryOn = activeLayers?.has('carryOptim') === true;
+  const overlayActiveForModal = portfolioLevel && carryOn && mvFrontier != null;
+  const namedScenarioLabel = scenarioLabelForId(
+    portfolioScenarioId,
+    universeFrontier,
+    setup.confidencePct,
+    conservativePoint,
+    unhedgedOriginUsdM,
+    policyVAR,
+  );
+  const activeScenarioLabel = overlayActiveForModal
+    ? (namedScenarioLabel
+      ?? (portfolioCarryK != null
+        ? 'Custom earn target'
+        : `Custom $${(policyVAR ?? 5).toFixed(1)}M`))
+    : namedScenarioLabel;
+  const inspectOverlayLeg = inspectRow && overlayActiveForModal
+    ? mvFrontier!.legs.find(l => l.ccy === inspectRow.ccy) ?? null
+    : null;
+
+  const setCcyResidual = (ccy: string, residual: number) => {
+    setLastMixResidual(residual);
+    setResidualByCcy({ ...residualByCcy, [ccy]: residual });
+  };
+
+  const profileForStrip = (
+    ccy: string,
+    residual: number,
+    schedule: LiquidityStrategyCcy['schedule'],
+  ) =>
+    fundingStripPreparedProfile({
+      ccy,
+      schedule,
+      residual,
+      forecastMonths: months,
+      marketRates: resolveMarketRatesForCcy(
+        marketRatesByCcy, ccy, ratesScopeId,
+      ),
+      ratesScopeId,
+    });
+
+  const stageFundingStrip = (
+    ccy: string,
+    residual: number,
+    schedule: LiquidityStrategyCcy['schedule'],
+  ) => {
+    if (!onPreparedByCcyChange) return;
+    const profile = profileForStrip(ccy, residual, schedule);
+    if (!profile) return;
+    onPreparedByCcyChange(prev =>
+      setPreparedHedgeForCcy(prev, ccy, profile),
+    );
+  };
+
+  const stageAllFundingStrips = () => {
+    if (!onPreparedByCcyChange) return;
+    onPreparedByCcyChange(prev => {
+      let next = prev;
+      let changed = false;
+      for (const c of selected.byCcy) {
+        const residual = residualByCcy[c.ccy];
+        if (residual == null || !residualNeedsFxStage(residual)) continue;
+        const profile = profileForStrip(c.ccy, residual, c.schedule);
+        if (!profile) continue;
+        next = setPreparedHedgeForCcy(next, c.ccy, profile);
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  };
+
+  const resetDeskPrograms = () => {
+    setResidualByCcy({});
+    setLastMixResidual(null);
+    if (!onPreparedByCcyChange) return;
+    onPreparedByCcyChange(prev => {
+      let next = prev;
+      let changed = false;
+      for (const [ccy, profile] of Object.entries(prev)) {
+        if (profile.preparedFor !== 'liquidity') continue;
+        next = clearPreparedHedgeForCcy(next, ccy);
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  };
+
+  const applyPortfolioDelta = () => {
+    const residual = lastMixResidual;
+    if (residual == null) return;
+    const next: Record<string, number> = {};
+    for (const c of selected.byCcy) next[c.ccy] = residual;
+    setResidualByCcy(next);
+  };
 
   return (
     <div className="space-y-4">
@@ -370,14 +1437,26 @@ export function LiquidityAnalyticsView({
         <span className="rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[9px] font-semibold text-slate-400">
           Tf {months}m
         </span>
-        <span className="ml-auto max-w-[26rem] text-right font-mono text-[9px] leading-snug text-slate-500">
-          prices the funding programme covering the dated-path dip — not a fourth risk metric
-        </span>
       </div>
 
       <section>
-        <ChapterLabel n={1} title="Summary" />
-        <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-4">
+        <ChapterLabel
+          n={1}
+          title="Summary"
+          info={
+            <>
+              <p>
+                Prices the funding programme covering the dated-path dip — not a fourth risk metric.
+              </p>
+              <p className="mt-1.5">
+                Total carry is Cash + FWD + Swap cash + CIP. Final CFaR is FX Net RSS’d with the
+                funding-swap bridge (overdraft is FX-only). Weighted return is Carry − standing CFaR
+                × {tailPct}%. Preview is a what-if — it is not the booked programme.
+              </p>
+            </>
+          }
+        />
+        <div className="grid grid-cols-4 divide-x divide-slate-800 overflow-hidden rounded-[10px] border border-slate-700 bg-slate-950/50">
           <SummaryCard
             label="Total carry"
             value={fmtSignedK(book.total / 1000, 0)}
@@ -387,8 +1466,14 @@ export function LiquidityAnalyticsView({
           />
           <SummaryCard
             label={`Final CFaR · ${setup.confidencePct}%`}
-            value={fmtAbsK(selected.finalCfarUsdM)}
-            sub="FX section RSS with the funding-swap bridge"
+            value={fmtAbsK(selectedCfarUsdM)}
+            sub={
+              selectedPortRisk.standaloneUsdM > selectedPortRisk.portfolioUsdM + 1e-6
+                ? `√(v′ρv) · ${fmtAbsK(selectedPortRisk.standaloneUsdM)} sum · −${fmtAbsK(selectedPortRisk.divBenefitUsdM)} div`
+                : selected.strategy.id === 'unfunded'
+                  ? 'CFaR-tab FX-only Net · no funding-swap bridge'
+                  : 'FX section RSS with the funding-swap bridge'
+            }
             tone="risk"
           />
           <SummaryCard
@@ -404,7 +1489,7 @@ export function LiquidityAnalyticsView({
               value={selected.strategy.label}
               sub={`${bufferConstraintLabel(selected.constraint)} · ${selected.constraintDetail || 'No layer'}`}
               tone="live"
-              valueClass="text-emerald-300 text-[15px] leading-tight"
+              valueClass="text-emerald-300"
             />
           ) : (
             <SummaryCard
@@ -412,14 +1497,34 @@ export function LiquidityAnalyticsView({
               value={selected.strategy.label}
               sub={`Live regime is ${liveStrategy.label} · ${bufferConstraintLabel(selected.constraint)} · ${selected.constraintDetail || 'No layer'}`}
               tone="preview"
-              valueClass="text-violet-300 text-[15px] leading-tight"
+              valueClass="text-violet-300"
             />
           )}
         </div>
       </section>
 
       <section>
-        <ChapterLabel n={2} title="Controls" />
+        <ChapterLabel
+          n={2}
+          title="Controls"
+          info={
+            <>
+              <p>
+                Weighted return uses Carry − standing CFaR × {tailPct}% (above origin). Confidence
+                chips write the shared CFaR level.
+              </p>
+              <p className="mt-1.5">
+                {bufferLevelOf(activeLayers) === 'portfolio'
+                  ? `Portfolio level · Σ⁻¹μ long/short mix · Policy VAR is the approval cap · Sweet spot is ${
+                      activeScenarioLabel ?? 'the Policy VAR fill'
+                    }.`
+                  : 'Per-currency chips — same stack as the Liquidity tab.'}
+                {' '}Binding dial → {liquidityFrontierDialLabel(dial)}
+                {selected.constraintDetail ? ` · ${selected.constraintDetail}` : ''}.
+              </p>
+            </>
+          }
+        />
         <div className="rounded-[10px] border border-slate-700 bg-slate-950/50 px-3 py-2.5">
           <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
             <div className="min-w-0">
@@ -451,14 +1556,106 @@ export function LiquidityAnalyticsView({
                   );
                 })}
               </div>
-              <div className="mt-1.5 font-mono text-[9px] leading-snug text-slate-500">
-                Carry − standing CFaR × {tailPct}% (above origin)
-              </div>
             </div>
             <div className="min-w-0 border-slate-800 md:border-l md:pl-6">
               <div className="mb-1.5 font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
                 Buffer regime
               </div>
+              <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+                <div
+                  className="inline-flex rounded-md border border-slate-700 bg-slate-950 p-0.5"
+                  role="group"
+                  aria-label="Buffer level"
+                >
+                  {(['currency', 'portfolio'] as const).map(level => {
+                    const on = bufferLevelOf(activeLayers) === level;
+                    return (
+                      <button
+                        key={level}
+                        type="button"
+                        disabled={!onLayerToggle}
+                        aria-pressed={on}
+                        onClick={() => {
+                          if (!onLayerToggle) return;
+                          setBufferLevel(activeLayers, level, onLayerToggle);
+                          if (level === 'currency' && layerPanel === 'portfolioDiv') {
+                            onLayerPanelChange?.(null);
+                          }
+                        }}
+                        title={
+                          level === 'portfolio'
+                            ? 'Same chips, book mix: Σ⁻¹μ overlay · Policy VAR + USD budget'
+                            : 'Same chips, each currency on its own floor / σ / carry ask'
+                        }
+                        className={`rounded px-2.5 py-1 font-mono text-[11px] font-semibold transition-colors ${
+                          on
+                            ? 'bg-violet-500/25 text-violet-100'
+                            : 'text-slate-500 hover:text-slate-300'
+                        } ${onLayerToggle ? '' : 'cursor-default opacity-80'}`}
+                      >
+                        {level === 'currency' ? 'Currency' : 'Portfolio'}
+                      </button>
+                    );
+                  })}
+                </div>
+                {bufferLevelOf(activeLayers) === 'portfolio' && (
+                  <div
+                    className="inline-flex rounded-md border border-violet-400/45 bg-slate-950 p-0.5"
+                    role="group"
+                    aria-label="Policy VAR"
+                  >
+                    {POLICY_VAR_LIMITS.map(pl => {
+                      const on = (policyVAR ?? 5) === pl.usd;
+                      return (
+                        <button
+                          key={pl.usd}
+                          type="button"
+                          disabled={!onPolicyVARChange}
+                          title={`${pl.label} · ${pl.who} approval`}
+                          onClick={() => {
+                            const keepMaxCarry = portfolioScenarioId === 'maxCarry';
+                            scenarioPolicyRef.current = pl.usd;
+                            scenarioPolicySyncedRef.current = keepMaxCarry;
+                            if (!keepMaxCarry) setPortfolioScenarioId(null);
+                            onPolicyVARChange?.(pl.usd);
+                          }}
+                          className={`rounded px-2 py-1 font-mono text-[11px] font-semibold transition-colors ${
+                            on
+                              ? 'bg-violet-500/25 text-violet-100'
+                              : 'text-slate-500 hover:text-slate-300'
+                          } ${onPolicyVARChange ? '' : 'cursor-default opacity-80'}`}
+                        >
+                          {pl.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              {bufferLevelOf(activeLayers) === 'portfolio' && (
+                <div className="mb-1.5 space-y-1.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-amber-200/90">
+                      Sweet spot
+                    </span>
+                    <PortfolioScenarioPresets
+                      frontier={universeFrontier}
+                      confidencePct={setup.confidencePct}
+                      selectedId={portfolioScenarioId}
+                      conservativePoint={conservativePoint}
+                      unhedgedOriginUsdM={unhedgedOriginUsdM}
+                      policyCapUsd={policyVAR}
+                      onApply={applyPortfolioScenario}
+                    />
+                  </div>
+                  {portfolioScenarioId && (
+                    <ScenarioAmplitudeSensitivity
+                      scenarioLabel={selectedScenario?.label ?? portfolioScenarioId}
+                      points={scenarioAmplitudeSensitivity}
+                    />
+                  )}
+                </div>
+              )}
               <div className="flex flex-wrap gap-1.5">
                 {BUFFER_LAYERS.map(layer => {
                   const active = layer.layers.some(id => activeLayers?.has(id) ?? false);
@@ -530,11 +1727,6 @@ export function LiquidityAnalyticsView({
                   );
                 })}
               </div>
-              <div className="mt-1.5 font-mono text-[9px] leading-snug text-slate-500">
-                Same layer stack as the Liquidity tab · binding dial →{' '}
-                <span className="text-slate-400">{liquidityFrontierDialLabel(dial)}</span>
-                {' · '}{selected.constraintDetail || 'No layer'}
-              </div>
             </div>
           </div>
         </div>
@@ -546,15 +1738,40 @@ export function LiquidityAnalyticsView({
         selectedId={selected.strategy.id}
         confidencePct={setup.confidencePct}
         constraintHue={constraintHue}
+        bookRows={bookRows ?? []}
         onSelect={setSelectedId}
+        portfolioLevel={bufferLevelOf(activeLayers) === 'portfolio'}
+        carryOn={activeLayers?.has('carryOptim') === true}
+        mvFrontier={mvFrontier}
+        overlayScenarioLabel={activeScenarioLabel}
+        universeFrontier={universeFrontier}
+        policyVAR={policyVAR ?? 5}
+        portfolioScenarioId={portfolioScenarioId}
+        conservativePoint={conservativePoint}
+        unhedgedOriginUsdM={unhedgedOriginUsdM}
+        onApplyScenario={applyPortfolioScenario}
+        onPickCustom={applyCustomFrontierPoint}
+        portfolioIncludedCcys={portfolioIncludedCcys}
+        onTogglePortfolioCcy={togglePortfolioCcy}
+        onSoloPortfolioCcy={soloPortfolioCcy}
+        onResetPortfolioCcys={resetPortfolioCcys}
       />
 
       <SelectedStrategyDetail
         result={selected}
-        unfunded={unfunded}
         isLive={isLive}
-        confidencePct={setup.confidencePct}
         onInspectCcy={setInspectCcy}
+        residualByCcy={residualByCcy}
+        onResidualChange={setCcyResidual}
+        preparedByCcy={preparedByCcy}
+        overlayLegs={portfolioLevel && carryOn ? mvFrontier?.legs : undefined}
+        onStage={onPreparedByCcyChange ? stageFundingStrip : undefined}
+        onStageAll={onPreparedByCcyChange ? stageAllFundingStrips : undefined}
+        onResetDesk={resetDeskPrograms}
+        onApplyPortfolioDelta={portfolioLevel ? applyPortfolioDelta : undefined}
+        canApplyPortfolioDelta={
+          portfolioLevel && lastMixResidual != null
+        }
       />
 
       {inspectRow && (
@@ -568,6 +1785,28 @@ export function LiquidityAnalyticsView({
           )}
           onSetupChange={onSetupChange}
           onClose={() => setInspectCcy(null)}
+          onPickResidual={residual => setCcyResidual(inspectRow.ccy, residual)}
+          onStage={
+            onPreparedByCcyChange
+              ? residual => {
+                  const row = selected.byCcy.find(c => c.ccy === inspectRow.ccy);
+                  if (!row || !residualNeedsFxStage(residual)) return;
+                  setCcyResidual(inspectRow.ccy, residual);
+                  stageFundingStrip(inspectRow.ccy, residual, row.schedule);
+                }
+              : undefined
+          }
+          staged={preparedByCcy?.[inspectRow.ccy]?.preparedFor === 'liquidity'}
+          portfolioSuggestion={
+            inspectOverlayLeg && activeScenarioLabel
+              ? {
+                  fcyM: inspectOverlayLeg.fcyM,
+                  usdM: inspectOverlayLeg.usdM,
+                  side: inspectOverlayLeg.side,
+                  scenarioLabel: activeScenarioLabel,
+                }
+              : null
+          }
         />
       )}
     </div>
@@ -587,14 +1826,6 @@ function SummaryCard({
   tone: 'carry' | 'risk' | 'sky' | 'live' | 'preview';
   valueClass?: string;
 }) {
-  const shell =
-    tone === 'carry' || tone === 'live'
-      ? 'border-emerald-500/35 bg-emerald-500/[0.07]'
-      : tone === 'risk'
-        ? 'border-amber-500/35 bg-amber-500/[0.07]'
-        : tone === 'sky'
-          ? 'border-sky-500/35 bg-sky-500/[0.07]'
-          : 'border-violet-400/40 bg-violet-500/[0.08]';
   const labelFg =
     tone === 'carry' || tone === 'live'
       ? 'text-emerald-300'
@@ -607,14 +1838,13 @@ function SummaryCard({
     valueClass
     ?? (tone === 'risk' ? 'text-amber-300' : tone === 'preview' ? 'text-violet-300' : 'text-emerald-300');
   return (
-    <div className={`rounded-[10px] border px-3 py-2.5 ${shell}`}>
-      <div className={`mb-1.5 font-mono text-[9px] font-semibold uppercase tracking-[0.08em] ${labelFg}`}>
+    <div className="min-w-0 px-2.5 py-1.5" title={sub}>
+      <div className={`font-mono text-[9px] font-semibold uppercase tracking-[0.08em] ${labelFg}`}>
         {label}
       </div>
-      <div className={`mb-1 font-mono text-xl font-semibold tabular-nums ${valueFg}`}>
+      <div className={`truncate font-mono text-sm font-semibold tabular-nums leading-tight ${valueFg}`}>
         {value}
       </div>
-      <div className="font-mono text-[9px] leading-snug text-slate-400">{sub}</div>
     </div>
   );
 }
@@ -625,26 +1855,136 @@ function RegimeSummaryTable({
   selectedId,
   confidencePct,
   constraintHue,
+  bookRows,
   onSelect,
+  portfolioLevel,
+  carryOn,
+  mvFrontier,
+  overlayScenarioLabel,
+  universeFrontier,
+  policyVAR,
+  portfolioScenarioId,
+  conservativePoint,
+  unhedgedOriginUsdM,
+  onApplyScenario,
+  onPickCustom,
+  portfolioIncludedCcys,
+  onTogglePortfolioCcy,
+  onSoloPortfolioCcy,
+  onResetPortfolioCcys,
 }: {
   results: readonly LiquidityStrategyResult[];
   liveId: LiquidityStrategyId;
   selectedId: LiquidityStrategyId;
   confidencePct: number;
   constraintHue: string;
+  bookRows: readonly RowState[];
   onSelect: (id: LiquidityStrategyId) => void;
+  portfolioLevel: boolean;
+  carryOn: boolean;
+  mvFrontier: EfficientCarryVarFrontier | null;
+  overlayScenarioLabel: string | null;
+  universeFrontier: PortfolioCarryFrontier | null;
+  policyVAR: number;
+  portfolioScenarioId: PortfolioScenarioId | null;
+  conservativePoint: PortfolioCarryFrontierPoint | null;
+  unhedgedOriginUsdM: number;
+  onApplyScenario: (id: PortfolioScenarioId, point: PortfolioCarryFrontierPoint) => void;
+  onPickCustom: (point: PortfolioCarryFrontierPoint) => void;
+  portfolioIncludedCcys: ReadonlySet<string> | null;
+  onTogglePortfolioCcy: (ccy: string) => void;
+  onSoloPortfolioCcy: (ccy: string) => void;
+  onResetPortfolioCcys: () => void;
 }) {
+  const portById = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof portfolioCfarSnapshot>>();
+    for (const r of results) {
+      map.set(
+        r.strategy.id,
+        portfolioCfarSnapshot(
+          r.byCcy.map(c => ({
+            ccy: c.ccy,
+            cfarUsdM: c.cfarUsdM,
+            standing: signedPeakStanding(c.plan),
+          })),
+        ),
+      );
+    }
+    return map;
+  }, [results]);
   const tailPct = (cfarTailProbability(confidencePct) * 100).toFixed(0);
-  const floorCfarUsdM = results.find(r => r.strategy.id === 'unfunded')?.finalCfarUsdM ?? 0;
+  const overdraftCfarUsdM = unhedgedOriginUsdM > 1e-9
+    ? unhedgedOriginUsdM
+    : (results.find(r => r.strategy.id === 'unfunded')?.finalCfarUsdM ?? 0);
+  const floorCfarUsdM = overdraftCfarUsdM;
+  const includedPlotRows = useMemo(
+    () => (bookRows ?? []).filter(row => (
+      row.ccy !== 'USD'
+      && CURRENCY_PARAMS[row.ccy]
+      && (!portfolioIncludedCcys || portfolioIncludedCcys.has(row.ccy))
+    )),
+    [bookRows, portfolioIncludedCcys],
+  );
+  const soloPlotRow = includedPlotRows.length === 1 ? includedPlotRows[0]! : null;
+  const plotFrontier = universeFrontier;
+  // The Σ⁻¹μ overlay is a cross-currency position on top of whichever
+  // funding regime is picked, not something a regime itself produces — so it
+  // adds identically to every row's carry/risk figures below. Carry is
+  // linear (exact addition); the overlay's own diversified VAR is combined
+  // with each row's diversified Port. CFaR by RSS, treating book risk and
+  // overlay risk as independent — a deliberate simplification (the true
+  // joint per-currency correlation between the two isn't available at this
+  // level) rather than a naive sum, which would overstate the risk.
+  const overlayActive = portfolioLevel && carryOn && mvFrontier != null;
+  const overlayCarryUsdYrM = overlayActive ? mvFrontier!.sweet.carryUsdYrM : 0;
+  const overlayVarUsdM = overlayActive ? mvFrontier!.sweet.varUsdM : 0;
+  // True when the fixed standalone exposure (delta_cfar) alone already
+  // exceeds the active Policy VAR cap, before any overlay decision — see
+  // CarryVarAllocResult.capBreachedAtZeroOverlay. Every row below shares
+  // this since the overlay adds identically to all of them.
+  const overlayCapBreached = overlayActive && mvFrontier!.sweet.capBreachedAtZeroOverlay;
+
   return (
     <section>
       <ChapterLabel
         n={3}
         title="Regimes"
-        hint="click a row to preview · does not persist the desk regime"
+        info={
+          <>
+            <p>Click a row to preview. Preview does not persist the desk regime.</p>
+            <ul className="mt-1.5 space-y-1">
+              {results.map(r => (
+                <li key={r.strategy.id}>
+                  <span className="font-semibold text-slate-200">{r.strategy.label}.</span>{' '}
+                  {r.strategy.summary}
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1.5">
+              Cash Carry is desk Cash + FWD — identical on every regime. The swap lives in Swap cash
+              + CIP. Sum CFaR is the arithmetic total. Port. CFaR is √(v′ρv) on signed
+              per-CCY CFaR (plus overlay Euler when Portfolio + Carry is on) — lower than
+              the sum because of the desk 14×14 corr. The per-CCY split is the Euler
+              share of that diversified total. Weighted return is Carry − Port. CFaR × {tailPct}%.
+            </p>
+            {overlayActive ? (
+              <p className="mt-1.5">
+                Portfolio + Carry: Total carry includes the Σ⁻¹μ overlay at{' '}
+                {overlayScenarioLabel ?? 'the Policy VAR fill'}. Port. CFaR folds overlay
+                Euler into the same √(v′ρv) as the book. Cash Carry / Swap cash / CIP stay
+                regime-only. Overlay FCY is H* − hold — not Swap Near.
+              </p>
+            ) : (
+              <p className="mt-1.5">
+                Select a row for carry vs CFaR as the books scale together. Portfolio + Carry shows
+                the overlay mix beside it.
+              </p>
+            )}
+          </>
+        }
       />
       <div className="overflow-x-auto rounded-[10px] border border-slate-700 bg-slate-950/50">
-        <table className="w-full min-w-[820px] border-collapse text-left font-mono text-[10px] leading-snug">
+        <table className="w-full min-w-[920px] border-collapse text-left font-mono text-[10px] leading-snug">
           <thead>
             <tr className="text-slate-500">
               <th className="px-3 py-2 font-semibold tracking-wide">Regime</th>
@@ -653,13 +1993,9 @@ function RegimeSummaryTable({
               <th className="px-3 py-2 text-right font-semibold tracking-wide">Swap cash</th>
               <th className="px-3 py-2 text-right font-semibold tracking-wide">CIP</th>
               <th className="px-3 py-2 text-right font-semibold tracking-wide">Total carry</th>
-              <th className="px-3 py-2 text-right font-semibold tracking-wide">Final CFaR</th>
-              <th
-                className="px-3 py-2 text-right font-semibold tracking-wide"
-                title={`Carry − standing CFaR × ${tailPct}% (above unfunded/origin)`}
-              >
-                Weighted return
-              </th>
+              <th className="px-3 py-2 text-right font-semibold tracking-wide">Sum CFaR</th>
+              <th className="px-3 py-2 text-right font-semibold tracking-wide">Port. CFaR</th>
+              <th className="px-3 py-2 text-right font-semibold tracking-wide">Weighted return</th>
             </tr>
           </thead>
           <tbody>
@@ -667,102 +2003,1565 @@ function RegimeSummaryTable({
               const live = r.strategy.id === liveId;
               const selected = r.strategy.id === selectedId;
               const book = strategyBookCarryK(r.byCcy);
+              const port = portById.get(r.strategy.id);
+              const sumCfarUsdM = r.finalCfarUsdM;
+              const include = (ccy: string) => (
+                !portfolioIncludedCcys || portfolioIncludedCcys.has(ccy)
+              );
+              const portRisk = regimePortfolioCfar(
+                r.byCcy.map(c => ({
+                  ccy: c.ccy,
+                  cfarUsdM: c.cfarUsdM,
+                  standing: signedPeakStanding(c.plan),
+                })),
+                overlayActive ? mvFrontier!.legs : undefined,
+                include,
+              );
+              const displayTotalK = book.total + overlayCarryUsdYrM * 1000;
+              const displayPortUsdM = portRisk.portfolioUsdM;
               const weighted = probabilityWeightedReturnUsdM(
-                book.total / 1000,
-                r.finalCfarUsdM,
+                displayTotalK / 1000,
+                displayPortUsdM,
                 confidencePct,
                 floorCfarUsdM,
               );
               return (
-                <tr
-                  key={r.strategy.id}
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={selected}
-                  onClick={() => onSelect(r.strategy.id)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      onSelect(r.strategy.id);
-                    }
-                  }}
-                  className={`cursor-pointer outline-none transition ${
-                    selected
-                      ? 'bg-sky-500/15 text-slate-100 shadow-[inset_0_0_0_1px_rgba(56,189,248,0.4)]'
-                      : live
-                        ? 'bg-sky-500/[0.06] text-slate-100 hover:bg-slate-800/55'
-                        : 'text-slate-300 hover:bg-slate-800/55'
-                  }`}
-                >
-                  <td className="border-b border-slate-900 px-3 py-2.5 align-top">
-                    <div className="mb-0.5 flex flex-wrap items-center gap-1.5">
-                      <span className="text-[11px] font-semibold text-slate-100">
-                        {r.strategy.label}
-                      </span>
-                      {live && (
-                        <span className="rounded border border-emerald-400/50 bg-emerald-500/15 px-1 py-px font-mono text-[8px] font-semibold uppercase tracking-wide text-emerald-300">
-                          Live
+                <Fragment key={r.strategy.id}>
+                  <tr
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={selected}
+                    onClick={() => onSelect(r.strategy.id)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        onSelect(r.strategy.id);
+                      }
+                    }}
+                    className={`cursor-pointer outline-none transition ${
+                      selected
+                        ? 'bg-sky-500/15 text-slate-100 shadow-[inset_0_0_0_1px_rgba(56,189,248,0.4)]'
+                        : live
+                          ? 'bg-sky-500/[0.06] text-slate-100 hover:bg-slate-800/55'
+                          : 'text-slate-300 hover:bg-slate-800/55'
+                    }`}
+                  >
+                    <td className="border-b border-slate-900 px-3 py-2.5 align-top">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-[11px] font-semibold text-slate-100">
+                          {r.strategy.label}
                         </span>
-                      )}
-                      {selected && (
-                        <span className="rounded border border-sky-400/50 bg-sky-500/15 px-1 py-px font-mono text-[8px] font-semibold uppercase tracking-wide text-sky-300">
-                          Selected
-                        </span>
-                      )}
-                    </div>
-                    <div className="max-w-[17.5rem] font-normal text-[9px] text-slate-500">
-                      {r.strategy.summary}
-                    </div>
-                  </td>
-                  <td className="border-b border-slate-900 px-3 py-2.5 align-top">
-                    <div className={`font-semibold ${constraintHue}`}>
+                        {live && (
+                          <span className="rounded border border-emerald-400/50 bg-emerald-500/15 px-1 py-px font-mono text-[8px] font-semibold uppercase tracking-wide text-emerald-300">
+                            Live
+                          </span>
+                        )}
+                        {selected && (
+                          <span className="rounded border border-sky-400/50 bg-sky-500/15 px-1 py-px font-mono text-[8px] font-semibold uppercase tracking-wide text-sky-300">
+                            Selected
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td
+                      className={`border-b border-slate-900 px-3 py-2.5 align-top font-semibold ${constraintHue}`}
+                      title={r.constraintDetail || undefined}
+                    >
                       {bufferConstraintLabel(r.constraint)}
-                    </div>
-                    <div className="text-[9px] text-slate-500">{r.constraintDetail}</div>
-                  </td>
-                  <td className={`border-b border-slate-900 px-3 py-2.5 text-right align-top ${moneyTone((book.cash + book.hedge) / 1000)}`}>
-                    {fmtSignedK((book.cash + book.hedge) / 1000, 0)}
-                  </td>
-                  <td className="border-b border-slate-900 px-3 py-2.5 text-right align-top text-sky-300">
-                    {fmtSignedK(book.swap / 1000, 0)}
-                  </td>
-                  <td className="border-b border-slate-900 px-3 py-2.5 text-right align-top text-emerald-300">
-                    {fmtSignedK(book.cip / 1000, 0)}
-                  </td>
-                  <td className={`border-b border-slate-900 px-3 py-2.5 text-right align-top font-semibold ${moneyTone(book.total / 1000)}`}>
-                    {fmtSignedK(book.total / 1000, 0)}
-                  </td>
-                  <td className="border-b border-slate-900 px-3 py-2.5 text-right align-top text-amber-300">
-                    {fmtAbsK(r.finalCfarUsdM)}
-                  </td>
-                  <td className={`border-b border-slate-900 px-3 py-2.5 text-right align-top ${moneyTone(weighted)}`}>
-                    {fmtSignedK(weighted)}
-                  </td>
-                </tr>
+                    </td>
+                    <td className={`border-b border-slate-900 px-3 py-2.5 text-right align-top ${moneyTone((book.cash + book.hedge) / 1000)}`}>
+                      {fmtSignedK((book.cash + book.hedge) / 1000, 0)}
+                    </td>
+                    <td className="border-b border-slate-900 px-3 py-2.5 text-right align-top text-sky-300">
+                      {fmtSignedK(book.swap / 1000, 0)}
+                    </td>
+                    <td className="border-b border-slate-900 px-3 py-2.5 text-right align-top text-emerald-300">
+                      {fmtSignedK(book.cip / 1000, 0)}
+                    </td>
+                    <td
+                      className={`border-b border-slate-900 px-3 py-2.5 text-right align-top font-semibold ${moneyTone(displayTotalK / 1000)}`}
+                      title={
+                        overlayActive && Math.abs(overlayCarryUsdYrM) > 1e-6
+                          ? `${fmtSignedK(overlayCarryUsdYrM)} overlay included`
+                          : undefined
+                      }
+                    >
+                      {fmtSignedK(displayTotalK / 1000, 0)}
+                    </td>
+                    <td className="border-b border-slate-900 px-3 py-2.5 text-right align-top text-amber-300/80">
+                      {fmtAbsK(sumCfarUsdM)}
+                    </td>
+                    <td
+                      className={`border-b border-slate-900 px-3 py-2.5 text-right align-top ${
+                        overlayCapBreached ? 'text-rose-400' : 'text-amber-200'
+                      }`}
+                      title={[
+                        portRisk.standaloneUsdM > 1e-9
+                          ? `${(portRisk.divFactor * 100).toFixed(0)}% of ${fmtAbsK(portRisk.standaloneUsdM)} sum · −${fmtAbsK(portRisk.divBenefitUsdM)} div`
+                          : null,
+                        port && port.standaloneUsdM > 1e-9 && r.strategy.id !== 'unfunded'
+                          ? `book ${(port.divFactor * 100).toFixed(0)}% of sum`
+                          : null,
+                        overlayCapBreached
+                          ? 'POLICY BREACH — base standalone exposure alone exceeds Policy VAR, before any overlay decision'
+                          : null,
+                      ].filter(Boolean).join(' · ') || undefined}
+                    >
+                      {overlayCapBreached && <span className="mr-0.5">⚠</span>}
+                      {fmtAbsK(displayPortUsdM)}
+                    </td>
+                    <td className={`border-b border-slate-900 px-3 py-2.5 text-right align-top ${moneyTone(weighted)}`}>
+                      {fmtSignedK(weighted)}
+                    </td>
+                  </tr>
+                  {selected && (
+                    <tr>
+                      <td colSpan={9} className="border-b border-slate-900 bg-slate-950/80 px-3 pb-3 pt-2">
+                        {portfolioLevel && plotFrontier && plotFrontier.points.length > 2 && (
+                          <div className="mb-2">
+                            <PortfolioCarryVarFrontierPlot
+                              frontier={plotFrontier}
+                              overlayFrontier={undefined}
+                              matchModalAxis={soloPlotRow != null}
+                              projectScenarioPoint={undefined}
+                              conservativePoint={conservativePoint}
+                              unhedgedOriginUsdM={unhedgedOriginUsdM}
+                              policyVAR={policyVAR}
+                              confidencePct={confidencePct}
+                              selectedScenarioId={portfolioScenarioId}
+                              onApplyScenario={onApplyScenario}
+                              onPickCustom={onPickCustom}
+                              onUseBalanced={
+                                universeFrontier
+                                  && universeFrontier.sweetSpotIndex >= 0
+                                  && universeFrontier.points[universeFrontier.sweetSpotIndex]
+                                  ? () => onApplyScenario(
+                                      'balanced',
+                                      universeFrontier.points[universeFrontier.sweetSpotIndex]!,
+                                    )
+                                  : undefined
+                              }
+                            />
+                          </div>
+                        )}
+                        <SweetStripSplit
+                          result={r}
+                          portRisk={portRisk}
+                          overlayLegs={portfolioLevel && carryOn ? mvFrontier?.legs : undefined}
+                          sweetT={mvFrontier?.sweet.t}
+                          carryBinding={mvFrontier?.sweet.carryBinding}
+                          overlayScenarioLabel={overlayScenarioLabel}
+                          portfolioIncludedCcys={portfolioLevel ? portfolioIncludedCcys : undefined}
+                          onTogglePortfolioCcy={portfolioLevel ? onTogglePortfolioCcy : undefined}
+                          onSoloPortfolioCcy={portfolioLevel ? onSoloPortfolioCcy : undefined}
+                          onResetPortfolioCcys={portfolioLevel ? onResetPortfolioCcys : undefined}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               );
             })}
           </tbody>
         </table>
-        <div className="border-t border-slate-900 px-3 py-1.5 font-mono text-[9px] leading-snug text-slate-500">
-          Cash Carry is desk Cash + FWD (Total without the funding-swap overlay) — identical on every regime; the swap lives in Swap cash + CIP. Final CFaR is this strategy&apos;s displayed bridge total, not a diversified portfolio VaR.
-        </div>
       </div>
     </section>
   );
 }
 
-function SelectedStrategyDetail({
+function finitePt(p: PortfolioFrontierPoint): boolean {
+  return Number.isFinite(p.cfarUsdM) && Number.isFinite(p.carryUsdYrM);
+}
+
+function tickDot(p: PortfolioFrontierPoint): boolean {
+  if (Math.abs(p.scale - 1) < 1e-6) return true;
+  const t = Math.round(p.scale * 4) / 4;
+  return Math.abs(p.scale - t) < 0.03 && t >= 0 && t <= 1.25;
+}
+
+function mixTick(p: PortfolioFrontierPoint): boolean {
+  const t = Math.round(p.cover * 4) / 4;
+  return Math.abs(p.cover - t) < 0.04;
+}
+
+function OverlayMixChips({ mix }: { mix: EfficientCarryVarFrontier }) {
+  const weights = l1Weights(mix.legs.map(l => l.usdM));
+  const legs = mix.legs
+    .map((leg, i) => ({ leg, w: weights[i]! }))
+    .filter(x => x.leg.side !== 'flat')
+    .slice(0, 10);
+  return (
+    <div className="mt-1.5 flex flex-wrap gap-1.5">
+      {legs.map(({ leg, w }) => {
+        const tilt = leg.mu > 1e-6 ? 'EARN' : leg.mu < -1e-6 ? 'PAY' : 'flat';
+        const hedge = (leg.side === 'long' && tilt === 'PAY')
+          || (leg.side === 'short' && tilt === 'EARN');
+        return (
+          <span
+            key={leg.ccy}
+            className={`rounded border px-1.5 py-0.5 font-mono text-[9px] ${
+              leg.side === 'long'
+                ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200'
+                : 'border-rose-400/40 bg-rose-500/10 text-rose-200'
+            }`}
+            title={`${tilt} vs USD${hedge ? ' · hedge vs a correlated name' : ''} · mix ${fmtWeight(w)} · overlay ${fmtSignedK(leg.usdM)} · ${leg.fcyM >= 0 ? '+' : '−'}${Math.abs(leg.fcyM).toFixed(2)}M ${leg.ccy}`}
+          >
+            {leg.ccy} {fmtWeight(w)} {leg.side} {fmtSignedK(leg.usdM)}
+            <span className="ml-1 text-slate-500">{hedge ? `${tilt} hedge` : tilt}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Sweet overlay mix vs this regime's funding-swap strip, per CCY.
+ * Overlay = H* − hold at the Σ⁻¹μ sweet. Strip = Swap Near / Book on the
+ * selected programme. Weights are signed L1 shares of USD.
+ */
+function SweetStripSplit({
   result,
-  unfunded,
-  isLive,
-  confidencePct,
-  onInspectCcy,
+  portRisk,
+  overlayLegs,
+  sweetT,
+  carryBinding,
+  overlayScenarioLabel,
+  portfolioIncludedCcys,
+  onTogglePortfolioCcy,
+  onSoloPortfolioCcy,
+  onResetPortfolioCcys,
 }: {
   result: LiquidityStrategyResult;
-  unfunded: LiquidityStrategyResult | undefined;
-  isLive: boolean;
+  portRisk?: DiversifiedUsdRisk;
+  overlayLegs?: readonly EfficientCarryLeg[];
+  sweetT?: number;
+  carryBinding?: boolean;
+  overlayScenarioLabel?: string | null;
+  /** Which currencies feed the Σ⁻¹μ overlay — undefined outside portfolio level, null = all. */
+  portfolioIncludedCcys?: ReadonlySet<string> | null;
+  onTogglePortfolioCcy?: (ccy: string) => void;
+  onSoloPortfolioCcy?: (ccy: string) => void;
+  onResetPortfolioCcys?: () => void;
+}) {
+  const byCcy = new Map(result.byCcy.map(c => [c.ccy, c]));
+  const portByCcy = new Map((portRisk?.byCcy ?? []).map(c => [c.ccy, c]));
+  const rows = joinOverlayStripWeights(
+    overlayLegs ?? [],
+    result.byCcy.map(c => ({
+      ccy: c.ccy,
+      bookNow: c.bookNow,
+      outstanding: stripOutstanding(c),
+    })),
+  ).filter(r => {
+    const c = byCcy.get(r.ccy);
+    const bookCarry = c
+      ? c.cashCarryUsdYrM + c.hedgeCarryUsdYrM + c.swapInterestUsdYrM + c.swapPointsUsdYrM
+      : 0;
+    // Keep hold names (0% mix, no strip) — Max Carry can concentrate the
+    // overlay in one CCY and used to hide everyone else, e.g. GBP.
+    return (
+      Math.abs(r.overlayUsdM) > 0.02
+      || Math.abs(r.stripUsdM) > 0.02
+      || Math.abs(r.bookNow) > 0.02
+      || Math.abs(c?.cfarUsdM ?? 0) > 0.02
+      || Math.abs(bookCarry) > 0.02
+      || Math.abs(portByCcy.get(r.ccy)?.componentUsdM ?? 0) > 0.02
+    );
+  });
+  if (rows.length === 0) return null;
+  const hasOverlay = (overlayLegs?.length ?? 0) > 0;
+  return (
+    <div className="mt-2 overflow-x-auto rounded-md border border-slate-800 bg-slate-950/60">
+      <div className="flex items-center gap-1.5 border-b border-slate-800 px-2.5 py-1.5">
+        <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.08em] text-slate-400">
+          {hasOverlay ? (overlayScenarioLabel ?? 'Sweet') : 'Strip'}
+        </span>
+        <InfoTip label="Strip split">
+          {hasOverlay ? (
+            <p>
+              {overlayScenarioLabel ?? 'Sweet'} mix on this regime
+              {typeof sweetT === 'number'
+                ? ` · t=${sweetT.toFixed(2)}${carryBinding ? ' (earn ask)' : ' (CFaR fill)'}`
+                : ''}
+              . Do is long/short × EARN/PAY (hedge = short an EARN or long a PAY vs a correlated
+              name). Carry is overlay μ′w; CFaR is this programme’s Net; Notional $ is overlay
+              USD size (position, not risk). Overlay CFaR is this leg’s own signed share of the
+              overlay’s diversified VAR (Euler component — the column sums exactly to Port. CFaR’s
+              overlay term; negative means this leg diversifies the book). Overlay FCY is H* −
+              hold, not Swap Near.
+            </p>
+          ) : (
+            <p>
+              This regime’s strip split (Σ |outstanding × spot|). Turn on Portfolio + Carry for the
+              overlay mix, Do, and CFaR/Carry columns.
+            </p>
+          )}
+        </InfoTip>
+        {onResetPortfolioCcys && portfolioIncludedCcys && (
+          <button
+            type="button"
+            onClick={onResetPortfolioCcys}
+            className="font-mono text-[9px] text-slate-500 hover:text-slate-300"
+            title="Re-include every currency in the Σ⁻¹μ overlay"
+          >
+            reset (all in)
+          </button>
+        )}
+      </div>
+      <table className="w-full min-w-[780px] text-left font-mono text-[10px]">
+        <thead>
+          <tr className="text-slate-500">
+            <th className="px-2.5 py-1.5 font-semibold">CCY</th>
+            <th className="px-2.5 py-1.5 font-semibold" title="What the overlay does on this name">Do</th>
+            {hasOverlay && (
+              <th className="px-2.5 py-1.5 font-semibold" title="Signed L1 share of overlay USD at the sweet">Mix w%</th>
+            )}
+            {hasOverlay && (
+              <th className="px-2.5 py-1.5 font-semibold" title="Overlay carry μ′w ($K/yr) — the discretionary Σ⁻¹μ position only, not the funding/hedge program">Overlay Carry</th>
+            )}
+            <th className="px-2.5 py-1.5 font-semibold" title="Cash + FWD + swap interest + CIP points ($K/yr) — the liquidity funding and hedging program only, never the overlay">Program Carry</th>
+            <th className="px-2.5 py-1.5 font-semibold" title="This regime’s displayed Net CFaR (standalone)">CFaR</th>
+            <th className="px-2.5 py-1.5 font-semibold" title="Euler share of diversified Port. CFaR — the column sums to Port. CFaR, which is below Σ CFaR">Port. CFaR</th>
+            {hasOverlay && (
+              <>
+                <th className="px-2.5 py-1.5 font-semibold" title="Overlay USD notional at the sweet — position size, not risk">Notional $</th>
+                <th className="px-2.5 py-1.5 font-semibold" title="This leg's signed share of the overlay's diversified VAR (Euler component — sums exactly to Port. CFaR's overlay term). Negative = this leg diversifies the book, reducing total risk.">Overlay CFaR</th>
+                <th className="px-2.5 py-1.5 font-semibold" title="H* − hold, M FCY">Overlay FCY</th>
+              </>
+            )}
+            <th className="px-2.5 py-1.5 font-semibold">Strip</th>
+            <th className="px-2.5 py-1.5 font-semibold">Schedule</th>
+            <th className="px-2.5 py-1.5 font-semibold">Swap Near</th>
+            <th className="px-2.5 py-1.5 font-semibold" title="Far-leg notional if the funding swap is term-booked (fully) or strip-term (partially) — 0 on a rolling regime, nothing is locked at a far date">Swap Far</th>
+            <th className="px-2.5 py-1.5 font-semibold">Swap Book</th>
+            <th className="px-2.5 py-1.5 font-semibold" title="Signed L1 share of swap-book USD">Strip w%</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(row => {
+            const c = byCcy.get(row.ccy);
+            const struct = c
+              ? fundingStructLabel(result.strategy, c.schedule)
+              : '—';
+            const schedule = c
+              ? compactFundingSchedule(c.schedule)
+              : '—';
+            const overlayCarryM = row.overlayCarryUsdYrM;
+            const bookCarryM = c
+              ? c.cashCarryUsdYrM + c.hedgeCarryUsdYrM + c.swapInterestUsdYrM + c.swapPointsUsdYrM
+              : 0;
+            const farLeg = c && c.plan.length > 0 ? c.plan[c.plan.length - 1]!.far_leg : 0;
+            const doLabel = hasOverlay
+              ? overlayDoLabel(row.side, row.mu)
+              : (Math.abs(row.outstanding) > 0.001 || Math.abs(row.bookNow) > 0.001
+                ? 'fund strip'
+                : 'hold');
+            const doTone = !hasOverlay || row.side === 'flat'
+              ? 'text-slate-400'
+              : row.side === 'long' ? 'text-emerald-300' : 'text-rose-300';
+            return (
+              <tr key={row.ccy} className="border-t border-slate-800/80 text-slate-300">
+                <td className="px-2.5 py-1.5 font-semibold text-violet-200">
+                  {onTogglePortfolioCcy ? (
+                    <label
+                      className="inline-flex cursor-pointer items-center gap-1"
+                      title={`Include/exclude ${row.ccy} in the Σ⁻¹μ overlay. Click "${row.ccy}" to isolate it alone — e.g. force the portfolio down to just EUR to check it converges onto EUR's own per-currency frontier.`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!portfolioIncludedCcys || portfolioIncludedCcys.has(row.ccy)}
+                        onChange={() => onTogglePortfolioCcy(row.ccy)}
+                        className="accent-violet-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => onSoloPortfolioCcy?.(row.ccy)}
+                        className="hover:text-violet-100"
+                      >
+                        {row.ccy}
+                      </button>
+                    </label>
+                  ) : row.ccy}
+                </td>
+                <td className={`px-2.5 py-1.5 ${doTone}`}>{doLabel}</td>
+                {hasOverlay && (
+                  <td className={`px-2.5 py-1.5 ${
+                    row.side === 'long' ? 'text-emerald-300' : row.side === 'short' ? 'text-rose-300' : 'text-slate-500'
+                  }`}>
+                    {fmtWeight(row.overlayWeight)}
+                  </td>
+                )}
+                {hasOverlay && (
+                  <td className={`px-2.5 py-1.5 ${moneyTone(overlayCarryM)}`}>
+                    {fmtSignedK(overlayCarryM)}
+                  </td>
+                )}
+                <td className={`px-2.5 py-1.5 ${moneyTone(bookCarryM)}`}>
+                  {fmtSignedK(bookCarryM)}
+                </td>
+                <td className="px-2.5 py-1.5 text-amber-200">
+                  {c ? fmtAbsK(c.cfarUsdM) : '—'}
+                </td>
+                <td className={`px-2.5 py-1.5 ${moneyTone(portByCcy.get(row.ccy)?.componentUsdM ?? 0)}`}>
+                  {portByCcy.get(row.ccy)
+                    ? fmtSignedK(portByCcy.get(row.ccy)!.componentUsdM)
+                    : '—'}
+                </td>
+                {hasOverlay && (
+                  <>
+                    <td className={`px-2.5 py-1.5 ${moneyTone(row.overlayUsdM)}`}>
+                      {fmtSignedK(row.overlayUsdM)}
+                    </td>
+                    <td className={`px-2.5 py-1.5 ${moneyTone(row.overlayComponentVarUsdM)}`}>
+                      {fmtSignedK(row.overlayComponentVarUsdM)}
+                    </td>
+                    <td className="px-2.5 py-1.5 text-sky-200/90">{fmtM(row.overlayFcyM)}</td>
+                  </>
+                )}
+                <td className="px-2.5 py-1.5 capitalize text-violet-300/90">{struct}</td>
+                <td className="px-2.5 py-1.5 text-amber-200/90">{schedule}</td>
+                <td className="px-2.5 py-1.5 text-sky-300">{fmtM(row.bookNow)}</td>
+                <td className={`px-2.5 py-1.5 ${moneyTone(farLeg)}`}>
+                  {Math.abs(farLeg) > 0.001 ? fmtM(farLeg) : '—'}
+                </td>
+                <td className={`px-2.5 py-1.5 ${moneyTone(row.outstanding)}`}>
+                  {Math.abs(row.outstanding) > 0.001 ? fmtM(row.outstanding) : '—'}
+                </td>
+                <td className="px-2.5 py-1.5 text-amber-200">{fmtWeight(row.stripWeight)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {portRisk && portRisk.byCcy.length > 0 && (
+        <div className="flex flex-wrap gap-x-3 border-t border-slate-800 px-2.5 py-1.5 font-mono text-[10px] text-slate-400">
+          <span>
+            Σ CFaR <span className="text-amber-300/80">{fmtAbsK(portRisk.standaloneUsdM)}</span>
+          </span>
+          <span>
+            Port. CFaR <span className="font-semibold text-amber-200">{fmtAbsK(portRisk.portfolioUsdM)}</span>
+          </span>
+          <span>
+            div −{fmtAbsK(portRisk.divBenefitUsdM)}
+            {' '}({((1 - portRisk.divFactor) * 100).toFixed(0)}%)
+          </span>
+          <span className="text-slate-600">Euler split sums to Port.</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The real (curvature-aware) carry/VAR frontier — limited approval-tier
+ * universe, zoomed so the bend around the sweet is visible. Distinct from
+ * the Σ⁻¹μ ray `mvFrontier` annotates `BookScaleFrontierPlot` with: that
+ * ray has no floor clamping, so it is linear by construction.
+ */
+const PORTFOLIO_SCENARIO_COLORS: Record<string, string> = {
+  unhedged: '#94a3b8',
+  conservative: '#60a5fa',
+  balanced: '#f59e0b',
+  // Was #f87171 — nearly identical to the far-leg's #fb7185 (both
+  // reddish-pink), read as the same curve at a glance. Violet is distinct
+  // from every other scenario color and from the far-leg pink.
+  maxCarry: '#a78bfa',
+  maxReturn: '#34d399',
+};
+
+function cfarKTicks(minM: number, maxM: number): number[] {
+  const lo = Math.floor(minM * 1000);
+  const hi = Math.ceil(maxM * 1000);
+  if (hi <= lo) return [minM];
+  const span = hi - lo;
+  const step = span <= 8 ? 1
+    : span <= 40 ? 5
+    : span <= 120 ? 10
+    : span <= 400 ? 25
+    : span <= 1000 ? 50
+    : span <= 2500 ? 100
+    : span <= 6000 ? 250
+    : 500;
+  const start = Math.floor(lo / step) * step;
+  const out: number[] = [];
+  for (let k = start; k <= hi + 1e-9; k += step) {
+    if (k + 1e-9 >= lo) out.push(k / 1000);
+  }
+  return out.length > 0 ? out : [minM];
+}
+
+function carryLogTicks(yMin: number, yMax: number): number[] {
+  const out = [0];
+  for (let exp = -4; exp <= 2; exp += 1) {
+    for (const f of [1, 2, 5]) {
+      const m = f * 10 ** exp;
+      if (m <= yMax * 1.02 + 1e-12) out.push(m);
+      if (-m >= yMin * 1.02 - 1e-12) out.push(-m);
+    }
+  }
+  return [...new Set(out)].sort((a, b) => a - b);
+}
+
+type CarryVarPlotView = { xMin: number; xMax: number; yMin: number; yMax: number };
+
+function svgLocalXY(
+  el: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  W: number,
+  H: number,
+): { sx: number; sy: number } | null {
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  return {
+    sx: ((clientX - rect.left) / rect.width) * W,
+    sy: ((clientY - rect.top) / rect.height) * H,
+  };
+}
+
+function inPlotRect(
+  sx: number,
+  sy: number,
+  padL: number,
+  padT: number,
+  plotW: number,
+  plotH: number,
+): boolean {
+  return sx >= padL && sx <= padL + plotW && sy >= padT && sy <= padT + plotH;
+}
+
+function clampCarryVarPlotView(
+  next: CarryVarPlotView,
+  data: CarryVarPlotView,
+  carryS: number,
+): CarryVarPlotView {
+  const minXSpan = 0.01;
+  const maxXSpan = Math.max(data.xMax - data.xMin, minXSpan);
+  const xSpan = Math.min(maxXSpan, Math.max(minXSpan, next.xMax - next.xMin));
+  let xMin = next.xMin;
+  if (xMin < data.xMin) xMin = data.xMin;
+  if (xMin + xSpan > data.xMax) xMin = data.xMax - xSpan;
+
+  const minZSpan = 0.14;
+  const dataZMin = carryFwd(data.yMin, carryS);
+  const dataZMax = carryFwd(data.yMax, carryS);
+  const maxZSpan = Math.max(dataZMax - dataZMin, minZSpan);
+  let z0 = carryFwd(next.yMin, carryS);
+  let z1 = carryFwd(next.yMax, carryS);
+  if (z1 < z0) {
+    const swap = z0;
+    z0 = z1;
+    z1 = swap;
+  }
+  const zSpan = Math.min(maxZSpan, Math.max(minZSpan, z1 - z0));
+  if (z0 < dataZMin) z0 = dataZMin;
+  if (z0 + zSpan > dataZMax) z0 = dataZMax - zSpan;
+  return {
+    xMin,
+    xMax: xMin + xSpan,
+    yMin: carryS * Math.sinh(z0),
+    yMax: carryS * Math.sinh(z0 + zSpan),
+  };
+}
+
+function thinTicks(
+  values: readonly number[],
+  pos: (v: number) => number,
+  minGap: number,
+): number[] {
+  const preferred = [...values].sort((a, b) => {
+    const az = Math.abs(a) < 1e-12 ? -1 : 0;
+    const bz = Math.abs(b) < 1e-12 ? -1 : 0;
+    if (az !== bz) return az - bz;
+    return Math.abs(b) - Math.abs(a);
+  });
+  const kept: number[] = [];
+  for (const v of preferred) {
+    if (kept.every(u => Math.abs(pos(u) - pos(v)) >= minGap)) kept.push(v);
+  }
+  return kept.sort((a, b) => a - b);
+}
+
+function pickDotsAlongPolyline(
+  pts: readonly { x: number; y: number }[],
+  maxDots: number,
+  minGap: number,
+): Set<number> {
+  const n = pts.length;
+  if (n === 0) return new Set();
+  if (n <= maxDots) {
+    const all = new Set<number>();
+    let last = 0;
+    all.add(0);
+    for (let i = 1; i < n; i += 1) {
+      const near = i / n < 0.4;
+      const gap = near ? minGap * 0.5 : minGap;
+      if (Math.hypot(pts[i]!.x - pts[last]!.x, pts[i]!.y - pts[last]!.y) >= gap) {
+        all.add(i);
+        last = i;
+      }
+    }
+    all.add(n - 1);
+    return all;
+  }
+  const out = new Set<number>([0]);
+  let last = 0;
+  for (let i = 1; i < n - 1; i += 1) {
+    const near = i / n < 0.4;
+    const gap = near ? minGap * 0.5 : minGap;
+    if (Math.hypot(pts[i]!.x - pts[last]!.x, pts[i]!.y - pts[last]!.y) >= gap) {
+      out.add(i);
+      last = i;
+      if (out.size >= maxDots - 1) break;
+    }
+  }
+  out.add(n - 1);
+  return out;
+}
+
+function nearestFrontierIndex(
+  points: readonly PortfolioCarryFrontierPoint[],
+  targetVarUsd: number,
+): number {
+  if (points.length === 0) return -1;
+  let best = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    if (Math.abs(points[i]!.portfolioVarUsd - targetVarUsd)
+      < Math.abs(points[best]!.portfolioVarUsd - targetVarUsd)) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+function SelectedFrontierMark({
+  cx,
+  cy,
+  label,
+  detail,
+  plotRight,
+  plotTop,
+  plotBottom,
+}: {
+  cx: number;
+  cy: number;
+  label: string;
+  detail: string;
+  plotRight: number;
+  plotTop: number;
+  plotBottom: number;
+}) {
+  const flipX = cx + 14 > plotRight - 96;
+  const flipY = cy < plotTop + 28;
+  const tx = flipX ? cx - 14 : cx + 14;
+  const ty = flipY
+    ? Math.min(plotBottom - 18, cy + 20)
+    : Math.max(plotTop + 12, cy - 16);
+  return (
+    <g className="pointer-events-none">
+      <circle cx={cx} cy={cy} r={20} fill="#38bdf8" fillOpacity={0.14} />
+      <circle cx={cx} cy={cy} r={13} fill="none" stroke="#7dd3fc" strokeWidth={2.25} />
+      <circle cx={cx} cy={cy} r={7} fill="#38bdf8" stroke="#f8fafc" strokeWidth={2} />
+      <text
+        x={tx}
+        y={ty}
+        textAnchor={flipX ? 'end' : 'start'}
+        fontSize={10}
+        fontWeight={700}
+        fill="#e0f2fe"
+      >
+        {label}
+      </text>
+      <text
+        x={tx}
+        y={ty + 12}
+        textAnchor={flipX ? 'end' : 'start'}
+        fontSize={8}
+        fill="#94a3b8"
+      >
+        {detail}
+      </text>
+    </g>
+  );
+}
+
+function UniverseLegend({
+  swatch,
+  border,
+  label,
+}: {
+  swatch: 'solid' | 'dashed' | 'dot';
+  border: string;
+  label: string;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 font-mono text-[9px] text-slate-400">
+      {swatch === 'dot' ? (
+        <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+      ) : (
+        <span
+          className={`h-0 w-3.5 border-t-2 ${border} ${
+            swatch === 'dashed' ? 'border-dashed' : ''
+          }`}
+        />
+      )}
+      {label}
+    </span>
+  );
+}
+
+function PortfolioCarryVarFrontierPlot({
+  frontier,
+  overlayFrontier,
+  projectScenarioPoint,
+  matchModalAxis,
+  conservativePoint,
+  unhedgedOriginUsdM,
+  policyVAR,
+  confidencePct,
+  selectedScenarioId,
+  compact,
+  onApplyScenario,
+  onPickCustom,
+  onUseBalanced,
+}: {
+  frontier: PortfolioCarryFrontier;
+  /** Optional second walk. Portfolio plot leaves this unset so one S(t) arm is used. */
+  overlayFrontier?: PortfolioCarryFrontier | null;
+  projectScenarioPoint?: (p: PortfolioCarryFrontierPoint) => { x: number; y: number } | null;
+  /** Same asinh arms + live-book frame as the per-currency modal. */
+  matchModalAxis?: boolean;
+  /** Funded H* book (cash + swap, no CIP) — Conservative is not a $5M fill. */
+  conservativePoint?: PortfolioCarryFrontierPoint | null;
+  /** Priced walk origin (t = 0, $0 carry). Not the CFaR-tab Σ. */
+  unhedgedOriginUsdM?: number | null;
+  policyVAR: number;
   confidencePct: number;
+  selectedScenarioId?: PortfolioScenarioId | null;
+  compact?: boolean;
+  onApplyScenario?: (id: PortfolioScenarioId, point: PortfolioCarryFrontierPoint) => void;
+  onPickCustom?: (point: PortfolioCarryFrontierPoint) => void;
+  onUseBalanced?: () => void;
+}) {
+  const clipRaw = useId();
+  const clipId = `lu-clip-${clipRaw.replace(/:/g, '')}`;
+  const svgRef = useRef<SVGSVGElement>(null);
+  const zoomRef = useRef<{
+    W: number;
+    H: number;
+    padL: number;
+    padT: number;
+    plotW: number;
+    plotH: number;
+    xMin: number;
+    xMax: number;
+    yMin: number;
+    yMax: number;
+    carryS: number;
+    dataFrame: CarryVarPlotView;
+    setView: (next: CarryVarPlotView) => void;
+  } | null>(null);
+  const [hover, setHover] = useState<{
+    label: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [view, setView] = useState<CarryVarPlotView | null>(null);
+  const [panning, setPanning] = useState(false);
+  const dragRef = useRef<{
+    pointerId: number;
+    lastSx: number;
+    lastSy: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
+  const pts = frontier.points;
+  const farPts = frontier.farPoints;
+  const sweet = pts[frontier.sweetSpotIndex] ?? null;
+  const noHedge = pts[0] ?? null;
+  let today = pts[0]!;
+  for (const p of pts) {
+    if (Math.abs(p.portfolioVarUsd - policyVAR) < Math.abs(today.portfolioVarUsd - policyVAR)) {
+      today = p;
+    }
+  }
+  const scenarioDefs = portfolioScenarioDefs(
+    overlayFrontier ?? frontier,
+    confidencePct,
+    conservativePoint,
+    unhedgedOriginUsdM,
+    policyVAR,
+  );
+  const walkOriginX = noHedge && Number.isFinite(noHedge.portfolioVarUsd)
+    ? Math.max(0, noHedge.portfolioVarUsd)
+    : 0;
+  const x0 = walkOriginX;
+  const unhedgedOrigin = { x: x0, y: 0 };
+  const scenarioXy = (
+    p: PortfolioCarryFrontierPoint | null,
+    id?: PortfolioScenarioId,
+  ) => {
+    if (!p) return null;
+    // Unhedged is the walk origin the arms start at — priced t = 0, $0 carry.
+    if (id === 'unhedged') return unhedgedOrigin;
+    // Conservative is the funded H* book (cash + swap, no CIP). Do not
+    // project k=0 through the modal overlay mapper — that collapses it
+    // onto Unhedged ($0 carry).
+    if (id === 'conservative') {
+      return { x: p.portfolioVarUsd, y: p.totalCarryUsdYr };
+    }
+    return projectScenarioPoint?.(p) ?? { x: p.portfolioVarUsd, y: p.totalCarryUsdYr };
+  };
+  const selectedOverlayPoint = selectedScenarioId
+    ? scenarioDefs.find(s => s.id === selectedScenarioId)?.point ?? null
+    : null;
+  const selectedXy = scenarioXy(selectedOverlayPoint, selectedScenarioId ?? undefined);
+  const autoWindow = matchModalAxis
+    ? liveBookWindow(pts, selectedXy?.x)
+    : limitedUniverseWindow(pts, scenarioDefs, selectedScenarioId);
+  const standingWalk = frontier.walk === 'book-scale';
+  const chord = matchModalAxis || standingWalk ? null : unclampedRayChord(pts);
+
+  const W = 680;
+  const H = compact ? 220 : 340;
+  const padL = 72;
+  const padR = 40;
+  const padT = 32;
+  const padB = 40;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const autoXMin = autoWindow?.xMin ?? Math.max(0, x0 - 0.05);
+  const autoXMax = autoWindow?.xMax ?? Math.max(x0 + 0.025, ...pts.map(p => p.portfolioVarUsd));
+  const inAutoX = (v: number) => v >= autoXMin - 1e-9 && v <= autoXMax + 1e-9;
+
+  const openY = [
+    0,
+    ...pts.filter(p => inAutoX(p.portfolioVarUsd)).map(p => p.totalCarryUsdYr),
+    ...scenarioDefs.flatMap(s => {
+      if (!s.point) return [];
+      if (matchModalAxis && s.id !== 'conservative' && s.id !== 'balanced' && s.id !== 'unhedged') {
+        return [];
+      }
+      const xy = scenarioXy(s.point, s.id);
+      return xy && inAutoX(xy.x) ? [xy.y] : [];
+    }),
+  ].filter(Number.isFinite);
+  const farYInFrame = farPts
+    .filter(p => inAutoX(p.portfolioVarUsd))
+    .map(p => p.totalCarryUsdYr)
+    .filter(Number.isFinite);
+  const yMaxData = Math.max(0.012, ...openY);
+  const openLo = Math.min(0, ...openY);
+  const farLo = Math.min(0, ...farYInFrame);
+  let autoYMin: number;
+  let autoYMax: number;
+  let carryS: number;
+  if (matchModalAxis) {
+    const axis = carryAxisFromArms(openLo, yMaxData, farLo);
+    carryS = axis.s;
+    autoYMin = carryS * Math.sinh(axis.zNeg);
+    autoYMax = carryS * Math.sinh(axis.zPos);
+  } else {
+    const ySpan = Math.max(yMaxData - openLo, 0.012);
+    autoYMin = farLo >= openLo - ySpan * 2.5 ? Math.min(openLo, farLo) : openLo;
+    const yPad = Math.max((yMaxData - autoYMin) * 0.08, 0.004);
+    autoYMin = autoYMin < 0 ? autoYMin - yPad : autoYMin;
+    autoYMax = yMaxData + yPad;
+    carryS = Math.max(Math.abs(autoYMin), Math.abs(autoYMax), 1e-6) / 4;
+  }
+  const autoFrame: CarryVarPlotView = {
+    xMin: autoXMin,
+    xMax: autoXMax,
+    yMin: autoYMin,
+    yMax: autoYMax,
+  };
+
+  const allCarry = [
+    ...pts.map(p => p.totalCarryUsdYr),
+    ...farPts.map(p => p.totalCarryUsdYr),
+  ].filter(Number.isFinite);
+  const allCfar = [
+    ...pts.map(p => p.portfolioVarUsd),
+    ...farPts.map(p => p.portfolioVarUsd),
+  ].filter(Number.isFinite);
+  const dataFrame: CarryVarPlotView = {
+    xMin: 0,
+    xMax: Math.max(autoFrame.xMax, ...allCfar, 0.05) * 1.12,
+    yMin: Math.min(autoFrame.yMin, ...allCarry, 0),
+    yMax: Math.max(autoFrame.yMax, ...allCarry, 0.012),
+  };
+
+  useEffect(() => {
+    setView(null);
+  }, [selectedScenarioId]);
+
+  const xMin = view?.xMin ?? autoFrame.xMin;
+  const xMax = view?.xMax ?? autoFrame.xMax;
+  const yMin = view?.yMin ?? autoFrame.yMin;
+  const yMax = view?.yMax ?? autoFrame.yMax;
+  const inX = (v: number) => v >= xMin - 1e-9 && v <= xMax + 1e-9;
+  const inFrame = (px: number, py: number) =>
+    inX(px) && py >= yMin - 1e-9 && py <= yMax + 1e-9;
+
+  const zMin = carryFwd(yMin, carryS);
+  const zMax = carryFwd(yMax, carryS);
+  const zDen = zMax - zMin;
+  const xDen = xMax - xMin;
+  const x = (v: number) => padL + (xDen > 1e-12 ? ((v - xMin) / xDen) * plotW : 0);
+  const y = (v: number) => padT + (1 - (carryFwd(v, carryS) - zMin) / (zDen || 1)) * plotH;
+  const y0 = y(0);
+  const yTickMin = yMin;
+  const yTickMax = yMax;
+  const originInX = x0 >= xMin - 1e-9 && x0 <= xMax + 1e-9;
+  const zeroInY = yMin <= 1e-12 && yMax >= -1e-12;
+
+  zoomRef.current = {
+    W, H, padL, padT, plotW, plotH, xMin, xMax, yMin, yMax, carryS, dataFrame, setView,
+  };
+
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      const z = zoomRef.current;
+      if (!z) return;
+      const pt = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+      if (!pt || !inPlotRect(pt.sx, pt.sy, z.padL, z.padT, z.plotW, z.plotH)) {
+        return;
+      }
+      e.preventDefault();
+      if (e.deltaY === 0) return;
+      const zLo = carryFwd(z.yMin, z.carryS);
+      const zHi = carryFwd(z.yMax, z.carryS);
+      const az = zHi - ((pt.sy - z.padT) / z.plotH) * (zHi - zLo);
+      const factor = Math.exp(e.deltaY * (e.ctrlKey ? 0.005 : 0.0018));
+      if (Math.abs(factor - 1) < 0.001) return;
+      const nzLo = az - (az - zLo) * factor;
+      const nzHi = az + (zHi - az) * factor;
+      z.setView(clampCarryVarPlotView(
+        {
+          xMin: z.xMin,
+          xMax: z.xMax,
+          yMin: z.carryS * Math.sinh(nzLo),
+          yMax: z.carryS * Math.sinh(nzHi),
+        },
+        z.dataFrame,
+        z.carryS,
+      ));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const endPan = (e: PointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    if (drag.moved) {
+      suppressClickRef.current = true;
+      queueMicrotask(() => { suppressClickRef.current = false; });
+    }
+    dragRef.current = null;
+    setPanning(false);
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+  };
+
+  const onPlotPointerDown = (e: PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    const z = zoomRef.current;
+    const el = svgRef.current;
+    if (!z || !el) return;
+    const pt = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+    if (!pt || !inPlotRect(pt.sx, pt.sy, z.padL, z.padT, z.plotW, z.plotH)) return;
+    if (snapNamedNear(pt.sx, pt.sy)) return;
+    dragRef.current = { pointerId: e.pointerId, lastSx: pt.sx, lastSy: pt.sy, moved: false };
+  };
+
+  const onPlotPointerMove = (e: PointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current;
+    const z = zoomRef.current;
+    const el = svgRef.current;
+    if (!drag || !z || !el || drag.pointerId !== e.pointerId) return;
+    const pt = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+    if (!pt) return;
+    const dSx = pt.sx - drag.lastSx;
+    const dSy = pt.sy - drag.lastSy;
+    if (!drag.moved && Math.hypot(dSx, dSy) < 3) return;
+    if (!drag.moved) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* already captured */ }
+    }
+    drag.moved = true;
+    drag.lastSx = pt.sx;
+    drag.lastSy = pt.sy;
+    if (!panning) setPanning(true);
+    const xSpan = z.xMax - z.xMin;
+    const zLo = carryFwd(z.yMin, z.carryS);
+    const zHi = carryFwd(z.yMax, z.carryS);
+    const zSpan = zHi - zLo;
+    z.setView(clampCarryVarPlotView(
+      {
+        xMin: z.xMin - (dSx / z.plotW) * xSpan,
+        xMax: z.xMax - (dSx / z.plotW) * xSpan,
+        yMin: z.carryS * Math.sinh(zLo + (dSy / z.plotH) * zSpan),
+        yMax: z.carryS * Math.sinh(zHi + (dSy / z.plotH) * zSpan),
+      },
+      z.dataFrame,
+      z.carryS,
+    ));
+  };
+
+  const toPath = (rows: readonly { x: number; y: number }[]) =>
+    rows
+      .map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.x).toFixed(1)},${y(p.y).toFixed(1)}`)
+      .join(' ');
+
+  const forkAtUnhedged = (
+    path: readonly { x: number; y: number }[],
+  ): { x: number; y: number }[] => {
+    if (x0 <= 1e-9) return [...path];
+    const rest = path.filter(p => (
+      p.x >= x0 - 1e-9 && Math.hypot(p.x - x0, p.y) > 1e-4
+    ));
+    return [{ x: x0, y: 0 }, ...rest];
+  };
+  const openPath = forkAtUnhedged(pts.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr })));
+  const farPath = forkAtUnhedged(farPts.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr })));
+  const openInView = pts.filter(p => (
+    p.portfolioVarUsd >= x0 - 1e-9 && inFrame(p.portfolioVarUsd, p.totalCarryUsdYr)
+  ));
+  const farInView = farPts.filter(p => (
+    p.portfolioVarUsd >= x0 - 1e-9 && inFrame(p.portfolioVarUsd, p.totalCarryUsdYr)
+  ));
+  const openDotAt = pickDotsAlongPolyline(
+    openInView.map(p => ({ x: x(p.portfolioVarUsd), y: y(p.totalCarryUsdYr) })),
+    24,
+    7,
+  );
+  const farDotAt = pickDotsAlongPolyline(
+    farInView.map(p => ({ x: x(p.portfolioVarUsd), y: y(p.totalCarryUsdYr) })),
+    22,
+    7,
+  );
+
+  const xTickRaw = cfarKTicks(xMin, xMax);
+  if (xMin <= 1e-9 && !xTickRaw.some(v => Math.abs(v) < 1e-9)) xTickRaw.unshift(0);
+  if (x0 > 0 && !xTickRaw.some(v => Math.abs(v * 1000 - x0 * 1000) < 0.51)) {
+    xTickRaw.push(x0);
+  }
+  xTickRaw.sort((a, b) => a - b);
+  const xTicks: number[] = [];
+  const xPriority = [x0, ...(xMin <= 1e-9 ? [0] : [])];
+  for (const v of xPriority) {
+    if (v >= xMin - 1e-9 && v <= xMax + 1e-9 && xTicks.every(u => Math.abs(x(u) - x(v)) >= 22)) {
+      xTicks.push(v);
+    }
+  }
+  for (const v of xTickRaw) {
+    if (xTicks.every(u => Math.abs(x(u) - x(v)) >= 36)) xTicks.push(v);
+  }
+  xTicks.sort((a, b) => a - b);
+  const yTicks = thinTicks(
+    carryLogTicks(yTickMin, yTickMax).filter(v => {
+      const py = y(v);
+      return py >= padT - 2 && py <= padT + plotH + 2;
+    }),
+    y,
+    14,
+  );
+
+  const hoverTip = hover
+    ? `${hover.label} · carry ${fmtSignedK(hover.y)} · CFaR ${fmtAbsK(hover.x)}`
+    : null;
+
+  const walkPts = (overlayFrontier ?? frontier).points;
+  const selectedLabel = selectedScenarioId
+    ? (scenarioDefs.find(s => s.id === selectedScenarioId)?.label ?? selectedScenarioId)
+    : 'Custom';
+  const selectedDetail = selectedXy
+    ? `${fmtAbsK(selectedXy.x)} · ${fmtSignedK(selectedXy.y)}/yr`
+    : today
+      ? `${fmtAbsK(today.portfolioVarUsd)} · ${fmtSignedK(today.totalCarryUsdYr)}/yr`
+      : '';
+  const selectedMarkXy = selectedXy
+    ?? (today ? { x: today.portfolioVarUsd, y: today.totalCarryUsdYr } : null);
+  const walkX = selectedMarkXy?.x ?? policyVAR;
+  const walkIdx = nearestFrontierIndex(walkPts, walkX);
+  const canWalkPrev = walkIdx > 0;
+  const canWalkNext = walkIdx >= 0 && walkIdx < walkPts.length - 1;
+  const snapNamedNear = (px: number, py: number) => {
+    let best: { id: PortfolioScenarioId; point: PortfolioCarryFrontierPoint; d: number } | null = null;
+    for (const s of scenarioDefs) {
+      const xy = scenarioXy(s.point, s.id);
+      if (!s.point || !xy || s.breached) continue;
+      const d = Math.hypot(x(xy.x) - px, y(xy.y) - py);
+      if (d <= 12 && (!best || d < best.d)) {
+        const point = s.id === 'unhedged'
+          ? { ...s.point, k: 0, portfolioVarUsd: x0, totalCarryUsdYr: 0 }
+          : s.point;
+        best = { id: s.id, point, d };
+      }
+    }
+    return best;
+  };
+  const applyOpenPoint = (p: PortfolioCarryFrontierPoint) => {
+    const named = snapNamedNear(x(p.portfolioVarUsd), y(p.totalCarryUsdYr));
+    if (named && onApplyScenario) onApplyScenario(named.id, named.point);
+    else onPickCustom?.(p);
+  };
+  const walkBy = (dir: -1 | 1) => {
+    const next = walkPts[walkIdx + dir];
+    if (next) applyOpenPoint(next);
+  };
+  const pickNearestOpenAt = (clientX: number, clientY: number) => {
+    const el = svgRef.current;
+    const z = zoomRef.current;
+    if (!el || !z) return null;
+    const loc = svgLocalXY(el, clientX, clientY, z.W, z.H);
+    if (!loc) return null;
+    let best: PortfolioCarryFrontierPoint | null = null;
+    let bestD = Infinity;
+    for (const p of pts) {
+      const d = Math.hypot(x(p.portfolioVarUsd) - loc.sx, y(p.totalCarryUsdYr) - loc.sy);
+      if (d < bestD) {
+        bestD = d;
+        best = p;
+      }
+    }
+    return bestD <= 22 ? best : null;
+  };
+
+  return (
+    <div className={`rounded-[10px] border border-slate-700 bg-slate-950 ${compact ? 'p-2' : 'p-3'}`}>
+      <div className={`flex flex-wrap items-center gap-2 ${compact ? 'mb-1' : 'mb-2 gap-2.5'}`}>
+        <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
+          Carry vs CFaR
+        </span>
+        <InfoTip label="Limited universe">
+          {matchModalAxis ? (
+            <p>
+              One currency — same standing walk, cash carry, and CFaR as that
+              name&apos;s per-currency modal. Scroll inside the plot to zoom, drag
+              to pan, double-click to reset.
+              Conservative / Balanced still apply the overlay Policy VAR fill.
+            </p>
+          ) : frontier.sweetSpotIndex === -1 ? (
+            <p>
+              Straight Σ⁻¹μ ray — carry and CFaR scale together until a sold PAY name hits a floor.
+              {frontier.nearestClampVarUsd != null
+                ? ` First clamp is ${frontier.nearestClampCcy} at ${fmtAbsK(frontier.nearestClampVarUsd)}${
+                    frontier.nearestClampVarUsd > POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd * 4
+                      ? ' — past the bounded sweep, so this window never bends.'
+                      : '.'
+                  }`
+                : ' No sold name in this book has a Min floor or an expensive overdraft (r_OD > r_USD), so nothing clamps. Dashed line = the ray.'}
+            </p>
+          ) : standingWalk ? (
+            <p>
+              Same standing walk as a one-name left-end: S(t) = t × book, one
+              pricer through Conservative (t = 1). Green is open cash; pink is
+              far (cash + points). Unhedged is the CFaR-tab All CCY Net at $0
+              carry — both arms leave that point. Click a preset, a green
+              sample, or the open curve.
+            </p>
+          ) : (
+            <p>
+              Frame is the live book and the $0-carry origin. Carry Y is log-scaled
+              so the live bend is visible; scroll inside the plot to zoom, drag to
+              pan, double-click to reset.
+              Dashed = unclamped Σ⁻¹μ ray. Solid peels off when a PAY short hits its
+              floor. Max Carry clips unless you pick it. Click a preset, a green
+              sample, or the open curve for a custom fill. ◀ ▶ steps the
+              prerendered dots.
+            </p>
+          )}
+        </InfoTip>
+        {scenarioDefs.map(s => (
+          <button
+            key={s.id}
+            type="button"
+            disabled={!s.point || !onApplyScenario || s.breached}
+            onClick={() => {
+              if (!s.point || s.breached) return;
+              onApplyScenario?.(s.id, s.id === 'unhedged'
+                ? { ...s.point, k: 0, portfolioVarUsd: x0, totalCarryUsdYr: 0 }
+                : s.point);
+            }}
+            className={`inline-flex items-center gap-1 font-mono text-[9px] ${
+              s.breached
+                ? 'text-rose-400'
+                : selectedScenarioId === s.id ? 'font-semibold text-amber-200' : 'text-slate-400'
+            } ${s.point && onApplyScenario && !s.breached ? 'hover:text-slate-200' : 'cursor-not-allowed'}`}
+            title={s.breached
+              ? `${s.label} — POLICY BREACH: base standalone exposure alone exceeds $${s.breachTierUsd?.toFixed(0)}M, no overlay sizing fixes this`
+              : (s.point
+                ? `${s.label} — ${fmtAbsK(s.id === 'unhedged' ? x0 : s.point.portfolioVarUsd)} CFaR, ${fmtSignedK(s.id === 'unhedged' ? 0 : s.point.totalCarryUsdYr)}/yr`
+                : (s.disabledHint ?? 'not in this universe'))}
+          >
+            <span
+              className="h-1.5 w-1.5 rounded-full"
+              style={{ background: s.breached ? '#f43f5e' : (s.point ? PORTFOLIO_SCENARIO_COLORS[s.id] : '#475569') }}
+            />
+            {s.breached && '⚠ '}{s.label}
+            {selectedScenarioId === s.id && !s.breached && <span className="text-amber-300/80">sweet</span>}
+            {s.breached && <span className="text-rose-500">breach</span>}
+            {!s.point && !s.breached && <span className="text-slate-600">(n/a)</span>}
+          </button>
+        ))}
+        {!selectedScenarioId && selectedMarkXy && (
+          <span className="inline-flex items-center gap-1 font-mono text-[9px] font-semibold text-sky-200">
+            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+            Custom
+            <span className="font-normal text-slate-500">{selectedDetail}</span>
+          </span>
+        )}
+        {onPickCustom && walkPts.length > 1 && (
+          <span className="inline-flex items-center overflow-hidden rounded border border-slate-700">
+            <button
+              type="button"
+              disabled={!canWalkPrev}
+              title="Previous prerendered point"
+              onClick={() => walkBy(-1)}
+              className="px-1.5 py-0.5 font-mono text-[10px] text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:text-slate-700"
+            >
+              ◀
+            </button>
+            <button
+              type="button"
+              disabled={!canWalkNext}
+              title="Next prerendered point"
+              onClick={() => walkBy(1)}
+              className="px-1.5 py-0.5 font-mono text-[10px] text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:text-slate-700"
+            >
+              ▶
+            </button>
+          </span>
+        )}
+        {((overlayFrontier && overlayFrontier.sweetSpotIndex >= 0
+          && overlayFrontier.points[overlayFrontier.sweetSpotIndex])
+          || sweet) && onUseBalanced && selectedScenarioId !== 'balanced' && !compact && (
+          <button
+            type="button"
+            onClick={onUseBalanced}
+            className="ml-auto shrink-0 rounded border border-amber-400/50 bg-amber-500/10 px-2 py-0.5 font-mono text-[9px] font-semibold text-amber-300 hover:bg-amber-500/20"
+            title={`Assign the Balanced sweet spot: ${fmtAbsK(
+              (overlayFrontier?.points[overlayFrontier.sweetSpotIndex] ?? sweet)!.portfolioVarUsd,
+            )} CFaR`}
+          >
+            use Balanced {fmtAbsK(
+              (overlayFrontier?.points[overlayFrontier.sweetSpotIndex] ?? sweet)!.portfolioVarUsd,
+            )}
+          </button>
+        )}
+      </div>
+      <div className="mb-2 flex flex-wrap items-baseline gap-3">
+        <span className="font-mono text-[9px] text-slate-500">
+          Origin: carry $0 @ section {noHedge ? fmtAbsK(noHedge.portfolioVarUsd) : '—'}
+          {matchModalAxis ? ' · same engine as CCY modal' : ' · log Y'} · scroll in plot to zoom · drag to pan
+        </span>
+        {view && (
+          <button
+            type="button"
+            onClick={() => setView(null)}
+            className="font-mono text-[9px] text-sky-400 hover:text-sky-300"
+          >
+            reset zoom
+          </button>
+        )}
+        <span className="ml-auto flex flex-wrap gap-2.5">
+          <UniverseLegend swatch="solid" border="border-emerald-400" label="open · cash" />
+          <UniverseLegend swatch="solid" border="border-rose-400" label="far · cash + points" />
+          {!matchModalAxis && !standingWalk && (
+            <UniverseLegend swatch="dashed" border="border-slate-400" label="unclamped ray" />
+          )}
+          <UniverseLegend swatch="dot" border="border-sky-400" label="selected" />
+        </span>
+      </div>
+      <div className="relative" style={{ overscrollBehavior: 'contain' }}>
+        <svg
+          ref={svgRef}
+          viewBox={`0 0 ${W} ${H}`}
+          className="block w-full touch-none select-none overflow-hidden rounded-md border border-slate-800 bg-slate-950/50"
+          tabIndex={0}
+          role="img"
+          aria-label="Carry versus CFaR. Arrow keys step prerendered points."
+          onDoubleClick={() => setView(null)}
+          onPointerDown={onPlotPointerDown}
+          onPointerMove={onPlotPointerMove}
+          onPointerUp={endPan}
+          onPointerCancel={endPan}
+          onClick={e => {
+            if (suppressClickRef.current) return;
+            const el = svgRef.current;
+            const z = zoomRef.current;
+            if (!el || !z) return;
+            const loc = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+            if (!loc) return;
+            const named = snapNamedNear(loc.sx, loc.sy);
+            if (named && onApplyScenario) {
+              onApplyScenario(named.id, named.point);
+            }
+          }}
+          onKeyDown={e => {
+            if (e.key === 'ArrowLeft' && canWalkPrev) {
+              e.preventDefault();
+              walkBy(-1);
+            } else if (e.key === 'ArrowRight' && canWalkNext) {
+              e.preventDefault();
+              walkBy(1);
+            }
+          }}
+        >
+          <defs>
+            <clipPath id={clipId}>
+              <rect x={padL} y={padT} width={plotW} height={plotH} />
+            </clipPath>
+          </defs>
+          <text x={padL + plotW / 2} y={H - 6} textAnchor="middle" fontSize={9} fill="#94a3b8">
+            CFaR ($K) — risk
+          </text>
+          <text
+            x={13}
+            y={padT + plotH / 2}
+            textAnchor="middle"
+            fontSize={9}
+            fill="#94a3b8"
+            transform={`rotate(-90 13 ${padT + plotH / 2})`}
+          >
+            Carry ($K/yr) — log
+          </text>
+          <line x1={padL} y1={padT} x2={W - padR} y2={padT} stroke="#334155" strokeWidth={1} />
+          <line x1={padL} y1={padT} x2={padL} y2={H - padB} stroke="#475569" strokeWidth={1} />
+          <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#334155" strokeWidth={1} />
+          {xTicks.map(v => (
+            <g key={`xt-${v}`}>
+              <line x1={x(v)} y1={H - padB} x2={x(v)} y2={H - padB + 4} stroke="#64748b" />
+              <text
+                x={x(v)}
+                y={H - padB + 15}
+                textAnchor="middle"
+                fontSize={8}
+                fill={Math.abs(v - x0) < 1e-6 ? '#e2e8f0' : '#cbd5e1'}
+              >
+                {fmtK(v)}
+              </text>
+            </g>
+          ))}
+          {yTicks.map(v => (
+            <g key={`yt-${v}`}>
+              <line x1={padL - 4} y1={y(v)} x2={padL} y2={y(v)} stroke="#64748b" />
+              <text
+                x={padL - 7}
+                y={y(v) + 3}
+                textAnchor="end"
+                fontSize={8}
+                fill={Math.abs(v) < 1e-9 ? '#e2e8f0' : '#cbd5e1'}
+              >
+                {Math.abs(v) < 1e-9 ? '$0' : fmtK(v)}
+              </text>
+            </g>
+          ))}
+          {originInX && (
+            <line x1={x(x0)} y1={padT} x2={x(x0)} y2={H - padB} stroke="#334155" strokeWidth={1} />
+          )}
+          {zeroInY && (
+            <line x1={padL} y1={y0} x2={W - padR} y2={y0} stroke="#94a3b8" strokeWidth={1.2} />
+          )}
+          {originInX && zeroInY && (
+            <>
+              <text x={x(x0) + 8} y={y0 + 12} fontSize={8} fill="#e2e8f0">
+                carry $0
+              </text>
+              <text x={x(x0) + 8} y={y0 + 23} fontSize={8} fill="#94a3b8">
+                unhedged {fmtAbsK(x0)}
+              </text>
+            </>
+          )}
+          <rect
+            x={padL}
+            y={padT}
+            width={plotW}
+            height={plotH}
+            fill="transparent"
+            className={panning ? 'cursor-grabbing' : 'cursor-grab'}
+          />
+          <g clipPath={`url(#${clipId})`}>
+            {chord && chord.length >= 2 && (
+              <path
+                d={toPath(chord)}
+                fill="none"
+                stroke="#64748b"
+                strokeWidth={1.25}
+                strokeDasharray="5 4"
+              />
+            )}
+            {openPath.length >= 2 && (
+              <path d={toPath(openPath)} fill="none" stroke="#34d399" strokeWidth={1.8} />
+            )}
+            {openPath.length >= 2 && onPickCustom && (
+              <path
+                d={toPath(openPath)}
+                fill="none"
+                stroke="transparent"
+                strokeWidth={16}
+                className="cursor-pointer"
+                onClick={e => {
+                  e.stopPropagation();
+                  if (suppressClickRef.current) return;
+                  const hit = pickNearestOpenAt(e.clientX, e.clientY);
+                  if (hit) applyOpenPoint(hit);
+                }}
+              />
+            )}
+            {farPath.length >= 2 && (
+              <path d={toPath(farPath)} fill="none" stroke="#fb7185" strokeWidth={1.6} />
+            )}
+          </g>
+          {farInView.map((p, i) => (
+            farDotAt.has(i) ? (
+              <circle
+                key={`f-${i}`}
+                cx={x(p.portfolioVarUsd)}
+                cy={y(p.totalCarryUsdYr)}
+                r={3.5}
+                fill="#fb7185"
+                stroke="#0b1220"
+                strokeWidth={1}
+                className="pointer-events-none"
+              />
+            ) : null
+          ))}
+          {openInView.map((p, i) => (
+            openDotAt.has(i) ? (
+              <g key={`o-${i}`}>
+                {onPickCustom && (
+                  <circle
+                    cx={x(p.portfolioVarUsd)}
+                    cy={y(p.totalCarryUsdYr)}
+                    r={9}
+                    fill="transparent"
+                    className="cursor-pointer"
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (suppressClickRef.current) return;
+                      applyOpenPoint(p);
+                    }}
+                    onDoubleClick={e => e.stopPropagation()}
+                    onMouseEnter={() => setHover({
+                      label: 'Custom sample',
+                      x: p.portfolioVarUsd,
+                      y: p.totalCarryUsdYr,
+                    })}
+                    onMouseLeave={() => setHover(null)}
+                  />
+                )}
+                <circle
+                  cx={x(p.portfolioVarUsd)}
+                  cy={y(p.totalCarryUsdYr)}
+                  r={3.5}
+                  fill="#34d399"
+                  stroke="#0b1220"
+                  strokeWidth={1}
+                  className="pointer-events-none"
+                />
+              </g>
+            ) : null
+          ))}
+          {scenarioDefs.map(s => {
+            const xy = scenarioXy(s.point, s.id);
+            if (!s.point || !xy || !inFrame(xy.x, xy.y)) return null;
+            const fill = s.breached ? '#f43f5e' : (PORTFOLIO_SCENARIO_COLORS[s.id] ?? '#94a3b8');
+            const p = s.id === 'unhedged'
+              ? { ...s.point, k: 0, portfolioVarUsd: x0, totalCarryUsdYr: 0 }
+              : s.point;
+            return (
+              <g
+                key={s.id}
+                onPointerDown={e => e.stopPropagation()}
+              >
+                <circle
+                  cx={x(xy.x)}
+                  cy={y(xy.y)}
+                  r={11}
+                  fill="transparent"
+                  className={onApplyScenario && !s.breached ? 'cursor-pointer' : undefined}
+                  onClick={e => {
+                    e.stopPropagation();
+                    if (suppressClickRef.current) return;
+                    if (onApplyScenario && !s.breached) onApplyScenario(s.id, p);
+                  }}
+                  onDoubleClick={e => e.stopPropagation()}
+                  onMouseEnter={() => setHover({
+                    label: s.breached ? `${s.label} (breach)` : s.label,
+                    x: xy.x,
+                    y: xy.y,
+                  })}
+                  onMouseLeave={() => setHover(null)}
+                />
+                <circle
+                  cx={x(xy.x)}
+                  cy={y(xy.y)}
+                  r={5}
+                  fill={fill}
+                  stroke="#0b1220"
+                  strokeWidth={1}
+                  className="pointer-events-none"
+                />
+              </g>
+            );
+          })}
+          {selectedMarkXy && inFrame(selectedMarkXy.x, selectedMarkXy.y) && (
+            <SelectedFrontierMark
+              cx={x(selectedMarkXy.x)}
+              cy={y(selectedMarkXy.y)}
+              label={selectedLabel}
+              detail={selectedDetail}
+              plotRight={padL + plotW}
+              plotTop={padT}
+              plotBottom={padT + plotH}
+            />
+          )}
+        </svg>
+        {hoverTip && (
+          <div className="pointer-events-none absolute right-2 top-2 rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[9px] font-semibold text-slate-200">
+            {hoverTip}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function SelectedStrategyDetail({
+  result,
+  isLive,
+  onInspectCcy,
+  residualByCcy,
+  onResidualChange,
+  preparedByCcy,
+  overlayLegs,
+  onStage,
+  onStageAll,
+  onResetDesk,
+  onApplyPortfolioDelta,
+  canApplyPortfolioDelta,
+}: {
+  result: LiquidityStrategyResult;
+  isLive: boolean;
   onInspectCcy: (ccy: string) => void;
+  residualByCcy: Record<string, number>;
+  onResidualChange: (ccy: string, residual: number) => void;
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  overlayLegs?: readonly EfficientCarryLeg[];
+  onStage?: (
+    ccy: string,
+    residual: number,
+    schedule: LiquidityStrategyCcy['schedule'],
+  ) => void;
+  onStageAll?: () => void;
+  onResetDesk: () => void;
+  onApplyPortfolioDelta?: () => void;
+  canApplyPortfolioDelta?: boolean;
 }) {
   // Open every CCY nest by default so leg pricing is on screen; chevron still
   // collapses. Switching programme re-opens so a new book is never hidden.
@@ -778,76 +3577,159 @@ function SelectedStrategyDetail({
     });
 
   const book = strategyBookCarryK(result.byCcy);
-  const unfundedByCcy = new Map(
-    (unfunded?.byCcy ?? []).map(c => [c.ccy, c] as const),
+  const swapCarryK = book.swap + book.cip;
+  const mixJoin = joinOverlayStripWeights(
+    overlayLegs ?? [],
+    result.byCcy.map(c => ({
+      ccy: c.ccy,
+      bookNow: c.bookNow,
+      outstanding: stripOutstanding(c),
+    })),
   );
-  const unfundedBook = unfunded ? strategyBookCarryK(unfunded.byCcy) : null;
-  const vsDoNothingUsdM = unfundedBook
-    ? (book.total - unfundedBook.total) / 1000
-    : 0;
-  const weightedUsdM = probabilityWeightedReturnUsdM(
-    book.total / 1000,
-    result.finalCfarUsdM,
-    confidencePct,
-    unfunded?.finalCfarUsdM ?? 0,
-  );
-  const tailPct = (cfarTailProbability(confidencePct) * 100).toFixed(0);
+  const mixByCcy = new Map(mixJoin.map(r => [r.ccy, r]));
+  const modeledCount = Object.keys(residualByCcy).length;
+  const stageable = result.byCcy.filter(c => {
+    const residual = residualByCcy[c.ccy];
+    return residual != null && residualNeedsFxStage(residual) && c.schedule.length > 0;
+  });
 
   return (
     <section>
       <ChapterLabel
         n={4}
         title="Book"
-        hint={isLive ? 'live desk' : 'preview'}
+        info={
+          <>
+            <p>
+              Funding-swap ledger only. Mix w% is the Σ⁻¹μ overlay at the sweet (H* − hold). Strip
+              w% is this programme’s swap-book USD. Δ residual 1 = open (stage FX strip) · 0 = far
+              (CIP on). Auto Δ copies the last frontier mix across the portfolio. Reset desk
+              restores the precomputed per-CCY swap programmes. Staged packages land in FX Risk,
+              Carry, and Decision.
+            </p>
+            <p className="mt-1.5">
+              Click a CCY to open the frontier. Chevron expands legs only.
+            </p>
+          </>
+        }
       />
       <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
-        <div className="mb-3">
+        <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
           <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
             {result.strategy.label}
             {isLive ? ' · live desk' : ' · preview'}
           </div>
-          <p className="mt-1.5 text-[10px] text-slate-500">
-            Click CCY for frontier · Carry − standing CFaR × {tailPct}% →{' '}
-            <span className="font-semibold text-slate-300">{fmtSignedK(weightedUsdM)}</span>
-          </p>
+          <div className="flex shrink-0 flex-wrap items-center gap-1">
+            {onApplyPortfolioDelta ? (
+              <button
+                type="button"
+                disabled={!canApplyPortfolioDelta}
+                onClick={onApplyPortfolioDelta}
+                title={
+                  canApplyPortfolioDelta
+                    ? 'Apply the last frontier Δ to every CCY strip (portfolio flow)'
+                    : 'Pick a Δ mix on a currency frontier first'
+                }
+                className="rounded border border-violet-500/50 bg-violet-500/15 px-2 py-1 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Auto Δ
+              </button>
+            ) : null}
+            <button
+              type="button"
+              disabled={modeledCount === 0}
+              onClick={onResetDesk}
+              title="Restore per-CCY precomputed swap programmes (launch desk)"
+              className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Reset desk
+            </button>
+            {onStageAll && stageable.length > 0 ? (
+              <button
+                type="button"
+                onClick={onStageAll}
+                title="Stage every Δ>0 strip for FX Risk / Carry / Decision"
+                className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30"
+              >
+                Stage all
+              </button>
+            ) : null}
+          </div>
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[640px] text-left text-xs">
+          <table className="w-full min-w-[820px] text-left text-xs">
             <thead>
               <tr className="border-b border-slate-800 text-slate-500">
                 <th className="py-2 pr-3 font-medium">CCY</th>
-                <th className="py-2 pr-3 font-medium">Struct</th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Strip settle-window skew — funding legs are not strip-skewed"
+                  title="Signed L1 share of Σ⁻¹μ overlay USD at the sweet (H* − hold)"
                 >
-                  Settle skew
+                  Mix w%
                 </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Signed L1 share of this programme’s swap-book USD"
+                >
+                  Strip w%
+                </th>
+                <th className="py-2 pr-3 font-medium">Struct</th>
                 <th className="py-2 pr-3 font-medium">Schedule</th>
-                <th className="py-2 pr-3 font-medium">Hedge Δ</th>
-                <th className="py-2 pr-3 font-medium">FWD pts</th>
-                <th className="py-2 pr-3 font-medium">Total carry</th>
-                <th className="py-2 pr-3 font-medium">Δ vs do nothing</th>
-                <th className="py-2 font-medium">Weighted return</th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Frontier residual Δ · 1 open (CIP off, stage FX) · 0 far (CIP on)"
+                >
+                  Δ
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Near-leg book-now in M FCY — funding-swap standing, not the FX hedge"
+                >
+                  Swap Near
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Swap notional outstanding once every leg on the funded path is on — every earlier leg is rolled or held, not run off, so the legs add up. Same figure as Swap Book on the desk."
+                >
+                  Swap Book
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Standing-book cash Δr (desk Buffer Carry) — not Cash Carry"
+                >
+                  Swap cash
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Far-leg CIP on the funding swap — scaled by (1−Δ)"
+                >
+                  CIP
+                </th>
+                <th
+                  className="py-2 font-medium"
+                  title="Swap cash + CIP"
+                >
+                  Swap carry
+                </th>
               </tr>
             </thead>
             <tbody>
               {result.byCcy.map(c => {
                 const canOpen = c.schedule.length > 0;
                 const open = canOpen && !collapsed.has(c.ccy);
-                const carryUsdM = rowCarryUsdM(c);
-                const vsUsdM = unfundedByCcy.has(c.ccy)
-                  ? carryUsdM - rowCarryUsdM(unfundedByCcy.get(c.ccy)!)
-                  : 0;
-                const floorCfar = unfundedByCcy.get(c.ccy)?.cfarUsdM ?? 0;
-                const weighted = probabilityWeightedReturnUsdM(
-                  carryUsdM,
-                  c.cfarUsdM,
-                  confidencePct,
-                  floorCfar,
-                );
+                const carryUsdM = swapCarryUsdM(c);
                 const struct = fundingStructLabel(result.strategy, c.schedule);
                 const schedule = compactFundingSchedule(c.schedule);
+                const endingBook = c.schedule.length > 0
+                  ? c.schedule[c.schedule.length - 1]!.outstanding
+                  : 0;
+                const modeled = Object.prototype.hasOwnProperty.call(residualByCcy, c.ccy);
+                const residual = modeled ? residualByCcy[c.ccy]! : 0;
+                const staged = preparedByCcy?.[c.ccy]?.preparedFor === 'liquidity';
+                const canStage = Boolean(
+                  onStage && modeled && residualNeedsFxStage(residual) && canOpen,
+                );
+                const mixRow = mixByCcy.get(c.ccy);
                 return (
                   <Fragment key={c.ccy}>
                     <tr
@@ -878,39 +3760,75 @@ function SelectedStrategyDetail({
                           </button>
                         )}
                         {c.ccy}
+                        {staged ? (
+                          <span className="ml-1.5 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 font-mono text-[8px] font-semibold uppercase tracking-wide text-emerald-200">
+                            Staged
+                          </span>
+                        ) : null}
+                      </td>
+                      <td
+                        className="py-2 pr-3 font-mono"
+                        title={mixRow ? `Overlay ${fmtSignedK(mixRow.overlayUsdM)} · ${fmtM(mixRow.overlayFcyM)} FCY` : 'No overlay mix'}
+                      >
+                        {mixRow ? fmtWeight(mixRow.overlayWeight) : '—'}
+                      </td>
+                      <td className="py-2 pr-3 font-mono text-amber-200">
+                        {mixRow ? fmtWeight(mixRow.stripWeight) : '—'}
                       </td>
                       <td className="py-2 pr-3 font-mono capitalize text-violet-300/90">
                         {struct}
                       </td>
-                      <td
-                        className="py-2 pr-3 font-mono text-slate-500"
-                        title="Funding legs are not strip-skewed"
-                      >
-                        —
-                      </td>
                       <td className="py-2 pr-3 font-mono text-amber-200/90">
                         {schedule}
+                      </td>
+                      <td
+                        className="py-2 pr-3"
+                        onClick={e => e.stopPropagation()}
+                        onKeyDown={e => e.stopPropagation()}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="range"
+                            min={0}
+                            max={100}
+                            step={1}
+                            value={Math.round(residual * 100)}
+                            aria-label={`${c.ccy} residual delta`}
+                            title="1 open · 0 far"
+                            onChange={e => {
+                              onResidualChange(c.ccy, Number(e.target.value) / 100);
+                            }}
+                            className="h-1 w-16 accent-yellow-300"
+                          />
+                          <span className="w-8 font-mono text-[10px] text-yellow-200">
+                            {modeled ? residual.toFixed(2) : 'desk'}
+                          </span>
+                          {canStage ? (
+                            <button
+                              type="button"
+                              onClick={() => onStage?.(c.ccy, residual, c.schedule)}
+                              className="rounded border border-violet-500/50 bg-violet-500/20 px-1.5 py-0.5 text-[9px] font-semibold text-violet-100 hover:bg-violet-500/30"
+                            >
+                              {staged ? 'Restage' : 'Stage'}
+                            </button>
+                          ) : null}
+                        </div>
                       </td>
                       <td className="py-2 pr-3 font-mono text-sky-300">
                         {fmtM(c.bookNow)}
                       </td>
-                      <td className="py-2 pr-3 font-mono text-emerald-300/90">
+                      <td className={`py-2 pr-3 font-mono ${moneyTone(endingBook)}`}
+                        title="Standing after every leg on the funded path is on">
+                        {Math.abs(endingBook) > 0.001 ? fmtM(endingBook) : '—'}
+                      </td>
+                      <td className={`py-2 pr-3 font-mono ${moneyTone(c.swapInterestUsdYrM)}`}>
+                        {fmtSignedK(c.swapInterestUsdYrM)}
+                      </td>
+                      <td className={`py-2 pr-3 font-mono ${moneyTone(c.swapPointsUsdYrM)}`}>
                         {fmtSignedK(c.swapPointsUsdYrM)}
                       </td>
-                      <td className={`py-2 pr-3 font-mono font-semibold ${
-                        carryUsdM >= 0 ? 'text-slate-300' : 'text-rose-300'
-                      }`}>
+                      <td className={`py-2 font-mono font-semibold ${moneyTone(carryUsdM)}`}>
                         {fmtSignedK(carryUsdM)}
-                      </td>
-                      <td className={`py-2 pr-3 font-mono ${
-                        Math.abs(vsUsdM) < 5e-5
-                          ? 'text-slate-500'
-                          : vsUsdM >= 0 ? 'text-emerald-200' : 'text-rose-300'
-                      }`}>
-                        {fmtSignedK(vsUsdM)}
-                      </td>
-                      <td className={`py-2 font-mono ${moneyTone(weighted)}`}>
-                        {fmtSignedK(weighted)}
                       </td>
                     </tr>
                     {open &&
@@ -922,26 +3840,46 @@ function SelectedStrategyDetail({
                           <td className="py-1.5 pl-5 pr-3 font-mono text-sky-200/90">
                             {l.preBookable ? 'Fwd-start' : 'Spot'}
                           </td>
+                          <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
+                          <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
                           <td className="py-1.5 pr-3 font-mono text-slate-500">
                             trade
                           </td>
-                          <td className="py-1.5 pr-3 text-slate-600">—</td>
                           <td className="py-1.5 pr-3 font-mono text-amber-200/80">
-                            M{l.valueDateMonths + 1}
+                            {l.settleMonths > 1 ? `${l.settleMonths}M far` : `M${l.valueDateMonths + 1}`}
+                          </td>
+                          <td className="py-1.5 pr-3 font-mono text-yellow-200/80">
+                            {modeled ? `${fmtM(residual * l.newLeg)} Δ` : '—'}
                           </td>
                           <td className="py-1.5 pr-3 font-mono text-slate-400">
                             {fmtM(l.newLeg)}
                           </td>
-                          <td className="py-1.5 pr-3 font-mono text-emerald-300/80">
+                          <td className="py-1.5 pr-3 font-mono text-slate-500"
+                            title="Rolled forward from earlier legs + this leg — every earlier leg is rolled or held, not run off">
+                            {Math.abs(l.outstanding) > 0.001 ? fmtM(l.outstanding) : '—'}
+                          </td>
+                          <td
+                            className={`py-1.5 pr-3 font-mono ${moneyTone(l.interestUsdYr)}`}
+                            title={`FCY ${fmtSignedK(l.fcyOnUsdYr)} · USD ${fmtSignedK(l.usdOnUsdYr)}`}
+                          >
+                            {fmtSignedK(l.interestUsdYr)}
+                          </td>
+                          <td
+                            className={`py-1.5 pr-3 font-mono ${moneyTone(l.pointsUsdYr)}`}
+                            title={
+                              l.midPoints != null
+                                ? `Mid ${l.midPoints.toFixed(2)} pts · ${l.settleMonths}M`
+                                : undefined
+                            }
+                          >
                             {fmtSignedK(l.pointsUsdYr)}
                           </td>
                           <td
-                            className={`py-1.5 pr-3 font-mono ${moneyTone(l.netUsdYr)}`}
+                            className={`py-1.5 font-mono ${moneyTone(l.netUsdYr)}`}
+                            title={`FCY ${fmtSignedK(l.fcyOnUsdYr)} · USD ${fmtSignedK(l.usdOnUsdYr)} · CIP ${fmtSignedK(l.pointsUsdYr)}`}
                           >
                             {fmtSignedK(l.netUsdYr)}
                           </td>
-                          <td className="py-1.5 pr-3 text-slate-600">—</td>
-                          <td className="py-1.5 text-slate-600">—</td>
                         </tr>
                       ))}
                   </Fragment>
@@ -950,7 +3888,7 @@ function SelectedStrategyDetail({
             </tbody>
             <tfoot>
               <tr className="border-t-2 border-slate-600 bg-slate-900/80 font-mono text-slate-200">
-                <td className="py-2 pr-3 font-semibold text-white" colSpan={4}>
+                <td className="py-2 pr-3 font-semibold text-white" colSpan={6}>
                   TOTAL $USD
                 </td>
                 <td className="py-2 pr-3 font-semibold text-sky-300">
@@ -958,26 +3896,21 @@ function SelectedStrategyDetail({
                     ? `${result.bookNowUsdM >= 0 ? '' : '−'}$${Math.abs(result.bookNowUsdM).toFixed(2)}M`
                     : '—'}
                 </td>
-                <td className="py-2 pr-3 font-semibold text-emerald-300">
+                <td className="py-2 pr-3 text-slate-500">—</td>
+                <td className={`py-2 pr-3 font-semibold ${moneyTone(book.swap / 1000)}`}>
+                  {fmtSignedK(book.swap / 1000)}
+                </td>
+                <td className={`py-2 pr-3 font-semibold ${moneyTone(book.cip / 1000)}`}>
                   {fmtSignedK(book.cip / 1000)}
                 </td>
-                <td className="py-2 pr-3 font-semibold text-emerald-100">
-                  {fmtSignedK(book.total / 1000)}
-                </td>
-                <td className={`py-2 pr-3 font-semibold ${moneyTone(vsDoNothingUsdM)}`}>
-                  {fmtSignedK(vsDoNothingUsdM)}
-                </td>
-                <td className={`py-2 font-semibold ${moneyTone(weightedUsdM)}`}>
-                  {fmtSignedK(weightedUsdM)}
+                <td className={`py-2 font-semibold ${moneyTone(swapCarryK / 1000)}`}>
+                  {fmtSignedK(swapCarryK / 1000)}
                 </td>
               </tr>
             </tfoot>
           </table>
         </div>
       </section>
-      <p className="mt-1.5 px-0.5 font-mono text-[9px] leading-snug text-slate-500">
-        Hedge Δ is the near-leg book-now in M FCY · child rows are each funding trade · ▾ hides them.
-      </p>
     </section>
   );
 }

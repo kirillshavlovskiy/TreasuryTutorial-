@@ -1,6 +1,7 @@
 /** Test-mode domain — Sigma Tasks on the workspace Entity → Dashboard → Simulator flow. */
 
 import type { EntityHedgeBook } from '@/lib/test-mode/hedge-var';
+import type { VarSetup } from '@/lib/test-mode/var-setup';
 import type { Workspace } from '@/lib/workspace-store';
 
 /** Resume location inside the sandbox task UI. */
@@ -95,11 +96,19 @@ export interface TestSandboxState {
   lastScore?: TaskScoreResult;
   /** Decision-layer hedge books keyed by entity id (or group scope). */
   hedgesByEntityId?: Record<string, EntityHedgeBook>;
+  /** Workbench desk VaR setup (not Task 01 answers). */
+  varSetup?: VarSetup;
   /** Last UI location so practice resumes where the student stopped. */
   ui?: SandboxUiState;
   seededAt: string;
   /** Wall-clock update time — used to merge local vs server copies. */
   updatedAt?: string;
+  /**
+   * Bumped only when the hedge book changes (book / prepare / overlay).
+   * Structure and navigation saves must keep the previous value so a thinner
+   * PUT cannot replace a richer Postgres row.
+   */
+  hedgesUpdatedAt?: string;
 }
 
 export interface ScoreCheck {

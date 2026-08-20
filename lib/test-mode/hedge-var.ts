@@ -3,8 +3,10 @@ import {
   fxBookNetLocalM,
   roundMoney,
   usdToFcyM,
+  type LayerId,
   type RowState,
 } from '@/lib/fx-buffer';
+import type { SwapForwardOverlay } from '@/lib/fx-hedge';
 import {
   effectiveForecastUncertainty1m,
   effectiveMonthlyFxFlowLocalM,
@@ -704,12 +706,13 @@ export interface PreparedHedgeProfile {
   swapPointsSide?: 'bid' | 'ask' | 'mid';
   /**
    * Which objective shaped this package — FX Risk's equal-VaR path chart
-   * ('var') or Cash Carry's Shape search / tick-trades editor ('carry').
+   * ('var'), Cash Carry's Shape search / tick-trades editor ('carry'), or
+   * Liquidity Book's residual-Δ funding strip ('liquidity').
    * Surfaced in Hedging Decision so the desk knows which lens sized what's
    * about to be booked. Undefined for packages prepared before this tag
    * existed.
    */
-  preparedFor?: 'var' | 'carry';
+  preparedFor?: 'var' | 'carry' | 'liquidity';
 }
 
 /** Staged (prepared) FX-hedge FWD-points carry per CCY — same $M as Decision Carry. */
@@ -754,6 +757,26 @@ export type CarryProfileSessionV1 = {
   shapeStartManual: boolean;
 };
 
+/**
+ * Overlay / residual Δ / Policy VAR the desk is running.
+ * Not a booked ticket — still has to round-trip with the hedge book or every
+ * reload / Fast Refresh wipes the programme the user just set.
+ */
+export interface EntityHedgeDeskState {
+  residualByCcy?: Record<string, number>;
+  swapForwardDeltaByRowId?: Record<string, number>;
+  optionDeltaByRowId?: Record<string, number>;
+  /** Live Swap+Fwd replacement overlay — must survive reload, not only React state. */
+  swapForwardOverlayByCcy?: Record<string, SwapForwardOverlay>;
+  hedgeStrategy?: string;
+  policyVAR?: number;
+  portfolioCarryK?: number;
+  /** Buffer chips (carry / floor / portfolio / CFaR) — must survive remount. */
+  activeLayers?: LayerId[];
+  /** Overlay sweet-spot chip (conservative / balanced / maxCarry / maxReturn). */
+  portfolioScenarioId?: string;
+}
+
 /** Per-entity (or group-scope) Decision-layer hedge book. */
 export interface EntityHedgeBook {
   bookedHedges: HedgeTicket[];
@@ -764,6 +787,8 @@ export interface EntityHedgeBook {
   carrySessionsByCcy?: Record<string, CarryProfileSessionV1>;
   /** Uploaded market-data curve (deposits + swap points) per CCY. */
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  /** Live overlay / residual Δ / Policy VAR (Analytics Liquidity desk). */
+  desk?: EntityHedgeDeskState;
 }
 
 export function emptyHedgeBook(): EntityHedgeBook {
@@ -773,7 +798,43 @@ export function emptyHedgeBook(): EntityHedgeBook {
     preparedByCcy: {},
     carrySessionsByCcy: {},
     marketRatesByCcy: {},
+    desk: {},
   };
+}
+
+export type HedgeTicketsPatch =
+  | HedgeTicket[]
+  | ((prev: HedgeTicket[]) => HedgeTicket[]);
+
+export type PreparedHedgesPatch =
+  | Record<string, PreparedHedgeProfile>
+  | ((prev: Record<string, PreparedHedgeProfile>) => Record<string, PreparedHedgeProfile>);
+
+export function applyHedgeTicketsPatch(
+  prev: HedgeTicket[],
+  patch: HedgeTicketsPatch,
+): HedgeTicket[] {
+  return typeof patch === 'function' ? patch(prev) : patch;
+}
+
+export function applyPreparedHedgesPatch(
+  prev: Record<string, PreparedHedgeProfile> | undefined,
+  patch: PreparedHedgesPatch,
+): Record<string, PreparedHedgeProfile> {
+  return typeof patch === 'function' ? patch(prev ?? {}) : patch;
+}
+
+/** Residual Δ from staged liquidity packages, then any explicit desk overlay. */
+export function residualByCcyFromBook(
+  book: Pick<EntityHedgeBook, 'preparedByCcy' | 'desk'>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [ccy, profile] of Object.entries(book.preparedByCcy ?? {})) {
+    if (profile.preparedFor === 'liquidity' && typeof profile.hedgeRatio === 'number') {
+      out[ccy] = profile.hedgeRatio;
+    }
+  }
+  return { ...out, ...(book.desk?.residualByCcy ?? {}) };
 }
 
 export function setPreparedHedgeForCcy(
@@ -850,6 +911,7 @@ export function applyConsolidatedBookedChange(
       preparedByCcy: prev[id]?.preparedByCcy ?? {},
       carrySessionsByCcy: prev[id]?.carrySessionsByCcy ?? {},
       marketRatesByCcy: prev[id]?.marketRatesByCcy ?? {},
+      ...(prev[id]?.desk ? { desk: prev[id]?.desk } : {}),
     };
   }
   out[GROUP_HEDGE_SCOPE] = {
@@ -858,6 +920,9 @@ export function applyConsolidatedBookedChange(
     preparedByCcy: prev[GROUP_HEDGE_SCOPE]?.preparedByCcy ?? {},
     carrySessionsByCcy: prev[GROUP_HEDGE_SCOPE]?.carrySessionsByCcy ?? {},
     marketRatesByCcy: prev[GROUP_HEDGE_SCOPE]?.marketRatesByCcy ?? {},
+    ...(prev[GROUP_HEDGE_SCOPE]?.desk
+      ? { desk: prev[GROUP_HEDGE_SCOPE]?.desk }
+      : {}),
   };
   return out;
 }

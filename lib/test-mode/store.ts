@@ -1,9 +1,21 @@
 import {
+  hedgeSidecarStorageKey,
+  hedgeWorkspaceFitScore,
+  mergeHedgeBooksPreservingPrepared,
+  mergeHedgesWithSidecar,
+  normalizeHedgeBooksMap,
+  parseHedgeSidecar,
+  pickHedgeBooksForWrite,
+  rebindHedgeBooksToWorkspace,
+  serializeHedgeSidecar,
+} from '@/lib/hedge-book-normalize';
+import { NORDTECH_ENTITY_IDS } from '@/lib/test-mode/fixtures/nordtech-accounts';
+import {
   createEntity,
   type Workspace,
 } from '@/lib/workspace-store';
 import { ensureTask01FxLayers } from '@/lib/test-mode/score';
-import type { EntityHedgeBook } from '@/lib/test-mode/hedge-var';
+import type { VarSetup } from '@/lib/test-mode/var-setup';
 import type {
   SandboxUiState,
   TaskAnswers,
@@ -66,16 +78,19 @@ export function seedNordtechWorkspace(): Workspace {
   let ws: Workspace = { entities: [] };
   const specs = [
     {
+      id: NORDTECH_ENTITY_IDS.us,
       name: 'NordTech US',
       baseCurrency: 'USD',
       description: 'Parent · USD hub — settles group cash',
     },
     {
+      id: NORDTECH_ENTITY_IDS.de,
       name: 'NordTech GmbH',
       baseCurrency: 'EUR',
       description: 'Frankfurt · EUR operating hub · debt · EU billing',
     },
     {
+      id: NORDTECH_ENTITY_IDS.pl,
       name: 'NordTech Poland',
       baseCurrency: 'PLN',
       description: 'Kraków · PLN payroll entity',
@@ -129,41 +144,9 @@ function isEntityShape(e: unknown): e is { name: string; baseCurrency: string; i
   );
 }
 
-function normalizeHedges(
-  raw: unknown,
-): Record<string, EntityHedgeBook> {
-  if (!raw || typeof raw !== 'object') return {};
-  const out: Record<string, EntityHedgeBook> = {};
-  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (!value || typeof value !== 'object') continue;
-    const book = value as {
-      bookedHedges?: unknown;
-      hedgeRatios?: unknown;
-      preparedByCcy?: unknown;
-      carrySessionsByCcy?: unknown;
-      marketRatesByCcy?: unknown;
-    };
-    out[key] = {
-      bookedHedges: Array.isArray(book.bookedHedges) ? book.bookedHedges : [],
-      hedgeRatios:
-        book.hedgeRatios && typeof book.hedgeRatios === 'object'
-          ? (book.hedgeRatios as Record<string, number>)
-          : {},
-      preparedByCcy:
-        book.preparedByCcy && typeof book.preparedByCcy === 'object'
-          ? (book.preparedByCcy as EntityHedgeBook['preparedByCcy'])
-          : {},
-      carrySessionsByCcy:
-        book.carrySessionsByCcy && typeof book.carrySessionsByCcy === 'object'
-          ? (book.carrySessionsByCcy as EntityHedgeBook['carrySessionsByCcy'])
-          : {},
-      marketRatesByCcy:
-        book.marketRatesByCcy && typeof book.marketRatesByCcy === 'object'
-          ? (book.marketRatesByCcy as EntityHedgeBook['marketRatesByCcy'])
-          : {},
-    };
-  }
-  return out;
+function normalizeVarSetupBlob(raw: unknown): VarSetup | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  return raw as VarSetup;
 }
 
 function normalizeUi(raw: unknown): SandboxUiState {
@@ -188,12 +171,26 @@ export function normalizeSandboxState(parsed: unknown): TestSandboxState {
   const seeded = seedSandbox();
   if (!parsed || typeof parsed !== 'object') return seeded;
   const blob = parsed as StoredBlob;
+  const hedges = normalizeHedgeBooksMap(blob.hedgesByEntityId);
 
-  if (!blob.workspace || !Array.isArray(blob.workspace.entities)) {
-    return seeded;
-  }
-  if (!blob.workspace.entities.every(isEntityShape)) {
-    return seeded;
+  if (
+    !blob.workspace
+    || !Array.isArray(blob.workspace.entities)
+    || !blob.workspace.entities.every(isEntityShape)
+  ) {
+    return {
+      ...seeded,
+      hedgesByEntityId: rebindHedgeBooksToWorkspace(
+        hedges,
+        seeded.workspace.entities,
+        normalizeUi(blob.ui).entityId,
+      ),
+      varSetup: normalizeVarSetupBlob(blob.varSetup) ?? seeded.varSetup,
+      ui: normalizeUi(blob.ui),
+      updatedAt: blob.updatedAt ?? seeded.updatedAt,
+      hedgesUpdatedAt:
+        typeof blob.hedgesUpdatedAt === 'string' ? blob.hedgesUpdatedAt : undefined,
+    };
   }
 
   const group = blob.group?.dashboard
@@ -210,6 +207,7 @@ export function normalizeSandboxState(parsed: unknown): TestSandboxState {
 
   const defaults = defaultTaskProgress();
   const workspace = ensureTask01FxLayers(blob.workspace);
+  const ui = normalizeUi(blob.ui);
 
   return {
     workspace,
@@ -220,44 +218,133 @@ export function normalizeSandboxState(parsed: unknown): TestSandboxState {
       steps: { ...defaults.steps, ...blob.progress?.steps },
     },
     lastScore: blob.lastScore,
-    hedgesByEntityId: normalizeHedges(blob.hedgesByEntityId),
-    ui: normalizeUi(blob.ui),
+    hedgesByEntityId: rebindHedgeBooksToWorkspace(
+      hedges,
+      workspace.entities,
+      ui.entityId,
+    ),
+    varSetup: normalizeVarSetupBlob(blob.varSetup),
+    ui,
     seededAt: blob.seededAt ?? new Date().toISOString(),
     updatedAt: blob.updatedAt ?? new Date().toISOString(),
+    hedgesUpdatedAt:
+      typeof blob.hedgesUpdatedAt === 'string' ? blob.hedgesUpdatedAt : undefined,
   };
 }
 
-export function loadSandbox(userKey: string): TestSandboxState {
-  if (typeof window === 'undefined') return seedSandbox();
+function getLocalStorage(): Storage | null {
   try {
-    const raw = window.localStorage.getItem(storageKey(userKey));
-    if (!raw) return seedSandbox();
-    const parsed = JSON.parse(raw) as StoredBlob;
-    // Migrate away from pre-v2 account-ladder sandbox shape.
-    // v3 → v4 is additive (hedges/ui); keep workspace/answers/progress.
-    if (!parsed?.version || parsed.version < 3) return seedSandbox();
-    const state = normalizeSandboxState(parsed);
-    // Persist layer / v4 backfill so Validate matches what the UI already shows.
-    saveSandbox(userKey, state);
-    return state;
+    return globalThis.window?.localStorage ?? null;
   } catch {
-    return seedSandbox();
+    return null;
   }
 }
 
-export function saveSandbox(userKey: string, state: TestSandboxState): void {
-  if (typeof window === 'undefined') return;
+function readHedgeSidecar(userKey: string) {
+  const storage = getLocalStorage();
+  if (!storage) return null;
+  try {
+    return parseHedgeSidecar(
+      storage.getItem(hedgeSidecarStorageKey(storageKey(userKey))),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function writeHedgeSidecar(
+  userKey: string,
+  hedges: TestSandboxState['hedgesByEntityId'],
+  hedgesUpdatedAt?: string,
+  storage: Storage | null = getLocalStorage(),
+): void {
+  if (!storage) return;
+  const payload = serializeHedgeSidecar(hedges, hedgesUpdatedAt);
+  try {
+    storage.setItem(
+      hedgeSidecarStorageKey(storageKey(userKey)),
+      payload,
+    );
+  } catch {
+    // Quota — full blob write may still succeed, or Neon PUT will.
+  }
+}
+
+function withSidecarHedges(state: TestSandboxState, userKey: string): TestSandboxState {
+  const picked = mergeHedgesWithSidecar(
+    state.hedgesByEntityId,
+    state.hedgesUpdatedAt,
+    readHedgeSidecar(userKey),
+  );
+  return {
+    ...state,
+    hedgesByEntityId: rebindHedgeBooksToWorkspace(
+      picked.hedgesByEntityId,
+      state.workspace.entities,
+      state.ui?.entityId,
+    ),
+    hedgesUpdatedAt: picked.hedgesUpdatedAt,
+  };
+}
+
+function peekSandboxState(userKey: string): TestSandboxState {
+  const storage = getLocalStorage();
+  if (!storage) return seedSandbox();
+  try {
+    const raw = storage.getItem(storageKey(userKey));
+    if (!raw) return withSidecarHedges(seedSandbox(), userKey);
+    const parsed = JSON.parse(raw) as StoredBlob;
+    // Migrate away from pre-v2 account-ladder sandbox shape.
+    // v3 → v4 is additive (hedges/ui); keep workspace/answers/progress.
+    if (!parsed?.version || parsed.version < 3) {
+      return withSidecarHedges(seedSandbox(), userKey);
+    }
+    return withSidecarHedges(normalizeSandboxState(parsed), userKey);
+  } catch {
+    return withSidecarHedges(seedSandbox(), userKey);
+  }
+}
+
+/** Read local sandbox. Never writes — a GET/hydration must not clobber a newer book. */
+export function loadSandbox(userKey: string): TestSandboxState {
+  return peekSandboxState(userKey);
+}
+
+export function saveSandbox(
+  userKey: string,
+  state: TestSandboxState,
+  opts?: { replaceHedges?: boolean },
+): void {
+  const storage = getLocalStorage();
+  if (!storage) return;
+  const incoming = normalizeSandboxState(state);
+  const existing = opts?.replaceHedges ? null : peekSandboxState(userKey);
+  const picked = existing
+    ? pickHedgeBooksForWrite(
+        incoming.hedgesByEntityId,
+        existing.hedgesByEntityId,
+        incoming.hedgesUpdatedAt,
+        existing.hedgesUpdatedAt,
+      )
+    : {
+        hedgesByEntityId: incoming.hedgesByEntityId,
+        hedgesUpdatedAt: incoming.hedgesUpdatedAt,
+      };
   const blob: StoredBlob = {
-    ...normalizeSandboxState(state),
+    ...incoming,
+    hedgesByEntityId: picked.hedgesByEntityId,
+    hedgesUpdatedAt: picked.hedgesUpdatedAt,
     updatedAt: state.updatedAt ?? new Date().toISOString(),
     version: STATE_VERSION,
   };
-  window.localStorage.setItem(storageKey(userKey), JSON.stringify(blob));
+  // Sidecar first: a quota throw on the fat workspace blob must not drop hedges.
+  writeHedgeSidecar(userKey, blob.hedgesByEntityId, blob.hedgesUpdatedAt, storage);
+  storage.setItem(storageKey(userKey), JSON.stringify(blob));
 }
 
 export function resetSandbox(userKey: string, taskId = '01'): TestSandboxState {
   const next = seedSandbox(taskId);
-  saveSandbox(userKey, next);
+  saveSandbox(userKey, next, { replaceHedges: true });
   return next;
 }
 
@@ -298,6 +385,7 @@ export function workspaceFxProfileCount(state: TestSandboxState): number {
 /**
  * Prefer the side with real FX setup when timestamps alone would keep an empty
  * reseed over a completed Task 01 workspace (common after guest/localStorage drift).
+ * When profile counts tie, keep the workspace whose entity ids still match the hedge book.
  */
 export function preferWorkspaceSetup(
   primary: TestSandboxState,
@@ -308,46 +396,60 @@ export function preferWorkspaceSetup(
   if (secondaryScore > primaryScore) {
     return { workspace: secondary.workspace, group: secondary.group };
   }
+  if (secondaryScore === primaryScore) {
+    const primaryFit = hedgeWorkspaceFitScore(
+      primary.hedgesByEntityId,
+      primary.workspace.entities.map(e => e.id),
+    );
+    const secondaryFit = hedgeWorkspaceFitScore(
+      secondary.hedgesByEntityId,
+      secondary.workspace.entities.map(e => e.id),
+    );
+    if (secondaryFit > primaryFit) {
+      return { workspace: secondary.workspace, group: secondary.group };
+    }
+  }
   return { workspace: primary.workspace, group: primary.group };
 }
 
+export { mergeHedgeBooksPreservingPrepared } from '@/lib/hedge-book-normalize';
+
 /**
- * Union prepared packages across two hedge maps so a newer workspace/UI
- * snapshot cannot drop Analytics "Prepare" packages still present on the
- * other copy (local ↔ server merge).
+ * Server PUT guard: a newer empty / structure-only / thinner hedge blob must
+ * not replace booked tickets, prepared packages, or desk overlay already in
+ * Postgres. A stale PUT (older updatedAt) is merged into the existing row.
  */
-export function mergeHedgeBooksPreservingPrepared(
-  primary: Record<string, EntityHedgeBook> | undefined,
-  secondary: Record<string, EntityHedgeBook> | undefined,
-): Record<string, EntityHedgeBook> {
-  const keys = new Set([
-    ...Object.keys(primary ?? {}),
-    ...Object.keys(secondary ?? {}),
-  ]);
-  const out: Record<string, EntityHedgeBook> = {};
-  for (const key of keys) {
-    const a = primary?.[key];
-    const b = secondary?.[key];
-    // Union by ticket id — a primary-only pick silently dropped every
-    // booked hedge on the other side whenever primary had at least one.
-    const byId = new Map((b?.bookedHedges ?? []).map(t => [t.id, t] as const));
-    for (const t of a?.bookedHedges ?? []) byId.set(t.id, t);
-    out[key] = {
-      bookedHedges: [...byId.values()],
-      hedgeRatios: { ...(b?.hedgeRatios ?? {}), ...(a?.hedgeRatios ?? {}) },
-      preparedByCcy: {
-        ...(b?.preparedByCcy ?? {}),
-        ...(a?.preparedByCcy ?? {}),
-      },
-      carrySessionsByCcy: {
-        ...(b?.carrySessionsByCcy ?? {}),
-        ...(a?.carrySessionsByCcy ?? {}),
-      },
-      marketRatesByCcy: {
-        ...(b?.marketRatesByCcy ?? {}),
-        ...(a?.marketRatesByCcy ?? {}),
-      },
+export function sandboxStateWithProtectedHedges(
+  incoming: TestSandboxState,
+  existing: TestSandboxState | null | undefined,
+): TestSandboxState {
+  if (!existing) return incoming;
+  const incomingAt = Date.parse(incoming.updatedAt ?? '') || 0;
+  const existingAt = Date.parse(existing.updatedAt ?? '') || 0;
+  if (incomingAt < existingAt) {
+    return {
+      ...existing,
+      hedgesByEntityId: mergeHedgeBooksPreservingPrepared(
+        existing.hedgesByEntityId,
+        incoming.hedgesByEntityId,
+      ),
+      hedgesUpdatedAt:
+        (Date.parse(incoming.hedgesUpdatedAt ?? '') || 0)
+          > (Date.parse(existing.hedgesUpdatedAt ?? '') || 0)
+          ? incoming.hedgesUpdatedAt
+          : existing.hedgesUpdatedAt,
     };
   }
-  return out;
+
+  const picked = pickHedgeBooksForWrite(
+    incoming.hedgesByEntityId,
+    existing.hedgesByEntityId,
+    incoming.hedgesUpdatedAt,
+    existing.hedgesUpdatedAt,
+  );
+  return {
+    ...incoming,
+    hedgesByEntityId: picked.hedgesByEntityId,
+    hedgesUpdatedAt: picked.hedgesUpdatedAt,
+  };
 }

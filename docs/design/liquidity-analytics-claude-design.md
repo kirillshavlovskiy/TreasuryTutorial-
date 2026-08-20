@@ -106,7 +106,7 @@ Chapter labels: `1 · Summary` · `2 · Controls` · `3 · Regimes` · `4 · Boo
 
 ## 1 · Summary cards
 
-4-up grid. Semantic kit from the hedge-carry modal / CFaR cards.
+4-up **one row** (never wrap to 2×2). One strip, `grid-cols-4 divide-x`, compact `text-sm` values.
 
 | Card | Color | Value | Sub |
 |------|-------|-------|-----|
@@ -162,13 +162,15 @@ Do not add Book now / Peak / Trips / Gap here — those belong on the per-CCY bo
 
 Same chrome as Cash Carry · Hedging summary. Header: `{Regime label} · live desk | preview`.
 
-Helper one-liner: *Click CCY for frontier · Carry × 100% − CFaR × {tail}% → {weighted}*.
+Helper one-liner: *Funding-swap ledger only · Swap cash + CIP → {swap carry}*.
 
-**Columns (always):** CCY · Struct · Settle skew · Schedule · Hedge Δ · FWD pts · Total carry · Δ vs do nothing · Weighted return
+**Columns (always):** CCY · Struct · Schedule · Swap Near · Swap cash · CIP · Swap carry
 
 Same chrome as Cash Carry · Hedging summary (`rounded-lg border … p-3`, `text-xs`).
 
-Settle skew is `—` (funding legs are not strip-skewed). Schedule is a **span** (`M1–M12`), never `M1/M2/…/M12`. Value dates live in the ▸ nest.
+This table is the **funding-swap book**, not the desk Cash Carry / Hedge FWD ledger. Cash Carry, Hedge FWD, Total carry, Δ vs do nothing, and Weighted return stay on chapter 1 cards and chapter 3 regimes.
+
+Schedule is a **span** (`M1–M12`), never `M1/M2/…/M12`. Value dates live in the ▸ nest.
 
 **Struct badges** (violet, like Cash Carry Strip/Bullet):
 
@@ -179,19 +181,19 @@ Settle skew is `—` (funding legs are not strip-skewed). Schedule is a **span**
 | rollingProgramme | `strip · N` |
 | termSwap | `bullet` or `term · N` |
 
-Hedge Δ = near-leg `bookNow` in M FCY (sky). FWD pts = CIP $K (emerald). Value dates live in the leg nest, not as a Schedule column.
+Swap Near = near-leg `bookNow` in M FCY (sky). Swap cash = standing cash Δr / Buffer Carry (sky). CIP = far-leg points $K (emerald). Swap carry = Swap cash + CIP. Value dates live in the leg nest, not as a Schedule column.
 
 CCY cell: ticker + ▸▾ if a leg schedule exists. **Row click opens the frontier.** Chevron click expands the nest only (`stopPropagation`).
 
 Hover `hover:bg-violet-500/10`. CCY `text-violet-200`.
 
-`tfoot` **TOTAL $USD** when ≥1 CCY: Book now $M · CIP · Total · Δ vs do nothing · Weighted.
+`tfoot` **TOTAL $USD** when ≥1 CCY: Swap Near $M · Swap cash · CIP · Swap carry.
 
 ### Leg schedule nest
 
 Same pattern as Cash Carry expand: `border-emerald-500/30` is *hedge*; this nest is **funding** — use `border-sky-500/30 bg-slate-950/70`.
 
-Columns: Value date · Trade (`spot-start swap` amber / `fwd-start swap` sky) · New leg · Rolled in · Outstanding · FCY O/N · USD O/N · Points · Leg carry.
+Columns: Spot / Fwd-start · trade · M{n} · New leg · Swap cash (FCY+USD Δr) · CIP · Leg carry (cash + CIP).
 
 Footer: Book total = Swap cash + CIP (same as the parent row). Caption: *Each line is that cycle’s standing book — not the unfunded liquidity path.*
 
@@ -213,7 +215,7 @@ Reuse **`docs/design/design-system-claude.md`**.
 
 - Panel: `rounded-xl border border-slate-700 bg-slate-900` (shell already on `VarAnalyticsPanel`)
 - Section: `rounded-lg border border-slate-700 bg-slate-950/40 p-3`
-- Cards: 4-up · `text-[9px]` labels · `font-mono text-sm` values
+- Cards: 4-up one row · `text-[9px]` labels · `font-mono text-sm` values
 - Tables: `text-[10px] font-mono` · head `text-slate-500` · `min-w-[640px]` / `[720px]`
 - Semantic: Carry emerald · CFaR / risk amber-rose · Cover / swap sky · Schedule amber · CCY / Decision violet · Live emerald · Selected sky · Open arm emerald · Far arm rose · Target Carry amber · Target VAR sky
 - Liquidity / funding gap (if shown): fuchsia / amber — `text-fuchsia-300/80`
@@ -244,10 +246,10 @@ Cash Carry is **identical** across funded rows (desk cash, not the swap). Near v
 
 ### Book (EUR row)
 
-| CCY | Struct | Hedge Δ | FWD pts | Total | Δ vs OD | Weighted |
-|-----|--------|---------|---------|-------|---------|----------|
-| EUR | strip · 6 | −12.40M | −$8.2K | +$14.1K | −$3.2K | +$6.0K |
-| GBP | strip · 6 | +8.10M | −$4.1K | +$7.9K | +$2.1K | +$4.4K |
+| CCY | Struct | Schedule | Swap Near | Swap cash | CIP | Swap carry |
+|-----|--------|----------|-----------|-----------|-----|------------|
+| EUR | strip · 6 | M1–M12 | −12.40M | +$22K | −$8.2K | +$13.8K |
+| GBP | strip · 6 | M1–M12 | +8.10M | +$11K | −$4.1K | +$6.9K |
 
 EUR frontier: origin CFaR **$359K** · carry **$0**. Green arm up and right; red arm down and right. Amber horizontal at Target Carry; two gold rings at the same X (open + / far −). Dashed tail after book S.
 
@@ -265,7 +267,7 @@ EUR frontier: origin CFaR **$359K** · carry **$0**. Green arm up and right; red
 8. **Cash Carry identical across strategies** — if the table implies it changes with the swap, the desk will not trust the ledger.
 9. **Near vs Rolling** look like duplicates on carry — keep the summary/tradeoff visible so the difference (rollover vs lock-today) is readable.
 10. **Do not mix books** — frontier S is swap exposure, not a liquidity-book close; no funded opening in any path sparkline you add later.
-11. **Settle skew column is a dash** — hide it rather than teaching a false FX-hedge concept on the funding book.
+11. **Book columns are funding-swap only** — Swap cash + CIP + Swap carry. Do not put Cash Carry, Hedge FWD, Total, Δ vs do nothing, or Weighted on this table.
 12. **All-CCY CFaR** on the regime row is an RSS/sum of the displayed bridge — caption it as the strategy total, not a diversified portfolio VaR (that lives on Portfolio VAR).
 
 ---
@@ -304,7 +306,7 @@ Already implemented; layout around it, do not replace the math.
 ## Deliverables
 
 1. **Chapter wire** — tab top→bottom (summary · controls · regimes · book)
-2. **Summary card layout** — 4-up + live/preview state
+2. **Summary card layout** — 4-up one row + live/preview state
 3. **Regime + book tables** — columns, badges, selection, nest
 4. **Frontier** — defer to `liquidity-frontier-modal-claude-design.md` (chart + controls, no table)
 5. **What changed** vs the current stacked prose (bullet list)
@@ -331,7 +333,7 @@ HARD SPLIT: liquidity path (open/trough/close) never includes the funding swap.
 Frontier S is swap-book notional (exposure to hedge), not a liquidity close.
 
 CHAPTERS (top → bottom)
-1. Summary cards: Total carry (emerald), Final CFaR (amber/rose), Weighted
+1. Summary cards: one row · Total carry (emerald), Final CFaR (amber/rose), Weighted
    return (sky), Live regime (emerald) or Preview (violet)
 2. Controls toolbar: Confidence 90/95/99 (blue) + buffer chips
    (Min floor amber · Forecast accuracy sky · Buffer Carry emerald ·
@@ -339,14 +341,15 @@ CHAPTERS (top → bottom)
 3. Regimes table: Regime (Live/Selected badges) · Constraint · Cash · Swap
    cash · CIP · Total · Final CFaR · Weighted. Click selects. No persist.
 4. Book table (selected regime): CCY · Struct (near/strip/bullet)
-   · Hedge Δ · FWD pts · Total · Δ vs do nothing · Weighted.
+   · Schedule · Swap Near · Swap cash · CIP · Swap carry.
    Row click → frontier modal (separate brief). Chevron → funding-leg nest only.
 
 FRONTIER MODAL: see liquidity-frontier-modal-claude-design.md — chart +
 controls to pick a return/risk sweet spot. No point table.
 
-FIX: kill the two prose strips; add summary cards; Live vs Preview; hide the
-dummy Settle-skew column; Cash Carry must look the same on every funded regime.
+FIX: kill the two prose strips; add summary cards; Live vs Preview; Book is
+swap cash + CIP only (no Cash/Hedge/Total/Δ/Weighted); Cash Carry must look
+the same on every funded regime.
 
 OUTPUT: Chapter wire · card layout · table columns/badges · Tailwind-class notes
 (frontier modal is a separate prompt)

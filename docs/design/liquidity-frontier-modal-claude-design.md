@@ -115,7 +115,7 @@ X ticks must be distinct $K (never a row of identical `$359K`).
 
 Click a dot to pick. Hover: faint ring + tooltip `{arm} · S {n} · carry {$K} · CFaR {$K} · E[return] {$K}`.
 
-Min floor **zooms the steep left** (small S). Carry / VAR **frames the cut in the plot** (tail past the gold ring, far arm below $0 kept visible) so the constraint is not glued to the ceiling. Sample **geometrically** from ~$0.25K (next to origin / section CFaR) so the green arm is not a few long chords.
+**Frame the live book and the $0-carry origin** (section CFaR labelled on the point and as an X tick). Do not scale the axes to the leveraged dashed tail — Leverage adds that tail and it clips. Min floor keeps the steep left readable. Carry / VAR still draws the cut if it sits on the live book. Sample **geometrically** from ~$0.25K (next to origin / section CFaR) so the green arm is not a few long chords.
 
 **Do not:** a 3rd independent axis; linear fake CFaR; pin every point to section CFaR; non-zero carry on the origin; spray 25/50/75 covers onto every S as a third family of arms (Δ lives on the **selected S** only — RSS mix, not a straight chord); CIP in Y except as far-arm points; a data table under the plot.
 

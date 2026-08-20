@@ -7,9 +7,20 @@ import {
   scaleFundingPlanByRetention,
   retainedFundingPlanByCcy,
   analyticsForwardsFromOverlays,
+  stripHedgeLegCarryUsdM,
+  fwdCarryForExposureCoverUsdM,
+  fwdHedgeCarryFromMarketUsd,
 } from './fx-hedge';
-import { fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
-import { DEFAULT_EURUSD_MARKET_RATES } from './fx-market-rates';
+import { CURRENCY_PARAMS, fcyToUsdM, fundingSwapCipPointsUsdYr } from './fx-buffer';
+import {
+  DEFAULT_EURUSD_MARKET_RATES,
+  emptyMarketRatesForCcy,
+  type FxMarketRatesBundle,
+} from './fx-market-rates';
+import {
+  hedgeImprovementBreakdownToT,
+  assignImpliedCarryFromSwapPoints,
+} from './test-mode/cash-carry-analytics';
 
 describe('resolveStrategyHedge — book-wide strategy selection', () => {
   // forecastFx = current book + cycle flows (flows = −50: payouts exceed payins).
@@ -250,7 +261,7 @@ describe('resolveStrategyHedge — book-wide strategy selection', () => {
       marketRates: DEFAULT_EURUSD_MARKET_RATES,
       farSettleMonths: 12,
     });
-    expect(h.cipCarryUsdYr).toBeCloseTo(swapNear * (170.98 / 10_000), 6);
+    expect(h.cipCarryUsdYr).toBeCloseTo(swapNear * (170.1 / 10_000), 6);
     const cash = fundingSwapCipPointsUsdYr(
       swapNear, fcyToUsdM(1, 'EUR'), 1.78, 3.50,
     );
@@ -455,5 +466,159 @@ describe('allocateSwapForwardOverlay + retention helpers', () => {
     expect(legs).toHaveLength(1);
     expect(legs[0]!.amountLocalM).toBeCloseTo(overlay.forwardLocalM, 9);
     expect(legs[0]!.amountLocalM).not.toBeCloseTo(overlay.remainingFarLocalM, 6);
+  });
+});
+
+describe('stripHedgeLegCarryUsdM — conversion cash', () => {
+  const rates = { creditPct: 3.41, debitPct: 4.41 };
+  const usd = { creditPct: 3.50, debitPct: 3.89 };
+
+  it('selling FCY earns USD credit and pays FCY debit', () => {
+    const sell = stripHedgeLegCarryUsdM({
+      notionalLocalM: -10,
+      ccy: 'PLN',
+      recognizeMonths: 0,
+      settleMonths: 6,
+      forecastEndMonths: 12,
+      fcyFwdRates: rates,
+      usdFwdRates: usd,
+      fcyCashRates: rates,
+      usdCashRates: usd,
+    });
+    expect(sell.fcyInterestUsdM).toBeLessThan(0);
+    expect(sell.usdInterestUsdM).toBeGreaterThan(0);
+    expect(sell.fwdCarryUsdM).toBeGreaterThan(0);
+  });
+
+  it('buying PLN forward pays FWD points and USD; FCY credit only after the buy', () => {
+    const buy = stripHedgeLegCarryUsdM({
+      notionalLocalM: 10,
+      ccy: 'PLN',
+      recognizeMonths: 0,
+      settleMonths: 6,
+      forecastEndMonths: 12,
+      fcyFwdRates: rates,
+      usdFwdRates: usd,
+      fcyCashRates: rates,
+      usdCashRates: usd,
+    });
+    expect(buy.fwdCarryUsdM).toBeLessThan(0);
+    expect(buy.usdInterestUsdM).toBeLessThan(0);
+    expect(buy.fcyInterestUsdM).toBeGreaterThan(0);
+    expect(buy.totalUsdM).toBeLessThan(0);
+  });
+
+  it('M12 cover of long PLN earns CIP when cash Δr is negative (not a buy)', () => {
+    const cover = 21.6;
+    const r_FCY = 3.41;
+    const r_USD = 3.50;
+    const priced = fwdCarryForExposureCoverUsdM({
+      coverLocalM: cover,
+      ccy: 'PLN',
+      settleMonths: 12,
+      r_FCY,
+      r_USD,
+    });
+    expect(r_FCY).toBeLessThan(r_USD);
+    expect(priced.fwdCarryUsdM).toBeGreaterThan(0);
+    expect(priced.fwdCarryUsdM).toBeCloseTo(
+      fwdHedgeCarryUsdYr(-cover, 'PLN', r_FCY, r_USD),
+      9,
+    );
+
+    const hedge = stripHedgeLegCarryUsdM({
+      notionalLocalM: -cover,
+      ccy: 'PLN',
+      recognizeMonths: 0,
+      settleMonths: 12,
+      forecastEndMonths: 12,
+      fcyFwdRates: rates,
+      usdFwdRates: usd,
+      fcyCashRates: rates,
+      usdCashRates: usd,
+      swapPointsCarryUsdM: priced.fwdCarryUsdM,
+    });
+    expect(hedge.fwdCarryUsdM).toBeGreaterThan(0);
+    expect(hedge.fcyInterestUsdM).toBeLessThan(0);
+    expect(hedge.usdInterestUsdM).toBeCloseTo(0, 8);
+  });
+
+  it('Cash Carry M12 PLN cover prints +CIP on the empty curve, not a buy', () => {
+    const bundle = emptyMarketRatesForCcy('PLN');
+    const profile = assignImpliedCarryFromSwapPoints(
+      {
+        structure: 'bullet',
+        basis: 'totalExpected',
+        ticketBasis: 'stock',
+        legs: [],
+        coverLocalM: 21.6,
+        hedgeRatio: 1,
+        settleMonths: 12,
+      },
+      { marketRates: bundle, bulletSettleMonths: 12 },
+    );
+    expect(profile.impliedCarryUsdM!).toBeGreaterThan(0);
+
+    const br = hedgeImprovementBreakdownToT(
+      [{
+        ccy: 'PLN',
+        amountLocalM: 21.6,
+        settleMonths: 12,
+        recognizeMonths: 0,
+        structure: 'bullet',
+        notionalKind: 'cover',
+      }],
+      12,
+      bundle,
+    );
+    expect(br.fwdCarryUsdM).toBeGreaterThan(0);
+    expect(br.fcyInterestUsdM).toBeLessThan(0);
+  });
+
+  it('sell-PLN hedge on negative USDPLN points earns inverted CIP, not N × pts/10_000', () => {
+    const S = 1 / CURRENCY_PARAMS.PLN!.spot;
+    const ask = -80;
+    const cover = 10;
+    const bundle: FxMarketRatesBundle = {
+      pair: 'USDPLN',
+      baseCcy: 'USD',
+      quoteCcy: 'PLN',
+      sourceFile: 'test',
+      spot: { bid: S, ask: S, mid: S },
+      deposits: [{
+        tenor: '1Y',
+        months: 12,
+        eur: { creditPct: 3.41, debitPct: 4.41 },
+        usd: { creditPct: 3.50, debitPct: 3.89 },
+        swapPoints: { bid: -92, ask },
+      }],
+    };
+    const earn = cover * (1 / (S + ask / 10_000) - 1 / S);
+    expect(earn).toBeGreaterThan(0);
+
+    const hedge = fwdHedgeCarryFromMarketUsd(
+      -cover, 'PLN', 3.41, 3.50, 12, bundle,
+    );
+    expect(hedge).toBeGreaterThan(0);
+    expect(hedge).toBeCloseTo(earn, 8);
+    expect(hedge).not.toBeCloseTo(cover * (ask / 10_000), 4);
+
+    const h = resolveStrategyHedge('SWAP_FWD', {
+      ccy: 'PLN',
+      currentFx: cover,
+      forecastFx: cover,
+      swapNear: 0,
+      swapForwardDelta: 1,
+      optDelta: 1,
+      horizonDays: 30,
+      r_FCY: 3.41,
+      r_USD: 3.50,
+      σ_daily: 0.006363,
+      marketRates: bundle,
+      farSettleMonths: 12,
+    });
+    expect(h.fwdNotional).toBeCloseTo(-cover, 6);
+    expect(h.fwdCarryUsdYr).toBeGreaterThan(0);
+    expect(h.fwdCarryUsdYr).toBeCloseTo(earn, 8);
   });
 });

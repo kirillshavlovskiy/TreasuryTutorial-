@@ -10,6 +10,7 @@ import {
   emptyWorkspace,
   fxConfigFromDashboardSetup,
   groupFxUnlocked,
+  loadWorkspaceDetailed,
   saveWorkspace,
   supportsInstruments,
   tickersFromInstruments,
@@ -19,6 +20,7 @@ import {
 } from '@/lib/workspace-store';
 import {
   applyWorkbenchStructureToSandbox,
+  curriculumSandboxUserKey,
   workspaceGroupToSandboxGroup,
 } from '@/lib/workspace-curriculum-bridge';
 import { seedSandbox } from '@/lib/test-mode/store';
@@ -162,6 +164,64 @@ describe('workspace curriculum bridge', () => {
       workbench.group?.includedEntityIds,
     );
     expect(merged.progress.steps.buildWorkspace).toBe('done');
+  });
+
+  it('keeps booked and prepared hedges when the workbench structure is mirrored', () => {
+    const workbench = applyStructureWizard(emptyWorkspace(), {
+      groupName: 'Live Group',
+      reportingCurrency: 'USD',
+      groupDashboardName: 'Consolidated FX',
+      subsidiaries: [
+        {
+          name: 'Entity Alpha',
+          baseCurrency: 'EUR',
+          dashboardName: 'Alpha FX',
+          setup: {
+            riskAsset: 'currencies',
+            protect: ['assetValue'],
+            optimize: ['var', 'hedgeCarry'],
+            tickers: ['EUR'],
+          },
+        },
+      ],
+    });
+    const entityId = workbench.entities[0]!.id;
+    const seeded = seedSandbox('01');
+    seeded.hedgesByEntityId = {
+      [entityId]: {
+        bookedHedges: [
+          {
+            id: 't1',
+            ccy: 'EUR',
+            instrument: 'forward',
+            basis: 'stock',
+            amountLocalM: 1.2,
+            maturity: '3m',
+            maturityLabel: '3m',
+            varUsdM: 0.1,
+            addressesHigherVar: false,
+          },
+        ],
+        hedgeRatios: { EUR: 0.5 },
+        preparedByCcy: {
+          EUR: {
+            structure: 'bullet',
+            basis: 'cash',
+            ticketBasis: 'stock',
+            legs: [],
+            coverLocalM: 1.2,
+            hedgeRatio: 0.5,
+            preparedFor: 'var',
+          },
+        },
+      },
+    };
+
+    const merged = applyWorkbenchStructureToSandbox(seeded, workbench);
+    const book = merged.hedgesByEntityId?.[entityId];
+    expect(book?.bookedHedges).toHaveLength(1);
+    expect(book?.bookedHedges[0]?.id).toBe('t1');
+    expect(book?.preparedByCcy?.EUR?.coverLocalM).toBe(1.2);
   });
 });
 
@@ -363,6 +423,230 @@ describe('saveWorkspace error path', () => {
 
     const result = saveWorkspace('user-test', { entities: [] });
     expect(result.ok).toBe(true);
-    expect(store.size).toBe(1);
+    expect(store.size).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('curriculumSandboxUserKey', () => {
+  it('prefixes a workbench email so it matches Task 01 localStorage', () => {
+    expect(curriculumSandboxUserKey('desk@sigma.local')).toBe('test:desk@sigma.local');
+    expect(curriculumSandboxUserKey('test:desk@sigma.local')).toBe(
+      'test:desk@sigma.local',
+    );
+    expect(curriculumSandboxUserKey('test:guest')).toBe('test:guest');
+  });
+});
+
+describe('workspace hedge persistence', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubStore(initial?: Record<string, string>) {
+    const store = new Map<string, string>(Object.entries(initial ?? {}));
+    vi.stubGlobal('window', {
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          store.set(k, v);
+        },
+        removeItem: (k: string) => {
+          store.delete(k);
+        },
+      },
+    });
+    return store;
+  }
+
+  it('round-trips booked + prepared hedges through localStorage', () => {
+    stubStore();
+    const ws: Workspace = { entities: [] };
+    const hedges = {
+      ent_1: {
+        bookedHedges: [
+          {
+            id: 'h1',
+            ccy: 'EUR',
+            instrument: 'forward' as const,
+            basis: 'stock' as const,
+            amountLocalM: 2,
+            maturity: '1m' as const,
+            maturityLabel: '1m',
+            varUsdM: 0.05,
+            addressesHigherVar: false,
+          },
+        ],
+        hedgeRatios: { EUR: 1 },
+        preparedByCcy: {
+          EUR: {
+            structure: 'bullet' as const,
+            basis: 'cash' as const,
+            ticketBasis: 'stock' as const,
+            legs: [],
+            coverLocalM: 2,
+            hedgeRatio: 1,
+            preparedFor: 'liquidity' as const,
+          },
+        },
+        desk: { residualByCcy: { EUR: 0.35 }, policyVAR: 8 },
+      },
+    };
+
+    expect(saveWorkspace('u', ws, { hedgesByEntityId: hedges }).ok).toBe(true);
+    const loaded = loadWorkspaceDetailed('u');
+    expect(loaded.workspace.entities).toEqual([]);
+    expect(loaded.hedgesByEntityId.ent_1?.bookedHedges[0]?.id).toBe('h1');
+    expect(loaded.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor).toBe(
+      'liquidity',
+    );
+    expect(loaded.hedgesByEntityId.ent_1?.desk?.residualByCcy?.EUR).toBe(0.35);
+    expect(loaded.hedgesByEntityId.ent_1?.desk?.policyVAR).toBe(8);
+  });
+
+  it('does not drop hedges when a later save only writes workspace structure', () => {
+    stubStore();
+    saveWorkspace(
+      'u',
+      { entities: [] },
+      {
+        hedgesByEntityId: {
+          ent_1: {
+            bookedHedges: [
+              {
+                id: 'keep-me',
+                ccy: 'JPY',
+                instrument: 'spot',
+                basis: 'stock',
+                amountLocalM: 3,
+                maturity: null,
+                maturityLabel: null,
+                varUsdM: 0,
+                addressesHigherVar: false,
+              },
+            ],
+            hedgeRatios: {},
+            preparedByCcy: {},
+          },
+        },
+      },
+    );
+    saveWorkspace('u', { entities: [], group: null });
+    const loaded = loadWorkspaceDetailed('u');
+    expect(loaded.hedgesByEntityId.ent_1?.bookedHedges[0]?.id).toBe('keep-me');
+  });
+
+  it('does not drop prepared packages when a later save sends booked tickets only', () => {
+    stubStore();
+    const prepared = {
+      EUR: {
+        structure: 'bullet' as const,
+        basis: 'cash' as const,
+        ticketBasis: 'stock' as const,
+        legs: [],
+        coverLocalM: 2,
+        hedgeRatio: 1,
+        preparedFor: 'liquidity' as const,
+      },
+    };
+    saveWorkspace(
+      'u',
+      { entities: [] },
+      {
+        hedgesByEntityId: {
+          ent_1: {
+            bookedHedges: [
+              {
+                id: 'keep-me',
+                ccy: 'JPY',
+                instrument: 'spot',
+                basis: 'stock',
+                amountLocalM: 3,
+                maturity: null,
+                maturityLabel: null,
+                varUsdM: 0,
+                addressesHigherVar: false,
+              },
+            ],
+            hedgeRatios: {},
+            preparedByCcy: prepared,
+          },
+        },
+        hedgesUpdatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    );
+    saveWorkspace(
+      'u',
+      { entities: [] },
+      {
+        hedgesByEntityId: {
+          ent_1: {
+            bookedHedges: [
+              {
+                id: 'keep-me',
+                ccy: 'JPY',
+                instrument: 'spot',
+                basis: 'stock',
+                amountLocalM: 3,
+                maturity: null,
+                maturityLabel: null,
+                varUsdM: 0,
+                addressesHigherVar: false,
+              },
+            ],
+            hedgeRatios: {},
+            preparedByCcy: {},
+          },
+        },
+        hedgesUpdatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    );
+    const loaded = loadWorkspaceDetailed('u');
+    expect(loaded.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor).toBe(
+      'liquidity',
+    );
+  });
+
+  it('recovers prepared hedges from the sidecar when the fat workspace blob is gone', () => {
+    const store = stubStore();
+    saveWorkspace(
+      'u',
+      { entities: [] },
+      {
+        hedgesByEntityId: {
+          ent_1: {
+            bookedHedges: [],
+            hedgeRatios: {},
+            preparedByCcy: {
+              EUR: {
+                structure: 'bullet' as const,
+                basis: 'cash' as const,
+                ticketBasis: 'stock' as const,
+                legs: [],
+                coverLocalM: 1,
+                hedgeRatio: 0.5,
+                preparedFor: 'liquidity' as const,
+              },
+            },
+          },
+        },
+        hedgesUpdatedAt: '2026-06-01T00:00:00.000Z',
+      },
+    );
+    store.delete('treasury:workspace:u');
+    const loaded = loadWorkspaceDetailed('u');
+    expect(loaded.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor).toBe(
+      'liquidity',
+    );
+  });
+
+  it('still reads a v1 bare workspace JSON blob', () => {
+    stubStore({
+      'treasury:workspace:u': JSON.stringify({
+        entities: [{ id: 'e1', name: 'Old Co', baseCurrency: 'USD', dashboards: [] }],
+      }),
+    });
+    const loaded = loadWorkspaceDetailed('u');
+    expect(loaded.workspace.entities[0]?.name).toBe('Old Co');
+    expect(loaded.hedgesByEntityId).toEqual({});
   });
 });

@@ -7,6 +7,7 @@ import {
   useState,
   useMemo,
   useEffect,
+  useRef,
   type ReactElement,
   type ReactNode,
 } from 'react';
@@ -49,7 +50,9 @@ import {
   applyBookedHedgePositions,
   hedgePositionOffsetsByCcy,
   fxTableRiskMetrics,
+  residualByCcyFromBook,
   stagedFxHedgeCarryByCcyUsdM,
+  type EntityHedgeDeskState,
   type HedgeTicket,
   type PreparedHedgeProfile,
 } from '@/lib/test-mode/hedge-var';
@@ -142,6 +145,12 @@ interface SimulatorProps {
   bookedHedges?: HedgeTicket[];
   /** Staged hedge packages — settle in the liquidity path alongside booked legs. */
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
+  /**
+   * Persisted overlay / residual Δ / Policy VAR. Required for reload — these
+   * used to live only in React state and vanished on every Fast Refresh.
+   */
+  desk?: EntityHedgeDeskState;
+  onDeskChange?: (desk: EntityHedgeDeskState) => void;
   /** Per-CCY JPM / uploaded curves — Cash Carry P&L on the liquidity table. */
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
   ratesScopeId?: string | null;
@@ -222,6 +231,8 @@ export function Simulator({
   onVarSetupChange,
   bookedHedges = [],
   preparedByCcy,
+  desk,
+  onDeskChange,
   marketRatesByCcy,
   ratesScopeId,
   tabLabels,
@@ -305,20 +316,77 @@ export function Simulator({
     [onForecastProfileChange],
   );
   const [forecastProfileOpen, setForecastProfileOpen] = useState(false);
-  const [hedgeStrategy, setHedgeStrategy] = useState<HedgeStrategy>('SWAP_ONLY');
+  const [hedgeStrategy, setHedgeStrategy] = useState<HedgeStrategy>(
+    () => (desk?.hedgeStrategy as HedgeStrategy | undefined) ?? 'SWAP_ONLY',
+  );
   /** Replacement Δ keyed by row id — default 1 when missing. */
   const [swapForwardDeltaByRowId, setSwapForwardDeltaByRowId] = useState<
     Record<string, number>
-  >({});
+  >(() => ({ ...(desk?.swapForwardDeltaByRowId ?? {}) }));
   const [optionDeltaByRowId, setOptionDeltaByRowId] = useState<
     Record<string, number>
-  >({});
+  >(() => ({ ...(desk?.optionDeltaByRowId ?? {}) }));
   const [swapForwardOverlayByCcy, setSwapForwardOverlayByCcy] = useState<
     Record<string, SwapForwardOverlay>
-  >({});
+  >(() => ({ ...(desk?.swapForwardOverlayByCcy ?? {}) }));
   const [deskCipByCcyUsdM, setDeskCipByCcyUsdM] = useState<
     Record<string, number>
   >({});
+  const [residualByCcy, setResidualByCcy] = useState<Record<string, number>>(
+    () =>
+      residualByCcyFromBook({
+        preparedByCcy,
+        desk,
+      }),
+  );
+
+  const deskSnapshotRef = useRef<EntityHedgeDeskState>({ ...(desk ?? {}) });
+  const onDeskChangeRef = useRef(onDeskChange);
+  onDeskChangeRef.current = onDeskChange;
+  const publishDesk = useCallback(
+    (patch: Partial<EntityHedgeDeskState>) => {
+      if (!onDeskChangeRef.current) return;
+      deskSnapshotRef.current = { ...deskSnapshotRef.current, ...patch };
+      onDeskChangeRef.current(deskSnapshotRef.current);
+    },
+    [],
+  );
+
+  const setHedgeStrategyPersist = useCallback(
+    (next: HedgeStrategy) => {
+      setHedgeStrategy(next);
+      publishDesk({ hedgeStrategy: next });
+    },
+    [publishDesk],
+  );
+  const setSwapForwardDeltaPersist = useCallback(
+    (next: Record<string, number>) => {
+      setSwapForwardDeltaByRowId(next);
+      publishDesk({ swapForwardDeltaByRowId: next });
+    },
+    [publishDesk],
+  );
+  const setOptionDeltaPersist = useCallback(
+    (next: Record<string, number>) => {
+      setOptionDeltaByRowId(next);
+      publishDesk({ optionDeltaByRowId: next });
+    },
+    [publishDesk],
+  );
+  const setResidualPersist = useCallback(
+    (next: Record<string, number>) => {
+      setResidualByCcy(next);
+      publishDesk({ residualByCcy: next });
+    },
+    [publishDesk],
+  );
+  const setSwapForwardOverlayPersist = useCallback(
+    (next: Record<string, SwapForwardOverlay>) => {
+      setSwapForwardOverlayByCcy(next);
+      publishDesk({ swapForwardOverlayByCcy: next });
+    },
+    [publishDesk],
+  );
 
   const liquidityTiming =
     resolveLiquidityTiming(forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
@@ -344,22 +412,114 @@ export function Simulator({
     setForecastProfile({ ...DEFAULT_FORECAST_PROFILE, byCcy: {}, formulas: {} });
   };
 
-  const [policyVAR, setPolicyVAR] = useState(5.0);
-
-  // No layer until one is chosen: with no liquidity rule on the desk holds the
-  // book, so a structural gap is priced through carry instead of being funded by
-  // a swap the policy never asked for.
+  const [policyVAR, setPolicyVAR] = useState(desk?.policyVAR ?? 5.0);
+  /** Shared overlay earn ask ($K/yr). Undefined = fill Policy VAR. */
+  const [portfolioCarryK, setPortfolioCarryK] = useState<number | undefined>(
+    () => desk?.portfolioCarryK,
+  );
+  const [portfolioScenarioId, setPortfolioScenarioId] = useState<string | null>(
+    () => desk?.portfolioScenarioId || null,
+  );
   const [activeLayers, setActiveLayers] = useState<Set<LayerId>>(
-    () => new Set((initialActiveLayers ?? []) as LayerId[])
+    () =>
+      new Set(
+        (desk?.activeLayers?.length
+          ? desk.activeLayers
+          : (initialActiveLayers ?? [])) as LayerId[],
+      ),
   );
   const onLayerToggle = (id: LayerId) =>
     setActiveLayers(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      publishDesk({ activeLayers: [...next] });
       return next;
     });
   const [layerPanel, setLayerPanel] = useState<BufferChipKey | null>(null);
+
+  useEffect(() => {
+    deskSnapshotRef.current = {
+      residualByCcy,
+      swapForwardDeltaByRowId,
+      optionDeltaByRowId,
+      hedgeStrategy,
+      policyVAR,
+      activeLayers: [...activeLayers],
+      ...(Object.keys(swapForwardOverlayByCcy).length > 0
+        ? { swapForwardOverlayByCcy }
+        : {}),
+      ...(portfolioCarryK != null ? { portfolioCarryK } : {}),
+      ...(portfolioScenarioId ? { portfolioScenarioId } : { portfolioScenarioId: '' }),
+    };
+  }, [
+    residualByCcy,
+    swapForwardDeltaByRowId,
+    optionDeltaByRowId,
+    swapForwardOverlayByCcy,
+    hedgeStrategy,
+    policyVAR,
+    portfolioCarryK,
+    portfolioScenarioId,
+    activeLayers,
+  ]);
+
+  useEffect(() => {
+    if (!desk) return;
+    const incoming = residualByCcyFromBook({ preparedByCcy, desk });
+    setResidualByCcy(prev =>
+      Object.keys(incoming).length > Object.keys(prev).length ? incoming : prev,
+    );
+    if (desk.swapForwardDeltaByRowId) {
+      setSwapForwardDeltaByRowId(prev =>
+        Object.keys(desk.swapForwardDeltaByRowId ?? {}).length
+          > Object.keys(prev).length
+          ? { ...desk.swapForwardDeltaByRowId }
+          : prev,
+      );
+    }
+    if (desk.swapForwardOverlayByCcy) {
+      setSwapForwardOverlayByCcy(prev =>
+        Object.keys(desk.swapForwardOverlayByCcy ?? {}).length
+          > Object.keys(prev).length
+          ? { ...desk.swapForwardOverlayByCcy }
+          : prev,
+      );
+    }
+    if (typeof desk.policyVAR === 'number') {
+      setPolicyVAR(prev => (prev === 5 && desk.policyVAR !== 5 ? desk.policyVAR! : prev));
+    }
+    if (Array.isArray(desk.activeLayers) && desk.activeLayers.length > 0) {
+      setActiveLayers(prev =>
+        prev.size === 0 ? new Set(desk.activeLayers as LayerId[]) : prev,
+      );
+    }
+    if (desk.portfolioScenarioId && !portfolioScenarioId) {
+      setPortfolioScenarioId(desk.portfolioScenarioId);
+    }
+  }, [desk, preparedByCcy, portfolioScenarioId]);
+
+  const setPolicyVARPersist = useCallback(
+    (usdM: number) => {
+      setPolicyVAR(usdM);
+      publishDesk({ policyVAR: usdM });
+    },
+    [publishDesk],
+  );
+  const setPortfolioCarryKPersist = useCallback(
+    (k: number | undefined) => {
+      setPortfolioCarryK(k);
+      publishDesk(k != null ? { portfolioCarryK: k } : { portfolioCarryK: undefined });
+    },
+    [publishDesk],
+  );
+  const setPortfolioScenarioPersist = useCallback(
+    (id: string | null) => {
+      setPortfolioScenarioId(id);
+      publishDesk({ portfolioScenarioId: id ?? '' });
+    },
+    [publishDesk],
+  );
 
   const onSharedChange = (key: keyof SharedGlobals, value: number) =>
     setShared(s => ({ ...s, [key]: value }));
@@ -420,10 +580,13 @@ export function Simulator({
       shared,
       activeLayers,
       policyVAR,
+      carryTargetUsdYrM: portfolioCarryK != null ? portfolioCarryK / 1000 : undefined,
       timing,
       forecastProfile,
       hedgeSettleByCcy,
       cfarNetByCcyUsd,
+      marketRatesByCcy,
+      ratesScopeId,
     }),
     [
       displayRows,
@@ -433,10 +596,13 @@ export function Simulator({
       shared,
       activeLayers,
       policyVAR,
+      portfolioCarryK,
       timing,
       forecastProfile,
       hedgeSettleByCcy,
       cfarNetByCcyUsd,
+      marketRatesByCcy,
+      ratesScopeId,
     ],
   );
 
@@ -633,7 +799,9 @@ export function Simulator({
               activeLayers={activeLayers}
               onLayerToggle={onLayerToggle}
               policyVAR={policyVAR}
-              onPolicyVARChange={setPolicyVAR}
+              onPolicyVARChange={setPolicyVARPersist}
+              portfolioCarryK={portfolioCarryK}
+              onPortfolioCarryKChange={setPortfolioCarryKPersist}
               portfolioSummary={dashboard.portfolioSummary}
               fcyComputed={dashboard.fcyComputed}
               usdComputed={dashboard.usdComputed}
@@ -671,12 +839,12 @@ export function Simulator({
               onFormulaChange={onFormulaChange}
               onFormulaChanges={onFormulaChanges}
               hedgeStrategy={hedgeStrategy}
-              onHedgeStrategyChange={setHedgeStrategy}
+              onHedgeStrategyChange={setHedgeStrategyPersist}
               swapForwardDeltaByCcy={swapForwardDeltaByRowId}
-              onSwapForwardDeltaByCcyChange={setSwapForwardDeltaByRowId}
+              onSwapForwardDeltaByCcyChange={setSwapForwardDeltaPersist}
               optionDeltaByCcy={optionDeltaByRowId}
-              onOptionDeltaByCcyChange={setOptionDeltaByRowId}
-              onSwapForwardOverlayByCcyChange={setSwapForwardOverlayByCcy}
+              onOptionDeltaByCcyChange={setOptionDeltaPersist}
+              onSwapForwardOverlayByCcyChange={setSwapForwardOverlayPersist}
               onDeskCipByCcyChange={setDeskCipByCcyUsdM}
               marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={ratesScopeId}
@@ -695,7 +863,7 @@ export function Simulator({
               simRows={rows}              onRowFieldChange={onRowFieldChange}
               activeLayers={activeLayers} onLayerToggle={onLayerToggle}
               layerRows={dashboard.layerRows}
-              policyVAR={policyVAR}       onPolicyVARChange={setPolicyVAR}
+              policyVAR={policyVAR}       onPolicyVARChange={setPolicyVARPersist}
               usdCash={usdCash}           onUsdCashChange={setUsdCash}
               usdPayout={usdParams.payout} onUsdPayoutChange={v => setUsdParams(p => ({ ...p, payout: v }))}
               usdNonLpCash={usdNonLpCash}
@@ -810,6 +978,14 @@ export function Simulator({
                     deskHedgeCarryByCcyUsdM?: Record<string, number>;
                     deskCashCarryByCcyUsdM?: Record<string, number>;
                     deskCipByCcyUsdM?: Record<string, number>;
+                    policyVAR?: number;
+                    onPolicyVARChange?: (usdM: number) => void;
+                    portfolioCarryK?: number;
+                    onPortfolioCarryKChange?: (k: number | undefined) => void;
+                    residualByCcy?: Record<string, number>;
+                    onResidualByCcyChange?: (next: Record<string, number>) => void;
+                    portfolioScenarioId?: string | null;
+                    onPortfolioScenarioIdChange?: (id: string | null) => void;
                   }>,
                   {
                     bookRows: rows,
@@ -827,6 +1003,14 @@ export function Simulator({
                     deskHedgeCarryByCcyUsdM: stagedHedgeCarryByCcyUsdM,
                     deskCashCarryByCcyUsdM: stagedCashCarryByCcyUsdM,
                     deskCipByCcyUsdM,
+                    policyVAR,
+                    onPolicyVARChange: setPolicyVARPersist,
+                    portfolioCarryK,
+                    onPortfolioCarryKChange: setPortfolioCarryKPersist,
+                    residualByCcy,
+                    onResidualByCcyChange: setResidualPersist,
+                    portfolioScenarioId,
+                    onPortfolioScenarioIdChange: setPortfolioScenarioPersist,
                   },
                 )
               : (analyticsPanel ?? (
@@ -856,7 +1040,9 @@ export function Simulator({
               activeLayers={activeLayers}
               onLayerToggle={onLayerToggle}
               policyVAR={policyVAR}
-              onPolicyVARChange={setPolicyVAR}
+              onPolicyVARChange={setPolicyVARPersist}
+              portfolioCarryK={portfolioCarryK}
+              onPortfolioCarryKChange={setPortfolioCarryKPersist}
               portfolioSummary={dashboard.portfolioSummary}
               fcyComputed={dashboard.fcyComputed}
               usdComputed={dashboard.usdComputed}
@@ -893,12 +1079,12 @@ export function Simulator({
               onFormulaChange={onFormulaChange}
               onFormulaChanges={onFormulaChanges}
               hedgeStrategy={hedgeStrategy}
-              onHedgeStrategyChange={setHedgeStrategy}
+              onHedgeStrategyChange={setHedgeStrategyPersist}
               swapForwardDeltaByCcy={swapForwardDeltaByRowId}
-              onSwapForwardDeltaByCcyChange={setSwapForwardDeltaByRowId}
+              onSwapForwardDeltaByCcyChange={setSwapForwardDeltaPersist}
               optionDeltaByCcy={optionDeltaByRowId}
-              onOptionDeltaByCcyChange={setOptionDeltaByRowId}
-              onSwapForwardOverlayByCcyChange={setSwapForwardOverlayByCcy}
+              onOptionDeltaByCcyChange={setOptionDeltaPersist}
+              onSwapForwardOverlayByCcyChange={setSwapForwardOverlayPersist}
               onDeskCipByCcyChange={setDeskCipByCcyUsdM}
               marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={ratesScopeId}

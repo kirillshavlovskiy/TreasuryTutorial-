@@ -28,6 +28,9 @@ import {
   type BufferChipKey,
   FORECAST_ACCURACY_LAYERS,
   forecastAccuracyLayerOn,
+  POLICY_VAR_LIMITS,
+  bufferLevelOf,
+  setBufferLevel,
   toggleLayerGroup,
   fundingSwapMonthCarryUsdM,
   fundingSwapCarryLegs,
@@ -39,10 +42,12 @@ import {
 import {
   fundedPlanFor,
   sizingFromPlan,
+  computePortfolioCarryFrontier,
   type FcyComputedRow,
   type UsdComputedRow,
   type PortfolioSummary,
 } from '@/lib/dashboard-model';
+import { LineChart, type ChartMarker } from '@/components/LineChart';
 import {
   carryBasisLabel,
   pathBufferCarry,
@@ -62,6 +67,7 @@ import {
 import {
   fundingSwapFarLegCipUsdM,
   fundingSwapPathFarCipUsdM,
+  fwdCarryMonthlyAccrualUsdM,
   resolveMarketRatesForCcy,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
@@ -347,13 +353,19 @@ function pnlCashCarryUsdM(
  */
 function pnlSwapCarryUsdM(
   r: {
-    liquidityPlan?: { standing_swap: number }[];
+    liquidityPlan?: {
+      standing_swap: number;
+      far_leg?: number;
+      cycleIndex?: number;
+    }[];
     swapCarryUsdYr: number;
     ccy: string;
     r_FCY: number;
     r_OD: number;
   },
   r_USD: number,
+  forecastMonths?: number,
+  bookingMode?: 'rolling' | 'term' | 'stripTerm',
 ): number {
   return fundingSwapCarryLegs({
     ccy: r.ccy,
@@ -362,6 +374,8 @@ function pnlSwapCarryUsdM(
     r_USD,
     r_OD: r.r_OD,
     fallbackCashUsdM: r.swapCarryUsdYr,
+    forecastMonths,
+    bookingMode,
   }).cashUsdM;
 }
 
@@ -381,6 +395,7 @@ function pnlFarCipUsdM(
   forecastMonths: number,
   marketRatesByCcy?: Record<string, FxMarketRatesBundle>,
   ratesScopeId?: string | null,
+  bookingMode?: 'rolling' | 'term' | 'stripTerm',
 ): number {
   const spot = CURRENCY_PARAMS[r.ccy]?.spot ?? 1;
   const standing = swapFarLegNotional(r.liquidityPlan, r.swapNear);
@@ -389,6 +404,7 @@ function pnlFarCipUsdM(
     standingFallback: standing,
     forecastMonths,
     bundle: resolveMarketRatesForCcy(marketRatesByCcy, r.ccy, ratesScopeId),
+    bookingMode,
     fallbackAnnualUsdYr: S =>
       fundingSwapCipPointsUsdYr(S, spot, r.r_FCY, r_USD),
   });
@@ -478,8 +494,8 @@ const BUFFER_LAYER_CHIPS: {
     hint: 'Steer Target LP Cash so Buffer Carry (swap cash Δr vs USD) hits the ask',
     settingsLabel: 'Buffer Carry target — standing-swap cash Δr ask, r_OD and Δr per currency' },
   { id: 'portfolioDiv', layers: ['portfolioDiv'], label: 'Portfolio VAR', band: '→ RISK', hue: 'violet',
-    hint: 'Cross-currency rebalance with VAR / USD budget limits',
-    settingsLabel: 'Portfolio VAR — notional sensitivity limit' },
+    hint: 'Portfolio level: Σ⁻¹μ overlay under the shared Policy VAR cap',
+    settingsLabel: 'Policy VAR — overlay sensitivity limit (portfolio level)' },
 ];
 
 type LayerChipHue = 'amber' | 'emerald' | 'violet' | 'sky';
@@ -628,11 +644,6 @@ function isLiquidityRowToggleTarget(target: EventTarget | null): boolean {
 
 // ─── Style constants ──────────────────────────────────────────────────────────
 
-const POLICY_VAR_LIMITS = [
-  { usd: 5, label: '$5M', who: 'Treasury' },
-  { usd: 10, label: '$10M', who: 'Director' },
-  { usd: 20, label: '$20M', who: 'CFO' },
-] as const;
 function GearIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -1634,6 +1645,8 @@ export function UnifiedSimulator({
   onLayerToggle,
   policyVAR,
   onPolicyVARChange,
+  portfolioCarryK,
+  onPortfolioCarryKChange,
   portfolioSummary,
   fcyComputed,
   usdComputed,
@@ -1711,6 +1724,9 @@ export function UnifiedSimulator({
   onLayerToggle: (id: LayerId) => void;
   policyVAR: number;
   onPolicyVARChange: (v: number) => void;
+  /** Shared overlay earn ask ($K/yr). Blank fills Policy VAR. */
+  portfolioCarryK?: number;
+  onPortfolioCarryKChange?: (k: number | undefined) => void;
   portfolioSummary: PortfolioSummary | null;
   /** Precomputed FCY rows from unified background calculation (page.tsx). */
   fcyComputed: FcyComputedRow[];
@@ -3106,6 +3122,24 @@ export function UnifiedSimulator({
     return '';
   };
 
+  /**
+   * Carry/VAR frontier for the Portfolio VAR panel — only computed while that
+   * panel is open. Simplest case: pure VAR-cap sweep (see
+   * `sweepPortfolioCarryFrontier`) — no manual pins, no USD funding budget.
+   */
+  const carryFrontier = useMemo(
+    () => (layerPanel === 'portfolioDiv'
+      ? computePortfolioCarryFrontier({
+          rows, shared, activeLayers, policyVAR,
+          forecastProfile, hedgeSettleByCcy, cfarNetByCcyUsd, marketRatesByCcy,
+        })
+      : null),
+    [
+      layerPanel, rows, shared, activeLayers, policyVAR,
+      forecastProfile, hedgeSettleByCcy, cfarNetByCcyUsd, marketRatesByCcy,
+    ],
+  );
+
   const resetRows = useCallback(() => {
     if (onResetTable) {
       onResetTable();
@@ -3239,8 +3273,13 @@ export function UnifiedSimulator({
   );
 
   const swapCarryTotal = useMemo(
-    () => computed.reduce((s, r) => s + pnlSwapCarryUsdM(r, shared.r_USD), 0),
-    [computed, shared.r_USD],
+    () => computed.reduce(
+      (s, r) => s + pnlSwapCarryUsdM(
+        r, shared.r_USD, forecastMonths, liquidityTiming.bookingMode ?? 'rolling',
+      ),
+      0,
+    ),
+    [computed, shared.r_USD, forecastMonths, liquidityTiming.bookingMode],
   );
 
   // ── FX Hedge — strategy applied per row on the hedging/funding layer ────────
@@ -3279,6 +3318,7 @@ export function UnifiedSimulator({
         : 1;
       const cipCarryUsdYr = pnlFarCipUsdM(
         r, shared.r_USD, forecastMonths, marketRatesByCcy, ratesScopeId,
+        liquidityTiming.bookingMode ?? 'rolling',
       ) * cipScale;
       return {
         ...r,
@@ -3289,10 +3329,11 @@ export function UnifiedSimulator({
     }),
     [
       computed, strategy, swapForwardDeltas, optionDeltas, shared.r_USD,
-      forecastMonths, marketRatesByCcy, ratesScopeId,
+      forecastMonths, marketRatesByCcy, ratesScopeId, liquidityTiming.bookingMode,
     ],
   );
 
+  const lastSwapOverlaySigRef = useRef('');
   useEffect(() => {
     if (!onSwapForwardOverlayByCcyChange) return;
     const next: Record<string, SwapForwardOverlay> = {};
@@ -3307,6 +3348,9 @@ export function UnifiedSimulator({
         });
       }
     }
+    const sig = JSON.stringify(next);
+    if (sig === lastSwapOverlaySigRef.current) return;
+    lastSwapOverlaySigRef.current = sig;
     onSwapForwardOverlayByCcyChange(next);
   }, [
     computedWithHedge,
@@ -3380,6 +3424,7 @@ export function UnifiedSimulator({
         const optEffectiveRes = spotRate ? resolved.values.optionHedgeUSD / spotRate : 0;
         const pathCip = pnlFarCipUsdM(
           r, shared.r_USD, forecastMonths, marketRatesByCcy, ratesScopeId,
+          liquidityTiming.bookingMode ?? 'rolling',
         );
         const bundle = resolveMarketRatesForCcy(
           marketRatesByCcy, r.ccy, ratesScopeId,
@@ -4946,6 +4991,38 @@ export function UnifiedSimulator({
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-gray-100 bg-gray-50 px-4 py-2">
           {/* Formula layer toggles — same state as Layer Setup tab */}
           <span className={toolCaption}>Buffer layers</span>
+          <div
+            className="inline-flex rounded-md border border-gray-200 bg-white p-0.5"
+            role="group"
+            aria-label="Buffer level"
+          >
+            {(['currency', 'portfolio'] as const).map(level => {
+              const on = bufferLevelOf(activeLayers) === level;
+              return (
+                <button
+                  key={level}
+                  type="button"
+                  aria-pressed={on}
+                  onClick={() => {
+                    setBufferLevel(activeLayers, level, onLayerToggle);
+                    if (level === 'currency' && layerPanel === 'portfolioDiv') {
+                      setLayerPanel(null);
+                    }
+                  }}
+                  title={
+                    level === 'portfolio'
+                      ? 'Same chips, book mix: Σ⁻¹μ overlay · Policy VAR + USD budget'
+                      : 'Same chips, each currency on its own floor / σ / carry ask'
+                  }
+                  className={`rounded px-2 py-0.5 font-mono text-[10px] font-semibold transition-colors ${
+                    on ? 'bg-violet-100 text-violet-800' : 'text-gray-500 hover:text-gray-800'
+                  }`}
+                >
+                  {level === 'currency' ? 'Currency' : 'Portfolio'}
+                </button>
+              );
+            })}
+          </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {BUFFER_LAYER_CHIPS.map(l => {
               const on = l.layers.some(id => activeLayers.has(id));
@@ -5665,6 +5742,40 @@ export function UnifiedSimulator({
                 ariaLabel="Policy VAR notional sensitivity limit"
               />
             </div>
+            {onPortfolioCarryKChange && (
+              <label
+                className="inline-flex items-center gap-1.5 rounded-md border border-emerald-300 bg-white px-2 py-1"
+                title="Shared overlay carry to earn ($K/yr). Same Σ⁻¹μ mix, smaller scale. Blank fills Policy VAR."
+              >
+                <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
+                  Earn
+                </span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="fill VAR"
+                  defaultValue={portfolioCarryK == null ? '' : String(portfolioCarryK)}
+                  key={portfolioCarryK == null ? 'empty' : String(portfolioCarryK)}
+                  onBlur={e => {
+                    const raw = e.target.value.trim().replace(/,/g, '');
+                    if (raw === '') {
+                      onPortfolioCarryKChange(undefined);
+                      return;
+                    }
+                    const n = Number(raw);
+                    if (!Number.isFinite(n)) return;
+                    onPortfolioCarryKChange(n);
+                    if (!activeLayers.has('carryOptim')) onLayerToggle('carryOptim');
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') e.currentTarget.blur();
+                  }}
+                  className="w-14 bg-transparent font-mono text-[11px] font-semibold text-emerald-800 outline-none placeholder:text-gray-400"
+                  aria-label="Portfolio carry to earn, $K per year"
+                />
+                <span className="font-mono text-[9px] text-gray-500">$K/yr</span>
+              </label>
+            )}
 
             {portfolioSummary && (
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px]">
@@ -5714,6 +5825,66 @@ export function UnifiedSimulator({
               )}
             </div>
             )}
+
+            {carryFrontier && carryFrontier.points.length > 2 && (() => {
+              const pts = carryFrontier.points;
+              const sweet = pts[carryFrontier.sweetSpotIndex] ?? null;
+              let today = pts[0]!;
+              for (const p of pts) {
+                if (Math.abs(p.portfolioVarUsd - policyVAR) < Math.abs(today.portfolioVarUsd - policyVAR)) today = p;
+              }
+              const markers: ChartMarker[] = [];
+              if (sweet) {
+                markers.push({
+                  x: sweet.portfolioVarUsd, y: sweet.totalCarryUsdYr,
+                  label: 'sweet spot', color: '#b45309',
+                });
+              }
+              markers.push({
+                x: today.portfolioVarUsd, y: today.totalCarryUsdYr,
+                label: 'today', color: '#6d28d9', ring: true,
+              });
+              return (
+                <div className="mt-3 border-t border-gray-100 pt-3">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2 mb-1">
+                    <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.08em] text-violet-700">
+                      Carry vs VAR — where does raising the limit stop paying off?
+                    </span>
+                    {sweet && Math.abs(sweet.portfolioVarUsd - policyVAR) > 0.05 && (
+                      <button
+                        type="button"
+                        onClick={() => onPolicyVARChange(Math.round(sweet.portfolioVarUsd * 10) / 10)}
+                        className="rounded border border-amber-300 bg-amber-50 px-2 py-0.5 font-mono text-[9px] font-semibold text-amber-800 hover:bg-amber-100"
+                        title={`Set Policy VAR to the sweet spot: $${f2(sweet.portfolioVarUsd)}M`}
+                      >
+                        use ${f2(sweet.portfolioVarUsd)}M
+                      </button>
+                    )}
+                  </div>
+                  <LineChart
+                    width={460}
+                    height={200}
+                    xLabel="Portfolio VAR ($M)"
+                    yLabel="Carry ($M/yr)"
+                    xDecimals={1}
+                    yDecimals={1}
+                    series={[{
+                      name: 'frontier',
+                      color: '#7c3aed',
+                      data: pts.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr })),
+                    }]}
+                    markers={markers}
+                  />
+                  <p className="mt-1 text-[10px] text-gray-500">
+                    Traced 0–{f2(Math.max(...pts.map(p => p.k)))}M against today&rsquo;s ${f2(policyVAR)}M limit.
+                    The line bends where a PAY currency runs out of floor room and stops growing while
+                    others keep climbing — <span className="font-semibold text-amber-700">sweet spot</span> is
+                    the point furthest from a straight line between the ends. No manual targets or USD
+                    funding budget in this view yet.
+                  </p>
+                </div>
+              );
+            })()}
             </div>
           </LayerModal>
         )}
@@ -6159,7 +6330,9 @@ export function UnifiedSimulator({
               );
               const hedgeCarry = pnlHedgeCarryUsdM(r.ccy, stagedHedgeCarryByCcyUsdM);
               const fxHedgeCarry = R?.hedgeCarryUsdYr ?? r.hedgeCarryUsdYr;
-              const swapCarry = pnlSwapCarryUsdM(r, shared.r_USD);
+              const swapCarry = pnlSwapCarryUsdM(
+                r, shared.r_USD, forecastMonths, liquidityTiming.bookingMode ?? 'rolling',
+              );
               const pnlTotalCarry = cashCarry + swapCarry + hedgeCarry;
               const residual = R?.residualFx ?? r.residualFx;
               const planOpen = liqPlanCcy === r.ccy;
@@ -6886,20 +7059,24 @@ export function UnifiedSimulator({
                 const bundle = resolveMarketRatesForCcy(
                   marketRatesByCcy, r.ccy, ratesScopeId,
                 );
-                const termFar = r.liquidityPlan!.some(
-                  x => Math.abs(x.far_leg ?? 0) > 0.001,
-                );
+                const termFar =
+                  (liquidityTiming.bookingMode ?? 'rolling') === 'term'
+                  && r.liquidityPlan!.some(
+                    x => Math.abs(x.far_leg ?? 0) > 0.001,
+                  );
                 const optScale = strategy === 'SWAP_FWD_OPT'
                   ? clampHedgeDelta(optionDeltas[r.id] ?? 0.5)
                   : 1;
-                // Term cover settles its points once, at the far date. Spread that
-                // single cash flow straight-line over the cycles the leg is alive
-                // for, so the monthly column reads as an accrual, not a lump on M1.
                 const farMonths = fundingSwapFarSettleMonths(
                   r.liquidityPlan, forecastMonths,
                 );
                 const cycleCip = termFar
-                  ? (p.cycleIndex < farMonths ? r.cipCarryUsdYr / farMonths : 0)
+                  ? fwdCarryMonthlyAccrualUsdM({
+                      notionalLocalM: retainedStanding,
+                      settleMonths: farMonths,
+                      month: p.cycleIndex + 1,
+                      bundle,
+                    }) * optScale
                   : fundingSwapFarLegCipUsdM({
                       standingLocalM: retainedStanding,
                       settleMonths: 1,

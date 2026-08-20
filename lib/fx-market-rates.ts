@@ -9,6 +9,7 @@ import defaultEurUsd from '@/data/fx-market-rates/EURUSD.json';
 import {
   CURRENCY_PARAMS,
   fundingSwapFarSettleMonths,
+  roundMoney,
 } from '@/lib/fx-buffer';
 
 export interface DepositSideRates {
@@ -93,16 +94,90 @@ export function defaultOvernightCashFromLp(
   };
 }
 
+/** Market quote vs USD is USD per 1 FCY. Every other FCY is units per 1 USD. */
+const USD_PER_FCY_QUOTED = new Set(['EUR', 'GBP', 'AUD', 'NZD']);
+
+export function isUsdPerFcyQuoted(ccy: string): boolean {
+  return USD_PER_FCY_QUOTED.has(ccy.toUpperCase());
+}
+
+/** Market pair vs USD: EURUSD / GBPUSD / AUDUSD / NZDUSD, else USDPLN, USDJPY, … */
+export function usdMarketPair(ccy: string): string {
+  const c = ccy.toUpperCase();
+  if (!c || c === 'USD') return 'USD';
+  return isUsdPerFcyQuoted(c) ? `${c}USD` : `USD${c}`;
+}
+
+function fcyCcyOf(
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy'>,
+): string {
+  const desk = (bundle.baseCcy || '').toUpperCase();
+  if (desk && desk !== 'USD' && CURRENCY_PARAMS[desk]) return desk;
+  const pair = (bundle.pair || '').replace('/', '').toUpperCase();
+  const a = pair.slice(0, 3);
+  const b = pair.slice(3, 6);
+  if (a === 'USD' && b && b !== 'USD') return b;
+  if (b === 'USD' && a && a !== 'USD') return a;
+  if (desk && desk !== 'USD') return desk;
+  return a && a !== 'USD' ? a : (b || 'EUR');
+}
+
+/**
+ * True when the market quote is FCY per 1 USD (USDPLN, USDJPY, USDCHF, …).
+ * EUR / GBP / AUD / NZD are the only USD-per-FCY quotes. Pair labels do not
+ * change that — a PLN book is USDPLN even if the file cell says PLNUSD.
+ */
+export function isUsdBaseFcyPair(
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot'>,
+): boolean {
+  const fcy = fcyCcyOf(bundle);
+  return fcy !== 'USD' && !isUsdPerFcyQuoted(fcy);
+}
+
 /** Ensure overnight cash exists (seed LP if missing). */
 export function normalizeMarketRatesBundle(
   bundle: FxMarketRatesBundle,
+  deskCcy?: string,
 ): FxMarketRatesBundle {
+  const baseCcy = (deskCcy || bundle.baseCcy || 'EUR').toUpperCase();
+  const pair = usdMarketPair(baseCcy);
+  const quoteCcy = isUsdPerFcyQuoted(baseCcy) ? 'USD' : baseCcy;
   const overnightCash =
     bundle.overnightCash ??
-    defaultOvernightCashFromLp(bundle.baseCcy || 'EUR');
-  return {
+    defaultOvernightCashFromLp(baseCcy);
+  const canon = {
     ...bundle,
+    baseCcy,
+    pair,
+    quoteCcy,
     overnightCash,
+  };
+  let spot = bundle.spot;
+  let deposits = bundle.deposits;
+  if (spot?.mid && isUsdBaseFcyPair({ ...canon, spot })) {
+    const lp = CURRENCY_PARAMS[baseCcy]?.spot;
+    const mid = spot.mid;
+    const tms = lp > 0 ? 1 / lp : 0;
+    if (lp > 0 && mid > 0) {
+      const isFcyPerUsd = mid * lp > 0.85 && mid * lp < 1.15;
+      const isUsdPerFcy = mid / lp > 0.85 && mid / lp < 1.15;
+      if (isUsdPerFcy && !isFcyPerUsd) {
+        spot = {
+          bid: 1 / (spot.ask || mid),
+          ask: 1 / (spot.bid || mid),
+          mid: 1 / mid,
+        };
+      } else if (!isFcyPerUsd && tms > 0) {
+        // EURUSD ~1.16 on a PLN book is not USDPLN. TMS quote; drop foreign points.
+        spot = { bid: tms, ask: tms, mid: tms };
+        deposits = stripQuotedForwards(deposits);
+      }
+    }
+  }
+  return {
+    ...canon,
+    spot,
+    deposits,
     rateConvention: {
       depositBid: 'term credit — forward CIP / points',
       depositAsk: 'term debit — forward CIP / points',
@@ -177,77 +252,335 @@ export function selectCreditDebitRate(
   return { ratePct: debitPct, side: 'debit' };
 }
 
-/**
- * EURUSD (and similar majors) swap points → outright delta.
- * FXOCalculator quotes points so F ≈ S + points/10_000.
- */
-export function swapPointsToPriceDelta(
-  points: number,
-  pair = 'EURUSD',
-): number {
-  const p = pair.replace('/', '').toUpperCase();
-  // JPY pairs use /100; most others (EURUSD) use /10_000.
-  const div = p.endsWith('JPY') ? 100 : 10_000;
-  return points / div;
+/** File spot is this FCY's USD quote (FCY per USD or USD per FCY), not a peer pair. */
+function spotMatchesDeskQuote(mid: number, fcy: string): boolean {
+  const lp = CURRENCY_PARAMS[fcy]?.spot;
+  if (!(lp > 0) || !(mid > 0)) return false;
+  const fcyPerUsd = 1 / lp;
+  if (mid / fcyPerUsd > 0.85 && mid / fcyPerUsd < 1.15) return true;
+  if (mid / lp > 0.85 && mid / lp < 1.15) return true;
+  return false;
 }
 
-/** Interpolate EUR/USD swap points (bid/ask) to a settle tenor. */
+function stripQuotedForwards(
+  deposits: readonly DepositTenorRow[],
+): DepositTenorRow[] {
+  return deposits.map(d => ({
+    tenor: d.tenor,
+    months: d.months,
+    eur: d.eur,
+    usd: d.usd,
+  }));
+}
+
+/** FCY per 1 USD — the quote the points sit on for every non-EUR/GBP/AUD/NZD pair. */
+function usdBasePairSpot(
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot'>,
+): number {
+  const fcy = fcyCcyOf(bundle);
+  const usdPerFcy = CURRENCY_PARAMS[fcy]?.spot;
+  const tmsFcyPerUsd = usdPerFcy > 0 ? 1 / usdPerFcy : 0;
+  const mid = bundle.spot?.mid;
+  if (!(typeof mid === 'number' && mid > 0)) return tmsFcyPerUsd;
+  // Already FCY per 1 USD (USDPLN ~3.64, USDJPY ~160).
+  if (usdPerFcy > 0 && mid * usdPerFcy > 0.85 && mid * usdPerFcy < 1.15) return mid;
+  // USD per 1 FCY, or a peer pair (EURUSD ~1.16 on PLN) — never treat those as USDPLN.
+  return tmsFcyPerUsd;
+}
+
+/** Points column is FCY per 1 USD. `points` unused — call sites stay stable. */
+export function swapPointsQuotedUsdPerDollar(
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot' | 'deposits'>,
+  _points?: number,
+): boolean {
+  return isUsdBaseFcyPair(bundle);
+}
+
+/** Pair-native F−S. FXOCalculator: F ≈ S + points/10_000 (JPY /100). */
+export function swapPointsToPriceDelta(
+  points: number,
+  pairOrCcy = 'EURUSD',
+): number {
+  const p = pairOrCcy.replace('/', '').toUpperCase();
+  const jpy = p === 'JPY' || p.includes('JPY');
+  return points / (jpy ? 100 : 10_000);
+}
+
+/**
+ * Swap points → USD per 1 FCY.
+ *
+ * EUR / GBP / AUD / NZD (USD per FCY): Δ = points / 10_000 (JPY / 100).
+ *
+ * USDPLN / USDJPY / USDCHF / … (FCY per 1 USD): the file points sit on that
+ * quote. Convert, do not multiply N × pts/10_000:
+ *   S = PLN per 1 USD (spot ~3.64; invert the book USD/PLN if needed)
+ *   F = S + points / 10_000
+ *   Δ = 1/F − 1/S
+ * Negative USDPLN points ⇒ F < S ⇒ Δ > 0. A long (sell PLN far) earns CIP.
+ */
+export function swapPointsToUsdPerFcyDelta(
+  points: number,
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot' | 'deposits'>,
+): number {
+  const fcy = fcyCcyOf(bundle);
+  const quoteDelta = swapPointsToPriceDelta(points, fcy);
+  if (!swapPointsQuotedUsdPerDollar(bundle, points)) return quoteDelta;
+  const S = usdBasePairSpot(bundle);
+  if (!(S > 0)) return 0;
+  const F = S + quoteDelta;
+  if (!(F > 0)) return 0;
+  return 1 / F - 1 / S;
+}
+
+/**
+ * Forward-forward swap points → USD per 1 FCY, for a leg that itself starts
+ * forward (not at spot) and runs to a later date. `pointsNear`/`pointsFar` are
+ * the curve's spot-to-X-month points at the leg's own start and end dates —
+ * NOT the tenor of the leg. Reading the curve's tenor-from-spot knot for a
+ * forward-starting leg prices the wrong window entirely once the curve has
+ * any slope: spot-to-7-months is not the same trade as 5-months-forward-to-
+ * 12-months-forward, even though both are "7 months" long.
+ *
+ * pointsNear = 0 (a spot-starting leg) reduces this exactly to
+ * {@link swapPointsToUsdPerFcyDelta} — same formula, same answer.
+ */
+export function swapPointsToUsdPerFcyFwdFwdDelta(
+  pointsNear: number,
+  pointsFar: number,
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot' | 'deposits'>,
+): number {
+  const fcy = fcyCcyOf(bundle);
+  const deltaNear = swapPointsToPriceDelta(pointsNear, fcy);
+  const deltaFar = swapPointsToPriceDelta(pointsFar, fcy);
+  if (!swapPointsQuotedUsdPerDollar(bundle, pointsFar)) return deltaFar - deltaNear;
+  const S = usdBasePairSpot(bundle);
+  if (!(S > 0)) return 0;
+  const Fnear = S + deltaNear;
+  const Ffar = S + deltaFar;
+  if (!(Fnear > 0) || !(Ffar > 0)) return 0;
+  return 1 / Ffar - 1 / Fnear;
+}
+
+/** First CIP knot — ON/SW/1W/2W are not the 3W–12M swap-points profile. */
+const CIP_CURVE_MIN_MONTHS = 21 / 30;
+const CIP_STUB_TENORS = new Set(['ON', 'TN', 'SN', 'SW', '1W', '2W']);
+
+function canonTenor(tenor: string): string {
+  return tenor.trim().toUpperCase().replace(/\s+/g, '');
+}
+
+export interface SwapPointsKnot {
+  tenor: string;
+  months: number;
+  bid: number;
+  ask: number;
+  mid: number;
+}
+
+export interface CipTenorBucket extends SwapPointsKnot {
+  /** CIP P&L on the supplied standing, priced at this knot's mid. */
+  cipUsdM: number;
+  booked: boolean;
+}
+
+function tenorLabelFromMonths(months: number): string {
+  let best: { tenor: string; d: number } | null = null;
+  for (const [tenor, m] of Object.entries(TENOR_MONTHS)) {
+    const d = Math.abs(m - months);
+    if (!best || d < best.d) best = { tenor, d };
+  }
+  return best && best.d < 0.2 ? best.tenor : `${months.toFixed(1)}M`;
+}
+
+/**
+ * 3W+ knots on the uploaded swap-points column. ON/SW/1W/2W are excluded.
+ * Duplicate tenors keep the first row.
+ */
+export function swapPointsTenorCurve(
+  deposits: readonly DepositTenorRow[],
+  _bundle?: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot'>,
+): SwapPointsKnot[] {
+  const seen = new Set<string>();
+  const raw: SwapPointsKnot[] = [];
+  for (const d of deposits) {
+    const tenor = canonTenor(d.tenor || '');
+    if (CIP_STUB_TENORS.has(tenor)) continue;
+    const months = d.months ?? TENOR_MONTHS[tenor] ?? null;
+    if (months == null || !Number.isFinite(months)) continue;
+    if ((months as number) < CIP_CURVE_MIN_MONTHS - 1e-9) continue;
+    const key = tenor || `${(months as number).toFixed(3)}`;
+    if (seen.has(key)) continue;
+    const bid = d.swapPoints?.bid ?? null;
+    const ask = d.swapPoints?.ask ?? null;
+    if (bid == null || ask == null) continue;
+    seen.add(key);
+    raw.push({
+      tenor: tenor || tenorLabelFromMonths(months as number),
+      months: months as number,
+      bid,
+      ask,
+      mid: (bid + ask) / 2,
+    });
+  }
+  raw.sort((a, b) => a.months - b.months);
+  return raw;
+}
+
+/** True when the 3W+ swap-points column can price CIP (not an O/N-only shell). */
+export function bundleHasCipSwapPoints(
+  bundle: FxMarketRatesBundle | null | undefined,
+): boolean {
+  if (!bundle?.deposits?.length) return false;
+  return swapPointsTenorCurve(bundle.deposits, bundle).length > 0;
+}
+
+/** EURUSD seed, keeping a desk shell's overnight / cash-interest mode. */
+function eurUsdSeedForDesk(shell?: FxMarketRatesBundle): FxMarketRatesBundle {
+  if (!shell) return DEFAULT_EURUSD_MARKET_RATES;
+  return normalizeMarketRatesBundle({
+    ...DEFAULT_EURUSD_MARKET_RATES,
+    overnightCash:
+      shell.overnightCash ?? DEFAULT_EURUSD_MARKET_RATES.overnightCash,
+    cashInterestMode:
+      shell.cashInterestMode ?? DEFAULT_EURUSD_MARKET_RATES.cashInterestMode,
+  }, 'EUR');
+}
+
+/** Interpolate bid/ask/mid on the 3W+ swap-points profile (not ON/SW). */
 export function interpolateSwapPoints(
   deposits: readonly DepositTenorRow[],
   months: number,
+  bundle?: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot'>,
 ): { bid: number; ask: number; mid: number } | null {
-  const pts = deposits
-    .filter(
-      d =>
-        d.months != null &&
-        Number.isFinite(d.months) &&
-        d.swapPoints?.bid != null &&
-        d.swapPoints?.ask != null,
-    )
-    .map(d => ({
-      m: d.months as number,
-      bid: d.swapPoints!.bid as number,
-      ask: d.swapPoints!.ask as number,
-    }))
-    .sort((a, b) => a.m - b.m);
+  const pts = swapPointsTenorCurve(deposits, bundle);
   if (pts.length === 0) return null;
-  const t = Math.max(0, months);
+  const t = Math.max(CIP_CURVE_MIN_MONTHS, months);
   const lerp = (
-    a: { bid: number; ask: number },
-    b: { bid: number; ask: number },
+    a: SwapPointsKnot,
+    b: SwapPointsKnot,
     w: number,
-  ) => {
+  ): { bid: number; ask: number; mid: number } => {
     const bid = a.bid + w * (b.bid - a.bid);
     const ask = a.ask + w * (b.ask - a.ask);
     return { bid, ask, mid: (bid + ask) / 2 };
   };
-  if (t <= pts[0]!.m) {
+  if (t <= pts[0]!.months) {
     const p = pts[0]!;
-    return { bid: p.bid, ask: p.ask, mid: (p.bid + p.ask) / 2 };
+    return { bid: p.bid, ask: p.ask, mid: p.mid };
   }
   const last = pts[pts.length - 1]!;
-  if (t >= last.m) {
-    return { bid: last.bid, ask: last.ask, mid: (last.bid + last.ask) / 2 };
+  if (t >= last.months) {
+    return { bid: last.bid, ask: last.ask, mid: last.mid };
   }
   for (let i = 0; i < pts.length - 1; i++) {
     const a = pts[i]!;
     const b = pts[i + 1]!;
-    if (t >= a.m && t <= b.m) {
-      const w = (t - a.m) / Math.max(1e-12, b.m - a.m);
+    if (t >= a.months && t <= b.months) {
+      const w = (t - a.months) / Math.max(1e-12, b.months - a.months);
       return lerp(a, b, w);
     }
   }
-  return { bid: last.bid, ask: last.ask, mid: (last.bid + last.ask) / 2 };
+  return { bid: last.bid, ask: last.ask, mid: last.mid };
 }
 
 /**
- * Forward points carry in $M from the EURUSD Swap Points column.
- * Positive notional = sell FCY → use bid points; buy → ask.
- * P&L = N_FCY_M × (F − S) with F−S from swap points.
+ * CIP-implied FCY rate (% p.a.) for a window on the swap-points curve.
+ *
+ * F and S are USD per 1 FCY (EURUSD / inverted USDPLN). Covered parity:
+ *   F/S ≈ (1 + r_USD τ) / (1 + r_FCY τ)
+ *   r_FCY = r_USD − (F−S)/S × (365/tenor_days)
+ *
+ * EURUSD 1M points are a premium (F > S) because r_EUR < r_USD — that is PAY
+ * for long EUR, not EARN. The plus form of this identity flips the tilt and
+ * the mean-variance mix then shorts correlated names (GBP/PLN) as hedges.
+ *
+ * Reads MID points — a rate estimate for sizing/allocation, not a trade
+ * price (unlike {@link fwdCarryFromSwapPointsUsdM}, which picks bid/ask by
+ * trade direction). `startMonths > 0` prices the forward-forward window.
+ */
+export function impliedCarryRatePct(
+  bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy' | 'spot' | 'deposits'>,
+  tenorMonths: number,
+  startMonths = 0,
+  rUsdPct = 0,
+): number | null {
+  const mid = bundle.spot?.mid;
+  if (!(typeof mid === 'number' && mid > 0) || !(tenorMonths > 0)) return null;
+  const sUsd = isUsdBaseFcyPair(bundle) ? 1 / usdBasePairSpot(bundle) : mid;
+  if (!(sUsd > 0)) return null;
+  const far = interpolateSwapPoints(bundle.deposits, startMonths + tenorMonths, bundle);
+  if (!far) return null;
+  const tenorDays = tenorMonths * 30;
+  let delta: number;
+  if (startMonths < 1e-9) {
+    delta = swapPointsToUsdPerFcyDelta(far.mid, bundle);
+  } else {
+    const near = interpolateSwapPoints(bundle.deposits, startMonths, bundle);
+    if (!near) return null;
+    delta = swapPointsToUsdPerFcyFwdFwdDelta(near.mid, far.mid, bundle);
+  }
+  // delta = F − S in USD per FCY. Premium (delta > 0) ⇒ r_FCY < r_USD.
+  return rUsdPct - (delta / sUsd) * (365 / tenorDays) * 100;
+}
+
+/**
+ * Mid CIP knots for the booked far. Rolling (1M) returns only the 1M knot —
+ * later tenors are not monthly rolls. Term returns knots up to the forecast.
+ */
+export function cipTenorProfile(input: {
+  notionalLocalM: number;
+  bundle: FxMarketRatesBundle;
+  bookedMonths?: number;
+  /** Inclusive cap in months (forecast horizon). */
+  maxMonths?: number;
+}): CipTenorBucket[] {
+  const N = input.notionalLocalM;
+  const booked = input.bookedMonths;
+  const cap =
+    typeof input.maxMonths === 'number' && Number.isFinite(input.maxMonths)
+      ? input.maxMonths
+      : Infinity;
+  const rolling =
+    typeof booked === 'number'
+    && Number.isFinite(booked)
+    && booked <= 1 + 0.35;
+  return swapPointsTenorCurve(input.bundle.deposits, input.bundle)
+    .filter(k => {
+      if (k.months > cap + 0.35) return false;
+      if (rolling) return Math.abs(k.months - 1) < 0.35;
+      return true;
+    })
+    .map(k => ({
+      ...k,
+      cipUsdM: N * swapPointsToUsdPerFcyDelta(k.mid, input.bundle),
+      booked:
+        typeof booked === 'number'
+        && Number.isFinite(booked)
+        && Math.abs(k.months - booked) < 0.35,
+    }));
+}
+
+/**
+ * Far-leg CIP at the settle tenor, priced on the 3W+ swap-points curve.
+ * P&L = N_FCY_M × Δ(USD per FCY). FCY-per-USD quotes invert 1/F − 1/S.
+ *
+ * Quote side: sell FCY far → ask; buy FCY far → bid.
+ * On USDPLN that means a long cover (sell PLN far) takes the ask — the
+ * less-negative side when points are negative.
  */
 export function fwdCarryFromSwapPointsUsdM(input: {
   notionalLocalM: number;
+  /** Duration of the leg — spot-to-settleMonths when startMonths is 0/omitted. */
   settleMonths: number;
+  /**
+   * Months from spot the leg itself starts. 0 (default) = spot-starting (the
+   * curve's settleMonths knot, as before). > 0 = forward-starting — priced off
+   * the forward-forward window (curve at startMonths → curve at
+   * startMonths+settleMonths), not the spot-to-settleMonths knot. A
+   * forward-starting leg read off the wrong window misprices it the moment
+   * the curve has any slope, even though "months long" looks the same.
+   */
+  startMonths?: number;
   bundle: FxMarketRatesBundle;
 }): {
   fwdCarryUsdM: number;
@@ -259,32 +592,83 @@ export function fwdCarryFromSwapPointsUsdM(input: {
   if (Math.abs(N) < 1e-12) {
     return { fwdCarryUsdM: 0, points: 0, priceDelta: 0, side: 'mid' };
   }
-  const curve = interpolateSwapPoints(
+  const mid = input.bundle.spot?.mid;
+  if (
+    typeof mid === 'number'
+    && mid > 0
+    && isUsdBaseFcyPair(input.bundle)
+    && !spotMatchesDeskQuote(mid, fcyCcyOf(input.bundle))
+  ) {
+    return null;
+  }
+  // Sell FCY far (N > 0 covering long) → ask; buy FCY far (N < 0) → bid.
+  // USDPLN ask is the RHS — less negative when the points column is negative.
+  const side: 'bid' | 'ask' = N >= 0 ? 'ask' : 'bid';
+  const pick = (c: { bid: number; ask: number; mid: number }) => c[side];
+  const startMonths = Math.max(0, input.startMonths ?? 0);
+  const farCurve = interpolateSwapPoints(
     input.bundle.deposits,
-    input.settleMonths,
+    startMonths + input.settleMonths,
+    input.bundle,
   );
-  if (!curve) return null;
-  const side: 'bid' | 'ask' = N >= 0 ? 'bid' : 'ask';
-  const points = side === 'bid' ? curve.bid : curve.ask;
-  const pair = input.bundle.pair || 'EURUSD';
-  const priceDelta = swapPointsToPriceDelta(points, pair);
-  // N in FCY millions × USD-per-FCY delta = USD millions.
+  if (!farCurve) return null;
+  if (startMonths < 1e-9) {
+    const points = pick(farCurve);
+    const priceDelta = swapPointsToUsdPerFcyDelta(points, input.bundle);
+    return { fwdCarryUsdM: N * priceDelta, points, priceDelta, side };
+  }
+  const nearCurve = interpolateSwapPoints(
+    input.bundle.deposits,
+    startMonths,
+    input.bundle,
+  );
+  if (!nearCurve) return null;
+  const nearPts = pick(nearCurve);
+  const farPts = pick(farCurve);
+  const priceDelta = swapPointsToUsdPerFcyFwdFwdDelta(
+    nearPts, farPts, input.bundle,
+  );
   return {
     fwdCarryUsdM: N * priceDelta,
-    points,
+    points: roundMoney(farPts - nearPts, 6),
     priceDelta,
     side,
   };
 }
 
 /**
+ * Locked-far monthly CIP: the settle-tenor points, spread evenly over the
+ * months the far is alive. Not CIP(t) − CIP(t−1) along the curve — that walk
+ * treats calendar month M4 as a 4M tenor and can flip sign vs the booked far.
+ */
+export function fwdCarryMonthlyAccrualUsdM(input: {
+  notionalLocalM: number;
+  settleMonths: number;
+  month: number;
+  bundle: FxMarketRatesBundle;
+}): number {
+  const S = input.settleMonths;
+  const m = input.month;
+  if (S < 1 - 1e-12 || m < 1 - 1e-12 || m > S + 1e-12) return 0;
+  const total = fwdCarryFromSwapPointsUsdM({
+    notionalLocalM: input.notionalLocalM,
+    settleMonths: S,
+    bundle: input.bundle,
+  });
+  if (!total) return 0;
+  return total.fwdCarryUsdM / S;
+}
+
+/**
  * Funding-swap far-leg CIP P&L ($M over the tenor) from the swap-points curve.
- * Same sign convention as {@link fwdCarryFromSwapPointsUsdM}: standing < 0
- * (sold FCY near → buy FCY far) hits the ask. Overnight cash Δr is not used.
+ * Same side rule as {@link fwdCarryFromSwapPointsUsdM}: long standing sells
+ * FCY far → ask; short standing buys FCY far → bid. Overnight cash Δr is not used.
  */
 export function fundingSwapFarLegCipUsdM(input: {
   standingLocalM: number;
   settleMonths: number;
+  /** Months from spot this leg itself starts — 0/omitted = spot-starting. */
+  startMonths?: number;
   bundle?: FxMarketRatesBundle | null;
   /** Deposit-rate CIP fallback already scaled to the tenor ($M). */
   fallbackUsdM?: number;
@@ -296,6 +680,7 @@ export function fundingSwapFarLegCipUsdM(input: {
     const pts = fwdCarryFromSwapPointsUsdM({
       notionalLocalM: N,
       settleMonths: input.settleMonths,
+      startMonths: input.startMonths,
       bundle: input.bundle,
     });
     if (pts) return pts.fwdCarryUsdM;
@@ -312,16 +697,21 @@ export function fundingSwapPathFarCipUsdM(input: {
     standing_swap: number;
     cycleIndex?: number;
     far_leg?: number;
+    /** Incremental leg this cycle adds — the notional a stripTerm tranche prices on. */
+    swap_needed?: number;
   }[];
   standingFallback: number;
   forecastMonths: number;
   bundle?: FxMarketRatesBundle | null;
   fallbackAnnualUsdYr: (standing: number) => number;
+  /** When `rolling`, never treat stray `far_leg` as term cover. */
+  bookingMode?: 'rolling' | 'term' | 'stripTerm';
 }): number {
-  const cipAt = (standing: number, months: number) =>
+  const cipAt = (standing: number, months: number, startMonths = 0) =>
     fundingSwapFarLegCipUsdM({
       standingLocalM: standing,
       settleMonths: months,
+      startMonths,
       bundle: input.bundle,
       fallbackUsdM: input.fallbackAnnualUsdYr(standing) * (months / 12),
     });
@@ -330,14 +720,44 @@ export function fundingSwapPathFarCipUsdM(input: {
   if (!plan?.length) {
     return cipAt(input.standingFallback, Math.max(1, input.forecastMonths));
   }
-  const term = plan.some(p => Math.abs(p.far_leg ?? 0) > 0.001);
+  // Strip to term: every leg is its OWN forward-starting tranche held to the
+  // same fixed maturity, priced ONCE on its own incremental notional
+  // (swap_needed) at ITS OWN remaining tenor, off the forward-forward window
+  // from ITS OWN start date to the horizon — not the curve's spot-to-tenor
+  // knot, which prices the wrong window the moment the curve has any slope.
+  // Pricing the cumulative standing_swap here would also re-price every
+  // earlier tranche again at each later cycle's tenor too — the same money
+  // counted at 12M, then again at 11M, again at 10M... Both a `term` and a
+  // `stripTerm` plan carry a closing far_leg, so this must branch before the
+  // far_leg-based term detection below or it would misread a multi-leg strip
+  // as one bullet swap priced on M1 alone.
+  if (input.bookingMode === 'stripTerm') {
+    const horizon = Math.max(1, input.forecastMonths);
+    return plan.reduce((s, p, i) => {
+      const notional = p.swap_needed ?? p.standing_swap;
+      if (Math.abs(notional) < 1e-9) return s;
+      const startMonths = p.cycleIndex ?? i;
+      const tenor = Math.max(0, horizon - startMonths);
+      return tenor < 1 - 1e-9 ? s : s + cipAt(notional, tenor, startMonths);
+    }, 0);
+  }
+  const term = input.bookingMode === 'term'
+    || (input.bookingMode !== 'rolling'
+      && plan.some(p => Math.abs(p.far_leg ?? 0) > 0.001));
   if (term) {
     return cipAt(
       plan[0]!.standing_swap,
       fundingSwapFarSettleMonths(plan, input.forecastMonths),
     );
   }
-  return plan.reduce((s, p) => s + cipAt(p.standing_swap, 1), 0);
+  // Rolling: each cycle's fresh 1-month roll is itself forward-starting once
+  // cycleIndex > 0 — cycle k's window is [k, k+1], priced off the
+  // forward-forward rate for that window, not the curve's spot-to-1M knot
+  // reused unchanged for every cycle regardless of how far out it is.
+  return plan.reduce(
+    (s, p, i) => s + cipAt(p.standing_swap, 1, p.cycleIndex ?? i),
+    0,
+  );
 }
 
 /** Linear interpolate credit/debit on a sorted deposit curve at `months`. */
@@ -465,10 +885,11 @@ export function suggestOvernightFromSw(
 /** Empty per-CCY shell — LP overnight, no term curve (until upload). */
 export function emptyMarketRatesForCcy(ccy: string): FxMarketRatesBundle {
   const base = (ccy || 'EUR').toUpperCase();
+  const pair = usdMarketPair(base);
   return normalizeMarketRatesBundle({
-    pair: `${base}USD`,
+    pair,
     baseCcy: base,
-    quoteCcy: 'USD',
+    quoteCcy: pair === 'USD' ? 'USD' : pair.slice(3, 6) || 'USD',
     sourceFile: 'LP defaults (no upload)',
     overnightCash: defaultOvernightCashFromLp(base),
     deposits: [],
@@ -512,7 +933,7 @@ export function stampSharedUsdOvernight(
         base: { ...on.base },
         usd: { ...shared },
       },
-    });
+    }, ccy);
   }
   return map;
 }
@@ -764,7 +1185,7 @@ export function parseFxoCalculatorWorkbook(
   const deposits: DepositTenorRow[] = [];
   for (let r = 1; r < cash.length; r++) {
     const row = cash[r] ?? [];
-    const tenor = asStr(row[0]);
+    const tenor = canonTenor(asStr(row[0]) ?? '');
     if (!tenor || /^maturity$/i.test(tenor)) continue;
     const eurBid = asNum(row[1]);
     const eurAsk = asNum(row[2]);
@@ -951,27 +1372,44 @@ export function resolveMarketRatesForCcy(
   ccy: string,
   scopeId?: string | null,
 ): FxMarketRatesBundle {
+  const forDesk = (bundle: FxMarketRatesBundle) =>
+    normalizeMarketRatesBundle(bundle, ccy);
+
   if (ccy === 'USD') {
     const peer = pickPeerMarketRatesForUsd(marketRatesByCcy);
-    if (peer) return peer.bundle;
+    if (peer) return normalizeMarketRatesBundle(peer.bundle);
     const scoped = loadStoredMarketRates(scopeId);
-    if (scoped?.deposits?.length) return scoped;
+    if (scoped?.deposits?.length) {
+      return normalizeMarketRatesBundle(scoped);
+    }
     return DEFAULT_EURUSD_MARKET_RATES;
   }
 
   const fromBook = marketRatesByCcy?.[ccy];
-  if (fromBook) return fromBook;
+  // A live CIP upload wins. An O/N-only / empty EUR shell must not shadow
+  // the bundled EURUSD swap-points curve — that is what prices Book CIP.
+  if (fromBook && bundleHasCipSwapPoints(fromBook)) return forDesk(fromBook);
 
   const scoped = loadStoredMarketRates(scopeId);
   if (
     scoped &&
+    bundleHasCipSwapPoints(scoped) &&
     (scoped.baseCcy === ccy ||
       (ccy === 'EUR' &&
         (scoped.baseCcy === 'EUR' || scoped.pair === 'EURUSD')))
   ) {
-    return scoped;
+    const desk = forDesk(scoped);
+    if (fromBook?.overnightCash) {
+      return {
+        ...desk,
+        overnightCash: forDesk(fromBook).overnightCash,
+        cashInterestMode:
+          fromBook.cashInterestMode ?? desk.cashInterestMode,
+      };
+    }
+    return desk;
   }
 
-  if (ccy === 'EUR') return DEFAULT_EURUSD_MARKET_RATES;
-  return emptyMarketRatesForCcy(ccy);
+  if (ccy === 'EUR') return eurUsdSeedForDesk(fromBook);
+  return fromBook ? forDesk(fromBook) : emptyMarketRatesForCcy(ccy);
 }

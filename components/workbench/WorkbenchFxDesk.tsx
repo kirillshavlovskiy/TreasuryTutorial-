@@ -26,11 +26,15 @@ import {
   rowsForSelectedCurrencies,
   simSeedForEntity,
 } from '@/lib/test-mode/nordtech-sim-seed';
-import type {
-  EntityHedgeBook,
-  HedgeTicket,
-  PreparedHedgeProfile,
+import {
+  applyHedgeTicketsPatch,
+  applyPreparedHedgesPatch,
+  type EntityHedgeBook,
+  type HedgeTicket,
+  type HedgeTicketsPatch,
+  type PreparedHedgesPatch,
 } from '@/lib/test-mode/hedge-var';
+import { applyDeskPatch } from '@/lib/hedge-book-normalize';
 import type { ForecastHedgeStructure } from '@/lib/test-mode/rolling-hedge';
 import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import type { VarSetup } from '@/lib/test-mode/var-setup';
@@ -102,10 +106,10 @@ export function WorkbenchFxDesk({
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
-  const setBookedHedges = (tickets: HedgeTicket[]) => {
+  const setBookedHedges = (tickets: HedgeTicketsPatch) => {
     onHedgeBookChange(prev => ({
       ...prev,
-      bookedHedges: tickets.map(t => ({
+      bookedHedges: applyHedgeTicketsPatch(prev.bookedHedges, tickets).map(t => ({
         ...t,
         entityId: entity.id,
         entityName: entity.name,
@@ -114,10 +118,10 @@ export function WorkbenchFxDesk({
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
-  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+  const setPreparedByCcy = (next: PreparedHedgesPatch) => {
     onHedgeBookChange(prev => ({
       ...prev,
-      preparedByCcy: next,
+      preparedByCcy: applyPreparedHedgesPatch(prev.preparedByCcy, next),
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
     }));
   };
@@ -130,6 +134,12 @@ export function WorkbenchFxDesk({
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgeBookChange(prev => ({
       ...prev,
+      bookedHedges: prev.bookedHedges.some(t => t.id === ticket.id)
+        ? prev.bookedHedges
+        : [
+            { ...ticket, entityId: entity.id, entityName: entity.name },
+            ...prev.bookedHedges,
+          ],
       hedgeRatios: { ...prev.hedgeRatios, [ticket.ccy]: 0 },
       preparedByCcy: prev.preparedByCcy ?? {},
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
@@ -195,6 +205,10 @@ export function WorkbenchFxDesk({
       onVarSetupChange={onVarSetupChange}
       bookedHedges={bookedHedges}
       preparedByCcy={preparedByCcy}
+      desk={hedgeBook.desk}
+      onDeskChange={next =>
+        onHedgeBookChange(prev => applyDeskPatch(prev, next))
+      }
       hedgeRatios={hedgeRatios}
       marketRatesByCcy={marketRatesByCcy}
       ratesScopeId={entity.id}

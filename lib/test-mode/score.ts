@@ -149,7 +149,7 @@ export function ensureTask01FxLayers(workspace: Workspace): Workspace {
       }),
     })),
   }));
-  return changed ? { entities } : workspace;
+  return changed ? { ...workspace, entities } : workspace;
 }
 
 function parseNum(raw: string): number | null {

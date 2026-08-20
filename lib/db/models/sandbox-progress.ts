@@ -99,7 +99,30 @@ export async function getSandboxProgressModel(): Promise<typeof SandboxProgress 
     if (!sequelize) return null;
     const Model = initSandboxProgressModel(sequelize, storageEnv);
     // Creates the env-specific table if missing — no force/alter.
-    await Model.sync();
+    // Skip sync when the table already exists: Neon + describe() can take
+    // longer than the client hydration window and a timed-out GET then
+    // writes an empty book over Postgres.
+    try {
+      const table = sandboxProgressTableName(storageEnv);
+      const [found] = await sequelize.query(
+        `SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = :table
+         LIMIT 1`,
+        { replacements: { table } },
+      );
+      if (!Array.isArray(found) || found.length === 0) {
+        await Model.sync();
+      }
+    } catch (err) {
+      try {
+        await Model.sync();
+      } catch (syncErr) {
+        console.warn(
+          '[sandbox] Model.sync failed — continuing if the table already exists',
+          syncErr ?? err,
+        );
+      }
+    }
     return Model;
   })().catch(err => {
     ready = null;

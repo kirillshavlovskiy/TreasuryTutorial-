@@ -20,6 +20,7 @@ import {
   usdActiveLayers,
   sumFcySwapNearUsd,
   optimizePortfolioCarry,
+  sweepPortfolioCarryFrontier,
   computePortfolioVAR,
   var95_1m_factor,
   combinedMultiplier,
@@ -34,7 +35,9 @@ import {
   type LayerId,
   type LayerResult,
   type LayeredBufferResult,
+  type PortfolioCarryInput,
   type PortfolioCarryResult,
+  type PortfolioCarryFrontier,
   type RowState,
   type SharedGlobals,
   type UsdParams,
@@ -48,6 +51,7 @@ import {
 import {
   buildLiquidityLadder,
   cycleCarrySplit,
+  DEFAULT_LIQUIDITY_TIMING,
   resolveLiquidityTiming,
   type HedgeSettleByCcy,
   type LadderCycle,
@@ -55,6 +59,13 @@ import {
   type LiquidityLadderResult,
   type LiquiditySizingBasis,
 } from './liquidity-ladder';
+import {
+  impliedCarryRatePct,
+  resolveMarketRatesForCcy,
+  type FxMarketRatesBundle,
+} from './fx-market-rates';
+import { fwdHedgeCarryFromMarketUsd } from './fx-hedge';
+import { rateVolBpYrFor } from './test-mode/cfar-residual';
 
 // ─── Simulator row math (lifted from UnifiedSimulator) ───────────────────────
 
@@ -202,6 +213,12 @@ export type FcyComputedRow = RowState & SimRowComputed & {
   overlayLeg: number;
   /** Annual USD carry P&L earned by this row's overlay leg ($M/yr): leg × spot × (r_FCY − r_USD)/100. */
   overlayCarryUSD: number;
+  /** Single "why is this number capped" answer — see PortfolioCarryResult. Only set with portfolioDiv on. */
+  binding_reason?: 'floor' | 'usdBudget' | 'varCap' | null;
+  /** This currency's share of total portfolio VAR ($M) — negative = diversifying. Only set with portfolioDiv on. */
+  component_var_usd?: number;
+  /** True when this row's target came from a desk-typed Target LP Cash, not the optimizer. */
+  manual_target?: boolean;
 };
 export type UsdComputedRow = RowState & UsdRowComputed;
 
@@ -661,6 +678,12 @@ export interface LayerTargetRow extends Pass1Row {
   usd_liquidity_mode?: 'normal' | 'stress';
   usd_implied_fcy_swap_usd?: number;
   usd_envelope_shortfall?: number;
+  /** Single "why is this number capped" answer — see PortfolioCarryResult. Only set with portfolioDiv on. */
+  binding_reason?: 'floor' | 'usdBudget' | 'varCap' | null;
+  /** This currency's share of total portfolio VAR ($M) — negative = diversifying. Only set with portfolioDiv on. */
+  component_var_usd?: number;
+  /** True when this row's target came from a desk-typed Target LP Cash, not the optimizer. */
+  manual_target?: boolean;
 }
 
 export interface DashboardInputs {
@@ -687,6 +710,36 @@ export interface DashboardInputs {
    * buffer funding or this swap, or the two modules loop.
    */
   cfarNetByCcyUsd?: Record<string, number>;
+  /**
+   * Live market swap-points curves per currency — when present, the
+   * portfolioDiv carry allocator prices its μ direction off the CIP-implied
+   * rate for the desk's chosen booking regime instead of the flat NP rate.
+   * See `computeLayerTargets`.
+   */
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  ratesScopeId?: string | null;
+  /**
+   * Shared overlay earn ask ($M/yr). Hit it at min VAR when feasible;
+   * blank / omitted fills the Policy VAR cap on the same Σ⁻¹μ ray.
+   */
+  carryTargetUsdYrM?: number;
+}
+
+/**
+ * FCY rate (% p.a.) for the portfolio μ tilt. A live uploaded curve
+ * replaces the flat NP rate; missing curves keep `fallbackRFcy`.
+ */
+export function impliedPortfolioRFcyPct(
+  ccy: string,
+  fallbackRFcy: number,
+  rUsd: number,
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+  tenorMonths: number,
+): number {
+  const bundle = marketRatesByCcy?.[ccy];
+  if (!bundle) return fallbackRFcy;
+  const implied = impliedCarryRatePct(bundle, tenorMonths, 0, rUsd);
+  return implied != null ? implied : fallbackRFcy;
 }
 
 export interface PortfolioSummary {
@@ -887,9 +940,26 @@ export function computeLayerTargets(
       r_OD: r.r_OD,
       carry_target: carryTargetByCcy[r.ccy],
     }));
+    // The portfolio μ direction is realised by trading the actual funding
+    // swap, so it reads that swap's CIP-implied rate for the desk's chosen
+    // regime — rolling reprices the near 1M window every cycle, term/stripTerm
+    // lock the whole horizon in today. Only currencies with a live, desk-
+    // uploaded curve get the override (never the baked-in EURUSD seed or the
+    // empty fallback `resolveMarketRatesForCcy` hands back otherwise) — those
+    // defaults are not a live view and must not silently move the EARN/PAY
+    // carry classification the rest of the model reads off the flat NP rate.
+    const bookingMode = resolveLiquidityTiming(input.forecastProfile)?.bookingMode ?? 'rolling';
+    const impliedTenorMonths = bookingMode === 'rolling' ? 1 : Math.max(1, forecastHorizonMonths(shared));
+    const impliedRFcyByCcy: Record<string, number> = {};
+    pass1Fcy.forEach((r) => {
+      const implied = impliedPortfolioRFcyPct(
+        r.ccy, r.r_FCY, shared.r_USD, input.marketRatesByCcy, impliedTenorMonths,
+      );
+      if (implied !== r.r_FCY) impliedRFcyByCcy[r.ccy] = implied;
+    });
     const optResult = optimizePortfolioCarry(
       optInputs, shared.σ_P, shared.r_USD, policyVAR,
-      fcyCollateralBudget, carryActive,
+      fcyCollateralBudget, carryActive, input.carryTargetUsdYrM, impliedRFcyByCcy,
     );
     optResult.forEach(r => {
       portOptResults[r.ccy] = r;
@@ -903,9 +973,24 @@ export function computeLayerTargets(
   const fcyRowsPreStress = pass1Fcy.map(r => {
     const delta_portfolio = deltaPortfolio[r.ccy] ?? 0;
     const opt = portOptResults[r.ccy];
+    // The portfolio carry overlay may only reposition EXISTING cash — moving
+    // money the desk already holds — never fabricate a funding swap purely
+    // to create a position where none exists. A currency with zero existing
+    // cash (r.cash) has nothing to reposition: opt.cash_threshold there is a
+    // pure Σ⁻¹μ target with no connection to any real holding (e.g. GBP in
+    // the Task 01 seed — cash=0, its only "position" is a non-cash equity
+    // stake, ir_invest_notional — not liquid FX at all), and sizing a real
+    // swap to it (computeFcySwapNear below) invents risk and CFaR that
+    // shouldn't exist. Distinct from raw_sum (a currency's own native
+    // buffer/carry target) — a currency can hold real cash with raw_sum≈0
+    // (zero payout, no floor set), and the overlay repositioning THAT cash
+    // is legitimate (see the CAD PAY sell-down test: lp_cash=95.1, payout=0
+    // — real money, zero flow — the overlay selling it down for carry is a
+    // real trade, not a fabricated one).
+    const hasExistingCash = Math.abs(r.cash) > 0.001;
     let cash_threshold = formulaLayersActive
       ? (portfolioActive
-        ? (opt?.cash_threshold ?? r.raw_sum)
+        ? (hasExistingCash ? (opt?.cash_threshold ?? r.raw_sum) : r.raw_sum)
         : r.raw_sum + delta_portfolio + (portOptCarryAdj[r.ccy] ?? 0))
       : r.peak_cash;
     const cash_threshold_raw = opt?.cash_threshold_raw ?? cash_threshold;
@@ -936,6 +1021,9 @@ export function computeLayerTargets(
       constrained: opt?.constrained ?? false,
       var_binding: opt?.var_binding ?? false,
       budget_binding: opt?.budget_binding ?? false,
+      binding_reason: opt?.binding_reason ?? null,
+      component_var_usd: opt?.component_var_usd,
+      manual_target: opt?.manual,
     };
   });
 
@@ -1135,6 +1223,9 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
       funding_binding: !!(layer?.usd_stress_trim || layer?.budget_binding),
       overlayLeg,
       overlayCarryUSD,
+      binding_reason: layer?.binding_reason ?? null,
+      component_var_usd: layer?.component_var_usd,
+      manual_target: layer?.manual_target,
     };
     return row;
   });
@@ -1237,4 +1328,186 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
   }
 
   return { layerRows, layerResults, fcyComputed, usdComputed, portfolioSummary };
+}
+
+export interface BookingModeComparisonRow {
+  ccy: string;
+  cashThresholdA: number;
+  cashThresholdB: number;
+  swapNeededA: number;
+  swapNeededB: number;
+  /** Expected annual USD swap-overlay carry under each regime ($M/yr). */
+  swapCarryUsdYrA: number;
+  swapCarryUsdYrB: number;
+  deltaCarryUsdYr: number;
+  carryDirA: 'earn' | 'pay' | 'neutral';
+  carryDirB: 'earn' | 'pay' | 'neutral';
+  /** True when the regime switch itself moves this currency between EARN and PAY. */
+  flipped: boolean;
+}
+
+export interface BookingModeComparison {
+  modeA: LiquidityBookingMode;
+  modeB: LiquidityBookingMode;
+  rows: BookingModeComparisonRow[];
+  totalDeltaCarryUsdYr: number;
+  flippedCount: number;
+}
+
+/**
+ * Regime preview: runs the full model under two booking modes and diffs the
+ * result per currency — so a desk switching `bookingMode` sees the impact
+ * before committing (expected carry Δ, any EARN/PAY flips) instead of only
+ * the new absolute numbers after the fact. When `input.forecastProfile` is
+ * absent there is no `liquidity.bookingMode` to override, so both sides
+ * compute identically — a harmless no-op comparison, not an error.
+ */
+export function compareBookingModes(
+  input: DashboardInputs,
+  modeA: LiquidityBookingMode,
+  modeB: LiquidityBookingMode,
+): BookingModeComparison {
+  const withMode = (mode: LiquidityBookingMode): ForecastProfileState | null | undefined => {
+    if (!input.forecastProfile) return input.forecastProfile;
+    const timing = resolveLiquidityTiming(input.forecastProfile) ?? DEFAULT_LIQUIDITY_TIMING;
+    return { ...input.forecastProfile, liquidity: { ...timing, bookingMode: mode } };
+  };
+  const a = computeDashboardModel({ ...input, forecastProfile: withMode(modeA) });
+  const b = computeDashboardModel({ ...input, forecastProfile: withMode(modeB) });
+  const byB = Object.fromEntries(b.fcyComputed.map(r => [r.ccy, r]));
+
+  const rows: BookingModeComparisonRow[] = a.fcyComputed.map((ra) => {
+    const rb = byB[ra.ccy];
+    const swapCarryUsdYrA = ra.swapCarryUsdYr ?? 0;
+    const swapCarryUsdYrB = rb?.swapCarryUsdYr ?? swapCarryUsdYrA;
+    return {
+      ccy: ra.ccy,
+      cashThresholdA: ra.cash_threshold,
+      cashThresholdB: rb?.cash_threshold ?? ra.cash_threshold,
+      swapNeededA: ra.swapNear,
+      swapNeededB: rb?.swapNear ?? ra.swapNear,
+      swapCarryUsdYrA,
+      swapCarryUsdYrB,
+      deltaCarryUsdYr: swapCarryUsdYrB - swapCarryUsdYrA,
+      carryDirA: ra.carryDir,
+      carryDirB: rb?.carryDir ?? ra.carryDir,
+      flipped: !!rb
+        && rb.carryDir !== ra.carryDir
+        && rb.carryDir !== 'neutral'
+        && ra.carryDir !== 'neutral',
+    };
+  });
+
+  return {
+    modeA,
+    modeB,
+    rows,
+    totalDeltaCarryUsdYr: rows.reduce((s, r) => s + r.deltaCarryUsdYr, 0),
+    flippedCount: rows.filter(r => r.flipped).length,
+  };
+}
+
+/**
+ * Portfolio carry/VAR frontier for the current book — see
+ * `sweepPortfolioCarryFrontier`. Builds the same hold-the-book base
+ * `computeLayerTargets` uses for its portfolioDiv pass (carryOptim and
+ * portfolioDiv themselves excluded from the layer set, since the frontier's
+ * job is to show what the carry tilt WOULD do, not read back a state it
+ * already applied) and sweeps it — the simplest case only: pure VAR cap, no
+ * manual pins, no USD funding budget.
+ */
+/**
+ * Everything `computePortfolioCarryFrontier` actually reads — a strict
+ * subset of `DashboardInputs` (any `DashboardInputs` already satisfies this
+ * shape) so callers that don't have a USD row / policy params handy, like
+ * the Analytics Liquidity view, don't have to fabricate them.
+ */
+export interface PortfolioCarryFrontierInput {
+  rows: RowState[];
+  shared: SharedGlobals;
+  activeLayers: Set<LayerId>;
+  policyVAR: number;
+  forecastProfile?: ForecastProfileState | null;
+  hedgeSettleByCcy?: HedgeSettleByCcy;
+  cfarNetByCcyUsd?: Record<string, number>;
+  marketRatesByCcy?: Record<string, FxMarketRatesBundle>;
+  /**
+   * Unhedged portfolio CFaR ($M) — CFaR-tab FX-only Net total / Overdraft
+   * Sum at the live confidence. Pins the frontier origin. Do not invent a
+   * second CFaR for the plot.
+   */
+  unhedgedCfarUsdM?: number;
+}
+
+export function computePortfolioCarryFrontier(
+  input: PortfolioCarryFrontierInput,
+  steps = 24,
+  rangeMultiple = 3,
+  /**
+   * Far-leg CIP pricing roughly doubles the per-call cost (a second full
+   * evalFarAt pass alongside evalAt for every k). Skip it for probe passes
+   * and diagnostics that never read farPoints — only the one final render
+   * that actually plots the far arm needs this true.
+   */
+  includeFar = false,
+): PortfolioCarryFrontier {
+  const layersForPass1 = new Set(
+    [...input.activeLayers].filter(l => l !== 'carryOptim' && l !== 'portfolioDiv') as LayerId[],
+  );
+  const pass1Fcy = input.rows.map(sr =>
+    buildPass1Fcy(
+      sr, input.shared, layersForPass1, input.activeLayers, input.forecastProfile,
+      input.hedgeSettleByCcy, undefined, cfarCoverFcyFor(sr.ccy, input.cfarNetByCcyUsd),
+    ),
+  );
+  const optInputs: PortfolioCarryInput[] = pass1Fcy.map(r => ({
+    ccy: r.ccy,
+    P: Math.abs(r.payout),
+    lp_cash: r.cash,
+    P_contrib: r.P_contrib,
+    forecasted_cash: r.peak_cash,
+    floor_contrib: r.floor_contrib,
+    delta_sigma: r.delta_sigma,
+    delta_cfar: r.delta_cfar,
+    r_FCY: r.r_FCY,
+    r_OD: r.r_OD,
+  }));
+  // Near-leg μ deliberately stays on raw r_FCY (the JPM NP deposit rate) —
+  // NOT the CIP-implied rate — so it matches unfundedCashCarryUsdYr exactly,
+  // the same rate source the per-currency frontier's own open/cash-carry arm
+  // uses. Isolating a single currency to this book must converge onto that
+  // currency's own per-currency curve; a CIP-implied override here (as
+  // optimizePortfolioCarry uses for its own, separate purpose) would price
+  // the same currency off a different rate than its per-currency counterpart
+  // and break that convergence.
+  // Far/hedge tenor for the far arm — always the full forecast horizon (a
+  // forward locking in the whole overlay), independent of bookingMode. Prices
+  // via fwdHedgeCarryFromMarketUsd — the SAME function and uploaded swap
+  // points the per-currency frontier's own far/hedged arm uses — rather than
+  // an annualized-rate approximation, so the sign matches the real model.
+  // legFcy is position-signed; the pricer takes the hedge trade (−legFcy).
+  const farTenorMonths = Math.max(1, forecastHorizonMonths(input.shared));
+  const rFcyByCcy = new Map(pass1Fcy.map(r => [r.ccy, r.r_FCY] as const));
+  const farLegCarryUsdYr = includeFar
+    ? (ccy: string, legFcy: number): number => {
+        const rFcy = rFcyByCcy.get(ccy);
+        if (rFcy == null) return 0;
+        const bundle = resolveMarketRatesForCcy(input.marketRatesByCcy, ccy);
+        return fwdHedgeCarryFromMarketUsd(
+          -legFcy, ccy, rFcy, input.shared.r_USD, farTenorMonths, bundle,
+        );
+      }
+    : undefined;
+  // Far arm's VAR — rate-differential vol on the funding notional, not FX
+  // spot vol (a forward hedge cancels spot via CIP near+far; see
+  // portfolioRateVarUsd). Same desk table rateVolBpYrFor uses for the real
+  // per-currency model's funding-swap CFaR.
+  const rateVolBpYrByCcy: Record<string, number> | undefined = includeFar
+    ? Object.fromEntries(pass1Fcy.map(r => [r.ccy, rateVolBpYrFor(r.ccy)]))
+    : undefined;
+  return sweepPortfolioCarryFrontier(
+    optInputs, input.shared.σ_P, input.shared.r_USD, input.policyVAR,
+    steps, rangeMultiple, undefined, farLegCarryUsdYr, rateVolBpYrByCcy,
+    farTenorMonths, input.unhedgedCfarUsdM,
+  );
 }

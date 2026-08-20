@@ -6,7 +6,18 @@
 
 import type { LayerId } from '@/lib/fx-buffer';
 import type { ForecastProfileState } from '@/lib/forecast-profile';
+import {
+  hedgeSidecarStorageKey,
+  mergeHedgesWithSidecar,
+  normalizeHedgeBooksMap,
+  parseHedgeSidecar,
+  pickHedgeBooksForWrite,
+  rebindHedgeBooksToWorkspace,
+  serializeHedgeSidecar,
+} from '@/lib/hedge-book-normalize';
 import { migrateFormulaOverrides } from '@/lib/sim-formulas';
+import type { EntityHedgeBook } from '@/lib/test-mode/hedge-var';
+import type { VarSetup } from '@/lib/test-mode/var-setup';
 
 export type RiskProfileType = 'fx' | 'bonds' | 'investments' | 'equities' | 'commodities';
 
@@ -607,6 +618,8 @@ export function entityHasFxSetup(entity: Entity): boolean {
 }
 
 const STORAGE_PREFIX = 'treasury:workspace:';
+/** v2: envelope with hedge books + VaR setup. v1 was the bare Workspace object. */
+export const WORKSPACE_BLOB_VERSION = 2;
 
 function storageKey(userKey: string): string {
   return `${STORAGE_PREFIX}${userKey}`;
@@ -618,13 +631,73 @@ export function emptyWorkspace(): Workspace {
 
 export interface WorkspaceLoadResult {
   workspace: Workspace;
+  hedgesByEntityId: Record<string, EntityHedgeBook>;
+  varSetup?: VarSetup;
+  updatedAt?: string;
+  hedgesUpdatedAt?: string;
   /** True when localStorage was unreadable / corrupt and we fell back to empty. */
   loadWarning?: string;
+}
+
+export interface WorkspaceSaveExtras {
+  hedgesByEntityId?: Record<string, EntityHedgeBook>;
+  varSetup?: VarSetup;
+  hedgesUpdatedAt?: string;
 }
 
 export interface WorkspaceSaveResult {
   ok: boolean;
   error?: string;
+}
+
+interface WorkspacePersistBlob {
+  version?: number;
+  workspace?: Workspace;
+  entities?: Workspace['entities'];
+  group?: Workspace['group'];
+  hedgesByEntityId?: unknown;
+  varSetup?: unknown;
+  updatedAt?: string;
+  hedgesUpdatedAt?: string;
+}
+
+function emptyLoadResult(loadWarning?: string): WorkspaceLoadResult {
+  return {
+    workspace: emptyWorkspace(),
+    hedgesByEntityId: {},
+    ...(loadWarning ? { loadWarning } : {}),
+  };
+}
+
+function isBareWorkspace(parsed: unknown): parsed is Workspace {
+  if (!parsed || typeof parsed !== 'object') return false;
+  const row = parsed as WorkspacePersistBlob;
+  return Array.isArray(row.entities) && row.workspace == null;
+}
+
+function parseWorkspaceBlob(parsed: unknown): WorkspaceLoadResult | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const blob = parsed as WorkspacePersistBlob;
+  if (isBareWorkspace(blob)) {
+    return {
+      workspace: migrateRenamedFormulaRefs(blob),
+      hedgesByEntityId: {},
+    };
+  }
+  if (!blob.workspace || !Array.isArray(blob.workspace.entities)) return null;
+  const varSetup =
+    blob.varSetup && typeof blob.varSetup === 'object'
+      ? (blob.varSetup as VarSetup)
+      : undefined;
+  return {
+    workspace: migrateRenamedFormulaRefs(blob.workspace),
+    hedgesByEntityId: normalizeHedgeBooksMap(blob.hedgesByEntityId),
+    ...(varSetup ? { varSetup } : {}),
+    ...(blob.updatedAt ? { updatedAt: blob.updatedAt } : {}),
+    ...(typeof blob.hedgesUpdatedAt === 'string'
+      ? { hedgesUpdatedAt: blob.hedgesUpdatedAt }
+      : {}),
+  };
 }
 
 /**
@@ -654,25 +727,60 @@ export function loadWorkspace(userKey: string): Workspace {
   return loadWorkspaceDetailed(userKey).workspace;
 }
 
+function readWorkspaceHedgeSidecar(userKey: string) {
+  if (typeof window === 'undefined') return null;
+  try {
+    return parseHedgeSidecar(
+      window.localStorage.getItem(hedgeSidecarStorageKey(storageKey(userKey))),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function withWorkspaceSidecar(
+  book: WorkspaceLoadResult,
+  userKey: string,
+): WorkspaceLoadResult {
+  const picked = mergeHedgesWithSidecar(
+    book.hedgesByEntityId,
+    book.hedgesUpdatedAt,
+    readWorkspaceHedgeSidecar(userKey),
+  );
+  return {
+    ...book,
+    hedgesByEntityId: rebindHedgeBooksToWorkspace(
+      picked.hedgesByEntityId,
+      book.workspace.entities,
+    ),
+    hedgesUpdatedAt: picked.hedgesUpdatedAt,
+  };
+}
+
 /** Load with an optional warning when storage is corrupt or unavailable. */
 export function loadWorkspaceDetailed(userKey: string): WorkspaceLoadResult {
-  if (typeof window === 'undefined') return { workspace: emptyWorkspace() };
+  if (typeof window === 'undefined') return emptyLoadResult();
   try {
     const raw = window.localStorage.getItem(storageKey(userKey));
-    if (!raw) return { workspace: emptyWorkspace() };
-    const parsed = JSON.parse(raw) as Workspace;
-    if (!parsed || !Array.isArray(parsed.entities)) {
-      return {
-        workspace: emptyWorkspace(),
-        loadWarning: 'Saved workspace was unreadable — started with an empty book.',
-      };
+    if (!raw) return withWorkspaceSidecar(emptyLoadResult(), userKey);
+    const parsed: unknown = JSON.parse(raw);
+    const book = parseWorkspaceBlob(parsed);
+    if (!book) {
+      return withWorkspaceSidecar(
+        emptyLoadResult(
+          'Saved workspace was unreadable — started with an empty book.',
+        ),
+        userKey,
+      );
     }
-    return { workspace: migrateRenamedFormulaRefs(parsed) };
+    return withWorkspaceSidecar(book, userKey);
   } catch {
-    return {
-      workspace: emptyWorkspace(),
-      loadWarning: 'Could not read workspace from browser storage — started empty.',
-    };
+    return withWorkspaceSidecar(
+      emptyLoadResult(
+        'Could not read workspace from browser storage — started empty.',
+      ),
+      userKey,
+    );
   }
 }
 
@@ -680,12 +788,43 @@ export function loadWorkspaceDetailed(userKey: string): WorkspaceLoadResult {
 export function saveWorkspace(
   userKey: string,
   workspace: Workspace,
+  extras?: WorkspaceSaveExtras,
 ): WorkspaceSaveResult {
   if (typeof window === 'undefined') {
     return { ok: false, error: 'Workspace save is only available in the browser.' };
   }
   try {
-    window.localStorage.setItem(storageKey(userKey), JSON.stringify(workspace));
+    const prev = loadWorkspaceDetailed(userKey);
+    const incomingHedges = extras?.hedgesByEntityId;
+    const picked =
+      incomingHedges === undefined
+        ? {
+            hedgesByEntityId: prev.hedgesByEntityId ?? {},
+            hedgesUpdatedAt: extras?.hedgesUpdatedAt ?? prev.hedgesUpdatedAt,
+          }
+        : pickHedgeBooksForWrite(
+            incomingHedges,
+            prev.hedgesByEntityId,
+            extras?.hedgesUpdatedAt,
+            prev.hedgesUpdatedAt,
+          );
+    const blob: WorkspacePersistBlob = {
+      version: WORKSPACE_BLOB_VERSION,
+      workspace,
+      hedgesByEntityId: picked.hedgesByEntityId,
+      varSetup: extras?.varSetup ?? prev.varSetup,
+      updatedAt: new Date().toISOString(),
+      hedgesUpdatedAt: picked.hedgesUpdatedAt,
+    };
+    try {
+      window.localStorage.setItem(
+        hedgeSidecarStorageKey(storageKey(userKey)),
+        serializeHedgeSidecar(blob.hedgesByEntityId, blob.hedgesUpdatedAt),
+      );
+    } catch {
+      // Quota — still try the full envelope / Neon PUT.
+    }
+    window.localStorage.setItem(storageKey(userKey), JSON.stringify(blob));
     return { ok: true };
   } catch (err) {
     const message =
@@ -705,10 +844,12 @@ export function createEntity(
     baseCurrency: string;
     description?: string;
     riskAssets?: RiskAssetId[];
+    /** Stable id — NordTech seed must not rotate or hedges orphan. */
+    id?: string;
   },
 ): { workspace: Workspace; entity: Entity } {
   const entity: Entity = {
-    id: makeId('ent'),
+    id: input.id?.trim() || makeId('ent'),
     name: input.name.trim(),
     baseCurrency: input.baseCurrency,
     description: input.description?.trim() ?? '',

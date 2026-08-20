@@ -1,6 +1,8 @@
 // FX Buffer Simulator — business logic
 // All formulas sourced from .claude/rules/project/decisions.md
 
+import { allocateCarryVarUsd } from '@/lib/portfolio-alloc';
+
 export interface SharedGlobals {
   r_USD: number;   // JPM NP USD credit rate % p.a.
   σ_P: number;     // payout forecast uncertainty fraction (0.10 = 10%)
@@ -381,6 +383,67 @@ export function toggleLayerGroup(
   }
 }
 
+/**
+ * Where buffer chips apply.
+ *   currency  — each name’s own floor / σ / carry ask
+ *   portfolio — same chips, joint mix: Σ⁻¹μ overlay, Policy VAR + USD budget
+ */
+export type BufferLevel = 'currency' | 'portfolio';
+
+export function bufferLevelOf(active: Set<LayerId> | undefined): BufferLevel {
+  return active?.has('portfolioDiv') ? 'portfolio' : 'currency';
+}
+
+/** Portfolio level is `portfolioDiv` — MV allocator + shared Policy VAR cap. */
+export function setBufferLevel(
+  active: Set<LayerId> | undefined,
+  level: BufferLevel,
+  toggle: (id: LayerId) => void,
+): void {
+  const on = active?.has('portfolioDiv') === true;
+  if (level === 'portfolio' && !on) {
+    toggle('portfolioDiv');
+    // Bring every layer the portfolio frontier can bend on. This removes
+    // the "forgot to flip a chip" failure mode entirely — it does NOT
+    // fabricate floor values or CFaR exposure numbers, which are real desk
+    // inputs. With every layer on and all of them still at 0, the frontier
+    // is correctly a straight line: that means the book genuinely has no
+    // floor set and no recorded exposure, not that a layer is missing.
+    if (!active?.has('floorH')) toggle('floorH');
+    if (!active?.has('carryOptim')) toggle('carryOptim');
+    if (!active?.has('cfarCover')) toggle('cfarCover');
+  }
+  if (level === 'currency' && on) toggle('portfolioDiv');
+}
+
+/** Desk Policy VAR approval rungs — overlay sensitivity cap ($M). */
+export const POLICY_VAR_LIMITS = [
+  { usd: 5, label: '$5M', who: 'Treasury' },
+  { usd: 10, label: '$10M', who: 'Director' },
+  { usd: 20, label: '$20M', who: 'CFO' },
+] as const;
+
+/**
+ * Bounded sweep cap ($M) for the named optimization presets.
+ * Always covers the approval rungs ($5–$20); stretches a little past the
+ * first floor-clamp so the knee is interior, but never traces an unbounded
+ * EARN ray (hard ceiling = 1.5× the top rung).
+ */
+export function universePolicyVarCap(nearestClampVarUsd: number | null): number {
+  const minTier = POLICY_VAR_LIMITS[0]!.usd;
+  const maxTier = POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
+  // Presets live on $5–$20. The sweep still has to reach the first PAY
+  // floor-clamp or the ray never bends. 4× the top rung is a hard ceiling
+  // so an EARN-only book cannot walk to infinity.
+  const limit = maxTier * 4;
+  const aroundClamp = nearestClampVarUsd != null
+    && Number.isFinite(nearestClampVarUsd)
+    && nearestClampVarUsd > 0
+    ? nearestClampVarUsd * 1.6
+    : 0;
+  return Math.min(Math.max(maxTier, minTier * 3, aroundClamp), limit);
+}
+
 /** True when any liquidity-funding layer is on — no layer selected means no swap. */
 export function liquidityFormulaLayersActive(active: Set<LayerId>): boolean {
   return active.has('floorH')
@@ -613,30 +676,121 @@ export interface FundingSwapCarryLegs {
  */
 export function fundingSwapCarryLegs(input: {
   ccy: string;
-  plan: readonly { standing_swap: number }[] | null | undefined;
+  plan: readonly {
+    standing_swap: number;
+    far_leg?: number;
+    cycleIndex?: number;
+    /** Incremental leg this cycle adds — the notional a stripTerm tranche prices on. */
+    swap_needed?: number;
+  }[] | null | undefined;
   r_FCY: number;
   r_USD: number;
   r_OD?: number;
   /** Used when the row carries no funded strip. */
   fallbackCashUsdM?: number;
+  /** Forecast / far tenor — term cash is M1 standing × this many months, not a 1M nest. */
+  forecastMonths?: number;
+  /**
+   * Explicit structure when the caller knows it — a single-leg `term` plan and a
+   * multi-leg `stripTerm` plan both carry a closing `far_leg`, so the shape alone
+   * cannot tell them apart. Omit to keep the legacy far_leg-based auto-detect
+   * (correct for plain `rolling` / `term` callers that never pass this).
+   */
+  bookingMode?: 'rolling' | 'term' | 'stripTerm';
 }): FundingSwapCarryLegs {
   const fallback = input.fallbackCashUsdM ?? 0;
   const plan = input.plan;
   if (!plan?.length) return { cashUsdM: fallback, fcyOnUsdM: 0 };
 
   const spot = ccySpotRate(input.ccy);
-  const cashUsdM = fundingSwapPathCarryUsdM(
-    plan, spot, input.r_FCY, input.r_USD, input.r_OD, 'cashDelta',
-  ) ?? fallback;
-  const fcyOnUsdM = plan.reduce(
-    (s, p) =>
-      s
-      + p.standing_swap
-        * (fundingSwapCashFcyRate(p.standing_swap, input.r_FCY, input.r_OD) / 100)
+
+  if (input.bookingMode === 'stripTerm') {
+    const horizon = Math.max(1, input.forecastMonths ?? plan.length);
+    let cashUsdM = 0;
+    let fcyOnUsdM = 0;
+    // Each leg is its OWN forward-starting tranche, priced ONCE on its own
+    // incremental notional (swap_needed) at its own remaining tenor — pricing
+    // the cumulative standing_swap here would re-price every earlier tranche
+    // again at each later cycle's tenor too. Same reasoning as the CIP path
+    // in fundingSwapPathFarCipUsdM — the two must stay on the same notional
+    // or "Swap cash" and "CIP" stop being comparable numbers.
+    plan.forEach((p, i) => {
+      const notional = p.swap_needed ?? p.standing_swap;
+      if (Math.abs(notional) < 1e-9) return;
+      const tenor = Math.max(0, horizon - (p.cycleIndex ?? i));
+      if (tenor < 1e-9) return;
+      const frac = tenor / FUNDING_SWAP_MONTHS_PA;
+      cashUsdM += fundingSwapCashDeltaUsdYr(
+        notional, spot, input.r_FCY, input.r_USD, input.r_OD,
+      ) * frac;
+      fcyOnUsdM += notional
+        * (fundingSwapCashFcyRate(notional, input.r_FCY, input.r_OD) / 100)
+        * spot * frac;
+    });
+    return { cashUsdM, fcyOnUsdM };
+  }
+
+  const term = input.bookingMode
+    ? input.bookingMode === 'term'
+    : plan.some(p => Math.abs(p.far_leg ?? 0) > 0.001);
+  if (term) {
+    const standing = plan[0]!.standing_swap;
+    const tenor = Math.max(
+      fundingSwapFarSettleMonths(plan, input.forecastMonths ?? plan.length),
+      input.forecastMonths ?? 0,
+      plan.length,
+    );
+    const frac = Math.max(1, tenor) / FUNDING_SWAP_MONTHS_PA;
+    const annual = fundingSwapCashDeltaUsdYr(
+      standing, spot, input.r_FCY, input.r_USD, input.r_OD,
+    );
+    const fcyRate = fundingSwapCashFcyRate(standing, input.r_FCY, input.r_OD);
+    return {
+      cashUsdM: annual * frac,
+      fcyOnUsdM: standing * (fcyRate / 100) * spot * frac,
+    };
+  }
+
+  const cashUsdM = (() => {
+    let sum = fundingSwapPathCarryUsdM(
+      plan, spot, input.r_FCY, input.r_USD, input.r_OD, 'cashDelta',
+    ) ?? fallback;
+    const horizon = Math.max(
+      plan.length,
+      input.forecastMonths ?? plan.length,
+    );
+    if (horizon > plan.length) {
+      const tail = plan[plan.length - 1]!.standing_swap;
+      sum += (horizon - plan.length) * fundingSwapMonthCarryUsdM(
+        tail, spot, input.r_FCY, input.r_USD, input.r_OD, 'cashDelta',
+      );
+    }
+    return sum;
+  })();
+  const fcyOnUsdM = (() => {
+    let sum = plan.reduce(
+      (s, p) =>
+        s
+        + p.standing_swap
+          * (fundingSwapCashFcyRate(p.standing_swap, input.r_FCY, input.r_OD) / 100)
+          * spot
+          / FUNDING_SWAP_MONTHS_PA,
+      0,
+    );
+    const horizon = Math.max(
+      plan.length,
+      input.forecastMonths ?? plan.length,
+    );
+    if (horizon > plan.length) {
+      const tail = plan[plan.length - 1]!.standing_swap;
+      sum += (horizon - plan.length)
+        * tail
+        * (fundingSwapCashFcyRate(tail, input.r_FCY, input.r_OD) / 100)
         * spot
-        / FUNDING_SWAP_MONTHS_PA,
-    0,
-  );
+        / FUNDING_SWAP_MONTHS_PA;
+    }
+    return sum;
+  })();
   return { cashUsdM, fcyOnUsdM };
 }
 
@@ -1473,6 +1627,22 @@ export interface PortfolioCarryResult {
   budget_binding: boolean;
   carry_dir: 'earn' | 'pay' | 'neutral';
   delta_r: number;          // r_USD − r_FCY
+  /**
+   * Single per-currency answer to "why did this overlay get capped", in the
+   * order the optimizer actually trims (floor first, then USD budget, which
+   * overrides a VAR trim when both would otherwise apply — see the budget
+   * bisection above, which sets `varBinding = false` the moment it runs).
+   * `null` = this currency's carry tilt is unconstrained.
+   */
+  binding_reason: 'floor' | 'usdBudget' | 'varCap' | null;
+  /**
+   * This currency's share of total portfolio VAR from its own overlay leg
+   * ($M) — the "why this number" figure: how much of the shared policy VAR
+   * budget this position uses, or (negative) how much it diversifies away.
+   */
+  component_var_usd: number;
+  /** True when this row's target came from a desk-typed Target LP Cash, not the optimizer. */
+  manual: boolean;
 }
 
 /** USD LP balance available to collateralise FCY buffers after USD outflows. */
@@ -1609,8 +1779,8 @@ export function enforcePortfolioVarCap(
 //   cap s down if the net overlay USD draw (EARN buys − PAY sell proceeds)
 //   exceeds usdBudget_M.
 //
-// One scale s moves every currency uniformly → limit ↑ ⇒ overlays ↑ everywhere,
-// and the FULL P&L budget converts into carry (aggressive fill).
+// Unpinned overlays follow Σ⁻¹μ (shared VAR + shared carry). One k scales
+// that ray to the policy VAR cap, or to a feasible portfolio carry ask.
 // USD swap leg (outside optimizer): swap_USD = −Σ(FCY swap × spot).
 //
 export function optimizePortfolioCarry(
@@ -1620,6 +1790,19 @@ export function optimizePortfolioCarry(
   policyVAR_M: number,
   usdBudget_M: number = Infinity,
   payoutCarry = true,
+  carryTargetUsdYrM?: number,
+  /**
+   * Per-currency CIP-implied FCY rate (% p.a.) for the desk's chosen funding
+   * regime (rolling = near 1M window, term/stripTerm = spot-to-horizon
+   * window) — see `impliedCarryRatePct`. Overrides `inp.r_FCY` in the
+   * mean-variance carry direction (μ) ONLY: the single-currency `dir`/`z_opt`
+   * scale below stays on the O/N NP rate per decisions.md "H redefined" — H*
+   * is an NP holding-cost decision, not a swap-points one. μ is the portfolio
+   * TILT direction, which is realised by trading the actual funding swap, so
+   * it should reflect what that swap actually costs under the active regime.
+   * Missing/absent entries fall back to the flat `inp.r_FCY` unchanged.
+   */
+  impliedRFcyByCcy?: Record<string, number>,
 ): PortfolioCarryResult[] {
   const fcyInputs = inputs.filter(inp => inp.ccy !== 'USD');
 
@@ -1687,6 +1870,12 @@ export function optimizePortfolioCarry(
     heldAt(s).map((h, i) => ({ ccy: h.ccy, cashFCY: h.cash_threshold - baseHeld[i].cash_threshold })),
   ).portfolio_VAR_USD;
 
+  const overlayVarLegs = (legs: readonly number[]) => computePortfolioVAR(
+    heldWithLegs(legs).map((h, i) => ({
+      ccy: h.ccy, cashFCY: h.cash_threshold - baseHeld[i]!.cash_threshold,
+    })),
+  ).portfolio_VAR_USD;
+
   // Overlay USD legs: EARN buys consume USD (+), PAY sells generate USD (−).
   // The book is largely self-funding — only the NET draw hits the USD budget.
   const usdShortfallAt = (s: number) => {
@@ -1698,20 +1887,69 @@ export function optimizePortfolioCarry(
     });
     return earnDemand - payProceeds - usdBudget_M;
   };
+  const usdShortfallLegs = (legs: readonly number[]) => {
+    let earnDemand = 0, payProceeds = 0;
+    heldWithLegs(legs).forEach((h, i) => {
+      const spot = CURRENCY_PARAMS[h.ccy]?.spot ?? 0;
+      const leg = (h.cash_threshold - baseHeld[i]!.cash_threshold) * spot;
+      if (leg > 0) earnDemand += leg; else payProceeds += -leg;
+    });
+    return earnDemand - payProceeds - usdBudget_M;
+  };
 
-  // Aggressive fill: largest s whose overlay VAR ≤ policyVAR (monotone in s —
-  // legs only grow until debit floors clamp them). Doubling + bisection.
-  let s = 0;
+  let legs: number[] | null = null;
   let varBinding = false;
+  let budgetBinding = false;
   const anyDir = meta.some(m => !m.manual && Math.abs(m.dir) > 1e-9);
+
   if (payoutCarry && anyDir) {
+    const ccys = meta.map(m => m.inp.ccy);
+    const mu = meta.map((m) => {
+      const implied = impliedRFcyByCcy?.[m.inp.ccy];
+      const rFcy = typeof implied === 'number' && Number.isFinite(implied) ? implied : m.inp.r_FCY;
+      return (rFcy - r_USD) / 100;
+    });
+    const pinnedUsdM = meta.map((m) => {
+      if (!m.manual || !m.p) return 0;
+      return m.dir * m.p.spot;
+    });
+    const alloc = allocateCarryVarUsd({
+      ccys,
+      mu,
+      varCapUsdM: policyVAR_M,
+      carryTargetUsdYrM,
+      pinnedUsdM,
+    });
+    if (alloc) {
+      const mvLegs = meta.map((m, i) => {
+        if (m.manual) return m.dir;
+        if (!m.p || m.p.spot < 1e-12) return 0;
+        return alloc.wUsdM[i]! / m.p.spot;
+      });
+      legs = mvLegs;
+      varBinding = alloc.varBinding;
+      if (overlayVarLegs(mvLegs) > policyVAR_M + 1e-6) {
+        let lo = 0, hi = 1;
+        for (let i = 0; i < 50; i++) {
+          const mid = (lo + hi) / 2;
+          const scaled = mvLegs.map((leg, j) => (meta[j]!.manual ? leg : mid * leg));
+          if (overlayVarLegs(scaled) > policyVAR_M) hi = mid; else lo = mid;
+        }
+        legs = mvLegs.map((leg, j) => (meta[j]!.manual ? leg : lo * leg));
+        varBinding = true;
+      }
+    }
+  }
+
+  let s = 0;
+  if (legs == null && payoutCarry && anyDir) {
     let hi = 1, grew = false;
     for (let k = 0; k < 40; k++) {
       if (overlayVarAt(hi) > policyVAR_M) { grew = true; break; }
       hi *= 2;
     }
     if (!grew) {
-      s = hi; // overlay VAR saturates below the limit (floors clamp everything)
+      s = hi;
     } else {
       let lo = 0;
       for (let i = 0; i < 60; i++) {
@@ -1722,10 +1960,19 @@ export function optimizePortfolioCarry(
     }
   }
 
-  // USD funding cap on the NET overlay draw: scale `s` down only when the
-  // EARN buys exceed PAY sell proceeds + the available USD budget.
-  let budgetBinding = false;
-  if (s > 0 && Number.isFinite(usdBudget_M) && usdShortfallAt(s) > 1e-6) {
+  if (legs != null) {
+    if (Number.isFinite(usdBudget_M) && usdShortfallLegs(legs) > 1e-6) {
+      budgetBinding = true;
+      varBinding = false;
+      let lo = 0, hi = 1;
+      for (let i = 0; i < 60; i++) {
+        const mid = (lo + hi) / 2;
+        const scaled = legs.map((leg, j) => (meta[j]!.manual ? leg : mid * leg));
+        if (usdShortfallLegs(scaled) > 1e-6) hi = mid; else lo = mid;
+      }
+      legs = legs.map((leg, j) => (meta[j]!.manual ? leg : lo * leg));
+    }
+  } else if (s > 0 && Number.isFinite(usdBudget_M) && usdShortfallAt(s) > 1e-6) {
     budgetBinding = true;
     varBinding = false;
     let lo = 0, hi = s;
@@ -1736,11 +1983,33 @@ export function optimizePortfolioCarry(
     s = lo;
   }
 
-  return meta.flatMap(m => {
+  const finalLegs = legs ?? meta.map(m => legAt(m, s));
+
+  // Per-currency share of total portfolio VAR from the FINAL overlay legs —
+  // the "why this number" figure. Negative = this leg diversifies the book
+  // and reduces total risk rather than consuming budget.
+  const componentVarByCcy: Record<string, number> = Object.fromEntries(
+    computePortfolioVAR(
+      heldWithLegs(finalLegs).map((h, i) => ({
+        ccy: h.ccy, cashFCY: h.cash_threshold - baseHeld[i]!.cash_threshold,
+      })),
+    ).currencies.map(c => [c.ccy, c.component_VAR_USD]),
+  );
+
+  return meta.flatMap((m, i) => {
     if (!m.p) return [];
-    const overlay = legAt(m, s);
+    const overlay = finalLegs[i]!;
     const raw_threshold = m.base + overlay;
     const floored = applyNoNegativeLpFloor(raw_threshold, m.inp.r_OD, r_USD);
+    // Trim precedence matches the bisections above: a floor always wins (the
+    // leg literally cannot go further), USD budget overrides a VAR trim when
+    // both would apply (see `varBinding = false` in the budget bisection),
+    // so VAR is only the reason when nothing tighter also bound.
+    const binding_reason: PortfolioCarryResult['binding_reason'] = floored.debit_floor_binding
+      ? 'floor'
+      : budgetBinding ? 'usdBudget'
+      : varBinding ? 'varCap'
+      : null;
     return [{
       ccy: m.inp.ccy,
       delta_carry: overlay,
@@ -1754,11 +2023,413 @@ export function optimizePortfolioCarry(
       lambda_usd: budgetBinding ? 1 : 0,
       constrained: varBinding || budgetBinding,
       var_binding: varBinding,
+      binding_reason,
+      component_var_usd: componentVarByCcy[m.inp.ccy] ?? 0,
+      manual: m.manual,
       budget_binding: budgetBinding,
       carry_dir: m.Δr > 0.05 ? 'pay' as const : m.Δr < -0.05 ? 'earn' as const : 'neutral' as const,
       delta_r: m.Δr,
     }];
   });
+}
+
+// ── Portfolio carry/VAR frontier — simplest case: pure VAR cap ────────────
+//
+// optimizePortfolioCarry solves for ONE k (bisected to your VAR cap). This
+// traces many k instead, so the desk can see the tradeoff curve and where it
+// bends — not just the single point the current settings landed on.
+//
+// Two independent things bend this into a genuine curve — mirroring exactly
+// the two mechanisms the per-currency frontier (liquidity-frontier.ts) uses,
+// generalized to a correlated multi-currency book:
+//
+//  1. Floor clamping: legs = k × Σ⁻¹μ is a FIXED direction, so on its own an
+//     unclamped ray has carry and VAR both exactly linear in k. The only
+//     thing that bends THAT part of the curve is a currency's overlay
+//     running into its floor and stopping early while the rest keep
+//     growing.
+//  2. Fixed standalone exposure (PortfolioCarryInput.delta_cfar): VAR is
+//     blended as Z×√(fixedVariance + overlayVariance) — the same
+//     √(fixed²+scaling²) shape displayedCfarUsdMFromFxNet uses per currency
+//     (cfar-net-by-ccy.ts), just with the fixed terms treated as
+//     independent across currencies (no evidence of correlation between
+//     different currencies' OWN base exposures) while the overlay portion
+//     still correlates via the 14×14 matrix. This alone guarantees real
+//     curvature — flat-sloped at k=0, asymptotically linear for large k —
+//     with NO floor clamp required at all. If every currency's delta_cfar
+//     is 0 (the default), this collapses back to exactly case 1.
+//
+// Carry gets the matching credit/debit split: a leg is priced at the
+// deposit-rate μ while its FINAL position stays in credit, and at the
+// (worse) overdraft rate once the overlay pushes it into debit — same
+// mechanism as unfundedCashCarryUsdYr's avgCredit/avgDebit split, producing
+// a real kink in carry exactly where a currency's position crosses zero.
+//
+// Conservative is NOT pinned here. Unhedged → hold is a priced standing
+// walk (`pricedFundingWalk`); this sweep is overlay-only from Unhedged.
+// The pink far/hedged arm is CIP overlay from the same Unhedged fork.
+//
+// frontierKneeIndex trusts a knee whenever a genuine curvature source is
+// present (fixed CFaR always qualifies; a pure floor-clamp ray only
+// qualifies at points that actually clamped) — otherwise "furthest from the
+// chord" would just be floating-point noise on a genuinely straight line.
+//
+// Scope: no manual pins, no USD funding budget — those are structurally
+// different constraints (a hard ceiling vs. this smooth quadratic one, and a
+// leg that never scales with k) and need their own sweep. This is the
+// starting case; usdBudget- and manual-pin-aware sweeps are follow-up work.
+
+export interface PortfolioCarryFrontierPoint {
+  /** Scale along the fixed Σ⁻¹μ ray — k = 1 is defined as a $1M VAR fill. */
+  k: number;
+  portfolioVarUsd: number;
+  totalCarryUsdYr: number;
+  /** Currencies floor-clamped at this point — the source of any curvature here. */
+  floorBoundCcys: string[];
+  /** Left-end leverage tail — live-book framing ignores these. */
+  levered?: boolean;
+}
+
+export interface PortfolioCarryFrontier {
+  points: PortfolioCarryFrontierPoint[];
+  /**
+   * Cash carry (same near-leg floor walk) plus real forward-hedge carry
+   * priced by the caller's farLegCarryUsdYr — same pink "far" arm the
+   * per-currency frontier renders, same fwdHedgeCarryFromMarketUsd pricer.
+   * Empty when farLegCarryUsdYr is not supplied.
+   */
+  farPoints: PortfolioCarryFrontierPoint[];
+  /**
+   * Index into `points` of the auto-detected knee, or −1 when no ray exists
+   * OR no currency floor-clamped anywhere in the swept range (the frontier
+   * is a straight line, so there is no genuine sweet spot to report).
+   */
+  sweetSpotIndex: number;
+  /**
+   * When `sweetSpotIndex === -1`, the currency and VAR level (solved in
+   * closed form, not by re-sweeping) where the FIRST clamp would occur on
+   * the unclamped ray, if any currency clamps at all. `null` means no
+   * currency in this book ever clamps in either direction — the ray is
+   * straight by construction, at any range, not a "range too small" case.
+   */
+  nearestClampCcy: string | null;
+  nearestClampVarUsd: number | null;
+  /** `book-scale` = S(t) walk (no Σ⁻¹μ dashed ray). Overlay sweep leaves this unset. */
+  walk?: 'book-scale' | 'overlay';
+}
+
+export function sweepPortfolioCarryFrontier(
+  inputs: PortfolioCarryInput[],
+  σ_P: number,
+  r_USD: number,
+  /** Desk's current policy VAR cap ($M) — the sweep's range is tied to this. */
+  policyVAR_M: number,
+  steps = 24,
+  /** How far past today's cap to trace, in multiples of it. */
+  rangeMultiple = 3,
+  /**
+   * Per-currency CIP-implied FCY rate (% p.a.) for the desk's chosen funding
+   * regime — same override optimizePortfolioCarry's μ takes (see there for
+   * why). Missing entries fall back to the flat `inp.r_FCY`.
+   */
+  impliedRFcyByCcy?: Record<string, number>,
+  /**
+   * Real per-leg forward-hedge carry pricer for the far/hedged arm — the
+   * caller supplies this (dashboard-model.ts wires it to
+   * fwdHedgeCarryFromMarketUsd against the desk's uploaded market swap
+   * points, the SAME function and inputs the per-currency frontier's own
+   * far/hedged arm prices with). Called once per currency per swept k with
+   * that leg's overlay notional (FCY). The wired pricer is hedge-signed
+   * (sell FCY = negative), so the caller passes −legFcy for a long overlay.
+   * Missing = farPoints comes back empty (no far arm to show).
+   */
+  farLegCarryUsdYr?: (ccy: string, legFcy: number) => number,
+  /**
+   * Rate-differential vol (bp/yr) per currency for the far/hedged arm's VAR
+   * — same rateVolBpYrFor desk table the real per-currency funding-swap
+   * CFaR uses. Missing = far arm's VAR is fixed-only (no rate-risk term).
+   */
+  rateVolBpYrByCcy?: Record<string, number>,
+  /**
+   * Forecast horizon in months (T) — scales both the near (FX-vol) and far
+   * (rate-vol) overlay VAR from the fixed 1-month figure computePortfolioVAR
+   * / portfolioRateVarUsd compute internally out to the real horizon, √T,
+   * same principle the per-currency frontier's standingCfarBandsUsdM uses
+   * (farSettleExposureCfarUsdM). Both functions are homogeneous of degree 1
+   * in the position vector, so scaling their 1-month output by √T is exact
+   * — no need to re-run the calc at T-month vol. Real per-currency vol
+   * (CURRENCY_PARAMS.σ_daily / rateVolBpYrFor) throughout, NOT the modal's
+   * flat curriculum constant. Default 1 = no change from the original
+   * fixed-1-month behavior.
+   */
+  horizonMonths = 1,
+  /**
+   * Unhedged portfolio CFaR ($M) from the same book as CFaR-tab Net /
+   * Overdraft Sum — `sumNetCfarUsdM(fxOnlyNetByCcyUsdM)` at the live
+   * confidence. Pins k=0 to that number. Omit to keep the legacy
+   * RSS(delta_cfar×spot) origin.
+   */
+  unhedgedCfarUsdM?: number,
+): PortfolioCarryFrontier {
+  const horizonScale = Math.sqrt(Math.max(1, horizonMonths));
+  const fcyInputs = inputs.filter(inp => inp.ccy !== 'USD' && CURRENCY_PARAMS[inp.ccy]);
+  if (fcyInputs.length === 0 || !(policyVAR_M > 0)) return { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null };
+
+  const ccys = fcyInputs.map(inp => inp.ccy);
+  const mu = fcyInputs.map((inp) => {
+    const implied = impliedRFcyByCcy?.[inp.ccy];
+    const rFcy = typeof implied === 'number' && Number.isFinite(implied) ? implied : inp.r_FCY;
+    return (rFcy - r_USD) / 100;
+  });
+  // Same hold-the-book base optimizePortfolioCarry uses — VAR and carry are
+  // both measured on the OVERLAY (deviation from this), never on the base.
+  const bases = fcyInputs.map(inp => Math.max(inp.forecasted_cash, 0) + inp.floor_contrib + inp.delta_sigma);
+
+  // Each currency's own standalone FX exposure risk — see the module
+  // comment. 0 for every currency (the default when delta_cfar is unset)
+  // reproduces the old pure-floor-clamp behavior exactly. delta_cfar is FCY
+  // (cfarCoverFcyFor converts the desk's USD Net CFaR to FCY on the way
+  // in, per LayeredBufferResult's own "FX-hedge Net CFaR in FCY" — see
+  // buildPass1Fcy) — convert back to USD here, or this is off by ~spot per
+  // currency: ~10% for EUR, orders of magnitude for JPY/HUF/ZAR where spot
+  // is far from 1.
+  const fixedVarUsd = fcyInputs.map((inp) => {
+    const p = CURRENCY_PARAMS[inp.ccy];
+    return Math.abs(inp.delta_cfar ?? 0) * (p?.spot ?? 1);
+  });
+  const fixedVariance = fixedVarUsd.reduce((s, v) => s + (v / Z_NEUTRAL) ** 2, 0);
+  const pinnedUnhedged = typeof unhedgedCfarUsdM === 'number'
+    && Number.isFinite(unhedgedCfarUsdM)
+    && unhedgedCfarUsdM >= 0
+    ? unhedgedCfarUsdM
+    : null;
+  const pinCfar = pinnedUnhedged;
+  const blendVar = (overlayVarUsd: number, originUsd: number | null) => {
+    if (originUsd != null) return Math.hypot(originUsd, overlayVarUsd);
+    const overlayVariance = (overlayVarUsd / Z_NEUTRAL) ** 2;
+    return Z_NEUTRAL * Math.sqrt(overlayVariance + fixedVariance);
+  };
+
+  // Fixed direction — the same Σ⁻¹μ ray the live optimizer follows, scaled so
+  // k = 1 fills exactly $1M of VAR: a stable, readable unit for the x-axis
+  // that does not depend on whatever policyVAR happens to be set to today.
+  const alloc = allocateCarryVarUsd({ ccys, mu, varCapUsdM: 1, skipLeverageCap: true });
+  if (!alloc) return { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null };
+  const unitLegUsd = alloc.wUsdM;
+
+  const evalAt = (k: number) => {
+    let totalCarryUsdYr = 0;
+    const floorBoundCcys: string[] = [];
+    const legsFcy = fcyInputs.map((inp, i) => {
+      const p = CURRENCY_PARAMS[inp.ccy]!;
+      const overlayFcy = p.spot > 1e-12 ? (k * unitLegUsd[i]!) / p.spot : 0;
+      const raw = bases[i]! + overlayFcy;
+      const { cash_threshold, debit_floor_binding } = applyNoNegativeLpFloor(raw, inp.r_OD, r_USD);
+      const floored = applyHardMinFloor(cash_threshold, inp.floor_contrib);
+      if (debit_floor_binding || Math.abs(floored - raw) > 0.001) floorBoundCcys.push(inp.ccy);
+      const legFcy = floored - bases[i]!;
+      // Credit/debit split — same mechanism as unfundedCashCarryUsdYr: price
+      // at the deposit rate μ while the FINAL position is still in credit,
+      // at the overdraft rate once the overlay has pushed it into debit.
+      const muDebit = (inp.r_OD - r_USD) / 100;
+      const rate = floored >= 0 ? mu[i]! : muDebit;
+      totalCarryUsdYr += legFcy * p.spot * rate;
+      return { ccy: inp.ccy, cashFCY: legFcy };
+    });
+    // computePortfolioVAR is a fixed 1-month figure — scale to the real
+    // forecast horizon (√T, homogeneity — see horizonMonths doc above).
+    const overlayVarUsd = computePortfolioVAR(legsFcy).portfolio_VAR_USD * horizonScale;
+    // √(fixed² + overlay²) — see the module comment for why this mirrors
+    // displayedCfarUsdMFromFxNet's per-currency shape, generalized so the
+    // overlay portion keeps its cross-currency correlation.
+    return { portfolioVarUsd: blendVar(overlayVarUsd, pinCfar), totalCarryUsdYr, floorBoundCcys };
+  };
+
+  // Far/hedged arm: same near-leg cash position/floor walk as evalAt (a
+  // forward overlay is a separate derivative — it does not touch the cash
+  // ladder). Carry = cash carry (same as near) plus the real forward-hedge
+  // carry from the caller's farLegCarryUsdYr (fwdHedgeCarryFromMarketUsd
+  // against the desk's actual uploaded swap points, not a flat CIP rate).
+  // VAR is NOT the near arm's FX-vol VAR — a forward hedge means CIP
+  // near+far cancels spot, so FX spot risk is gone; the only residual risk
+  // is the rate-differential vol on the outstanding notional (same driver
+  // fundingSwapBridgeBands/rateVolBpYrFor use for the real per-currency
+  // model's funding-swap CFaR). portfolioRateVarUsd prices that.
+  const evalFarAt = (k: number) => {
+    let totalCarryUsdYr = 0;
+    const legs = fcyInputs.map((inp, i) => {
+      const p = CURRENCY_PARAMS[inp.ccy]!;
+      const overlayFcy = p.spot > 1e-12 ? (k * unitLegUsd[i]!) / p.spot : 0;
+      const raw = bases[i]! + overlayFcy;
+      const { cash_threshold } = applyNoNegativeLpFloor(raw, inp.r_OD, r_USD);
+      const floored = applyHardMinFloor(cash_threshold, inp.floor_contrib);
+      const legFcy = floored - bases[i]!;
+      const muDebit = (inp.r_OD - r_USD) / 100;
+      const rate = floored >= 0 ? mu[i]! : muDebit;
+      totalCarryUsdYr += legFcy * p.spot * rate;
+      if (farLegCarryUsdYr) totalCarryUsdYr += farLegCarryUsdYr(inp.ccy, legFcy);
+      return { ccy: inp.ccy, legFcy, spot: p.spot };
+    });
+    // Same fixed-1-month → real-horizon √T scaling as the near arm.
+    const overlayVarUsd = rateVolBpYrByCcy
+      ? portfolioRateVarUsd(legs, rateVolBpYrByCcy) * horizonScale
+      : 0;
+    // Far tail is CIP / fully-hedged overlay from Unhedged — not the
+    // funded H* hold. Conservative cash+swap is open-arm only.
+    return { portfolioVarUsd: blendVar(overlayVarUsd, pinnedUnhedged), totalCarryUsdYr };
+  };
+
+  // Range tied to today's policy VAR, not a self-terminating search: an EARN
+  // currency's overlay has NO upper floor in this scope (no USD budget yet —
+  // see the module comment), so "sweep until every currency floor-clamps"
+  // can never terminate the moment any currency is EARN-direction. Tracing
+  // out to a fixed multiple of the desk's actual cap is bounded by
+  // construction and answers the question the desk actually has: "if I moved
+  // my limit, would I still be on the straight part of the line, or past the
+  // bend already?"
+  const kMax = policyVAR_M * Math.max(1, rangeMultiple);
+
+  // Closed-form first clamp — independent of the sampled grid. Only a SOLD
+  // leg (w < 0) with a real threshold clamps; EARN has no upper floor here.
+  let nearestClampCcy: string | null = null;
+  let nearestClampVarUsd: number | null = null;
+  fcyInputs.forEach((inp, i) => {
+    const w = unitLegUsd[i]!;
+    if (w >= 0) return;
+    const p = CURRENCY_PARAMS[inp.ccy]!;
+    const threshold = inp.floor_contrib > 0.001
+      ? inp.floor_contrib
+      : (allowsNegativeLp(inp.r_OD, r_USD) ? null : 0);
+    if (threshold == null) return;
+    const gapFcy = bases[i]! - threshold;
+    if (gapFcy <= 0) return;
+    const breakVarUsd = (gapFcy * p.spot) / -w;
+    if (!Number.isFinite(breakVarUsd) || breakVarUsd <= 0) return;
+    if (nearestClampVarUsd == null || breakVarUsd < nearestClampVarUsd) {
+      nearestClampVarUsd = breakVarUsd;
+      nearestClampCcy = inp.ccy;
+    }
+  });
+
+  const ks = new Set<number>();
+  for (let s = 0; s <= steps; s++) ks.add((kMax * s) / steps);
+  if (nearestClampVarUsd != null && nearestClampVarUsd < kMax) {
+    ks.add(nearestClampVarUsd);
+    ks.add(Math.max(0, nearestClampVarUsd * 0.82));
+    ks.add(Math.min(kMax, nearestClampVarUsd * 1.18));
+  }
+  // Denser sampling near k=0 — the fixed-CFaR RSS shape (√(fixed²+overlay²))
+  // bends hardest right at the origin (see the module comment: flat slope
+  // at k=0, curving as the overlay term catches up to the fixed one) and
+  // flattens out toward a straight ray further along. The linear grid above
+  // can step clean over that whole bend in one stride when kMax is large,
+  // rendering a genuinely curved region as a straight segment. Geometric
+  // spacing (i/nearSteps)² biases points toward k=0 within the first 8% of
+  // the range, without touching the existing linear/clamp grid.
+  if (kMax > 0) {
+    const nearFrac = 0.08;
+    const nearSteps = 12;
+    for (let i = 1; i <= nearSteps; i++) {
+      ks.add(kMax * nearFrac * (i / nearSteps) ** 2);
+    }
+  }
+
+  const overlayPoints: PortfolioCarryFrontierPoint[] = [...ks]
+    .sort((a, b) => a - b)
+    .map(k => {
+      const { portfolioVarUsd, totalCarryUsdYr, floorBoundCcys } = evalAt(k);
+      return {
+        k,
+        portfolioVarUsd,
+        totalCarryUsdYr,
+        floorBoundCcys,
+      };
+    });
+
+  const points = overlayPoints;
+
+  const farSweep: PortfolioCarryFrontierPoint[] = farLegCarryUsdYr
+    ? [...ks].sort((a, b) => a - b).map((k) => {
+        const { portfolioVarUsd, totalCarryUsdYr } = evalFarAt(k);
+        return {
+          k,
+          portfolioVarUsd,
+          totalCarryUsdYr,
+          floorBoundCcys: [],
+        };
+      })
+    : [];
+  // Shared Unhedged fork: no H* buffer, no overlay, no CIP. Green and pink
+  // are priced independently after this point (open/buffer vs far hedge).
+  const unhedgedOrigin: PortfolioCarryFrontierPoint | null = pinnedUnhedged != null
+    ? {
+      k: -1,
+      portfolioVarUsd: pinnedUnhedged,
+      totalCarryUsdYr: 0,
+      floorBoundCcys: [],
+    }
+    : null;
+  const isUnhedgedOrigin = (p: PortfolioCarryFrontierPoint) => (
+    unhedgedOrigin != null
+    && Math.abs(p.portfolioVarUsd - unhedgedOrigin.portfolioVarUsd) < 1e-6
+    && Math.abs(p.totalCarryUsdYr) < 1e-6
+  );
+  const openArmed = unhedgedOrigin && (points.length === 0 || !isUnhedgedOrigin(points[0]!))
+    ? [unhedgedOrigin, ...points]
+    : points;
+  const farPoints = farLegCarryUsdYr
+    ? (unhedgedOrigin
+      ? [unhedgedOrigin, ...farSweep.filter(p => p.k > 1e-12)]
+      : farSweep)
+    : [];
+
+  const overlayKnee = frontierKneeIndex(overlayPoints, fixedVariance > 1e-9 || pinCfar != null);
+  const fundingPad = openArmed.length - overlayPoints.length;
+  return {
+    points: openArmed,
+    farPoints,
+    sweetSpotIndex: overlayKnee >= 0 ? overlayKnee + fundingPad : -1,
+    nearestClampCcy,
+    nearestClampVarUsd,
+  };
+}
+
+/**
+ * Point farthest from the straight line joining the frontier's two ends —
+ * the bend. Without a fixed CFaR term, on the unclamped stretch every point
+ * sits ON that chord (the ray is linear), so this correctly returns 0
+ * distance until floor-clamping actually bends the curve away from it. With
+ * a fixed CFaR term, √(fixed²+overlay²) is never exactly linear, so every
+ * point is a legitimate candidate — see the module comment.
+ */
+function frontierKneeIndex(
+  points: readonly PortfolioCarryFrontierPoint[],
+  hasFixedCfar: boolean,
+): number {
+  if (points.length < 3) return Math.max(0, points.length - 1);
+  const p0 = points[0]!;
+  const pN = points[points.length - 1]!;
+  const dx = pN.portfolioVarUsd - p0.portfolioVarUsd;
+  const dy = pN.totalCarryUsdYr - p0.totalCarryUsdYr;
+  const norm = Math.hypot(dx, dy);
+  if (norm < 1e-9) return -1;
+  let bestIdx = -1;
+  let bestDist = -Infinity;
+  points.forEach((p, i) => {
+    // Without a fixed CFaR term, only a genuine floor clamp bends the fixed
+    // Σ⁻¹μ ray (see the module comment above sweepPortfolioCarryFrontier) —
+    // without one, every point sits on (or numerically near) the straight
+    // chord, so "furthest from the chord" would just be floating-point
+    // noise, not a real knee. That noise is what made the "use $X.XM"
+    // button walk to a different, larger value on every click instead of
+    // settling on a stable optimum. A fixed CFaR term removes that
+    // ambiguity entirely — curvature is then structurally guaranteed.
+    if (!hasFixedCfar && p.floorBoundCcys.length === 0) return;
+    const cross = (p.portfolioVarUsd - p0.portfolioVarUsd) * dy - (p.totalCarryUsdYr - p0.totalCarryUsdYr) * dx;
+    const dist = Math.abs(cross) / norm;
+    if (dist > bestDist) { bestDist = dist; bestIdx = i; }
+  });
+  return bestIdx;
 }
 
 // ── Portfolio USD VAR — multi-currency diversified buffer ─────────────────
@@ -2032,4 +2703,35 @@ export function computePortfolioVAR(inputs: PortfolioVARInput[]): PortfolioVARRe
       beta: standalone_VARs[i] > 0 ? component_VARs[i] / standalone_VARs[i] : 0,
     })),
   };
+}
+
+/**
+ * Portfolio VAR on a hedged leg, priced off rate-differential vol instead of
+ * FX spot vol. A forward-hedged position has CIP near+far cancelling spot —
+ * same reasoning fundingSwapBridgeBands/rateVolBpYrFor use for the real
+ * per-currency model's funding-swap CFaR: the only residual risk left is
+ * uncertainty in the rate differential on the outstanding notional, not FX
+ * spot moves. Same cross-currency correlation structure as
+ * computePortfolioVAR, different vol source — duplicated rather than shared
+ * with it to avoid touching that function's tested behavior.
+ */
+function portfolioRateVarUsd(
+  legs: readonly { ccy: string; legFcy: number; spot: number }[],
+  rateVolBpYrByCcy: Record<string, number>,
+): number {
+  const valid = legs.filter(l => Math.abs(l.legFcy) > 0 && CORR_CURRENCIES.indexOf(l.ccy) >= 0);
+  if (valid.length === 0) return 0;
+  const idx = valid.map(l => CORR_CURRENCIES.indexOf(l.ccy));
+  const vols = valid.map((l) => {
+    const bpYr = rateVolBpYrByCcy[l.ccy] ?? 0;
+    const sigmaMonthly = bpYr / 10000 / Math.sqrt(12);
+    return l.legFcy * l.spot * sigmaMonthly;
+  });
+  let variance = 0;
+  for (let i = 0; i < valid.length; i++) {
+    for (let j = 0; j < valid.length; j++) {
+      variance += vols[i]! * vols[j]! * CORR_MATRIX[idx[i]!]![idx[j]!]!;
+    }
+  }
+  return Z_NEUTRAL * Math.sqrt(Math.max(0, variance));
 }

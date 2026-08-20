@@ -12,7 +12,10 @@ export default async function WorkspacePage() {
   }
 
   const { name, email, image } = session.user;
-  const userKey = email ?? name ?? 'default';
+  if (!email) {
+    redirect('/');
+  }
+  const userKey = email;
   const sandboxEnabled = isTestModeEnabled();
 
   return (

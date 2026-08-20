@@ -42,7 +42,11 @@ import {
 function profileWithTiming(): ForecastProfileState {
   return {
     ...DEFAULT_FORECAST_PROFILE,
-    liquidity: { ...DEFAULT_LIQUIDITY_TIMING, granularity: 'month' },
+    // Pinned explicitly: this suite compares the desk helpers (called below
+    // with no bookingMode, which defaults to rolling-style pricing) against
+    // the Analytics-tab strategy row — they must be looking at the same
+    // structure, independent of whatever the platform default happens to be.
+    liquidity: { ...DEFAULT_LIQUIDITY_TIMING, granularity: 'month', bookingMode: 'rolling' },
   };
 }
 
@@ -146,7 +150,7 @@ describe('Swap+Fwd Δ — Analytics funding carry reports the desk book', () => 
     };
     const live = strategyForRegime(
       DEFAULT_LIQUIDITY_TIMING.sizingBasis ?? 'horizon',
-      DEFAULT_LIQUIDITY_TIMING.bookingMode ?? 'rolling',
+      'rolling', // pinned — matches profileWithTiming(), independent of the platform default
     );
 
     const legsAt = (delta: number) => {
@@ -175,14 +179,38 @@ describe('Swap+Fwd Δ — Analytics funding carry reports the desk book', () => 
     const half = legsAt(0.5);
     const full = legsAt(1);
 
-    // Swap cash is the unscaled standing book. CIP on the live regime follows
-    // the desk: retained far = (1−Δ).
+    // Swap cash is the unscaled standing book. CIP follows residual Δ on
+    // every priced programme (Book table shows the selected one).
     expect(Math.abs(flat.cash)).toBeGreaterThan(0);
     expect(half.cash).toBeCloseTo(flat.cash, 9);
     expect(full.cash).toBeCloseTo(flat.cash, 9);
     expect(Math.abs(flat.cip)).toBeGreaterThan(0);
     expect(half.cip).toBeCloseTo(flat.cip * 0.5, 9);
     expect(full.cip).toBeCloseTo(0, 9);
+
+    const previewAt = (delta: number) => {
+      const results = evaluateLiquidityStrategies(
+        liquidityStrategyInputFrom({
+          setup,
+          bookRows: [row],
+          forecastProfile: profile,
+          bookedHedges: [],
+          preparedByCcy: {},
+          livePlanByCcy,
+          swapForwardOverlayByCcy: {
+            EUR: allocateSwapForwardOverlay({
+              exposureLocalM: 10,
+              swapNearLocalM: 6,
+              delta,
+            }),
+          },
+        }),
+      );
+      return results.find(r => r.strategy.id === 'termSwap')!.swapPointsUsdYrM;
+    };
+    const previewFlat = previewAt(0);
+    expect(Math.abs(previewFlat)).toBeGreaterThan(0);
+    expect(previewAt(0.5)).toBeCloseTo(previewFlat * 0.5, 9);
   });
 
   it('Analytics swap cash carry and CIP match the desk helpers exactly', () => {
@@ -222,7 +250,7 @@ describe('Swap+Fwd Δ — Analytics funding carry reports the desk book', () => 
     );
     const live = strategyForRegime(
       DEFAULT_LIQUIDITY_TIMING.sizingBasis ?? 'horizon',
-      DEFAULT_LIQUIDITY_TIMING.bookingMode ?? 'rolling',
+      'rolling', // pinned — matches profileWithTiming(), independent of the platform default
     );
     const eur = results
       .find(r => r.strategy.id === live.id)!

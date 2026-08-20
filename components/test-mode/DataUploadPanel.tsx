@@ -5,12 +5,14 @@ import { setMarketRatesForCcy } from '@/lib/test-mode';
 import {
   cashInterestModeOf,
   clearStoredMarketRates,
+  bundleHasCipSwapPoints,
   DEFAULT_EURUSD_MARKET_RATES,
   defaultOvernightCashFromLp,
   effectiveOvernightCash,
   getActiveMarketRates,
   normalizeMarketRatesBundle,
   overnightCashFromDeposits,
+  emptyMarketRatesForCcy,
   parseFxoCalculatorWorkbook,
   pickPeerMarketRatesForUsd,
   pickSharedUsdOvernight,
@@ -21,6 +23,9 @@ import {
   stampSharedUsdOvernight,
   suggestOvernightFromSw,
   SW_TO_ON_EUR,
+  usdMarketPair,
+  isUsdBaseFcyPair,
+  isUsdPerFcyQuoted,
   type CashInterestMode,
   type DepositSideRates,
   type FxMarketRatesBundle,
@@ -101,7 +106,7 @@ export function DataUploadPanel({
     ? selectedCcy
     : (uploadCcys[0] ?? 'EUR');
 
-  const hasUpload = Boolean(marketRatesByCcy[previewCcy]);
+  const hasUpload = bundleHasCipSwapPoints(marketRatesByCcy[previewCcy]);
   const rates = resolveMarketRatesForCcy(
     marketRatesByCcy,
     previewCcy,
@@ -152,13 +157,13 @@ export function DataUploadPanel({
     targetCcy: string = previewCcy,
     opts?: { stampUsd?: DepositSideRates },
   ) => {
-    const quote = (next.quoteCcy || 'USD').toUpperCase();
+    const pair = usdMarketPair(targetCcy);
     const stamped = normalizeMarketRatesBundle({
       ...next,
       baseCcy: targetCcy,
-      quoteCcy: quote,
-      pair: `${targetCcy}${quote}`,
-    });
+      quoteCcy: isUsdPerFcyQuoted(targetCcy) ? 'USD' : targetCcy,
+      pair,
+    }, targetCcy);
     saveStoredMarketRates(stamped, scopeId);
     let nextMap = setMarketRatesForCcy(marketRatesByCcy, targetCcy, stamped);
     if (opts?.stampUsd) {
@@ -217,7 +222,11 @@ export function DataUploadPanel({
 
   const clearUpload = () => {
     clearStoredMarketRates(scopeId);
-    commitUpload(getActiveMarketRates(scopeId));
+    commitUpload(
+      previewCcy === 'EUR'
+        ? getActiveMarketRates(scopeId)
+        : emptyMarketRatesForCcy(previewCcy),
+    );
     setUploadError(null);
   };
 
@@ -313,8 +322,8 @@ export function DataUploadPanel({
           </h3>
           <p className="max-w-[760px] text-xs leading-relaxed text-slate-500">
             {scopeLabel}-level market data. Overnight cash feeds interest
-            income; the {previewCcy}USD swap points column feeds forward
-            carry.
+            income; the {usdMarketPair(previewCcy)} swap points column feeds
+            forward carry.
           </p>
         </div>
         <div className="flex flex-none flex-col items-end gap-2">
@@ -389,7 +398,7 @@ export function DataUploadPanel({
                     {rates.sourceFile}
                   </span>
                   <span className="rounded border border-slate-700 px-1 py-px text-[9px] font-semibold text-slate-400">
-                    {rates.pair || `${previewCcy}USD`}
+                    {usdMarketPair(previewCcy)}
                   </span>
                 </div>
               </div>
@@ -653,7 +662,7 @@ export function DataUploadPanel({
       <section className="flex flex-col gap-2.5">
         <div className="flex flex-wrap items-baseline justify-between gap-4">
           <div className="text-[9px] font-semibold uppercase tracking-[0.1em] text-slate-500">
-            Term curve + {previewCcy}USD swap points
+            Term curve + {usdMarketPair(previewCcy)} swap points
           </div>
           <div className="text-[10px] text-slate-600">
             Deposits % p.a. · swap points feed forward carry
@@ -686,7 +695,7 @@ export function DataUploadPanel({
                     colSpan={2}
                     className="border-b border-slate-800 px-1 pb-1.5 pt-2.5 pr-4 text-right text-amber-300/90"
                   >
-                    {previewCcy}USD swap points
+                    {usdMarketPair(previewCcy)} swap points
                   </th>
                   <th className="px-4 pb-1.5 pt-2.5" />
                 </tr>
@@ -768,6 +777,10 @@ export function DataUploadPanel({
         <span>
           Cash Carry uses overnight for cash interest; swap points bid/ask
           for bullet and strip forward carry, interpolated to settle tenor.
+          {' '}
+          {isUsdBaseFcyPair(rates)
+            ? `${usdMarketPair(previewCcy)} points are FCY per 1 USD. Read Bid/Ask as printed; outright = S + pts/10_000 on that quote. CIP is N × (1/F − 1/S), not N × pts/10_000. Long cover sells FCY far at the ask — negative points earn.`
+            : `${usdMarketPair(previewCcy)} points are USD per 1 FCY. CIP = N × pts/10_000 (JPY /100).`}
           {' '}
           {cashMode === 'current'
             ? 'Cash interest mode: flat Current O/N for all months.'

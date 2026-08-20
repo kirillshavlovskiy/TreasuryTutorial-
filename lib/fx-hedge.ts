@@ -173,6 +173,11 @@ export function suggestCarryHedge(inp: HedgeSuggestionInput): HedgeSuggestion {
 /**
  * Outright forward carry: prefer uploaded Market data swap points for the
  * settle tenor; fall back to deposit-rate CIP annualised over that tenor.
+ *
+ * `notional` is the hedge trade (sell FCY = negative), same as
+ * {@link fwdHedgeCarryUsdYr}. Market points are booked-signed (+ = sell FCY
+ * far) — pass −notional into {@link fwdCarryFromSwapPointsUsdM}. Feeding the
+ * hedge trade straight in prices a *buy* and flips USDPLN CIP to a cost.
  */
 export function fwdHedgeCarryFromMarketUsd(
   notional: number,
@@ -186,7 +191,7 @@ export function fwdHedgeCarryFromMarketUsd(
   const months = Math.max(1e-9, settleMonths);
   if (bundle) {
     const pts = fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: notional,
+      notionalLocalM: -notional,
       settleMonths: months,
       bundle,
     });
@@ -214,6 +219,48 @@ export function fwdHedgeCarryUsdYr(
 ): number {
   if (Math.abs(notional) < 0.001) return 0;
   return -notional * fcyToUsdM(1, ccy) * (r_USD - r_FCY) / 100;
+}
+
+/**
+ * FWD / CIP on an exposure-cover (signed with the book: long +).
+ *
+ * Market points use +cover (sell FCY far). Deposit fallback uses the hedge
+ * trade −cover, because {@link fwdHedgeCarryUsdYr} is sell-negative. Passing
+ * +cover into the fallback prices a *buy* and flips PLN M12 CIP to a cost
+ * whenever r_FCY < r_USD.
+ */
+export function fwdCarryForExposureCoverUsdM(input: {
+  coverLocalM: number;
+  ccy: string;
+  settleMonths: number;
+  bundle?: FxMarketRatesBundle | null;
+  r_FCY: number;
+  r_USD: number;
+}): { fwdCarryUsdM: number; points?: number; side?: 'bid' | 'ask' | 'mid' } {
+  const cover = input.coverLocalM;
+  const settle = input.settleMonths;
+  if (Math.abs(cover) < 0.001 || settle < 1 - 1e-12) {
+    return { fwdCarryUsdM: 0 };
+  }
+  if (input.bundle) {
+    const pts = fwdCarryFromSwapPointsUsdM({
+      notionalLocalM: cover,
+      settleMonths: settle,
+      bundle: input.bundle,
+    });
+    if (pts) {
+      return {
+        fwdCarryUsdM: pts.fwdCarryUsdM,
+        points: pts.points,
+        side: pts.side,
+      };
+    }
+  }
+  return {
+    fwdCarryUsdM:
+      fwdHedgeCarryUsdYr(-cover, input.ccy, input.r_FCY, input.r_USD)
+      * (settle / 12),
+  };
 }
 
 /** Period carry breakdown for one strip/bullet forward (USD M over the path). */
@@ -258,9 +305,9 @@ function pickSideRate(
 /**
  * Carry on a hedge forward over the forecast path:
  * - FWD: EURUSD Swap Points column (preferred) or deposit-rate CIP fallback
- * - FCY / USD cash interest: overnight cash rates (separate input)
- *
- * Long → credit; short / OD → debit on overnight rates.
+ * - FCY cash interest on the hedge Δ (long → credit; short / OD → debit)
+ * - USD cash interest on the conversion opposite (−Δ): sell FCY earns USD;
+ *   buy FCY pays USD (debit if the USD side goes short)
  */
 export function stripHedgeLegCarryUsdM(input: {
   notionalLocalM: number;
@@ -318,9 +365,7 @@ export function stripHedgeLegCarryUsdM(input: {
   const usdCash = input.usdCashRates ?? input.usdRates;
 
   const fcyFwdCredit = fcyFwd?.creditPct ?? input.r_FCY ?? 0;
-  const fcyFwdDebit = fcyFwd?.debitPct ?? input.r_FCY ?? fcyFwdCredit;
   const usdFwdCredit = usdFwd?.creditPct ?? input.r_USD ?? 0;
-  const usdFwdDebit = usdFwd?.debitPct ?? input.r_USD ?? usdFwdCredit;
 
   const fcyCashCredit = fcyCash?.creditPct ?? input.r_FCY ?? fcyFwdCredit;
   const fcyCashDebit =
@@ -329,14 +374,9 @@ export function stripHedgeLegCarryUsdM(input: {
   const usdCashDebit =
     usdCash?.debitPct ?? input.r_USD ?? usdCashCredit;
 
-  const fcyFwdPick = pickSideRate(N, fcyFwdCredit, fcyFwdDebit);
-  const usdFwdPick = pickSideRate(usdNotional, usdFwdCredit, usdFwdDebit);
   const fcyCashPick = pickSideRate(N, fcyCashCredit, fcyCashDebit);
-  const usdCashPick = pickSideRate(
-    usdNotional,
-    usdCashCredit,
-    usdCashDebit,
-  );
+  const usdBal = -usdNotional;
+  const usdCashPick = pickSideRate(usdBal, usdCashCredit, usdCashDebit);
 
   const useSwapPoints =
     typeof input.swapPointsCarryUsdM === 'number' &&
@@ -346,13 +386,20 @@ export function stripHedgeLegCarryUsdM(input: {
     : fwdHedgeCarryUsdYr(
         N,
         input.ccy,
-        fcyFwdPick.ratePct,
-        usdFwdPick.ratePct,
+        fcyFwdCredit,
+        usdFwdCredit,
       ) * settleYr;
-  const fcyInterestUsdM =
-    usdNotional * (fcyCashPick.ratePct / 100) * fcyYr;
-  const usdInterestUsdM =
-    usdNotional * (usdCashPick.ratePct / 100) * usdYr;
+  const cashInterest = (
+    signedUsdM: number,
+    ratePct: number,
+    years: number,
+  ): number => {
+    if (Math.abs(signedUsdM) < 1e-15 || years < 1e-15) return 0;
+    if (signedUsdM >= 0) return signedUsdM * (ratePct / 100) * years;
+    return -Math.abs(signedUsdM) * (ratePct / 100) * years;
+  };
+  const fcyInterestUsdM = cashInterest(usdNotional, fcyCashPick.ratePct, fcyYr);
+  const usdInterestUsdM = cashInterest(usdBal, usdCashPick.ratePct, usdYr);
   return {
     fwdCarryUsdM,
     fcyInterestUsdM,

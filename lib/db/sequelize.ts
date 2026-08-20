@@ -8,7 +8,11 @@ let sequelize: Sequelize | null | undefined;
  * instead of plain `DATABASE_URL`.
  */
 export function resolveDatabaseUrl(): string | null {
+  // Prefer a direct (non-pooler) URL so Sequelize's parameterized queries
+  // are not subject to PgBouncer transaction-mode prepared-statement limits.
   const candidates = [
+    process.env.DATABASE_URL_UNPOOLED,
+    process.env.POSTGRES_URL_NON_POOLING,
     process.env.DATABASE_URL,
     process.env.ssigma_DATABASE_URL,
     process.env.POSTGRES_URL,
@@ -23,6 +27,9 @@ export function resolveDatabaseUrl(): string | null {
 
 /** Shared Sequelize instance — null when no Postgres URL is configured. */
 export function getSequelize(): Sequelize | null {
+  if (sequelize === null && resolveDatabaseUrl()) {
+    sequelize = undefined;
+  }
   if (sequelize !== undefined) return sequelize;
 
   const url = resolveDatabaseUrl();

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ccySpotRate, type RowState } from '@/lib/fx-buffer';
+import type { OverlaySide } from '@/lib/portfolio-alloc';
 import {
   bookCashCarryK,
   buildLiquidityLeftEndFrontier,
@@ -344,6 +345,10 @@ export function LiquidityFrontierModal({
   bookStanding = 0,
   onSetupChange,
   onClose,
+  onPickResidual,
+  onStage,
+  staged = false,
+  portfolioSuggestion = null,
 }: {
   row: RowState;
   strategy: LiquidityStrategy;
@@ -352,6 +357,25 @@ export function LiquidityFrontierModal({
   bookStanding?: number;
   onSetupChange?: (setup: VarSetup) => void;
   onClose: () => void;
+  /** User picked a mix Δ (1 = open, 0 = far) — write it onto the Book strip. */
+  onPickResidual?: (residual: number) => void;
+  /** Stage the residual-Δ FX strip for FX Risk / Carry / Decision. */
+  onStage?: (residual: number) => void;
+  staged?: boolean;
+  /**
+   * This currency's Σ⁻¹μ overlay leg under the desk's active portfolio
+   * scenario (Conservative / Balanced / Max Carry / custom) — `fcyM` is
+   * H* − hold, same convention as `SweetStripSplit`'s Overlay FCY column.
+   * When present, it preselects the frontier point nearest
+   * `bookStanding + fcyM` instead of the per-currency dial default, so the
+   * modal opens where the portfolio optimizer put this currency.
+   */
+  portfolioSuggestion?: {
+    fcyM: number;
+    usdM: number;
+    side: OverlaySide;
+    scenarioLabel: string;
+  } | null;
 }) {
   const liveS = Math.abs(bookStanding) > 0.01
     ? bookStanding
@@ -369,10 +393,7 @@ export function LiquidityFrontierModal({
   useEffect(() => {
     setMaxCarryK(m => Math.max(levMin, m));
   }, [levMin]);
-  /** Carry/VAR cut: keep a tail past the gold ring so the cut is not the roof. */
-  const plotCapK = searching && bookK > 0.5
-    ? Math.max(maxCarryK, bookK * 1.7)
-    : maxCarryK;
+  const plotCapK = maxCarryK;
 
   const carryUsdK = useMemo(() => frontierCarryDotsK(bookK, {
     targetCashK: searching ? bookK : 0,
@@ -450,7 +471,18 @@ export function LiquidityFrontierModal({
     result.constraint.openHit,
     twins.map(t => ({ key: t.key, standing: t.open.peakBook })),
   );
-  const autoIdx = indexOfTwinKey(twins, autoKey, result.constraint.openHit?.standing);
+  const dialAutoIdx = indexOfTwinKey(twins, autoKey, result.constraint.openHit?.standing);
+  // Portfolio suggestion wins the initial pick when one exists — it reflects
+  // the desk's active cross-currency scenario, which the per-currency dial
+  // default (cash floor / carry target / VAR target) knows nothing about.
+  // A live manual pick (below) always overrides both.
+  const suggestedStanding = portfolioSuggestion && Math.abs(portfolioSuggestion.fcyM) > 0.01
+    ? bookStanding + portfolioSuggestion.fcyM
+    : null;
+  const suggestedIdx = suggestedStanding != null
+    ? indexOfTwinStanding(twins, suggestedStanding)
+    : -1;
+  const autoIdx = suggestedIdx >= 0 ? suggestedIdx : dialAutoIdx;
   const [pick, setPick] = useState<{ epoch: string; idx: number; cover: number } | null>(null);
   const livePick = pick?.epoch === snapEpoch ? pick : null;
   const armIdx = livePick != null
@@ -462,11 +494,13 @@ export function LiquidityFrontierModal({
   const commit = (next: { idx?: number; cover?: number }) => {
     const idx = next.idx ?? armIdx;
     const at = twins[idx] ?? twins[0]!;
+    const nextCover = at.key === 'origin' ? 0 : (next.cover ?? cover);
     setPick({
       epoch: snapEpoch,
       idx,
-      cover: at.key === 'origin' ? 0 : (next.cover ?? cover),
+      cover: nextCover,
     });
+    onPickResidual?.(at.key === 'origin' ? 1 : 1 - nextCover);
   };
 
   const selected = isOrigin
@@ -505,6 +539,15 @@ export function LiquidityFrontierModal({
     if (idx < 0 || idx >= twins.length) return;
     commit({ idx, cover: heldCover(idx) });
   };
+  /** Snap back to the portfolio optimizer's own point, undoing any manual walk/drag. */
+  const matchPortfolio = () => {
+    if (suggestedIdx < 0) return;
+    commit({ idx: suggestedIdx, cover: 0 });
+  };
+  const atSuggestion = suggestedIdx >= 0 && armIdx === suggestedIdx && cover < 1e-9;
+  const deltaVsSuggestionM = suggestedStanding != null
+    ? (isOrigin ? 0 : selected.peakBook) - suggestedStanding
+    : null;
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -595,6 +638,16 @@ export function LiquidityFrontierModal({
               <HeaderChip className="text-slate-400">
                 {constraintDetail || 'No layer'}
               </HeaderChip>
+              {suggestedStanding != null && portfolioSuggestion && (
+                <HeaderChip
+                  className={atSuggestion ? 'text-violet-300' : 'text-violet-400/70'}
+                >
+                  Portfolio · {portfolioSuggestion.scenarioLabel} → S {suggestedStanding.toFixed(1)} M
+                  {!atSuggestion && deltaVsSuggestionM != null
+                    ? ` (${deltaVsSuggestionM >= 0 ? '+' : '−'}${Math.abs(deltaVsSuggestionM).toFixed(1)} vs pick)`
+                    : ''}
+                </HeaderChip>
+              )}
               <HeaderChip className={
                 selected.totalCarryUsdYrM >= 0 ? 'text-emerald-300' : 'text-rose-300'
               }>
@@ -620,13 +673,34 @@ export function LiquidityFrontierModal({
               </HeaderChip>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="ml-auto shrink-0 rounded-md border border-slate-600 px-2.5 py-1.5 text-[10px] font-semibold text-slate-300 hover:bg-slate-800"
-          >
-            Esc
-          </button>
+          <div className="ml-auto flex shrink-0 items-center gap-1">
+            {staged ? (
+              <span className="rounded border border-emerald-500/40 bg-emerald-500/15 px-2 py-1 text-[10px] font-semibold text-emerald-200">
+                ✓ Staged
+              </span>
+            ) : null}
+            {onStage && livePick != null && residual > 1e-6 ? (
+              <button
+                type="button"
+                onClick={() => onStage(residual)}
+                title={
+                  staged
+                    ? 'Restage this Δ strip into FX Risk / Carry / Decision'
+                    : 'Stage this Δ>0 strip for FX Risk / Carry / Decision'
+                }
+                className="rounded border border-violet-500/50 bg-violet-500/20 px-2.5 py-1.5 text-[10px] font-semibold text-violet-100 hover:bg-violet-500/30"
+              >
+                {staged ? 'Restage' : 'Stage'}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border border-slate-600 px-2.5 py-1.5 text-[10px] font-semibold text-slate-300 hover:bg-slate-800"
+            >
+              Esc
+            </button>
+          </div>
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3.5">
@@ -658,7 +732,7 @@ export function LiquidityFrontierModal({
                 Carry vs CFaR
               </span>
               <span className="font-mono text-[9px] text-slate-500">
-                Y = mild log carry · X from $0 · section at {fmtK(result.cfarOriginUsdM)}
+                Origin: carry $0 @ section {fmtAbsK(result.cfarOriginUsdM)} · frame = live book
               </span>
               <span className="ml-auto flex flex-wrap gap-2.5">
                 <Legend swatch="solid" border="border-emerald-400" label="open · cash" />
@@ -679,11 +753,10 @@ export function LiquidityFrontierModal({
               constraint={result.constraint}
               bookStanding={result.bookStanding}
               zoomOut={searching}
-              maxCarryK={plotCapK}
               confidencePct={confidencePct}
             />
             <p className="mt-1.5 font-mono text-[9px] leading-snug text-slate-500">
-              Solid arms are the live book · dashed arms are leveraged S past it. Yellow is the Δ curve at the picked S — RSS mix, not a straight chord.
+              Frame is the live book and the $0-carry origin. Drag Leverage to add a dashed tail — it clips, it does not zoom the plot out.
             </p>
           </div>
 
@@ -747,13 +820,20 @@ export function LiquidityFrontierModal({
             </ControlField>
 
             <ControlField
-              label="Walk the frontier"
-              hint={arm === 'mix' ? 'same S · Δ held' : arm === 'far' ? 'far arm' : 'open arm'}
+              label={portfolioSuggestion ? 'Portfolio Δ · walk' : 'Walk the frontier'}
+              hint={
+                suggestedStanding != null
+                  ? (atSuggestion
+                    ? 'at portfolio pick'
+                    : `${deltaVsSuggestionM! >= 0 ? '+' : '−'}${Math.abs(deltaVsSuggestionM!).toFixed(1)} M vs ${portfolioSuggestion!.scenarioLabel}`)
+                  : (arm === 'mix' ? 'same S · Δ held' : arm === 'far' ? 'far arm' : 'open arm')
+              }
             >
               <button
                 type="button"
                 disabled={armIdx <= 0}
                 onClick={() => stepArm(-1)}
+                title="Decrease S — step to the next lower standing"
                 className="h-[22px] w-6 shrink-0 rounded border border-slate-700 bg-slate-900 font-mono text-[11px] font-semibold text-slate-300 hover:border-slate-500 disabled:cursor-not-allowed disabled:text-slate-600"
               >
                 ‹
@@ -765,10 +845,22 @@ export function LiquidityFrontierModal({
                 type="button"
                 disabled={armIdx >= twins.length - 1}
                 onClick={() => stepArm(1)}
+                title="Increase S — step to the next higher standing"
                 className="h-[22px] w-6 shrink-0 rounded border border-slate-700 bg-slate-900 font-mono text-[11px] font-semibold text-slate-300 hover:border-slate-500 disabled:cursor-not-allowed disabled:text-slate-600"
               >
                 ›
               </button>
+              {suggestedIdx >= 0 && (
+                <button
+                  type="button"
+                  disabled={atSuggestion}
+                  onClick={matchPortfolio}
+                  title={`Snap back to the ${portfolioSuggestion!.scenarioLabel} portfolio pick, undoing any manual walk`}
+                  className="h-[22px] shrink-0 rounded border border-violet-500/50 bg-violet-500/10 px-1.5 font-mono text-[9px] font-semibold text-violet-200 hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Match
+                </button>
+              )}
               <input
                 type="range"
                 min={0}
@@ -789,7 +881,7 @@ export function LiquidityFrontierModal({
 
             <ControlField
               label="Leverage"
-              hint={`book ${fmtK(result.bookCashK / 1000)} · max ${fmtK(maxCarryK / 1000)}`}
+              hint={`book ${fmtK(result.bookCashK / 1000)} solid · drag for dashed tail`}
             >
               <input
                 type="range"
@@ -850,7 +942,6 @@ function FrontierPlot({
   constraint,
   bookStanding,
   zoomOut,
-  maxCarryK,
   confidencePct,
 }: {
   origin: LiquidityFrontierPoint;
@@ -863,7 +954,6 @@ function FrontierPlot({
   constraint: LiquidityFrontierConstraint;
   bookStanding: number;
   zoomOut: boolean;
-  maxCarryK: number;
   confidencePct: number;
 }) {
   const W = 680;
@@ -886,30 +976,27 @@ function FrontierPlot({
   const openLev = open.filter(p => p.levered);
   const hedgeSolid = hedged.filter(p => !p.levered);
   const hedgeLev = hedged.filter(p => p.levered);
-  const capM = Number.isFinite(maxCarryK) && maxCarryK > 0 ? maxCarryK / 1000 : Infinity;
-  const inCap = (p: LiquidityFrontierPoint) =>
-    Math.abs(p.cashCarryUsdYrM) <= capM + 6e-4;
-  const drawn = [origin, ...upper, ...lower, ...isoSlice].filter(
-    p => Math.abs(p.peakBook) < 1e-6 || inCap(p),
-  );
-  const constraintCarry = zoomOut
-    ? [
-        constraint.hCarryUsdYrM ?? 0,
-        constraint.openHit?.carryUsdYrM ?? 0,
-        constraint.hedgeHit?.carryUsdYrM ?? 0,
-      ]
-    : [];
+  const framePts = [
+    origin,
+    ...openSolid,
+    ...hedgeSolid,
+    ...(selected ? [selected] : []),
+    ...isoSlice,
+  ];
   const openCash = [
     0,
-    ...open.filter(p => inCap(p) || Math.abs(p.peakBook) < 1e-6).map(p => p.cashCarryUsdYrM),
+    ...openSolid.map(p => p.cashCarryUsdYrM),
+    ...(selected ? [selected.totalCarryUsdYrM] : []),
     ...(zoomOut ? [constraint.openHit?.carryUsdYrM ?? 0, constraint.hCarryUsdYrM ?? 0] : []),
   ].filter(v => Number.isFinite(v));
   const farCarry = [
-    ...hedged.filter(p => inCap(p) || Math.abs(p.peakBook) < 1e-6).map(p => p.totalCarryUsdYrM),
+    0,
+    ...hedgeSolid.map(p => p.totalCarryUsdYrM),
+    ...(selected ? [selected.totalCarryUsdYrM] : []),
     ...(zoomOut ? [constraint.hedgeHit?.carryUsdYrM ?? 0] : []),
   ].filter(v => Number.isFinite(v));
   const cfars = [
-    ...drawn.map(p => p.finalCfarUsdM),
+    ...framePts.map(p => p.finalCfarUsdM),
     cfarOriginUsdM,
     ...(zoomOut ? [
       constraint.vCfarUsdM ?? 0,
@@ -918,15 +1005,9 @@ function FrontierPlot({
     ] : []),
   ].filter(v => Number.isFinite(v) && v >= 0);
   const x0 = Math.max(0, cfarOriginUsdM);
-  const cfarMax = Math.max(x0, ...cfars);
-  const xMin = 0;
-  const vCut = zoomOut ? (constraint.vCfarUsdM ?? 0) : 0;
-  const xMax = Math.max(
-    cfarMax * 1.16,
-    x0 * 2.05,
-    x0 + 0.04,
-    vCut > 1e-9 ? vCut * 1.28 : 0,
-  );
+  const cfarHi = Math.max(x0, ...cfars);
+  const xMax = Math.max(cfarHi * 1.08, x0 + 0.025);
+  const xMin = Math.max(0, x0 - (xMax - x0) * 0.28);
   const yMaxData = Math.max(0, ...openCash, 0.012);
   const yMinOpen = Math.min(0, ...openCash);
   const yMinFar = Math.min(0, ...farCarry);
@@ -951,15 +1032,22 @@ function FrontierPlot({
   const bookPt = openSolid[openSolid.length - 1] ?? null;
   const bookFar = hedgeSolid[hedgeSolid.length - 1] ?? null;
   const xTickRaw = cfarKTicks(xMin, xMax);
-  if (!xTickRaw.some(v => Math.abs(v) < 1e-9)) xTickRaw.unshift(0);
+  if (xMin <= 1e-9 && !xTickRaw.some(v => Math.abs(v) < 1e-9)) xTickRaw.unshift(0);
   if (x0 > 0 && !xTickRaw.some(v => Math.abs(v * 1000 - x0 * 1000) < 0.51)) {
     xTickRaw.push(x0);
   }
   xTickRaw.sort((a, b) => a - b);
   const xTicks: number[] = [];
+  const xPriority = [x0, ...(xMin <= 1e-9 ? [0] : [])];
+  for (const v of xPriority) {
+    if (v >= xMin - 1e-9 && v <= xMax + 1e-9 && xTicks.every(u => Math.abs(x(u) - x(v)) >= 22)) {
+      xTicks.push(v);
+    }
+  }
   for (const v of xTickRaw) {
     if (xTicks.every(u => Math.abs(x(u) - x(v)) >= 36)) xTicks.push(v);
   }
+  xTicks.sort((a, b) => a - b);
   const yTicks = thinTicks(
     carryLogTicks(yTickMin, yTickMax).filter(v => {
       const py = y(v);
@@ -1067,16 +1155,28 @@ function FrontierPlot({
       {xTicks.map(v => (
         <g key={`xt-${v}`}>
           <line x1={x(v)} y1={H - padB} x2={x(v)} y2={H - padB + 4} stroke="#64748b" />
-          <text x={x(v)} y={H - padB + 15} textAnchor="middle" fontSize={8} fill="#cbd5e1">
+          <text
+            x={x(v)}
+            y={H - padB + 15}
+            textAnchor="middle"
+            fontSize={8}
+            fill={Math.abs(v - x0) < 1e-6 ? '#e2e8f0' : '#cbd5e1'}
+          >
             {fmtK(v)}
           </text>
         </g>
       ))}
-      {yTicks.filter(v => Math.abs(v) > 1e-9).map(v => (
+      {yTicks.map(v => (
         <g key={`yt-${v}`}>
           <line x1={padL - 4} y1={y(v)} x2={padL} y2={y(v)} stroke="#64748b" />
-          <text x={padL - 7} y={y(v) + 3} textAnchor="end" fontSize={8} fill="#cbd5e1">
-            {fmtK(v)}
+          <text
+            x={padL - 7}
+            y={y(v) + 3}
+            textAnchor="end"
+            fontSize={8}
+            fill={Math.abs(v) < 1e-9 ? '#e2e8f0' : '#cbd5e1'}
+          >
+            {Math.abs(v) < 1e-9 ? '$0' : fmtK(v)}
           </text>
         </g>
       ))}
@@ -1096,8 +1196,11 @@ function FrontierPlot({
         stroke="#94a3b8"
         strokeWidth={1.2}
       />
-      <text x={x(x0) + 4} y={y0 - 6} fontSize={8} fill="#94a3b8">
-        CFaR section {fmtK(x0)} · carry 0
+      <text x={x(x0) + 8} y={y0 + 12} fontSize={8} fill="#e2e8f0">
+        carry $0
+      </text>
+      <text x={x(x0) + 8} y={y0 + 23} fontSize={8} fill="#94a3b8">
+        section {fmtAbsK(x0)}
       </text>
       <g clipPath="url(#liq-frontier-clip)">
       {openSolid.length > 0 && (
@@ -1221,7 +1324,7 @@ function FrontierPlot({
       {isoDots.map((p, i) => (
         hitCircle(p, '#facc15', 3, `m-${p.delta.toFixed(4)}:${i}`, 'mix')
       ))}
-      {hitCircle(origin, '#f8fafc', 5, 'origin', 'origin')}
+      {hitCircle(origin, '#f8fafc', 6.5, 'origin', 'origin')}
       {selected && Math.abs(selected.peakBook) > 1e-6 && (
         <circle
           cx={x(selected.finalCfarUsdM)}

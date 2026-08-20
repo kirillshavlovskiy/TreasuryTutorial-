@@ -596,4 +596,60 @@ Engine entry point: `computeAnalyticsVarUsdM` (also used by `buildHedgeVarSummar
 2. EUR VaR evolution: narrow bar chart (click = set `horizon`) + confidence column on the right.
 3. Same setup feeds Hedging Decision, Live Ladder, Risk Metrics Exp/VaR.
 
+## USDPLN CIP — invert points; hedge notional is sell-negative
+
+**Date:** 2026-08-20
+**Decision:** USDPLN (and every FCY-per-USD pair) CIP is `N × (1/F − 1/S)`, never `N × points/10_000`. `N` is book-signed (+ = long FCY = sell FCY far). Hedge trades are sell-negative — convert with `cover = −hedge` before the market pricer. Negative USDPLN points on a long cover earn CIP.
+**Alternatives considered:** Treat every pair like EURUSD (`N × pts/10_000`) — rejected; that prints a cost on a long PLN. Pass the hedge notional straight into `fwdCarryFromSwapPointsUsdM` — rejected; `N < 0` prices a buy and flips the invert back to a cost.
+**Reason:** FXO CashTable points sit on the market quote. USDPLN is PLN per 1 USD (~3.64). The book P&L is USD per 1 PLN. The invert is the quote conversion, not a sign hack.
+**Anti-patterns:** Do not multiply PLN notional by raw points. Do not skip the invert because the file cell says PLNUSD or PLNPLN. Do not feed `overlay.forwardLocalM` (sell-negative) into the market pricer as if it were a long cover. Do not force far-arm Y to `−|points|` when cash pays and CIP earns.
+**Ticket:** —
+
+### How to read the Market data points column
+
+FXOCalculator `CashTable` columns (0-indexed): tenor, FCY bid/ask, USD bid/ask, **swap points bid (5) / ask (6)**, outright bid/ask (7–8).
+
+| Cell | What it is |
+|------|------------|
+| Pair (Legs sheet) | `USDPLN` — even if the cell says PLNUSD / PLNPLN, a PLN book is USDPLN |
+| Spot mid | PLN per 1 USD (~3.64). Book spot is USD per PLN (~0.275) — invert when needed |
+| Swap points bid / ask | Printed as-is. Typical 1Y: bid more negative than ask (e.g. −92 / −80) |
+| Outright mid | `S + points/10_000` on the USDPLN quote (JPY `/100`). Example: 3.64 + (−80)/10_000 = 3.632 |
+
+Side: **long cover sells PLN far → take the ask** (less negative when points are negative). Short cover buys PLN far → bid.
+
+EUR / GBP / AUD / NZD are the only USD-per-FCY quotes. Those points *are* already USD per FCY: `Δ = points/10_000`, no invert.
+
+### How to calculate CIP for USDPLN
+
+```
+S     = USDPLN spot          // PLN per 1 USD. If you only have USD/PLN: S = 1 / spot
+pts   = ask if N ≥ 0 else bid
+F     = S + pts / 10_000     // JPY: /100
+Δ     = 1/F − 1/S            // USD per 1 PLN
+CIP   = N_PLN_M × Δ          // $M over the tenor
+```
+
+`N_PLN_M` is the **cover** (book-signed). A +21.6M long sells 21.6M PLN far.
+
+Worked 1Y ask = −80, S = 3.64, N = +10M:
+
+```
+F   = 3.64 − 0.0080 = 3.632
+Δ   = 1/3.632 − 1/3.64 ≈ +0.000605
+CIP = 10 × 0.000605 ≈ +$6.1k     // earn
+```
+
+Naive `10 × (−80)/10_000 = −$80k` is the quote increment, not USD P&L.
+
+### Hedge vs funding-swap callers
+
+| Caller | What it holds | Into `fwdCarryFromSwapPointsUsdM` |
+|--------|----------------|-----------------------------------|
+| Funding-swap CIP (`fundingSwapPathFarCipUsdM`) | Standing book `+N` | `+N` |
+| Exposure cover (`fwdCarryForExposureCoverUsdM`) | Cover `+N` | `+N` (fallback uses `−N` because `fwdHedgeCarryUsdYr` is sell-negative) |
+| Hedge FWD (`fwdHedgeCarryFromMarketUsd`) | Hedge trade `−N` | `−notional` → `+N` |
+
+Code: `swapPointsToUsdPerFcyDelta` / `fwdCarryFromSwapPointsUsdM` in `lib/fx-market-rates.ts`.
+
 <!-- Add new decisions above this line -->

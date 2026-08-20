@@ -14,7 +14,7 @@
 
 import { useState } from 'react';
 import { DeskStepper } from '@/components/DeskStepper';
-import { ccySpotRate } from '@/lib/fx-buffer';
+import { ccySpotRate, fundingSwapCashDeltaUsdYr } from '@/lib/fx-buffer';
 import { swapLegSchedule, type SwapLegScheduleRow } from '@/lib/forecast-profile';
 import type { FcyComputedRow } from '@/lib/dashboard-model';
 import {
@@ -73,7 +73,7 @@ function rowFromNearLeg(r: FcyComputedRow, r_USD: number, nearLeg: number, cycle
     }],
     usdFunded: nearLeg * spot,
     deltaR,
-    costUsdYr: nearLeg * spot * (deltaR / 100),
+    costUsdYr: -fundingSwapCashDeltaUsdYr(nearLeg, spot, r.r_FCY, r_USD, r.r_OD),
     cycles,
   };
 }
@@ -139,7 +139,7 @@ export function decisionRowFor(r: FcyComputedRow, r_USD: number): DecisionRow | 
     schedule: swapLegSchedule(plan),
     usdFunded: peakBook * spot,
     deltaR,
-    costUsdYr: avgBook * spot * (deltaR / 100),
+    costUsdYr: -fundingSwapCashDeltaUsdYr(avgBook, spot, r.r_FCY, r_USD, r.r_OD),
     cycles: plan.length,
   };
 }

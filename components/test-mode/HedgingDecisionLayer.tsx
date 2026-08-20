@@ -256,10 +256,18 @@ interface HedgingDecisionLayerProps {
   onHedgeRatiosChange?: (ratios: Record<string, number>) => void;
   /** Booked hedge tickets — shared with Live Ladder for VaR recalculation. */
   bookedHedges?: HedgeTicket[];
-  onBookedHedgesChange?: (tickets: HedgeTicket[]) => void;
+  onBookedHedgesChange?: (
+    next: HedgeTicket[] | ((prev: HedgeTicket[]) => HedgeTicket[]),
+  ) => void;
   /** Analytics-prepared packages (not live until Send). */
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
-  onPreparedByCcyChange?: (next: Record<string, PreparedHedgeProfile>) => void;
+  onPreparedByCcyChange?: (
+    next:
+      | Record<string, PreparedHedgeProfile>
+      | ((
+          prev: Record<string, PreparedHedgeProfile>,
+        ) => Record<string, PreparedHedgeProfile>),
+  ) => void;
   /** Entity/group scope for Market data swap-points carry on Prepare. */
   ratesScopeId?: string;
   /** DB-persisted market data per currency (Market data tab uploads). */
@@ -348,13 +356,21 @@ export function HedgingDecisionLayer({
     if (onHedgeRatiosChange) onHedgeRatiosChange(next);
     else setLocalRatios(next);
   };
-  const setBooked = (next: HedgeTicket[]) => {
+  const setBooked = (
+    next: HedgeTicket[] | ((prev: HedgeTicket[]) => HedgeTicket[]),
+  ) => {
     if (onBookedHedgesChange) onBookedHedgesChange(next);
-    else setLocalBooked(next);
+    else setLocalBooked(prev => (typeof next === 'function' ? next(prev) : next));
   };
-  const setPreparedByCcy = (next: Record<string, PreparedHedgeProfile>) => {
+  const setPreparedByCcy = (
+    next:
+      | Record<string, PreparedHedgeProfile>
+      | ((
+          prev: Record<string, PreparedHedgeProfile>,
+        ) => Record<string, PreparedHedgeProfile>),
+  ) => {
     if (onPreparedByCcyChange) onPreparedByCcyChange(next);
-    else setLocalPrepared(next);
+    else setLocalPrepared(prev => (typeof next === 'function' ? next(prev) : next));
   };
 
   const TfM =
@@ -528,10 +544,10 @@ export function HedgingDecisionLayer({
     }
     // Never auto-book strips from path chips — only Decision %. Prepare/Send is explicit.
     if (hasRollingStripForCcy(booked, chartRow.ccy)) {
-      setBooked(clearRollingStripForCcy(booked, chartRow.ccy));
+      setBooked(prev => clearRollingStripForCcy(prev, chartRow.ccy));
     }
     if (preparedByCcy[chartRow.ccy]) {
-      setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, chartRow.ccy));
+      setPreparedByCcy(prev => clearPreparedHedgeForCcy(prev, chartRow.ccy));
     }
     const bulletEq = equalVarLinearHedgeNotionalLocalM(
       chartBar.stockNetM,
@@ -623,8 +639,8 @@ export function HedgingDecisionLayer({
           bulletSettleMonths: defaultTf,
         },
       );
-      setPreparedByCcy(
-        setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+      setPreparedByCcy(prev =>
+        setPreparedHedgeForCcy(prev, chartRow.ccy, {
           ...profile,
           preparedFor: 'var',
         }),
@@ -682,8 +698,8 @@ export function HedgingDecisionLayer({
         bulletSettleMonths,
       },
     );
-    setPreparedByCcy(
-      setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+    setPreparedByCcy(prev =>
+      setPreparedHedgeForCcy(prev, chartRow.ccy, {
         ...profile,
         preparedFor: 'var',
       }),
@@ -692,7 +708,7 @@ export function HedgingDecisionLayer({
   };
 
   const discardPrepared = (ccy: string) => {
-    setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+    setPreparedByCcy(prev => clearPreparedHedgeForCcy(prev, ccy));
   };
 
   /** Commit Analytics-prepared package onto the live Decision book. */
@@ -724,12 +740,12 @@ export function HedgingDecisionLayer({
         monthlyFlowsByCcy[ccy] ?? [],
         settleMonthsByEdgeIndex,
       );
-      setBooked(mergeRollingStripIntoBook(booked, tickets, ccy));
+      setBooked(prev => mergeRollingStripIntoBook(prev, tickets, ccy));
       setRatios({ ...ratios, [ccy]: 0 });
       for (const t of tickets) {
         if (isLiveHedgeTicket(t)) onBookHedge?.(t);
       }
-      setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+      setPreparedByCcy(prev => clearPreparedHedgeForCcy(prev, ccy));
       return;
     }
 
@@ -763,13 +779,15 @@ export function HedgingDecisionLayer({
         horizon: maturity,
       }),
     };
-    const withoutStrip = hasRollingStripForCcy(booked, ccy)
-      ? clearRollingStripForCcy(booked, ccy)
-      : booked;
-    setBooked([ticket, ...withoutStrip]);
+    setBooked(prev => {
+      const withoutStrip = hasRollingStripForCcy(prev, ccy)
+        ? clearRollingStripForCcy(prev, ccy)
+        : prev;
+      return [ticket, ...withoutStrip];
+    });
     setRatios({ ...ratios, [ccy]: 0 });
     onBookHedge?.(ticket);
-    setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+    setPreparedByCcy(prev => clearPreparedHedgeForCcy(prev, ccy));
   };
 
   const openBookModal = (ccy: string) => {
@@ -814,7 +832,7 @@ export function HedgingDecisionLayer({
   const confirmBook = (edited: HedgeTicket) => {
     // Each confirm appends a new transaction; incremental hedge % resets on the net book.
     const ticket: HedgeTicket = { ...edited, id: newHedgeTicketId() };
-    setBooked([ticket, ...booked]);
+    setBooked(prev => [ticket, ...prev]);
     setRatios({ ...ratios, [ticket.ccy]: 0 });
     onBookHedge?.(ticket);
     setDraft(null);
@@ -822,7 +840,7 @@ export function HedgingDecisionLayer({
 
   /** Cancel one ticket, or the whole strip if it belongs to a roll. */
   const requestCancellation = (ticket: HedgeTicket) => {
-    setBooked(removeHedgeTicketOrStrip(booked, ticket));
+    setBooked(prev => removeHedgeTicketOrStrip(prev, ticket));
     setRatios({ ...ratios, [ticket.ccy]: 0 });
   };
 
@@ -911,8 +929,8 @@ export function HedgingDecisionLayer({
           varSetup.forecastMonths || horizonMonths(varSetup.horizon),
       },
     );
-    setPreparedByCcy(
-      setPreparedHedgeForCcy(preparedByCcy, rollingStrip.ccy, {
+    setPreparedByCcy(prev =>
+      setPreparedHedgeForCcy(prev, rollingStrip.ccy, {
         ...profile,
         preparedFor: 'var',
       }),
@@ -1074,7 +1092,7 @@ export function HedgingDecisionLayer({
     if (!row) return;
     const targetLocalM = row.targetHedgeLocalM * (ratioPct / 100);
     if (Math.abs(targetLocalM) < 1e-9) {
-      setPreparedByCcy(clearPreparedHedgeForCcy(preparedByCcy, ccy));
+      setPreparedByCcy(prev => clearPreparedHedgeForCcy(prev, ccy));
       return;
     }
     const profile = buildStructuredProfile(
@@ -1084,8 +1102,8 @@ export function HedgingDecisionLayer({
       cfg,
       basis,
     );
-    setPreparedByCcy(
-      setPreparedHedgeForCcy(preparedByCcy, ccy, {
+    setPreparedByCcy(prev =>
+      setPreparedHedgeForCcy(prev, ccy, {
         ...profile,
         preparedFor: 'var',
       }),
@@ -1989,7 +2007,11 @@ export function HedgingDecisionLayer({
                                       ? [
                                           prepared.preparedFor === 'carry'
                                             ? 'Cash Carry'
-                                            : 'prepared',
+                                            : prepared.preparedFor === 'liquidity'
+                                              ? 'Liquidity'
+                                              : prepared.preparedFor === 'var'
+                                                ? 'FX Risk'
+                                                : 'prepared',
                                           regimeLabel,
                                         ]
                                           .filter(Boolean)

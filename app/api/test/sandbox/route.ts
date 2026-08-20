@@ -6,11 +6,12 @@ import {
   getSandboxStorageEnv,
   isSandboxDatabaseAvailable,
   loadSandboxProgress,
-  saveSandboxProgress,
+  saveSandboxPut,
 } from '@/lib/test-mode/sandbox-service';
-import { normalizeSandboxState, seedSandbox } from '@/lib/test-mode/store';
+import { seedSandbox } from '@/lib/test-mode/store';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 function taskIdFrom(searchParams: URLSearchParams, bodyTaskId?: unknown): string {
   const raw =
@@ -82,14 +83,18 @@ export async function PUT(request: Request) {
   }
 
   try {
-    const body = (await request.json()) as { taskId?: string; state?: unknown };
+    const body = (await request.json()) as {
+      taskId?: string;
+      state?: unknown;
+      patch?: unknown;
+    };
     const taskId = taskIdFrom(new URL(request.url).searchParams, body.taskId);
-    if (!body.state || typeof body.state !== 'object') {
+    const { isSandboxHedgePatch } = await import('@/lib/test-mode/sandbox-put');
+    if (!isSandboxHedgePatch(body) && (!body.state || typeof body.state !== 'object')) {
       return NextResponse.json({ error: 'Missing state' }, { status: 400 });
     }
 
-    const state = normalizeSandboxState(body.state);
-    const record = await saveSandboxProgress(emailOrErr, state, taskId);
+    const record = await saveSandboxPut(emailOrErr, body, taskId);
     return NextResponse.json({
       state: record.state,
       updatedAt: record.updatedAt,

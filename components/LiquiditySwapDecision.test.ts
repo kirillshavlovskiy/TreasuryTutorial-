@@ -6,6 +6,7 @@ import {
 } from '@/components/LiquiditySwapDecision';
 import type { FcyComputedRow } from '@/lib/dashboard-model';
 import type { LiquidityCycleProjection } from '@/lib/forecast-profile';
+import { ccySpotRate } from '@/lib/fx-buffer';
 
 /**
  * Only the fields decisionRowFor / swapLegSchedule actually read — the real
@@ -24,6 +25,7 @@ function mkPlan(
 function mkRow(overrides: {
   ccy: string;
   r_FCY: number;
+  r_OD?: number;
   cycleDrawdown?: number;
   swapNear?: number;
   liquidityPlan?: LiquidityCycleProjection[];
@@ -103,6 +105,28 @@ describe('decisionRowFor', () => {
     const d = decisionRowFor(row, 4)!;
     expect(d.deltaR).toBe(3);
     expect(d.costUsdYr).toBeCloseTo(15 * (3 / 100), 10);
+  });
+
+  it('a PLN cash-short standing pays OD vs USD — not an inverted credit earn', () => {
+    const plan = mkPlan([
+      { swap_needed: -10, standing_swap: -10, drawdown: 8 },
+      { swap_needed: -10, standing_swap: -20, drawdown: 8 },
+    ]);
+    const row = mkRow({
+      ccy: 'PLN',
+      r_FCY: 3.41,
+      r_OD: 4.41,
+      liquidityPlan: plan,
+    });
+    const d = decisionRowFor(row, 3.50)!;
+    const spot = ccySpotRate('PLN');
+    const avgBook = -15;
+    expect(avgBook * spot * ((3.50 - 3.41) / 100)).toBeLessThan(0);
+    expect(d.costUsdYr).toBeGreaterThan(0);
+    expect(d.costUsdYr).toBeCloseTo(
+      -avgBook * ((4.41 - 3.50) / 100) * spot,
+      8,
+    );
   });
 
   it('flags rolling only when the plan has more than one cycle and the last one still drains', () => {
