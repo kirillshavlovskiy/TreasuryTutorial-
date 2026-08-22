@@ -364,7 +364,7 @@ export function LiquidityFrontierModal({
   staged?: boolean;
   /**
    * This currency's Σ⁻¹μ overlay leg under the desk's active portfolio
-   * scenario (Conservative / Balanced / Max Carry / custom) — `fcyM` is
+   * scenario (Carry Target / Balanced / Max Policy Risk / custom) — `fcyM` is
    * H* − hold, same convention as `SweetStripSplit`'s Overlay FCY column.
    * When present, it preselects the frontier point nearest
    * `bookStanding + fcyM` instead of the per-currency dial default, so the

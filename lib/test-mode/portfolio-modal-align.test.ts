@@ -6,6 +6,7 @@ import { liquidityStrategyMeta } from '@/lib/test-mode/liquidity-strategies';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
 import {
   buildLiquidityLeftEndFrontier,
+  carryFwd,
   priceLiquidityStanding,
   type LiquidityFrontierInput,
 } from '@/lib/test-mode/liquidity-frontier';
@@ -13,7 +14,13 @@ import {
   buildSoloCcyAlignedFrontier,
   conservativeFundingPoint,
   maxVarWithinPolicyPoint,
+  localCarryCfarSlope,
+  carryTargetOnArm,
+  DEFAULT_DESK_TARGET_CARRY_USD_YR,
   orderedLiquidityScenarioPoints,
+  tangencyByParallelDerivative,
+  tangencyFromTrueZero,
+  tangencyFromOrigin,
   modalDefaultCarryUsdK,
   mixFundingAndOverlay,
   pricedFundingWalk,
@@ -330,8 +337,9 @@ describe('maxVarWithinPolicyPoint', () => {
     });
     expect(o.origin!.totalCarryUsdYr).toBe(0);
     expect(o.conservative!.portfolioVarUsd).toBeGreaterThan(o.origin!.portfolioVarUsd);
-    expect(o.balanced!.portfolioVarUsd).toBeGreaterThan(o.conservative!.portfolioVarUsd);
-    expect(o.maxCarry!.portfolioVarUsd).toBeGreaterThan(o.balanced!.portfolioVarUsd);
+    expect(o.balanced!.portfolioVarUsd).toBeCloseTo(
+      tangencyFromTrueZero(pts)!.portfolioVarUsd, 8,
+    );
     expect(o.maxCarry!.portfolioVarUsd).toBeLessThanOrEqual(20 + 1e-6);
   });
 
@@ -353,7 +361,123 @@ describe('maxVarWithinPolicyPoint', () => {
     expect(o.conservative!.portfolioVarUsd).toBeGreaterThan(o.origin!.portfolioVarUsd);
   });
 
-  it('does not let a pre-book knee become Balanced', () => {
+  it('tangencyByParallelDerivative is the (γ−origin)∥γ′ vertex', () => {
+    const pts = [
+      pt(0, 0, 0),
+      pt(1, 1, 1),
+      pt(2, 2, 1.5),
+      pt(3, 3, 2.5),
+    ];
+    const hit = tangencyByParallelDerivative(pts, { portfolioVarUsd: 0, totalCarryUsdYr: 0 });
+    expect(hit!.portfolioVarUsd).toBeCloseTo(2, 8);
+  });
+
+  it('localCarryCfarSlope is the neighbor difference, not the origin secant', () => {
+    const pts = [
+      pt(0, 1, 0),
+      pt(1, 2, 1),
+      pt(2, 4, 1.5),
+    ];
+    expect(localCarryCfarSlope(pts, pts[1]!)).toBeCloseTo((1.5 - 0) / (4 - 1), 8);
+    expect(localCarryCfarSlope(pts, pts[1]!)).not.toBeCloseTo((1 - 0) / (2 - 1), 4);
+  });
+
+  it('the (0,0) ray through the touch stays above every other sample', () => {
+    const pts = [
+      pt(0, 0.634, 0),
+      pt(0.4, 0.80, 0.04),
+      pt(0.8, 1.10, 0.09),
+      pt(1, 2.125, 0.114),
+      pt(1.4, 4.0, 0.20),
+      pt(2, 8.0, 0.35),
+      pt(4, 20, 0.50),
+    ];
+    const s = 0.50;
+    const touch = tangencyFromTrueZero(pts, s)!;
+    const cap = carryFwd(touch.totalCarryUsdYr, s) / touch.portfolioVarUsd;
+    for (const p of pts) {
+      if (p.portfolioVarUsd <= 1e-9) continue;
+      expect(carryFwd(p.totalCarryUsdYr, s) / p.portfolioVarUsd).toBeLessThanOrEqual(cap + 1e-12);
+    }
+  });
+
+  it('places Carry Target on the open-arm interpolant at the ask', () => {
+    const pts = [
+      pt(0, 0.50, 0),
+      pt(1, 1.00, 0.20),
+      pt(2, 4.00, 0.60),
+      pt(3, 10.0, 1.00),
+    ];
+    const hit = carryTargetOnArm(pts, 0.40);
+    expect(hit).not.toBeNull();
+    expect(hit!.totalCarryUsdYr).toBeCloseTo(0.40, 8);
+    expect(hit!.portfolioVarUsd).toBeCloseTo(2.50, 8);
+    expect(carryTargetOnArm(pts, 2.00)).toBeNull();
+    const o = orderedLiquidityScenarioPoints({
+      points: pts,
+      conservative: pts[1],
+      policyCapUsd: 20,
+      carryTargetUsdYr: 0.40,
+    });
+    expect(o.carryTarget!.portfolioVarUsd).toBeCloseTo(hit!.portfolioVarUsd, 8);
+  });
+
+  it('interpolates Carry Target from Unhedged when k=0 already has program carry', () => {
+    const pts = [
+      pt(0, 0.50, 0.08),
+      pt(1, 2.00, 0.20),
+      pt(2, 8.00, 0.40),
+    ];
+    const o = orderedLiquidityScenarioPoints({
+      points: pts,
+      conservative: pts[1],
+      policyCapUsd: 20,
+      carryTargetUsdYr: 0.032,
+    });
+    expect(o.carryTarget).not.toBeNull();
+    expect(o.carryTarget!.totalCarryUsdYr).toBeCloseTo(0.032, 8);
+    expect(o.carryTarget!.portfolioVarUsd).toBeGreaterThan(0.50);
+    expect(o.carryTarget!.portfolioVarUsd).toBeLessThan(2.00);
+  });
+
+  it('defaults a blank Earn to $32k/yr, not the H* book carry', () => {
+    const pts = [
+      pt(0, 0.634, 0),
+      pt(1, 2.125, 0.114),
+      pt(2, 8.0, 0.35),
+    ];
+    const o = orderedLiquidityScenarioPoints({
+      points: pts,
+      conservative: pts[1],
+      policyCapUsd: 20,
+    });
+    expect(o.carryTarget).not.toBeNull();
+    expect(o.carryTarget!.totalCarryUsdYr).toBeCloseTo(DEFAULT_DESK_TARGET_CARRY_USD_YR, 8);
+    expect(o.carryTarget!.portfolioVarUsd).toBeGreaterThan(0.634);
+    expect(o.carryTarget!.portfolioVarUsd).toBeLessThan(2.125);
+    expect(o.carryTarget!.totalCarryUsdYr).not.toBeCloseTo(0.114, 2);
+  });
+
+  it('sets Balanced at the (0,0) touch on the full arm, ignoring Conservative', () => {
+    const pts = [
+      pt(0, 0.50, 0),
+      pt(1, 1.00, 0.30),
+      pt(1.4, 3.00, 0.90),
+      pt(2.2, 6.00, 1.20),
+      pt(3.0, 10.0, 1.35),
+      pt(4.0, 20.0, 1.50),
+    ];
+    const touch = tangencyFromTrueZero(pts);
+    expect(touch).not.toBeNull();
+    const o = orderedLiquidityScenarioPoints({
+      points: pts,
+      conservative: pts[1],
+      policyCapUsd: 20,
+    });
+    expect(o.balanced!.portfolioVarUsd).toBeCloseTo(touch!.portfolioVarUsd, 8);
+  });
+
+  it('can place Balanced before Conservative when that is the (0,0) touch', () => {
     const pts = [
       pt(0, 0.3, 0),
       pt(0.6, 0.35, 0.18),
@@ -367,8 +491,34 @@ describe('maxVarWithinPolicyPoint', () => {
       policyCapUsd: 12,
     });
     expect(o.conservative!.k).toBeCloseTo(1, 5);
-    expect(o.balanced!.k).toBeGreaterThan(1 - 1e-6);
-    expect(o.balanced!.portfolioVarUsd).toBeGreaterThan(o.conservative!.portfolioVarUsd);
+    expect(o.balanced!.portfolioVarUsd).toBeCloseTo(
+      tangencyFromTrueZero(pts)!.portfolioVarUsd, 8,
+    );
+    expect(o.balanced!.portfolioVarUsd).toBeLessThan(o.conservative!.portfolioVarUsd);
+  });
+
+  it('does not collapse Balanced and Max Carry when the cap is Conservative CFaR', () => {
+    const cons = 2.125;
+    const pts = [
+      pt(0, 0.634, 0),
+      pt(1, cons, 0.411),
+      pt(1.2, 4.0, 0.55),
+      pt(1.5, 5.0, 0.62),
+      pt(2, 8.994, 0.80),
+      pt(4, 20, 1.10),
+    ];
+    const o = orderedLiquidityScenarioPoints({
+      points: pts,
+      conservative: pts[1],
+      policyCapUsd: cons,
+      originCfarUsd: 0.634,
+    });
+    expect(o.conservative!.portfolioVarUsd).toBeCloseTo(cons, 5);
+    expect(o.balanced!.portfolioVarUsd).toBeCloseTo(
+      tangencyFromTrueZero(pts)!.portfolioVarUsd, 8,
+    );
+    expect(o.maxCarry!.portfolioVarUsd).toBeGreaterThanOrEqual(5 - 1e-6);
+    expect(o.maxCarry!.portfolioVarUsd).toBeLessThanOrEqual(5 + 1e-6);
   });
 
   it('re-targets when the policy cap moves from $20M to $5M', () => {

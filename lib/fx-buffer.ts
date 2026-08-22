@@ -424,6 +424,24 @@ export const POLICY_VAR_LIMITS = [
 ] as const;
 
 /**
+ * Approval-rung cap for Conservative / Balanced / Max Carry placement.
+ * A selected fill (Conservative $2.1M, a custom sample) is not a cap —
+ * snap it up to the smallest $5/$10/$20 rung that still contains it so
+ * the three presets cannot collapse onto one X.
+ */
+export function approvalTierCapUsd(policyVAR: number | null | undefined): number {
+  const tiers = POLICY_VAR_LIMITS.map(p => p.usd);
+  const maxTier = tiers[tiers.length - 1]!;
+  const minTier = tiers[0]!;
+  if (typeof policyVAR !== 'number' || !Number.isFinite(policyVAR) || policyVAR <= 0) {
+    return minTier;
+  }
+  const exact = tiers.find(t => Math.abs(t - policyVAR) < 1e-9);
+  if (exact != null) return exact;
+  return tiers.find(t => t + 1e-6 >= policyVAR) ?? maxTier;
+}
+
+/**
  * Bounded sweep cap ($M) for the named optimization presets.
  * Always covers the approval rungs ($5–$20); stretches a little past the
  * first floor-clamp so the knee is interior, but never traces an unbounded
@@ -901,7 +919,9 @@ export function computeLayeredBuffer(
   const hold = payCarry ? layerSum : Math.max(trough, 0) + layerSum;
   const raw_sum = hold;
 
-  const noNeg = applyNoNegativeLpFloor(raw_sum, r_OD, r_USD);
+  const noNeg = manual_carry_target
+    ? { cash_threshold: raw_sum, debit_floor_binding: false }
+    : applyNoNegativeLpFloor(raw_sum, r_OD, r_USD);
   // Hard minimum: with the floor layer on, the trough cushion never drops below cash_floor.
   const cash_threshold = applyHardMinFloor(noNeg.cash_threshold, floor_contrib);
   const debit_floor_binding = noNeg.debit_floor_binding;
@@ -974,6 +994,13 @@ export function allowsNegativeLp(r_OD: number, r_USD: number): boolean {
   return !isExpensiveOverdraft(r_OD, r_USD);
 }
 
+/** Desk typed a Target LP Cash / Buffer Carry ask — honor it through the debit floor. */
+export function rowHasManualCarryTarget(
+  row: { carry_target?: number } | null | undefined,
+): boolean {
+  return typeof row?.carry_target === 'number' && Number.isFinite(row.carry_target);
+}
+
 /**
  * Hard per-currency minimum: with the floor layer on and a positive floor set,
  * the target/cushion never drops below it (through any regime — carry sell-down,
@@ -1026,9 +1053,13 @@ export function computeFcySwapNear(
   r_USD: number,
   formulaLayersActive: boolean,
   troughCash_M: number,
+  /** Manual carry ask — size the swap to the target even when r_OD > r_USD. */
+  allowOverdraft = false,
 ): number {
   if (!formulaLayersActive) return 0;
-  return clampSwapNoNegativeCash(cash_threshold - troughCash_M, cashPos, r_OD, r_USD);
+  const raw = cash_threshold - troughCash_M;
+  if (allowOverdraft) return raw;
+  return clampSwapNoNegativeCash(raw, cashPos, r_OD, r_USD);
 }
 
 
@@ -2086,6 +2117,15 @@ export interface PortfolioCarryFrontierPoint {
   totalCarryUsdYr: number;
   /** Currencies floor-clamped at this point — the source of any curvature here. */
   floorBoundCcys: string[];
+  /**
+   * Σ|legFcy_i × spot_i| — total capital moved across all legs at this point
+   * (M USD). Only populated on the Σ⁻¹μ overlay walk (sweepPortfolioCarryFrontier);
+   * the book-scale S(t) walk (portfolio-modal-align.ts) scales the whole
+   * existing book uniformly, so "capital added" isn't a separate figure there.
+   */
+  grossOverlayUsdM?: number;
+  /** Σ(legFcy_i × spot_i) — net long(+)/short(−) capital across legs (M USD). Same scope note as grossOverlayUsdM. */
+  netOverlayUsdM?: number;
   /** Left-end leverage tail — live-book framing ignores these. */
   levered?: boolean;
 }
@@ -2116,6 +2156,29 @@ export interface PortfolioCarryFrontier {
   nearestClampVarUsd: number | null;
   /** `book-scale` = S(t) walk (no Σ⁻¹μ dashed ray). Overlay sweep leaves this unset. */
   walk?: 'book-scale' | 'overlay';
+  /**
+   * Index into `points` of the tangency portfolio — argmax of
+   * (carry − points[0].carry)/(CFaR − points[0].CFaR), i.e. where a line
+   * from the curve's own zero-carry "do nothing" origin (points[0] — a
+   * pinned unhedged CFaR when one is set, ~0 otherwise) is tangent to the
+   * curve (the Markowitz/CAL construction). NOT necessarily literal (0,0):
+   * a pinned unhedged CFaR moves the achievable domain's floor away from
+   * zero, and a ray measured from true zero in that case cuts under the
+   * whole curve without ever touching it. −1 when no point has CFaR past
+   * the origin, OR when the ratio never rises above its own first sampled
+   * value — a curve whose CFaR is itself RSS-blended against the same
+   * fixed origin has a ratio that spikes near k→0 and decays monotonically
+   * from there (quadrature near its own vertex, not a real interior peak);
+   * see frontierTangencyIndex for the measured shape. On the Σ⁻¹μ ray this
+   * is only ever interior when something bends it away from a straight
+   * line through the origin (a floor clamp, most commonly) — on an
+   * unclamped ray the ratio is flat, so this lands on the first point past
+   * the origin. Unset on the book-scale S(t) walk
+   * built by `portfolio-modal-align.ts` (a diagnostic sensitivity strip,
+   * not the plotted curve) — set on `toPortfolioCarryFrontier`'s own
+   * book-scale walk, which is what the default Portfolio chart renders.
+   */
+  tangencyIndex?: number;
 }
 
 export function sweepPortfolioCarryFrontier(
@@ -2173,7 +2236,7 @@ export function sweepPortfolioCarryFrontier(
 ): PortfolioCarryFrontier {
   const horizonScale = Math.sqrt(Math.max(1, horizonMonths));
   const fcyInputs = inputs.filter(inp => inp.ccy !== 'USD' && CURRENCY_PARAMS[inp.ccy]);
-  if (fcyInputs.length === 0 || !(policyVAR_M > 0)) return { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null };
+  if (fcyInputs.length === 0 || !(policyVAR_M > 0)) return { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null, tangencyIndex: -1 };
 
   const ccys = fcyInputs.map(inp => inp.ccy);
   const mu = fcyInputs.map((inp) => {
@@ -2214,11 +2277,13 @@ export function sweepPortfolioCarryFrontier(
   // k = 1 fills exactly $1M of VAR: a stable, readable unit for the x-axis
   // that does not depend on whatever policyVAR happens to be set to today.
   const alloc = allocateCarryVarUsd({ ccys, mu, varCapUsdM: 1, skipLeverageCap: true });
-  if (!alloc) return { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null };
+  if (!alloc) return { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null, tangencyIndex: -1 };
   const unitLegUsd = alloc.wUsdM;
 
   const evalAt = (k: number) => {
     let totalCarryUsdYr = 0;
+    let grossOverlayUsdM = 0;
+    let netOverlayUsdM = 0;
     const floorBoundCcys: string[] = [];
     const legsFcy = fcyInputs.map((inp, i) => {
       const p = CURRENCY_PARAMS[inp.ccy]!;
@@ -2228,6 +2293,9 @@ export function sweepPortfolioCarryFrontier(
       const floored = applyHardMinFloor(cash_threshold, inp.floor_contrib);
       if (debit_floor_binding || Math.abs(floored - raw) > 0.001) floorBoundCcys.push(inp.ccy);
       const legFcy = floored - bases[i]!;
+      const legUsd = legFcy * p.spot;
+      grossOverlayUsdM += Math.abs(legUsd);
+      netOverlayUsdM += legUsd;
       // Credit/debit split — same mechanism as unfundedCashCarryUsdYr: price
       // at the deposit rate μ while the FINAL position is still in credit,
       // at the overdraft rate once the overlay has pushed it into debit.
@@ -2242,7 +2310,13 @@ export function sweepPortfolioCarryFrontier(
     // √(fixed² + overlay²) — see the module comment for why this mirrors
     // displayedCfarUsdMFromFxNet's per-currency shape, generalized so the
     // overlay portion keeps its cross-currency correlation.
-    return { portfolioVarUsd: blendVar(overlayVarUsd, pinCfar), totalCarryUsdYr, floorBoundCcys };
+    return {
+      portfolioVarUsd: blendVar(overlayVarUsd, pinCfar),
+      totalCarryUsdYr,
+      floorBoundCcys,
+      grossOverlayUsdM,
+      netOverlayUsdM,
+    };
   };
 
   // Far/hedged arm: same near-leg cash position/floor walk as evalAt (a
@@ -2257,6 +2331,8 @@ export function sweepPortfolioCarryFrontier(
   // model's funding-swap CFaR). portfolioRateVarUsd prices that.
   const evalFarAt = (k: number) => {
     let totalCarryUsdYr = 0;
+    let grossOverlayUsdM = 0;
+    let netOverlayUsdM = 0;
     const legs = fcyInputs.map((inp, i) => {
       const p = CURRENCY_PARAMS[inp.ccy]!;
       const overlayFcy = p.spot > 1e-12 ? (k * unitLegUsd[i]!) / p.spot : 0;
@@ -2264,6 +2340,9 @@ export function sweepPortfolioCarryFrontier(
       const { cash_threshold } = applyNoNegativeLpFloor(raw, inp.r_OD, r_USD);
       const floored = applyHardMinFloor(cash_threshold, inp.floor_contrib);
       const legFcy = floored - bases[i]!;
+      const legUsd = legFcy * p.spot;
+      grossOverlayUsdM += Math.abs(legUsd);
+      netOverlayUsdM += legUsd;
       const muDebit = (inp.r_OD - r_USD) / 100;
       const rate = floored >= 0 ? mu[i]! : muDebit;
       totalCarryUsdYr += legFcy * p.spot * rate;
@@ -2276,7 +2355,12 @@ export function sweepPortfolioCarryFrontier(
       : 0;
     // Far tail is CIP / fully-hedged overlay from Unhedged — not the
     // funded H* hold. Conservative cash+swap is open-arm only.
-    return { portfolioVarUsd: blendVar(overlayVarUsd, pinnedUnhedged), totalCarryUsdYr };
+    return {
+      portfolioVarUsd: blendVar(overlayVarUsd, pinnedUnhedged),
+      totalCarryUsdYr,
+      grossOverlayUsdM,
+      netOverlayUsdM,
+    };
   };
 
   // Range tied to today's policy VAR, not a self-terminating search: an EARN
@@ -2337,25 +2421,67 @@ export function sweepPortfolioCarryFrontier(
   const overlayPoints: PortfolioCarryFrontierPoint[] = [...ks]
     .sort((a, b) => a - b)
     .map(k => {
-      const { portfolioVarUsd, totalCarryUsdYr, floorBoundCcys } = evalAt(k);
+      const { portfolioVarUsd, totalCarryUsdYr, floorBoundCcys, grossOverlayUsdM, netOverlayUsdM } = evalAt(k);
       return {
         k,
         portfolioVarUsd,
         totalCarryUsdYr,
         floorBoundCcys,
+        grossOverlayUsdM,
+        netOverlayUsdM,
       };
     });
 
-  const points = overlayPoints;
+  // Tangency portfolio — argmax carry(k)/CFaR(k), the line from the curve's
+  // own zero-carry origin (overlayPoints[0] — pinCfar when a fixed base is
+  // blended in, ~0 otherwise) tangent to the curve. NOT literal (0,0): a
+  // pinned unhedged CFaR can put the achievable domain's floor well to the
+  // right of zero, and measuring from true zero there produces a ray that
+  // cuts under the whole curve without touching it. Refine the discrete
+  // argmax with a golden-section search inside its two neighbors' bracket
+  // so the reported point isn't just whatever landed on the sampling grid.
+  // Same guard frontierKneeIndex uses: without a fixed CFaR term or a real
+  // floor clamp, the ray is flat/monotonic by construction and the "peak"
+  // is floating-point noise between near-tied ratios (~1e-13 apart) —
+  // refining that would wander to an arbitrary point on a flat plateau
+  // instead of reporting the true (first-point) answer, and would add a
+  // sampling point on every single sweep even when nothing actually bends.
+  const originCfar = overlayPoints[0]!.portfolioVarUsd;
+  const originCarry = overlayPoints[0]!.totalCarryUsdYr;
+  const hasCurvature = fixedVariance > 1e-9 || pinCfar != null
+    || overlayPoints.some(p => p.floorBoundCcys.length > 0);
+  // Without curvature, skip the ratio scan entirely rather than let noise
+  // in near-tied ratios (~1e-13 apart) pick a later point at random — go
+  // straight to the deterministic answer, the first point past the origin.
+  const tangencyCoarseIdx = hasCurvature
+    ? frontierTangencyIndex(overlayPoints, originCfar, originCarry)
+    : overlayPoints.findIndex(p => p.portfolioVarUsd > originCfar + 1e-9);
+  let tangencyPoint = tangencyCoarseIdx >= 0 ? overlayPoints[tangencyCoarseIdx]! : null;
+  if (hasCurvature && tangencyCoarseIdx > 0 && tangencyCoarseIdx < overlayPoints.length - 1) {
+    const lo = overlayPoints[tangencyCoarseIdx - 1]!.k;
+    const hi = overlayPoints[tangencyCoarseIdx + 1]!.k;
+    const refined = refineTangencyPoint(evalAt, lo, hi, originCfar, originCarry);
+    const ratioOf = (p: { portfolioVarUsd: number; totalCarryUsdYr: number }) => {
+      const d = p.portfolioVarUsd - originCfar;
+      return d > 1e-9 ? (p.totalCarryUsdYr - originCarry) / d : -Infinity;
+    };
+    if (ratioOf(refined) > ratioOf(tangencyPoint!) + 1e-9) tangencyPoint = refined;
+  }
+  const points: PortfolioCarryFrontierPoint[] = tangencyPoint
+    && !overlayPoints.some(p => Math.abs(p.k - tangencyPoint!.k) < 1e-9)
+    ? [...overlayPoints, tangencyPoint].sort((a, b) => a.k - b.k)
+    : overlayPoints;
 
   const farSweep: PortfolioCarryFrontierPoint[] = farLegCarryUsdYr
     ? [...ks].sort((a, b) => a - b).map((k) => {
-        const { portfolioVarUsd, totalCarryUsdYr } = evalFarAt(k);
+        const { portfolioVarUsd, totalCarryUsdYr, grossOverlayUsdM, netOverlayUsdM } = evalFarAt(k);
         return {
           k,
           portfolioVarUsd,
           totalCarryUsdYr,
           floorBoundCcys: [],
+          grossOverlayUsdM,
+          netOverlayUsdM,
         };
       })
     : [];
@@ -2367,6 +2493,8 @@ export function sweepPortfolioCarryFrontier(
       portfolioVarUsd: pinnedUnhedged,
       totalCarryUsdYr: 0,
       floorBoundCcys: [],
+      grossOverlayUsdM: 0,
+      netOverlayUsdM: 0,
     }
     : null;
   const isUnhedgedOrigin = (p: PortfolioCarryFrontierPoint) => (
@@ -2383,14 +2511,18 @@ export function sweepPortfolioCarryFrontier(
       : farSweep)
     : [];
 
-  const overlayKnee = frontierKneeIndex(overlayPoints, fixedVariance > 1e-9 || pinCfar != null);
-  const fundingPad = openArmed.length - overlayPoints.length;
+  const overlayKnee = frontierKneeIndex(points, fixedVariance > 1e-9 || pinCfar != null);
+  const fundingPad = openArmed.length - points.length;
+  const tangencyIdxInOverlay = tangencyPoint
+    ? points.findIndex(p => Math.abs(p.k - tangencyPoint!.k) < 1e-9)
+    : -1;
   return {
     points: openArmed,
     farPoints,
     sweetSpotIndex: overlayKnee >= 0 ? overlayKnee + fundingPad : -1,
     nearestClampCcy,
     nearestClampVarUsd,
+    tangencyIndex: tangencyIdxInOverlay >= 0 ? tangencyIdxInOverlay + fundingPad : -1,
   };
 }
 
@@ -2430,6 +2562,118 @@ function frontierKneeIndex(
     if (dist > bestDist) { bestDist = dist; bestIdx = i; }
   });
   return bestIdx;
+}
+
+/**
+ * Index maximizing (carry − originCarry)/(CFaR − originCfar) — the
+ * tangency-portfolio point (line from the curve's own zero-carry "do
+ * nothing" origin, tangent to the curve).
+ *
+ * The origin is NOT always mathematical (0,0): a book with a fixed
+ * unhedged/base exposure has a real CFaR floor you cannot get below just by
+ * not adding overlay (e.g. an Unhedged reference at $634K CFaR) — the curve
+ * simply doesn't exist for CFaR < that floor. Measuring the ratio from true
+ * zero when the achievable domain starts well to the right of it produces a
+ * ray that visually cuts under the entire curve without touching it, and
+ * can push the "tangency" point to whatever the last point happens to be
+ * (RSS-blended CFaR only asymptotically approaches its best ratio, never
+ * turns over) instead of the curve's real interior peak. Pass the curve's
+ * own zero-carry origin — typically points[0] — as (originCfar,
+ * originCarry); omit for a frontier that genuinely starts at (0,0).
+ *
+ * Requires a genuine hump: the ratio must rise above its own first sampled
+ * value somewhere before this returns anything other than −1. Without that
+ * check, a book-scale walk whose CFaR is ALSO RSS-blended against the same
+ * fixed origin (sqrt(originCfar² + scalable²)) produces a ratio that
+ * SPIKES toward the sample closest to the origin and decays monotonically
+ * from there — because the excess CFaR over origin grows quadratically in
+ * the sizing parameter near k→0 while carry grows linearly, not a genuine
+ * interior peak, just how quadrature behaves near its own vertex. Reporting
+ * that spike would put the "tangency" marker right on top of the origin
+ * point on every such chart — real data measured off this exact codebase's
+ * own book-scale walk showed a ratio of 1.24 at the first sample decaying
+ * to 0.17 by the 40th, never rising again. −1 either when no point has
+ * CFaR strictly past the origin, or when the ratio never exceeds its own
+ * first value (no real hump to report).
+ */
+export function frontierTangencyIndex(
+  points: readonly PortfolioCarryFrontierPoint[],
+  originCfar = 0,
+  originCarry = 0,
+): number {
+  const ratios: { i: number; ratio: number }[] = [];
+  points.forEach((p, i) => {
+    const dCfar = p.portfolioVarUsd - originCfar;
+    if (!(dCfar > 1e-9)) return;
+    ratios.push({ i, ratio: (p.totalCarryUsdYr - originCarry) / dCfar });
+  });
+  if (ratios.length === 0) return -1;
+  const firstRatio = ratios[0]!.ratio;
+  if (!ratios.some(r => r.ratio > firstRatio + 1e-9)) return -1;
+  let bestIdx = -1;
+  let bestRatio = -Infinity;
+  for (const r of ratios) {
+    if (r.ratio > bestRatio) { bestRatio = r.ratio; bestIdx = r.i; }
+  }
+  return bestIdx;
+}
+
+/**
+ * Golden-section refinement of the tangency point within a bracket [lo, hi]
+ * — the two neighbors of a discrete argmax found by frontierTangencyIndex.
+ * Assumes a single interior peak inside that narrow bracket (reasonable
+ * locally even though the ratio is not guaranteed unimodal across the
+ * WHOLE range — multiple currencies can clamp in sequence and produce more
+ * than one hump globally; this only ever refines the one already found).
+ */
+function refineTangencyPoint(
+  evalAt: (k: number) => {
+    portfolioVarUsd: number;
+    totalCarryUsdYr: number;
+    floorBoundCcys: string[];
+    grossOverlayUsdM: number;
+    netOverlayUsdM: number;
+  },
+  lo: number,
+  hi: number,
+  originCfar = 0,
+  originCarry = 0,
+  iters = 40,
+): PortfolioCarryFrontierPoint {
+  const invphi = (Math.sqrt(5) - 1) / 2;
+  const at = (k: number) => {
+    const r = evalAt(k);
+    const dCfar = r.portfolioVarUsd - originCfar;
+    return {
+      k,
+      ...r,
+      ratio: dCfar > 1e-9 ? (r.totalCarryUsdYr - originCarry) / dCfar : -Infinity,
+    };
+  };
+  let a = lo;
+  let b = hi;
+  let c = at(b - invphi * (b - a));
+  let d = at(a + invphi * (b - a));
+  for (let i = 0; i < iters && b - a > 1e-9; i++) {
+    if (c.ratio > d.ratio) {
+      b = d.k;
+      d = c;
+      c = at(b - invphi * (b - a));
+    } else {
+      a = c.k;
+      c = d;
+      d = at(a + invphi * (b - a));
+    }
+  }
+  const best = c.ratio >= d.ratio ? c : d;
+  return {
+    k: best.k,
+    portfolioVarUsd: best.portfolioVarUsd,
+    totalCarryUsdYr: best.totalCarryUsdYr,
+    floorBoundCcys: best.floorBoundCcys,
+    grossOverlayUsdM: best.grossOverlayUsdM,
+    netOverlayUsdM: best.netOverlayUsdM,
+  };
 }
 
 // ── Portfolio USD VAR — multi-currency diversified buffer ─────────────────

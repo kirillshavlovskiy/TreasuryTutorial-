@@ -141,9 +141,9 @@ describe('carry P&L ↔ cash target inversion', () => {
   });
 
   it('clamps an unreachable Buffer Carry ask to the standing-path extreme', () => {
-    // Small EUR book: M1 Buffer Carry is a few $k, so a $5M ask (typing 5000 in
-    // the $k field) cannot land — the solver must still return a book.
-    const row = { ...rowFor('EUR'), cash: 2.5, payout: 0, collections: 0, fcastFX: 0 };
+    // PLN loses both long (r_FCY < r_USD) and short (r_OD > r_USD) — no standing
+    // earns a positive $k ask. The solver still returns the closest book.
+    const row = { ...rowFor('PLN'), cash: 2.5, payout: 0, collections: 0, fcastFX: 0 };
     const layers = new Set<LayerId>(['floorH', 'sigmaP', 'carryOptim']);
     const solved = targetForBufferCarry(
       50, row, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
@@ -155,6 +155,22 @@ describe('carry P&L ↔ cash target inversion', () => {
       { ...row, carry_target: solved!.target }, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
     );
     expect(landed).toBeCloseTo(solved!.carryUsd, 6);
+  });
+
+  it('a large EARN $k ask is not stuck at the current cash book', () => {
+    const row = { ...rowFor('GBP'), cash: 32, payout: 0, collections: 0, fcastFX: 0, cash_floor: 0 };
+    const layers = new Set<LayerId>(['carryOptim']);
+    const ask = 0.40;
+    const solved = targetForBufferCarry(
+      ask, row, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    expect(solved).not.toBeNull();
+    expect(solved!.exact).toBe(true);
+    expect(solved!.target).toBeGreaterThan(32 * 2);
+    const landed = pathBufferCarry(
+      { ...row, carry_target: solved!.target }, SHARED, layers, 12, DEFAULT_FORECAST_PROFILE,
+    );
+    expect(Math.abs(landed - ask)).toBeLessThan(ask * 1e-4);
   });
 
   it('path Buffer Carry is the Σ of the per-cycle legs, not one month', () => {

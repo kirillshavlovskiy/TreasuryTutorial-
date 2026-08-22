@@ -15,8 +15,10 @@ const DESK_LAYER_IDS = new Set<string>([
 ]);
 const DESK_SCENARIO_IDS = new Set([
   'conservative',
+  'carryTarget',
   'balanced',
   'maxCarry',
+  'maxPolicyRisk',
   'maxReturn',
 ]);
 

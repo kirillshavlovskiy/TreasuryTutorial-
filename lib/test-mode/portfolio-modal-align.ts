@@ -9,7 +9,9 @@
 
 import { allocateCarryVarUsd } from '@/lib/portfolio-alloc';
 import {
+  approvalTierCapUsd,
   ccySpotRate,
+  POLICY_VAR_LIMITS,
   type PortfolioCarryFrontier,
   type PortfolioCarryFrontierPoint,
   type RowState,
@@ -17,6 +19,7 @@ import {
 import {
   bookCashCarryK,
   buildLiquidityLeftEndFrontier,
+  carryFwd,
   frontierCarryDotsK,
   liquidityFrontierDial,
   priceLiquidityStanding,
@@ -343,7 +346,46 @@ export function buildSoloCcyAlignedFrontier(input: {
  * leftover book standing — that lifts the marker off the X-axis.
  */
 /**
- * Max Carry: highest open-arm CFaR still inside the policy cap.
+ * Desk Target Carry when Earn is blank ($M/yr). $32k/yr — not the H* book's
+ * own cash carry (that is what pinned the marker at ~$114k).
+ */
+export const DEFAULT_DESK_TARGET_CARRY_USD_YR = 32 / 1000;
+
+/**
+ * Open-arm point whose cash carry matches a desk Target Carry ($M/yr).
+ * Interpolates the segment that straddles the ask. Off-arm asks return null.
+ */
+export function carryTargetOnArm(
+  points: readonly PortfolioCarryFrontierPoint[],
+  targetUsdYr: number,
+): PortfolioCarryFrontierPoint | null {
+  if (!Number.isFinite(targetUsdYr)) return null;
+  const arm = points
+    .filter(p => (
+      Number.isFinite(p.portfolioVarUsd)
+      && Number.isFinite(p.totalCarryUsdYr)
+      && p.k >= -1e-12
+    ))
+    .sort((a, b) => a.k - b.k || a.portfolioVarUsd - b.portfolioVarUsd);
+  if (arm.length === 0) return null;
+  for (const p of arm) {
+    if (Math.abs(p.totalCarryUsdYr - targetUsdYr) < 1e-9) return p;
+  }
+  for (let i = 0; i < arm.length - 1; i++) {
+    const a = arm[i]!;
+    const b = arm[i + 1]!;
+    const lo = Math.min(a.totalCarryUsdYr, b.totalCarryUsdYr);
+    const hi = Math.max(a.totalCarryUsdYr, b.totalCarryUsdYr);
+    if (targetUsdYr < lo - 1e-12 || targetUsdYr > hi + 1e-12) continue;
+    const span = b.totalCarryUsdYr - a.totalCarryUsdYr;
+    if (Math.abs(span) < 1e-12) continue;
+    return lerpFrontierPoint(a, b, (targetUsdYr - a.totalCarryUsdYr) / span);
+  }
+  return null;
+}
+
+/**
+ * Max Policy Risk: highest open-arm CFaR still inside the policy cap.
  * Overlay k≥0 only — the funding approach is not a Policy VAR fill.
  * If the sweep straddles the cap, interpolate onto the cap so the
  * scenario is the fill, not the last sample $2M short of it.
@@ -419,28 +461,161 @@ function kneeBetween(
   return best;
 }
 
+/** d(carry)/d(CFaR) at `at`, from neighboring samples on the arm. */
+export function localCarryCfarSlope(
+  pts: readonly { portfolioVarUsd: number; totalCarryUsdYr: number }[],
+  at: { portfolioVarUsd: number },
+): number | null {
+  const sorted = pts
+    .filter(p => Number.isFinite(p.portfolioVarUsd) && Number.isFinite(p.totalCarryUsdYr))
+    .sort((a, b) => a.portfolioVarUsd - b.portfolioVarUsd);
+  if (sorted.length < 2) return null;
+  let i = 0;
+  let bestD = Infinity;
+  for (let k = 0; k < sorted.length; k++) {
+    const d = Math.abs(sorted[k]!.portfolioVarUsd - at.portfolioVarUsd);
+    if (d < bestD) {
+      bestD = d;
+      i = k;
+    }
+  }
+  const lo = i > 0 ? i - 1 : i;
+  const hi = i < sorted.length - 1 ? i + 1 : i;
+  if (lo === hi) return null;
+  const dx = sorted[hi]!.portfolioVarUsd - sorted[lo]!.portfolioVarUsd;
+  if (!(dx > 1e-9)) return null;
+  return (sorted[hi]!.totalCarryUsdYr - sorted[lo]!.totalCarryUsdYr) / dx;
+}
+
 /**
- * Open-arm presets in increasing CFaR:
- *   $0-carry origin < Conservative < Balanced < Max Carry.
- * Conservative prefers the book (k = 1) when that already sits right of origin.
- * Unhedged X is the walk's first vertex — never a larger CFaR-tab Σ pin
- * the green/pink arms do not start from.
+ * Supporting line from the $0-carry origin: argmax (carry − y0)/(CFaR − x0).
+ * That touch point is where the Unhedged ray is tangent to the arm.
+ */
+export function tangencyFromOrigin(
+  pts: readonly PortfolioCarryFrontierPoint[],
+  origin: { portfolioVarUsd: number; totalCarryUsdYr: number },
+): PortfolioCarryFrontierPoint | null {
+  let best: PortfolioCarryFrontierPoint | null = null;
+  let bestRatio = -Infinity;
+  for (const p of pts) {
+    const dx = p.portfolioVarUsd - origin.portfolioVarUsd;
+    if (!(dx > 1e-9) || !Number.isFinite(p.totalCarryUsdYr)) continue;
+    const ratio = (p.totalCarryUsdYr - origin.totalCarryUsdYr) / dx;
+    if (!Number.isFinite(ratio)) continue;
+    if (ratio > bestRatio) {
+      bestRatio = ratio;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/**
+ * Classical tangency: (γ − origin) ∥ γ′.
+ * Cross product (x−x0)·z′ − (z−z0)·x′ = 0 at the touch point.
+ * `mapCarry` is the plot Y (asinh) so the same line is straight on screen.
+ */
+export function tangencyByParallelDerivative(
+  pts: readonly PortfolioCarryFrontierPoint[],
+  origin: { portfolioVarUsd: number; totalCarryUsdYr: number },
+  input?: {
+    mapCarry?: (usdYr: number) => number;
+    pick?: (p: PortfolioCarryFrontierPoint) => boolean;
+  },
+): PortfolioCarryFrontierPoint | null {
+  const mapCarry = input?.mapCarry ?? ((v: number) => v);
+  const arm = pts
+    .filter(p => Number.isFinite(p.portfolioVarUsd) && Number.isFinite(p.totalCarryUsdYr))
+    .sort((a, b) => a.portfolioVarUsd - b.portfolioVarUsd || a.k - b.k);
+  if (arm.length < 3) return null;
+  let best: PortfolioCarryFrontierPoint | null = null;
+  let bestAbs = Infinity;
+  for (let i = 1; i < arm.length - 1; i++) {
+    const p = arm[i]!;
+    if (input?.pick && !input.pick(p)) continue;
+    const dx = arm[i + 1]!.portfolioVarUsd - arm[i - 1]!.portfolioVarUsd;
+    const dz = mapCarry(arm[i + 1]!.totalCarryUsdYr) - mapCarry(arm[i - 1]!.totalCarryUsdYr);
+    if (!(Math.abs(dx) > 1e-12)) continue;
+    const rx = p.portfolioVarUsd - origin.portfolioVarUsd;
+    const rz = mapCarry(p.totalCarryUsdYr) - mapCarry(origin.totalCarryUsdYr);
+    if (!(rx > 1e-12)) continue;
+    const cross = rx * dz - rz * dx;
+    if (Math.abs(cross) < bestAbs) {
+      bestAbs = Math.abs(cross);
+      best = p;
+    }
+  }
+  return best;
+}
+
+/** Same asinh band `carryAxisFromArms` uses when the plot does not pass `s`. */
+export function plotCarryS(pts: readonly { totalCarryUsdYr: number }[]): number {
+  const yHi = Math.max(0.012, ...pts.map(p => p.totalCarryUsdYr).filter(Number.isFinite));
+  const yLo = Math.min(0, ...pts.map(p => p.totalCarryUsdYr).filter(Number.isFinite));
+  return Math.max(0.012, yHi, Math.abs(yLo) * 1.2);
+}
+
+/**
+ * Supporting-ray touch from true (0, 0) on the whole open arm.
+ * Plot space: X = CFaR, Z = asinh(carry / s). Touch = the sample that
+ * maximises Z/X — the unique hull vertex whose ray from the origin stays
+ * on one side of every other sample. Interpolating off that vertex makes
+ * a secant through the green polyline; do not lerp.
+ */
+export function tangencyFromTrueZero(
+  pts: readonly PortfolioCarryFrontierPoint[],
+  carryS?: number,
+): PortfolioCarryFrontierPoint | null {
+  const arm = pts
+    .filter(p => (
+      Number.isFinite(p.portfolioVarUsd)
+      && Number.isFinite(p.totalCarryUsdYr)
+      && p.portfolioVarUsd > 1e-9
+    ))
+    .sort((a, b) => a.portfolioVarUsd - b.portfolioVarUsd || a.k - b.k);
+  if (arm.length === 0) return null;
+
+  const s = Math.max(carryS ?? plotCarryS(arm), 1e-6);
+  let best = arm[0]!;
+  let bestRatio = -Infinity;
+  for (const p of arm) {
+    const z = carryFwd(p.totalCarryUsdYr, s);
+    if (!Number.isFinite(z)) continue;
+    const ratio = z / p.portfolioVarUsd;
+    if (ratio > bestRatio + 1e-15) {
+      bestRatio = ratio;
+      best = p;
+    }
+  }
+  return bestRatio > -Infinity ? best : null;
+}
+
+/**
+ * Open-arm presets: $0-carry origin, optional Carry Target, Balanced,
+ * Max Policy Risk. Balanced is the (0, 0) supporting-ray touch.
  */
 export function orderedLiquidityScenarioPoints(input: {
   points: readonly PortfolioCarryFrontierPoint[];
   conservative?: PortfolioCarryFrontierPoint | null;
   policyCapUsd: number;
   originCfarUsd?: number | null;
+  /** Plot asinh band — must match the chart or the graze drifts. */
+  carryS?: number;
+  /** Desk Target Carry ($M/yr). When set, Carry Target sits on this Y. */
+  carryTargetUsdYr?: number | null;
 }): {
   origin: PortfolioCarryFrontierPoint | null;
   conservative: PortfolioCarryFrontierPoint | null;
+  carryTarget: PortfolioCarryFrontierPoint | null;
   balanced: PortfolioCarryFrontierPoint | null;
   maxCarry: PortfolioCarryFrontierPoint | null;
 } {
   const arm = input.points
     .filter(p => Number.isFinite(p.portfolioVarUsd) && Number.isFinite(p.totalCarryUsdYr) && p.k >= -1e-12)
     .sort((a, b) => a.k - b.k || a.portfolioVarUsd - b.portfolioVarUsd);
-  const empty = { origin: null, conservative: null, balanced: null, maxCarry: null };
+  const empty = {
+    origin: null, conservative: null, carryTarget: null, balanced: null, maxCarry: null,
+  };
   if (arm.length === 0) return empty;
 
   const walkOrigin = arm[0]!;
@@ -459,32 +634,41 @@ export function orderedLiquidityScenarioPoints(input: {
     : afterOrigin.find(p => Math.abs(p.k - 1) < 1e-6)
       ?? afterOrigin[0]
       ?? null;
+  const balanced = tangencyFromTrueZero(arm, input.carryS);
+  const ask = typeof input.carryTargetUsdYr === 'number' && Number.isFinite(input.carryTargetUsdYr)
+    ? input.carryTargetUsdYr
+    : DEFAULT_DESK_TARGET_CARRY_USD_YR;
+  // Synthetic origin (Y = 0) is not always the first walk sample — after
+  // lift, k = 0 still has program carry. Search from Unhedged so Earn
+  // interpolates onto the first segment instead of going null / clamping
+  // every desk $K to the same hold point.
+  const searchArm = [
+    origin,
+    ...arm.filter(p => p.portfolioVarUsd > originCfar + 1e-6 || p.k > 1e-12),
+  ];
+  const carryTarget = carryTargetOnArm(searchArm, ask);
   if (!book) {
-    return { origin, conservative: null, balanced: null, maxCarry: null };
+    return { origin, conservative: null, carryTarget, balanced, maxCarry: null };
   }
 
   const afterBook = arm.filter(p => (
     p.k >= book.k - 1e-9 && p.portfolioVarUsd > book.portfolioVarUsd + 1e-6
   ));
-  const cap = Math.max(input.policyCapUsd, book.portfolioVarUsd + 1e-3);
+  // Never use Conservative's own CFaR as the Max Carry cap — that pins
+  // Balanced and Max Carry onto the same X as the hold.
+  const requested = approvalTierCapUsd(input.policyCapUsd);
+  const roomPastBook = POLICY_VAR_LIMITS.find(p => p.usd > book.portfolioVarUsd + 0.05)?.usd
+    ?? POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
+  const cap = requested <= book.portfolioVarUsd + 0.05 ? roomPastBook : requested;
   let maxCarry = maxVarWithinPolicyPoint([book, ...afterBook], cap);
   if (!maxCarry || maxCarry.portfolioVarUsd <= book.portfolioVarUsd + 1e-6) {
     maxCarry = afterBook[afterBook.length - 1] ?? null;
   }
   if (!maxCarry) {
-    return { origin, conservative: book, balanced: null, maxCarry: null };
+    return { origin, conservative: book, carryTarget, balanced, maxCarry: null };
   }
 
-  const interior = afterBook.filter(p => p.portfolioVarUsd < maxCarry!.portfolioVarUsd - 1e-6);
-  let balanced = kneeBetween(interior);
-  if (!balanced || balanced.portfolioVarUsd <= book.portfolioVarUsd + 1e-6) {
-    balanced = interior[Math.floor(interior.length / 2)] ?? lerpFrontierPoint(book, maxCarry, 0.5);
-  }
-  if (balanced.portfolioVarUsd >= maxCarry.portfolioVarUsd - 1e-6) {
-    balanced = lerpFrontierPoint(book, maxCarry, 0.5);
-  }
-
-  return { origin, conservative: book, balanced, maxCarry };
+  return { origin, conservative: book, carryTarget, balanced, maxCarry };
 }
 
 export function overlayKToModalXy(

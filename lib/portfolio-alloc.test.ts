@@ -6,6 +6,7 @@ import {
   buildEfficientCarryVarFrontier,
   joinOverlayStripWeights,
   overlayBookBaseFcyM,
+  scaleOverlayLegs,
 } from '@/lib/portfolio-alloc';
 
 describe('allocateCarryVarUsd', () => {
@@ -175,6 +176,16 @@ describe('buildEfficientCarryVarFrontier — credit/debit split and fixed CFaR',
     }
   });
 
+  it('scaleOverlayLegs is the Policy VAR fill at t=1 and half the notionals at t=½', () => {
+    const fr = buildEfficientCarryVarFrontier({ ccys, mu, varCapUsdM: 10 })!;
+    const full = scaleOverlayLegs(fr.capLegs, 1);
+    const half = scaleOverlayLegs(fr.capLegs, 0.5);
+    const zero = scaleOverlayLegs(fr.capLegs, 0);
+    expect(full[0]!.usdM).toBeCloseTo(fr.capLegs[0]!.usdM, 8);
+    expect(half[0]!.usdM).toBeCloseTo(fr.capLegs[0]!.usdM * 0.5, 8);
+    expect(zero.every(l => Math.abs(l.usdM) < 1e-12)).toBe(true);
+  });
+
   it('fixedCfarUsdM makes pin-only VAR the RSS of the fixed CFaRs, not zero', () => {
     const fixedCfarUsdM = [4, 0, 3]; // EUR, GBP, MXN
     const fr = buildEfficientCarryVarFrontier({
@@ -197,6 +208,73 @@ describe('buildEfficientCarryVarFrontier — credit/debit split and fixed CFaR',
     const slopeNear = near.varUsdM / Math.max(near.t, 1e-9);
     const slopeFar = far.varUsdM / far.t;
     expect(slopeNear).toBeGreaterThan(slopeFar);
+  });
+});
+
+describe('buildEfficientCarryVarFrontier — floorFcy (desk min-floor)', () => {
+  const r_USD = 3.5;
+  const ccys = ['EUR', 'GBP', 'MXN'] as const;
+  const mu = ccys.map(c => (CURRENCY_PARAMS[c]!.carry - r_USD) / 100);
+  const rOd = ccys.map(c => CURRENCY_PARAMS[c]!.r_OD);
+  const basesFcy = ccys.map(c => (c === 'EUR' ? 30 : 0));
+
+  it('without a floor, EUR is sold down (short) same as the credit/debit-split test', () => {
+    const fr = buildEfficientCarryVarFrontier({
+      ccys, mu, varCapUsdM: 20, basesFcy, rOd, r_USD,
+    })!;
+    const eur = fr.legs.find(l => l.ccy === 'EUR')!;
+    const finalFcy = 30 + eur.fcyM;
+    expect(finalFcy).toBeLessThan(30);
+  });
+
+  it('a floor above the unconstrained final position pulls the overlay up to hit it exactly', () => {
+    const unconstrained = buildEfficientCarryVarFrontier({
+      ccys, mu, varCapUsdM: 20, basesFcy, rOd, r_USD,
+    })!;
+    const eurBefore = unconstrained.legs.find(l => l.ccy === 'EUR')!;
+    const finalBefore = 30 + eurBefore.fcyM;
+    // EUR is the natural PAY name here and gets sold deeply short
+    // unconstrained (see the credit/debit-split test) — a realistic desk
+    // floor (cash_floor is always ≥0 in this domain, never a negative
+    // minimum) sits well above that.
+    expect(finalBefore).toBeLessThan(0);
+
+    const floorFcy = [10, 0, 0];
+    const floored = buildEfficientCarryVarFrontier({
+      ccys, mu, varCapUsdM: 20, basesFcy, rOd, r_USD, floorFcy,
+    })!;
+    const eurAfter = floored.legs.find(l => l.ccy === 'EUR')!;
+    const finalAfter = 30 + eurAfter.fcyM;
+    expect(finalAfter).toBeGreaterThan(finalBefore);
+    expect(finalAfter).toBeCloseTo(floorFcy[0]!, 6);
+  });
+
+  it('a floor already satisfied by the unconstrained solve is a no-op', () => {
+    // MXN is the natural big EARN name here — it goes long unconstrained
+    // (see the sign-flip discussion elsewhere), so a small positive floor
+    // is already satisfied without the clip ever engaging.
+    const unconstrained = buildEfficientCarryVarFrontier({
+      ccys, mu, varCapUsdM: 20, basesFcy, rOd, r_USD,
+    })!;
+    const mxnBefore = unconstrained.legs.find(l => l.ccy === 'MXN')!;
+    expect(mxnBefore.fcyM).toBeGreaterThan(1);
+
+    const floorFcy = [0, 0, 0.5];
+    const floored = buildEfficientCarryVarFrontier({
+      ccys, mu, varCapUsdM: 20, basesFcy, rOd, r_USD, floorFcy,
+    })!;
+    const mxnAfter = floored.legs.find(l => l.ccy === 'MXN')!;
+    expect(mxnAfter.usdM).toBeCloseTo(mxnBefore.usdM, 6);
+  });
+
+  it('floorFcy without basesFcy is ignored — a floor needs a base to measure the final position against', () => {
+    const withFloor = buildEfficientCarryVarFrontier({
+      ccys, mu, varCapUsdM: 20, r_USD, floorFcy: [1000, 0, 0],
+    })!;
+    const bare = buildEfficientCarryVarFrontier({ ccys, mu, varCapUsdM: 20, r_USD })!;
+    withFloor.legs.forEach((leg, i) => {
+      expect(leg.usdM).toBeCloseTo(bare.legs[i]!.usdM, 6);
+    });
   });
 });
 
@@ -272,6 +350,21 @@ describe('joinOverlayStripWeights', () => {
     expect(gbp.overlayWeight).toBeCloseTo(-1 / 3, 9);
     expect(Math.abs(eur.stripWeight) + Math.abs(gbp.stripWeight)).toBeCloseTo(1, 9);
     expect(eur.overlayWeight + gbp.overlayWeight).toBeCloseTo(1 / 3, 9);
+  });
+
+  it('keeps a book name with $0 overlay and $0 CFaR strip so untick does not drop it', () => {
+    const joined = joinOverlayStripWeights(
+      [{ ccy: 'EUR', mu: -0.01, usdM: 3, fcyM: 3 / 1.1, side: 'long', carryUsdYrM: -0.03, componentVarUsdM: 0.4 }],
+      [
+        { ccy: 'EUR', bookNow: -2.5, outstanding: -2.5 },
+        { ccy: 'GBP', bookNow: 0, outstanding: 0 },
+      ],
+    );
+    expect(joined.map(r => r.ccy).sort()).toEqual(['EUR', 'GBP']);
+    const gbp = joined.find(r => r.ccy === 'GBP')!;
+    expect(gbp.overlayUsdM).toBe(0);
+    expect(gbp.overlayWeight).toBe(0);
+    expect(gbp.stripUsdM).toBe(0);
   });
 
   it('still splits the strip when there is no overlay mix', () => {

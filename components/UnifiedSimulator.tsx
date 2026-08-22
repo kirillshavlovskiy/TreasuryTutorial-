@@ -492,7 +492,7 @@ const BUFFER_LAYER_CHIPS: {
     settingsLabel: 'Forecast accuracy — payout σ and Net CFaR cover per currency' },
   { id: 'carryOptim', layers: ['carryOptim'], label: 'Buffer Carry target', band: '→ BUFFER · SWAP', hue: 'emerald',
     hint: 'Steer Target LP Cash so Buffer Carry (swap cash Δr vs USD) hits the ask',
-    settingsLabel: 'Buffer Carry target — standing-swap cash Δr ask, r_OD and Δr per currency' },
+    settingsLabel: 'Buffer Carry target — Total Carry ask ($K/yr) plus per-currency r_OD / Target LP Cash / Buffer Carry' },
   { id: 'portfolioDiv', layers: ['portfolioDiv'], label: 'Portfolio VAR', band: '→ RISK', hue: 'violet',
     hint: 'Portfolio level: Σ⁻¹μ overlay under the shared Policy VAR cap',
     settingsLabel: 'Policy VAR — overlay sensitivity limit (portfolio level)' },
@@ -3013,8 +3013,10 @@ export function UnifiedSimulator({
     const k = parseFloat(raw);
     if (!Number.isFinite(k)) return clearCarryDrafts(row.id);
     const askUsd = k / 1000;
+    const invertLayers = new Set(carryPreviewLayers);
+    invertLayers.delete('portfolioDiv');
     const solved = targetForBufferCarry(
-      askUsd, row, shared, carryPreviewLayers, carryAskMonths, forecastProfile,
+      askUsd, row, shared, invertLayers, carryAskMonths, forecastProfile,
       { hedgeSettle: hedgeSettleByCcy[row.ccy], planFor: deskPlanFor },
     );
     setDrafts(prev => {
@@ -3024,9 +3026,11 @@ export function UnifiedSimulator({
       return next;
     });
     if (solved === null) {
+      // Keep the typed ask visible — clearing it looked like the field rejected input.
+      setDrafts(prev => ({ ...prev, [`${row.id}.carry_pnl`]: String(k) }));
       setCarryNotes(prev => ({
         ...prev,
-        [row.id]: `${row.ccy} Buffer Carry does not move vs USD at these rates.`,
+        [row.id]: `${row.ccy} Buffer Carry does not move vs USD at r_FCY ${f2(row.r_FCY)}% / r_OD ${f2(row.r_OD)}% (r_USD ${f2(shared.r_USD)}%). Use Cash target to set Target LP Cash directly.`,
       }));
       return;
     }
@@ -3034,9 +3038,13 @@ export function UnifiedSimulator({
     setCarryTarget(row.id, solved.target);
     if (solved.exact) return;
     const bound = askUsd > solved.carryUsd ? 'max' : 'min';
+    const straddle = row.r_FCY <= shared.r_USD && row.r_OD >= shared.r_USD;
+    setDrafts(prev => ({ ...prev, [`${row.id}.carry_pnl`]: String(k) }));
     setCarryNotes(prev => ({
       ...prev,
-      [row.id]: `${carryAskMonths}m ${bound} ${usdK(solved.carryUsd)} on ${row.ccy}`,
+      [row.id]: straddle && askUsd > solved.carryUsd + 1e-6
+        ? `${row.ccy} cannot earn ${usdK(askUsd)} — r_FCY ${f2(row.r_FCY)}% and r_OD ${f2(row.r_OD)}% both lose vs r_USD ${f2(shared.r_USD)}%. Best reachable ${usdK(solved.carryUsd)}. Switch Steer on → Cash target to hold a Target LP Cash of your choosing.`
+        : `${carryAskMonths}m ${bound} ${usdK(solved.carryUsd)} on ${row.ccy} (asked ${usdK(askUsd)})`,
     }));
   }, [
     clearCarryDrafts, setCarryTarget, ensureCarryLayer, shared,
@@ -3094,8 +3102,8 @@ export function UnifiedSimulator({
     if (carryLive && r.usd_stress_trim) return 'USD stress';
     // r_OD above r_USD makes an overdraft dearer than holding USD, so the model
     // refuses to run the balance negative however the target was arrived at.
-    if (r.debit_floor_binding || r.r_OD > shared.r_USD) return 'no overdraft';
-    if (r.cash_floor > 0.0001) return 'floor';
+    if (r.debit_floor_binding) return 'no overdraft';
+    if (r.cash_floor > 0.0001 && target <= r.cash_floor + 0.01) return 'floor';
     return 'clamped';
   };
 
@@ -5352,16 +5360,58 @@ export function UnifiedSimulator({
           <LayerModal
             hue="emerald"
             title="Buffer Carry target"
-            subtitle="steer Target LP Cash so Buffer Carry (standing-swap cash Δr vs USD) hits the ask"
-            readout={`r_USD ${f2(shared.r_USD)}% · ${carryAskMonths}m ${usdK(carryTotals.horizon)}`}
+            subtitle="desk Total Carry ask + per-currency Target LP Cash so Buffer Carry (standing-swap cash Δr vs USD) hits the ask"
+            readout={`r_USD ${f2(shared.r_USD)}% · 12m Total ${
+              portfolioCarryK != null ? usdK(portfolioCarryK / 1000) : '$32k'
+            } · ${carryAskMonths}m Σ ${usdK(carryTotals.horizon)}`}
             footnote={carryLive
-              ? 'Setup for the Buffer Carry target layer — a positive P&L ask on a PAY currency shorts FCY (sell near). Buffer Carry = cash Δr on the standing funding-swap book (same as the desk Buffer Carry column). CIP points sit in FX HEDGE. Targets still clamp to floors and the portfolio VAR cap'
-              : 'Preview only until you commit a cash or Buffer Carry ask — that turns this layer on so Target LP Cash and Swap Near land in the main table. Buffer Carry is standing-swap cash Δr, not TWA LP cash carry'}
+              ? 'Setup for the Buffer Carry target layer — Total Carry ($K/yr) places the Analytics Carry Target sweet spot. Per-currency asks short FCY on a PAY name (sell near). Buffer Carry = cash Δr on the standing funding-swap book (same as the desk Buffer Carry column). CIP points sit in FX HEDGE. A typed ask is not blocked by expensive overdraft (r_OD > r_USD); that rate only prices the short. An explicit Min floor still binds if that layer is on.'
+              : 'Preview only until you commit Total Carry or a cash / Buffer Carry ask — that turns this layer on so Target LP Cash and Swap Near land in the main table. Buffer Carry is standing-swap cash Δr, not TWA LP cash carry'}
             simDark={simDark}
             size="lg"
             onClose={() => setLayerPanel(null)}
           >
             <div className="flex flex-col gap-2.5">
+              {onPortfolioCarryKChange && (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md border border-emerald-200 bg-emerald-50/80 px-2.5 py-2">
+                  <span className={toolCaption}>Desk ask</span>
+                  <label
+                    className="inline-flex items-center gap-1.5 rounded-md border border-emerald-300 bg-white px-2 py-1"
+                    title="Total Carry ask ($K/yr). Places the Carry Target marker on the Analytics Total Carry curve. Blank = $32k/yr. Per-currency rows below still size Target LP Cash / Buffer Carry."
+                  >
+                    <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
+                      Total Carry
+                    </span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="32"
+                      defaultValue={portfolioCarryK == null ? '' : String(portfolioCarryK)}
+                      key={portfolioCarryK == null ? 'empty' : String(portfolioCarryK)}
+                      onBlur={e => {
+                        const raw = e.target.value.trim().replace(/,/g, '');
+                        if (raw === '') {
+                          onPortfolioCarryKChange(undefined);
+                          return;
+                        }
+                        const n = Number(raw);
+                        if (!Number.isFinite(n)) return;
+                        onPortfolioCarryKChange(n);
+                        if (!activeLayers.has('carryOptim')) onLayerToggle('carryOptim');
+                      }}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') e.currentTarget.blur();
+                      }}
+                      className="w-14 bg-transparent font-mono text-[11px] font-semibold text-emerald-800 outline-none placeholder:text-gray-400"
+                      aria-label="Total Carry target, $K per year"
+                    />
+                    <span className="font-mono text-[9px] text-gray-500">$K/yr</span>
+                  </label>
+                  <span className="font-mono text-[10px] text-emerald-800/80">
+                    Carry Target sweet spot · blank defaults to $32k/yr
+                  </span>
+                </div>
+              )}
               <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
                 <span className={toolCaption}>Steer on</span>
                 <div className="inline-flex rounded-md border border-emerald-300 bg-white p-0.5">
@@ -5742,40 +5792,6 @@ export function UnifiedSimulator({
                 ariaLabel="Policy VAR notional sensitivity limit"
               />
             </div>
-            {onPortfolioCarryKChange && (
-              <label
-                className="inline-flex items-center gap-1.5 rounded-md border border-emerald-300 bg-white px-2 py-1"
-                title="Shared overlay carry to earn ($K/yr). Same Σ⁻¹μ mix, smaller scale. Blank fills Policy VAR."
-              >
-                <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
-                  Earn
-                </span>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  placeholder="fill VAR"
-                  defaultValue={portfolioCarryK == null ? '' : String(portfolioCarryK)}
-                  key={portfolioCarryK == null ? 'empty' : String(portfolioCarryK)}
-                  onBlur={e => {
-                    const raw = e.target.value.trim().replace(/,/g, '');
-                    if (raw === '') {
-                      onPortfolioCarryKChange(undefined);
-                      return;
-                    }
-                    const n = Number(raw);
-                    if (!Number.isFinite(n)) return;
-                    onPortfolioCarryKChange(n);
-                    if (!activeLayers.has('carryOptim')) onLayerToggle('carryOptim');
-                  }}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') e.currentTarget.blur();
-                  }}
-                  className="w-14 bg-transparent font-mono text-[11px] font-semibold text-emerald-800 outline-none placeholder:text-gray-400"
-                  aria-label="Portfolio carry to earn, $K per year"
-                />
-                <span className="font-mono text-[9px] text-gray-500">$K/yr</span>
-              </label>
-            )}
 
             {portfolioSummary && (
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px]">

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { INITIAL_ROWS, type LayerId, type RowState, type SharedGlobals } from '@/lib/fx-buffer';
+import { CURRENCY_PARAMS, INITIAL_ROWS, type LayerId, type RowState, type SharedGlobals } from '@/lib/fx-buffer';
 import { DEFAULT_FORECAST_PROFILE, type ForecastProfileState } from '@/lib/forecast-profile';
 import { DEFAULT_LIQUIDITY_TIMING, type LiquidityTiming } from '@/lib/liquidity-ladder';
 import { liquidityStrategyMeta } from '@/lib/test-mode/liquidity-strategies';
@@ -8,8 +8,13 @@ import type { LiquidityFrontierInput } from '@/lib/test-mode/liquidity-frontier'
 import {
   buildPortfolioLiquidityFrontier,
   diversifiedUsdRisk,
+  fxPositionCfarUsdM,
+  overlayPlusNearFcyM,
   overlayStandingAtPlotScale,
+  priceBooksAtScale,
+  priceRegimeChartCfar,
   regimePortfolioCfar,
+  splitPlotCfarByCcy,
   pairCorr,
   portfolioCfarSnapshot,
   riskStanding,
@@ -102,6 +107,79 @@ describe('regimePortfolioCfar', () => {
   });
 });
 
+describe('fxPositionCfarUsdM', () => {
+  it('PLN overlay 3.6 + near 1.8 is vol×z×spot, not the 5.4 notional and not Swap Book', () => {
+    const fcy = overlayPlusNearFcyM(3.6, 1.8);
+    expect(fcy).toBeCloseTo(5.4, 8);
+    const cfar = fxPositionCfarUsdM(fcy, 'PLN', 95, 1);
+    const spot = CURRENCY_PARAMS.PLN!.spot;
+    const vol = CURRENCY_PARAMS.PLN!.σ_daily * Math.sqrt(21) * 1.645;
+    expect(cfar).toBeCloseTo(5.4 * spot * vol, 8);
+    expect(Math.abs(cfar)).toBeLessThan(0.25);
+    expect(Math.abs(cfar)).not.toBeCloseTo(5.4 * spot, 1);
+    expect(Math.abs(cfar)).not.toBeCloseTo(4.862, 1);
+  });
+});
+
+describe('splitPlotCfarByCcy', () => {
+  it('Unhedged (no incremental) returns tab nets that sum to the headline', () => {
+    const r = splitPlotCfarByCcy({
+      books: [
+        { ccy: 'EUR', cfarUsdM: 0.411, standing: 0, sectionUsdM: 0.411 },
+        { ccy: 'PLN', cfarUsdM: 0.223, standing: 0, sectionUsdM: 0.223 },
+        { ccy: 'GBP', cfarUsdM: 0, standing: 0, sectionUsdM: 0 },
+      ],
+      tabNetByCcyUsd: { EUR: 0.411, PLN: 0.223, GBP: 0 },
+      headlineUsdM: 0.634,
+    });
+    expect(r.portfolioUsdM).toBeCloseTo(0.634, 8);
+    expect(r.byCcy.reduce((s, c) => s + c.componentUsdM, 0)).toBeCloseTo(0.634, 8);
+    expect(r.byCcy.find(c => c.ccy === 'EUR')!.componentUsdM).toBeCloseTo(0.411, 6);
+    expect(r.byCcy.find(c => c.ccy === 'PLN')!.componentUsdM).toBeCloseTo(0.223, 6);
+    expect(r.byCcy.find(c => c.ccy === 'GBP')!.componentUsdM).toBeCloseTo(0, 8);
+  });
+
+  it('Balanced overlay gives GBP a Target CFaR share that still sums to the plot X', () => {
+    const r = splitPlotCfarByCcy({
+      books: [
+        { ccy: 'EUR', cfarUsdM: 1.2, standing: -2.5, sectionUsdM: 0.411 },
+        { ccy: 'PLN', cfarUsdM: 0.8, standing: 1.8, sectionUsdM: 0.223 },
+        { ccy: 'GBP', cfarUsdM: 0, standing: 0, sectionUsdM: 0 },
+      ],
+      tabNetByCcyUsd: { EUR: 0.411, PLN: 0.223, GBP: 0 },
+      overlay: [
+        { ccy: 'GBP', componentVarUsdM: 3.2 },
+        { ccy: 'EUR', componentVarUsdM: -1.1 },
+        { ccy: 'PLN', componentVarUsdM: 0.2 },
+      ],
+      headlineUsdM: 8.994,
+    });
+    expect(r.portfolioUsdM).toBeCloseTo(8.994, 8);
+    expect(r.byCcy.reduce((s, c) => s + c.componentUsdM, 0)).toBeCloseTo(8.994, 8);
+    const gbp = r.byCcy.find(c => c.ccy === 'GBP')!.componentUsdM;
+    expect(gbp).toBeGreaterThan(1);
+  });
+
+  it('overlay + Swap Near incrementals Euler to the chart marker, not Swap Book', () => {
+    const plnInc = Math.abs(fxPositionCfarUsdM(overlayPlusNearFcyM(3.6, 1.8), 'PLN', 95, 1));
+    const eurInc = Math.abs(fxPositionCfarUsdM(overlayPlusNearFcyM(-1.0, -2.5), 'EUR', 95, 1));
+    const r = splitPlotCfarByCcy({
+      books: [
+        { ccy: 'EUR', cfarUsdM: eurInc, standing: -3.5, sectionUsdM: 0.411 },
+        { ccy: 'PLN', cfarUsdM: plnInc, standing: 5.4, sectionUsdM: 0.223 },
+      ],
+      tabNetByCcyUsd: { EUR: 0.411, PLN: 0.223 },
+      headlineUsdM: 6.687,
+    });
+    expect(r.portfolioUsdM).toBeCloseTo(6.687, 8);
+    expect(r.byCcy.reduce((s, c) => s + c.componentUsdM, 0)).toBeCloseTo(6.687, 8);
+    const pln = r.byCcy.find(c => c.ccy === 'PLN')!.componentUsdM;
+    expect(Math.abs(pln)).toBeGreaterThan(0);
+    expect(Math.abs(pln)).not.toBeCloseTo(4.862, 1);
+    expect(Math.abs(pln)).toBeLessThan(6.687);
+  });
+});
+
 describe('portfolioCfarSnapshot', () => {
   it('matches diversifiedUsdRisk on signed CFaR', () => {
     const snap = portfolioCfarSnapshot([
@@ -139,6 +217,46 @@ function profileWith(timing: Partial<LiquidityTiming> = {}): ForecastProfileStat
     liquidity: { ...DEFAULT_LIQUIDITY_TIMING, enabled: true, ...timing },
   };
 }
+
+describe('priceBooksAtScale carry', () => {
+  const rows = [row(eur, { id: 'e' }), row(gbp, { id: 'g' })];
+  const engine: Omit<LiquidityFrontierInput, 'row' | 'strategy' | 'bookStanding' | 'carryUsdK'> = {
+    months: 6,
+    shared,
+    activeLayers: new Set<LayerId>(['floorH', 'carryOptim']),
+    forecastProfile: profileWith({ bookingMode: 'rolling', sizingBasis: 'horizon' }),
+    setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, confidencePct: 95 },
+    cfarNetByCcyUsd: { EUR: 0.36, GBP: 0.22 },
+  };
+  const stratInput: LiquidityStrategyInput = {
+    rows,
+    months: 6,
+    shared,
+    activeLayers: engine.activeLayers,
+    forecastProfile: engine.forecastProfile,
+    setup: engine.setup,
+    cfarNetByCcyUsd: engine.cfarNetByCcyUsd,
+  };
+
+  it('Unhedged scale is $0 carry; hold scale is solution-dependent, not the live snapshot only', () => {
+    const results = evaluateLiquidityStrategies(stratInput);
+    const rolling = results.find(r => r.strategy.id === 'rollingProgramme')!;
+    const origin = priceBooksAtScale({
+      result: rolling, rows, engine, scale: 0,
+    });
+    expect(origin.every(p => p.carryUsdYrM === 0)).toBe(true);
+    const hold = priceBooksAtScale({
+      result: rolling, rows, engine, scale: 1,
+    });
+    const levered = priceBooksAtScale({
+      result: rolling, rows, engine, scale: 1.4,
+    });
+    const holdSum = hold.reduce((s, p) => s + p.carryUsdYrM, 0);
+    const levSum = levered.reduce((s, p) => s + p.carryUsdYrM, 0);
+    expect(holdSum).not.toBeCloseTo(0, 4);
+    expect(Math.abs(levSum)).toBeGreaterThan(Math.abs(holdSum) - 1e-9);
+  });
+});
 
 describe('buildPortfolioLiquidityFrontier', () => {
   const rows = [row(eur, { id: 'e' }), row(gbp, { id: 'g' })];
@@ -256,6 +374,72 @@ describe('buildPortfolioLiquidityFrontier', () => {
     expect(f.farPoints.slice(1).every(p => p.portfolioVarUsd >= tabSum - 1e-6)).toBe(true);
   });
 
+  it('regime table CFaR matches the plot — Unhedged pin and Conservative t = 1', () => {
+    const results = evaluateLiquidityStrategies(stratInput);
+    const unfunded = results.find(r => r.strategy.id === 'unfunded')!;
+    const rolling = results.find(r => r.strategy.id === 'rollingProgramme')!;
+    const tabSum = 0.36 + 0.22;
+    const u = priceRegimeChartCfar({
+      result: unfunded,
+      strategy: unfunded.strategy,
+      rows,
+      engine,
+    });
+    expect(u.sumUsdM).toBeCloseTo(tabSum, 8);
+    expect(u.portUsdM).toBeCloseTo(tabSum, 8);
+    const liq = buildPortfolioLiquidityFrontier({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows,
+      engine,
+    });
+    const hold = liq.open.find(p => Math.abs(p.scale - 1) < 1e-6)!;
+    const priced = priceRegimeChartCfar({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows,
+      engine,
+    });
+    expect(priced.portUsdM).toBeCloseTo(hold.cfarUsdM, 8);
+    expect(priced.sumUsdM).toBeCloseTo(hold.standaloneCfarUsdM, 8);
+    expect(priced.portUsdM).toBeGreaterThanOrEqual(tabSum - 1e-6);
+  });
+
+  it('same-S twins share the FX-hedge basis but not one vertical — far IR add is smaller', () => {
+    const results = evaluateLiquidityStrategies(stratInput);
+    const rolling = results.find(r => r.strategy.id === 'rollingProgramme')!;
+    const liq = buildPortfolioLiquidityFrontier({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows,
+      engine,
+    });
+    const f = toPortfolioCarryFrontier(liq);
+    const tabSum = 0.36 + 0.22;
+    const twins = liq.open.filter(o => (
+      o.scale > 0.25 && liq.far.some(p => Math.abs(p.scale - o.scale) < 1e-6)
+    ));
+    expect(twins.length).toBeGreaterThan(2);
+    for (const open of twins) {
+      const far = liq.far.find(p => Math.abs(p.scale - open.scale) < 1e-6);
+      expect(far).toBeDefined();
+      expect(far!.cfarUsdM).toBeGreaterThanOrEqual(tabSum - 1e-6);
+      expect(open.cfarUsdM).toBeGreaterThanOrEqual(tabSum - 1e-6);
+      expect(far!.cfarUsdM).toBeLessThan(open.cfarUsdM - 0.001);
+    }
+    const plotTwins = f.points.filter(p => (
+      p.k > 0.25 && f.farPoints.some(q => Math.abs(q.k - p.k) < 1e-6)
+    ));
+    expect(plotTwins.length).toBeGreaterThan(0);
+    for (const open of plotTwins) {
+      const far = f.farPoints.find(p => Math.abs(p.k - open.k) < 1e-6);
+      expect(far).toBeDefined();
+      expect(far!.portfolioVarUsd).not.toBeCloseTo(open.portfolioVarUsd, 2);
+      expect(far!.portfolioVarUsd).toBeLessThan(open.portfolioVarUsd - 0.001);
+      expect(far!.portfolioVarUsd).toBeGreaterThanOrEqual(tabSum - 1e-6);
+    }
+  });
+
   it('t = 0 keeps the live book sign so long/short names offset', () => {
     expect(riskStanding(-12, 0)).toBe(-12);
     expect(riskStanding(-12, -3)).toBe(-3);
@@ -295,8 +479,8 @@ describe('buildPortfolioLiquidityFrontier', () => {
     });
     expect(ordered.origin!.totalCarryUsdYr).toBe(0);
     expect(ordered.conservative!.portfolioVarUsd).toBeGreaterThan(ordered.origin!.portfolioVarUsd);
-    expect(ordered.balanced!.portfolioVarUsd).toBeGreaterThan(ordered.conservative!.portfolioVarUsd);
-    expect(ordered.maxCarry!.portfolioVarUsd).toBeGreaterThan(ordered.balanced!.portfolioVarUsd);
+    expect(ordered.balanced).toBeDefined();
+    expect(ordered.maxCarry!.portfolioVarUsd).toBeGreaterThan(ordered.origin!.portfolioVarUsd);
   });
 
   it('yellow mix sits between open and far at the book S', () => {

@@ -48,7 +48,10 @@ import {
   computePortfolioVAR,
   optimizePortfolioCarry,
   sweepPortfolioCarryFrontier,
+  frontierTangencyIndex,
+  type PortfolioCarryFrontierPoint,
   universePolicyVarCap,
+  approvalTierCapUsd,
   POLICY_VAR_LIMITS,
   computeEffectiveUsdBudget,
   toggleLayerGroup,
@@ -539,6 +542,13 @@ describe('computeLayeredBuffer', () => {
     const rAed = computeLayeredBuffer(P, P, σ_P, r_USD, aedCarry, aedOd, 5.0, all3);
     expect(rAed.cash_threshold).toBeGreaterThanOrEqual(5.0);
     expect(rAed.cash_threshold).toBe(Math.max(5.0, rAed.raw_sum));
+  });
+
+  it('a typed carry ask may run H* negative even when r_OD > r_USD', () => {
+    const { carry: aedCarry, r_OD: aedOd } = CURRENCY_PARAMS.AED!;
+    const r = computeLayeredBuffer(0, 0, σ_P, r_USD, aedCarry, aedOd, 0, carry, 0, -20);
+    expect(r.cash_threshold).toBeLessThan(0);
+    expect(r.debit_floor_binding).toBe(false);
   });
 
   it('additive identity: PAY cushion = layerSum; EARN = max(trough,0) + layers', () => {
@@ -1531,6 +1541,24 @@ describe('optimizePortfolioCarry', () => {
   });
 });
 
+describe('approvalTierCapUsd', () => {
+  it('keeps an exact $5 / $10 / $20 chip', () => {
+    expect(approvalTierCapUsd(5)).toBe(5);
+    expect(approvalTierCapUsd(10)).toBe(10);
+    expect(approvalTierCapUsd(20)).toBe(20);
+  });
+
+  it('does not treat Conservative CFaR as a cap', () => {
+    expect(approvalTierCapUsd(2.125)).toBe(5);
+    expect(approvalTierCapUsd(0.634)).toBe(5);
+  });
+
+  it('steps a fill past $5M up to the next rung', () => {
+    expect(approvalTierCapUsd(8.994)).toBe(10);
+    expect(approvalTierCapUsd(12)).toBe(20);
+  });
+});
+
 describe('universePolicyVarCap', () => {
   it('covers the $20 approval rung when nothing clamps', () => {
     expect(universePolicyVarCap(null)).toBe(20);
@@ -1565,8 +1593,12 @@ describe('sweepPortfolioCarryFrontier', () => {
 
   it('range is bounded by policyVAR_M — never runs away when a currency is EARN-only', () => {
     // GBP and MXN both earn vs USD in CURRENCY_PARAMS — an unbounded "sweep
-    // until everyone floor-clamps" search never terminates here, since
-    // neither ever hits a floor. The range must come from policyVAR_M alone.
+    // until everyone floor-clamps" search never terminates purely on that
+    // basis, since neither is a PAY currency. The range must come from
+    // policyVAR_M alone. (MXN's much larger carry does make the Σ⁻¹μ
+    // direction short GBP to lever MXN further, so GBP's own leg floor-
+    // clamps at 0 late in the range — that's what the +1 tangency-refinement
+    // point below is bracketing.)
     const f = sweepPortfolioCarryFrontier(
       [makeInput('GBP', 131.8), makeInput('MXN', 238.0)],
       σ_P, r_USD, 10, 12, 3,
@@ -1574,9 +1606,42 @@ describe('sweepPortfolioCarryFrontier', () => {
     expect(f.points[f.points.length - 1]!.k).toBeCloseTo(30, 6); // policyVAR_M(10) × rangeMultiple(3)
     // 13 linear steps + up to 12 near-origin densification points (some may
     // coincide with the linear grid and dedupe via the Set) — see the
-    // "denser sampling near k=0" comment in sweepPortfolioCarryFrontier.
+    // "denser sampling near k=0" comment in sweepPortfolioCarryFrontier —
+    // plus at most 1 golden-section tangency-refinement point once GBP's
+    // late floor clamp gives the ratio a genuine interior peak to refine.
     expect(f.points.length).toBeGreaterThanOrEqual(13);
-    expect(f.points.length).toBeLessThanOrEqual(28);
+    expect(f.points.length).toBeLessThanOrEqual(29);
+  });
+
+  it('tangencyIndex is the true argmax of carry/CFaR and sits strictly inside the range once a leg clamps', () => {
+    // Same GBP+MXN book as above — GBP's late floor clamp is what gives the
+    // ratio a genuine interior peak (see the comment on the previous test).
+    const f = sweepPortfolioCarryFrontier(
+      [makeInput('GBP', 131.8), makeInput('MXN', 238.0)],
+      σ_P, r_USD, 10, 12, 3,
+    );
+    expect(f.tangencyIndex).toBeGreaterThan(0);
+    expect(f.tangencyIndex).toBeLessThan(f.points.length - 1);
+    const tangent = f.points[f.tangencyIndex!]!;
+    const tangentRatio = tangent.totalCarryUsdYr / tangent.portfolioVarUsd;
+    for (const p of f.points) {
+      if (!(p.portfolioVarUsd > 1e-9)) continue;
+      expect(p.totalCarryUsdYr / p.portfolioVarUsd).toBeLessThanOrEqual(tangentRatio + 1e-9);
+    }
+    // The refined point sits inside GBP's clamp region, past where GBP
+    // first floor-binds.
+    const firstClampIdx = f.points.findIndex(p => p.floorBoundCcys.includes('GBP'));
+    expect(firstClampIdx).toBeGreaterThan(0);
+    expect(tangent.k).toBeGreaterThan(f.points[firstClampIdx]!.k - 0.001);
+  });
+
+  it('tangencyIndex lands on the first positive-CFaR point when nothing ever clamps', () => {
+    // A single EARN currency alone never floor-clamps and has no fixed CFaR
+    // term — the ray is flat by construction, so tangency must resolve to
+    // the very first point, not wander via floating-point noise.
+    const f = sweepPortfolioCarryFrontier([makeInput('MXN', 238.0)], σ_P, r_USD, 10);
+    const firstPositive = f.points.findIndex(p => p.portfolioVarUsd > 1e-9);
+    expect(f.tangencyIndex).toBe(firstPositive);
   });
 
   it('carry and VAR both start at zero and grow with k', () => {
@@ -1622,7 +1687,7 @@ describe('sweepPortfolioCarryFrontier', () => {
   });
 
   it('no currencies / no positive policyVAR_M — empty frontier, not a crash', () => {
-    const empty = { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null };
+    const empty = { points: [], farPoints: [], sweetSpotIndex: -1, nearestClampCcy: null, nearestClampVarUsd: null, tangencyIndex: -1 };
     expect(sweepPortfolioCarryFrontier([], σ_P, r_USD, 10)).toEqual(empty);
     expect(
       sweepPortfolioCarryFrontier([makeInput('GBP', 10)], σ_P, r_USD, 0),
@@ -1918,6 +1983,47 @@ describe('sweepPortfolioCarryFrontier', () => {
       // slope not staying constant across the whole sweep.
       expect(Math.abs(late - early)).toBeGreaterThan(1e-6);
     });
+  });
+});
+
+describe('frontierTangencyIndex — genuine hump required', () => {
+  const pt = (
+    portfolioVarUsd: number, totalCarryUsdYr: number,
+  ): PortfolioCarryFrontierPoint => ({ k: 0, portfolioVarUsd, totalCarryUsdYr, floorBoundCcys: [] });
+
+  it('−1 on a monotonically-decaying ratio (RSS-blended CFaR spiking at k→0, real shape measured off the book-scale walk)', () => {
+    // Ratio decays 1.24 → 0.65 → 0.49 → … → 0.165, never rising again —
+    // matches the actual portfolio-liquidity-frontier.ts book-scale curve.
+    const origin = pt(0.58, 0);
+    const points = [
+      origin,
+      pt(0.5999671369974838, 0.02472378),
+      pt(0.6562333898148056, 0.04944758),
+      pt(0.7198572682865128, 0.06867719),
+      pt(1.031299154862294, 0.13735437),
+      pt(3.8809474903815118, 0.6180947),
+      pt(15.360405423346643, 2.47237882),
+    ];
+    expect(frontierTangencyIndex(points, origin.portfolioVarUsd, origin.totalCarryUsdYr)).toBe(-1);
+  });
+
+  it('finds the genuine interior peak when the ratio actually rises before falling', () => {
+    const origin = pt(1, 0);
+    const points = [
+      origin,
+      pt(1.5, 0.3),  // ratio 0.6
+      pt(2, 0.6),    // ratio 0.6
+      pt(2.5, 1.05), // ratio 0.7 — the real peak
+      pt(3, 1.2),    // ratio 0.6
+      pt(4, 1.5),    // ratio 0.5
+    ];
+    const idx = frontierTangencyIndex(points, origin.portfolioVarUsd, origin.totalCarryUsdYr);
+    expect(idx).toBe(3);
+  });
+
+  it('−1 when no point has CFaR past the origin', () => {
+    const origin = pt(1, 0);
+    expect(frontierTangencyIndex([origin, pt(1, 0.5)], 1, 0)).toBe(-1);
   });
 });
 

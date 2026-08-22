@@ -528,6 +528,13 @@ export function targetForBufferCarry(
   let minCarry = Infinity;
   let targetAtMin = 0;
   let sampled = false;
+  const spot = CURRENCY_PARAMS[row.ccy]?.spot ?? 1;
+  const yearFrac = Math.max(months, 1) / 12;
+  const dCredit = Math.abs((row.r_FCY - shared.r_USD) / 100);
+  const dDebit = Math.abs((row.r_OD - shared.r_USD) / 100);
+  const rate = Math.max(dCredit, dDebit, 1e-5);
+  const impliedFcy = Math.abs(carryUsd) / (Math.max(spot, 1e-8) * rate * yearFrac);
+  const cashAbs = Math.max(Math.abs(row.cash), 1);
 
   const consider = (t: number, f: number) => {
     if (isolated(t) || !Number.isFinite(f)) return;
@@ -542,8 +549,8 @@ export function targetForBufferCarry(
     }
   };
 
-  for (let w = 0; w < 6 && !bracketed; w += 1) {
-    const span = Math.max(Math.abs(row.cash), 1) * 4 * 2 ** w;
+  for (let w = 0; w < 8 && !bracketed; w += 1) {
+    const span = Math.max(cashAbs * 4, impliedFcy * 1.5, 50) * 2 ** w;
     const from = row.cash - span;
     const step = (2 * span) / STEPS;
     let prev = from;

@@ -6,6 +6,7 @@ import {
   computeLayeredBuffer,
   computeFcySwapNear,
   liquidityFormulaLayersActive,
+  rowHasManualCarryTarget,
   type RowState,
   type SharedGlobals,
   type LayerId,
@@ -1441,6 +1442,7 @@ export function projectLiquidityCycles(
     shared.r_USD,
     formulaLayersActive,
     ctx.forecasted_cash,
+    rowHasManualCarryTarget(row),
   ), true);
   // No layer selected is no funding policy: the desk is reading the book as it
   // stands, so neither convention may book a leg. The term solve answers a

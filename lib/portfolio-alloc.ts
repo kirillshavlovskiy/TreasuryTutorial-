@@ -35,12 +35,12 @@ const MATERIALITY_MU = 0.0015;
  * too loose in practice. (Was 12x — a single leg reaching $240M against a
  * $20M policy cap was still an unreasonable multiple.)
  */
-const MAX_LEG_LEVERAGE = 3;
+export const OVERLAY_MAX_LEG_LEVERAGE = 3;
 /**
  * Second, independent ceiling: a leg's overlay notional also can't exceed
  * this multiple of that CURRENCY's own real base book (|basesFcy_i| ×
- * spot_i). MAX_LEG_LEVERAGE alone bounds every leg by the SAME shared VAR
- * cap regardless of that currency's real size — a correlation-driven
+ * spot_i). OVERLAY_MAX_LEG_LEVERAGE alone bounds every leg by the SAME shared
+ * VAR cap regardless of that currency's real size — a correlation-driven
  * diversifier (e.g. low-vol SEK helping cancel other legs' risk) can get
  * slammed to the full cap×3 ceiling even when its real NP book is a small
  * fraction of that (observed: HUF real book ~$2.9M vs a $60M ceiling at the
@@ -49,7 +49,23 @@ const MAX_LEG_LEVERAGE = 3;
  * revisit with the desk. Skipped when basesFcy isn't supplied (old flat
  * behavior) — only applied per-leg when that leg's own base is provided.
  */
-const MAX_BASE_MULTIPLE = 2;
+export const OVERLAY_MAX_BASE_MULTIPLE = 2;
+
+const MAX_LEG_LEVERAGE = OVERLAY_MAX_LEG_LEVERAGE;
+const MAX_BASE_MULTIPLE = OVERLAY_MAX_BASE_MULTIPLE;
+
+/** Per-leg overlay notional ceiling ($M) under the active Policy VAR. */
+export function overlayLegNotionalCeilingUsdM(input: {
+  policyCapUsdM: number;
+  baseFcyM?: number;
+  spot?: number;
+}): number {
+  const capLev = Math.max(0, input.policyCapUsdM) * MAX_LEG_LEVERAGE;
+  const baseUsd = Math.abs(input.baseFcyM ?? 0) * Math.max(0, input.spot ?? 0);
+  if (baseUsd > 1e-6) return Math.min(capLev, baseUsd * MAX_BASE_MULTIPLE);
+  return capLev;
+}
+
 export interface CarryVarAllocInput {
   ccys: readonly string[];
   /** $ carry / $ overlay / year — (r_FCY − r_USD) / 100. */
@@ -68,6 +84,14 @@ export interface CarryVarAllocInput {
   /** Overdraft rate (% p.a.) per currency, paired with basesFcy. */
   rOd?: readonly number[];
   r_USD?: number;
+  /**
+   * Per-currency minimum FINAL position (M FCY, i.e. basesFcy[i] +
+   * overlayFcy[i]) — the desk's floorH cash_floor. Paired with basesFcy: a
+   * floor without a base to measure the final position against is
+   * meaningless, so entries are ignored unless basesFcy is also supplied.
+   * Omitted/0/negative entries are ignored (no floor for that leg).
+   */
+  floorFcy?: readonly number[];
   /**
    * Standalone FX exposure CFaR ($M) per currency — RSS'd into VAR as an
    * independent term (see overlayVarUsdM). Omitted/0 = old pure-ray VAR,
@@ -417,6 +441,27 @@ function solveCarryVarUsd(input: CarryVarAllocInput): CarryVarSolve | null {
       });
     }
   }
+  // Floor — the mirror of the leverage ceiling above: rescale `dir[i]` (not
+  // pin, same reasoning as the ceiling) so the leg's FINAL position
+  // (basesFcy[i] + overlayFcy[i]) lands at least at floorFcy[i] at kVar.
+  // Runs after the ceiling so a genuine floor always wins if the two ever
+  // conflict — the floor is an operational minimum the desk set directly,
+  // the ceiling is a derived risk-sizing guard. A leg the ceiling clipped
+  // down below its own floor gets pushed back up here.
+  if (kVar > 1e-12 && input.floorFcy && basesFcy) {
+    const wAtKVar = addScaled(pin, dir, kVar);
+    freeIdx.forEach((i) => {
+      const floorFcyI = input.floorFcy![i];
+      if (floorFcyI == null || !(floorFcyI > 0)) return;
+      const spot = CURRENCY_PARAMS[ccys[i]!]?.spot ?? 0;
+      if (spot <= 1e-12) return;
+      const baseFcy = basesFcy[i] ?? 0;
+      const finalFcy = baseFcy + wAtKVar[i]! / spot;
+      if (finalFcy >= floorFcyI - 1e-9) return;
+      const requiredUsdM = (floorFcyI - baseFcy) * spot;
+      dir[i] = (requiredUsdM - pin[i]!) / kVar;
+    });
+  }
   const target = input.carryTargetUsdYrM;
   let k = kVar;
   let carryBinding = false;
@@ -529,6 +574,35 @@ function legsFromUsd(
       carryUsdYrM: usdM * legCarryRate(mu[i]!, finalFcy, rOd?.[i], r_USD),
     };
   }).sort((a, b) => Math.abs(b.usdM) - Math.abs(a.usdM));
+}
+
+/**
+ * Σ⁻¹μ ray at fraction `t` of the Policy VAR fill (t = 0 hold, t = 1 cap).
+ * Weights are linear on the ray; component VAR is recomputed at the scaled book.
+ */
+export function scaleOverlayLegs(
+  legs: readonly EfficientCarryLeg[],
+  t: number,
+): EfficientCarryLeg[] {
+  const s = Number.isFinite(t) ? Math.max(0, t) : 0;
+  if (legs.length === 0) return [];
+  if (Math.abs(s - 1) < 1e-12) return [...legs];
+  const ccys = legs.map(l => l.ccy);
+  const wUsdM = legs.map(l => l.usdM * s);
+  const varByCcy = new Map(
+    legsFromUsd(ccys, legs.map(l => l.mu), wUsdM).map(l => [l.ccy, l.componentVarUsdM] as const),
+  );
+  return legs.map(l => {
+    const usdM = l.usdM * s;
+    return {
+      ...l,
+      usdM,
+      fcyM: l.fcyM * s,
+      carryUsdYrM: l.carryUsdYrM * s,
+      componentVarUsdM: varByCcy.get(l.ccy) ?? l.componentVarUsdM * s,
+      side: overlaySide(usdM),
+    };
+  });
 }
 
 /**

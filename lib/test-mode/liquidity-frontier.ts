@@ -802,8 +802,9 @@ export function farSettleExposureCfarUsdM(
 
 /**
  * Far on (desk Δ = 0) — early unwind of the locked far via a swap to raise
- * USD vs K. Rate-diff vol, same family as displayed funding-swap CFaR.
- * Full FX revaluation of S is the open-cash factor above, not this one.
+ * USD vs K. FX-hedge CFaR is the basis; only rate-diff vol is added.
+ * Same S as open, much smaller add — not a shared vertical, and not a
+ * jump left of the Unhedged vertex.
  */
 export function farSettleUnwindCfarUsdM(
   standing: number,
@@ -1107,9 +1108,8 @@ function priceCarryPair(
 
 /**
  * CFaR of a partial far-on at one S.
- * Leftover FX on (1−α)S and unwind on αS, RSS'd, then RSS'd with the section.
- * Cover α: 0 = open cash, 1 = far on. Desk residual Δ = 1 − α.
- * Not a linear blend of the two endpoint CFaRs.
+ * Leftover FX on (1−α)S and unwind on αS, RSS'd, then RSS'd with the
+ * FX-hedge basis. Cover α: 0 = open cash, 1 = far on.
  */
 export function rssMixCfarUsdM(
   sectionUsdM: number,
@@ -1187,7 +1187,9 @@ export function isoSSliceAlphas(
   }
   const section = Math.max(0, sectionUsdM);
   const fxAdd = Math.sqrt(Math.max(0, open.finalCfarUsdM ** 2 - section ** 2));
-  const rateAdd = Math.sqrt(Math.max(0, far.finalCfarUsdM ** 2 - section ** 2));
+  const rateAdd = far.finalCfarUsdM + 1e-12 >= section
+    ? Math.sqrt(Math.max(0, far.finalCfarUsdM ** 2 - section ** 2))
+    : Math.max(0, far.finalCfarUsdM);
   const den = fxAdd * fxAdd + rateAdd * rateAdd;
   if (den > 1e-16) {
     const aStar = (fxAdd * fxAdd) / den;
@@ -1236,7 +1238,8 @@ export interface LiquidityStandingPrice {
 
 /**
  * Price open-cash and far-on at an arbitrary signed standing.
- * CFaR is RSS(section, swap bands) — a curve in |S|, not a linear VAR chord.
+ * FX-hedge CFaR is the basis. Open adds FX bands; far adds rate-diff
+ * bands. Same S, different X — both ≥ basis.
  */
 export function priceLiquidityStanding(
   input: LiquidityStandingPriceInput,

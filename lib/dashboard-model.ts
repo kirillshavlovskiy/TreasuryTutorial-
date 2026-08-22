@@ -12,6 +12,7 @@ import {
   computeUsdBuffer,
   computeFcySwapNear,
   applyNoNegativeLpFloor,
+  rowHasManualCarryTarget,
   applyHardMinFloor,
   assessUsdLiquidityPriority,
   deriveUsdLiquidity,
@@ -446,6 +447,7 @@ export function computeSimdRow(
 
   const hStarLeg = syncedSwap ?? computeFcySwapNear(
     cash_threshold_pre_swap, cashPos, r.fcastFX, r.r_OD, shared.r_USD, formulaLayersActive, swapAnchor,
+    rowHasManualCarryTarget(r),
   );
   // SWAP band = the trade booked today (M1 near). The H* cycle's increment stays
   // on `hStarLeg` so trough + that leg still equals the cushion. Mixing the two
@@ -994,7 +996,11 @@ export function computeLayerTargets(
         : r.raw_sum + delta_portfolio + (portOptCarryAdj[r.ccy] ?? 0))
       : r.peak_cash;
     const cash_threshold_raw = opt?.cash_threshold_raw ?? cash_threshold;
-    if (!portfolioActive && formulaLayersActive) {
+    if (
+      !portfolioActive
+      && formulaLayersActive
+      && !rowHasManualCarryTarget({ carry_target: carryTargetByCcy[r.ccy] })
+    ) {
       ({ cash_threshold } = applyNoNegativeLpFloor(cash_threshold, r.r_OD, shared.r_USD));
     }
     // Hard minimum: with the floor layer on, the target never drops below cash_floor.
@@ -1005,6 +1011,7 @@ export function computeLayerTargets(
       ?? (cash_threshold_raw < -0.001 && cash_threshold >= -0.001);
     const swap_needed = r.planned_near_leg ?? computeFcySwapNear(
       cash_threshold, r.total_cash, 0, r.r_OD, shared.r_USD, formulaLayersActive, r.peak_cash,
+      rowHasManualCarryTarget({ carry_target: carryTargetByCcy[r.ccy] }),
     );
     const delta_carry_final = portfolioActive
       ? (portOptCarryAdj[r.ccy] ?? 0)
