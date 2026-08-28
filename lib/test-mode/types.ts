@@ -16,7 +16,10 @@ export type TaskStepId =
   | 'buildWorkspace'
   | 'largestMismatch'
   | 'setVarConfidence'
-  | 'readVar';
+  | 'readVar'
+  | 'openCashCarry'
+  | 'readCarryByCcy'
+  | 'readCarryTotal';
 
 export interface TaskProgress {
   taskId: string;
@@ -65,6 +68,20 @@ export interface TaskAnswers {
    * (confidence × horizon × exposure basis) within ±5%.
    */
   eurVarUsdK: string;
+  /** Task 02: Cash Carry forecast Tf in months (expected 12). */
+  carryForecastMonths: string;
+  /** Task 02: do-nothing (unhedged) carry @ Tf in $K, per exposure. */
+  carryEurUsdK: string;
+  carryGbpUsdK: string;
+  carryPlnUsdK: string;
+  carryMxnUsdK: string;
+  carryJpyUsdK: string;
+  /** Task 02: All-CCY Σ do-nothing carry @ Tf in $K. */
+  carryAllCcyUsdK: string;
+  /** Task 02: currency with the largest positive do-nothing carry. */
+  carryEarnCcy: string;
+  /** Task 02: currency with the largest negative (or smallest) do-nothing carry. */
+  carryPayCcy: string;
 }
 
 /** Parent-company consolidated dashboard (group net + risk VaR layer). */

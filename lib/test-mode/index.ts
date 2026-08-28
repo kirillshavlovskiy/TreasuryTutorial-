@@ -181,6 +181,7 @@ export {
   displayedCfarNetByCcyUsdM,
   hedgeSettleScheduleForCfar,
   sumNetCfarUsdM,
+  fxOnlyCfarReserveUsdM,
 } from '@/lib/test-mode/cfar-net-by-ccy';
 export {
   fundingSwapOutstandingByMonth,
@@ -191,9 +192,11 @@ export {
 export {
   ensureTask01FxLayers,
   entityHasLocalPositions,
+  expectedTask02CarryUsdM,
   localReadinessByEntity,
   localsReadyForConsolidation,
   scoreTask01,
+  scoreTask02,
 } from '@/lib/test-mode/score';
 export {
   HEDGE_PATH_BASIS_OPTIONS,
@@ -344,10 +347,18 @@ export {
   classifyNordtechEntity,
   mergedEntityForecastProfile,
   rowsForSelectedCurrencies,
+  isTask02,
   simSeedForEntity,
+  task02ForecastFor,
+  task02ForecastProfile,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
   TASK01_REQUIRED_FX_INPUTS,
+  TASK02_CARRY_CCYS,
+  TASK02_FORECAST_MONTHS,
+  TASK02_REQUIRED_ANALYTICAL_LAYERS,
+  TASK02_REQUIRED_DECISION_LAYERS,
+  TASK02_REQUIRED_FX_INPUTS,
   type EntitySimSeed,
 } from '@/lib/test-mode/nordtech-sim-seed';
 export {

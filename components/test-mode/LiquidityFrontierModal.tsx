@@ -1,21 +1,30 @@
 'use client';
 
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ccySpotRate, type RowState } from '@/lib/fx-buffer';
 import type { OverlaySide } from '@/lib/portfolio-alloc';
 import {
+  clampCarryVarPlotView,
+  inPlotRect,
+  svgLocalXY,
+  type CarryVarPlotView,
+} from '@/lib/test-mode/carry-var-plot-nav';
+import {
+  applyPortfolioFrontierTargets,
   bookCashCarryK,
   buildLiquidityLeftEndFrontier,
   carryAxisFromArms,
   carryFwd,
   constraintTwinFromHits,
   frontierCarryDotsK,
+  interpAlong,
   isoSSlicePoints,
   liquidityFrontierDial,
   liquidityFrontierDialLabel,
   priceIsoSSlice,
   snapFrontierStandKey,
+  tangencyOnLiquidityArm,
   type LiquidityFrontierConstraint,
   type LiquidityFrontierInput,
   type LiquidityFrontierPoint,
@@ -26,25 +35,46 @@ import {
 } from '@/lib/test-mode/liquidity-strategies';
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
 import type { VarSetup } from '@/lib/test-mode/var-setup';
+import type { AskFillMode } from '@/lib/test-mode/solution-pick';
+import {
+  walkStandingFromSetpoints,
+  type CcyScenarioSetpoint,
+} from '@/lib/test-mode/efficient-frontier-job';
+import {
+  alignLeftEndToCcyTicket,
+  bookStandingChipLabel,
+  ccyModalAlignTicket,
+  modalCcyTicketTargets,
+} from '@/lib/test-mode/portfolio-modal-align';
 
 function fmtK(usdM: number): string {
+  if (!Number.isFinite(usdM) || Math.abs(usdM) < 5e-5) return '$0K';
+  if (Math.abs(usdM) >= 1 - 1e-9) {
+    return `${usdM >= 0 ? '' : '−'}$${Math.abs(usdM).toFixed(1)}M`;
+  }
   const k = usdM * 1000;
-  if (Math.abs(k) < 0.05) return '$0K';
   const dec = Math.abs(k) < 10 ? 1 : 0;
   return `${k >= 0 ? '' : '−'}$${Math.abs(k).toFixed(dec)}K`;
 }
 
 function fmtSignedK(usdM: number): string {
+  if (!Number.isFinite(usdM) || Math.abs(usdM) < 5e-5) return '$0K';
+  if (Math.abs(usdM) >= 1 - 1e-9) {
+    const sign = usdM > 0 ? '+' : usdM < 0 ? '−' : '';
+    return `${sign}$${Math.abs(usdM).toFixed(1)}M`;
+  }
   const k = usdM * 1000;
-  if (Math.abs(k) < 0.05) return '$0K';
   const dec = Math.abs(k) < 10 ? 1 : 0;
   const sign = k > 0 ? '+' : k < 0 ? '−' : '';
   return `${sign}$${Math.abs(k).toFixed(dec)}K`;
 }
 
 function fmtAbsK(usdM: number): string {
+  if (!Number.isFinite(usdM) || Math.abs(usdM) < 5e-5) return '$0K';
+  if (Math.abs(usdM) >= 1 - 1e-9) {
+    return `$${Math.abs(usdM).toFixed(1)}M`;
+  }
   const k = Math.abs(usdM * 1000);
-  if (k < 0.05) return '$0K';
   return `$${k.toFixed(k < 10 ? 1 : 0)}K`;
 }
 
@@ -246,6 +276,108 @@ function isoMixDotPoints(
   return out.sort((a, b) => a.delta - b.delta);
 }
 
+type PlotLabelDraft = {
+  id: string;
+  text: string;
+  ax: number;
+  ay: number;
+  fill: string;
+  lines?: 1 | 2;
+  sub?: string;
+  prefer?: 'right' | 'below' | 'above' | 'left';
+};
+
+type PlacedPlotLabel = {
+  id: string;
+  text: string;
+  sub?: string;
+  x: number;
+  y: number;
+  anchor: 'start' | 'end' | 'middle';
+  fill: string;
+};
+
+function estimateLabelW(text: string): number {
+  return Math.max(28, text.length * 4.55);
+}
+
+function boxesOverlap(
+  a: { x: number; y: number; w: number; h: number },
+  b: { x: number; y: number; w: number; h: number },
+  pad = 4,
+): boolean {
+  return !(
+    a.x + a.w + pad < b.x
+    || b.x + b.w + pad < a.x
+    || a.y + a.h + pad < b.y
+    || b.y + b.h + pad < a.y
+  );
+}
+
+function placePlotLabels(
+  items: readonly PlotLabelDraft[],
+  plot: { l: number; t: number; r: number; b: number },
+): PlacedPlotLabel[] {
+  const placedBoxes: { x: number; y: number; w: number; h: number }[] = [];
+  const out: PlacedPlotLabel[] = [];
+  for (const item of items) {
+    const w = Math.max(estimateLabelW(item.text), item.sub ? estimateLabelW(item.sub) : 0);
+    const h = (item.lines ?? (item.sub ? 2 : 1)) * 11;
+    const opts: { x: number; y: number; anchor: 'start' | 'end' | 'middle' }[] = [
+      { x: item.ax + 8, y: item.ay - 6, anchor: 'start' },
+      { x: item.ax + 8, y: item.ay + 12, anchor: 'start' },
+      { x: item.ax - 8, y: item.ay - 6, anchor: 'end' },
+      { x: item.ax - 8, y: item.ay + 12, anchor: 'end' },
+      { x: item.ax, y: item.ay - 14, anchor: 'middle' },
+      { x: item.ax, y: item.ay + 16, anchor: 'middle' },
+    ];
+    const order = item.prefer === 'below' ? [1, 5, 0, 2, 3, 4]
+      : item.prefer === 'above' ? [0, 4, 2, 1, 3, 5]
+        : item.prefer === 'left' ? [2, 3, 0, 1, 4, 5]
+          : [0, 1, 2, 3, 4, 5];
+    const ranked = order.map(i => opts[i]!);
+    const boxOf = (o: (typeof opts)[number]) => ({
+      x: o.anchor === 'end' ? o.x - w : o.anchor === 'middle' ? o.x - w / 2 : o.x,
+      y: o.y - 8,
+      w,
+      h,
+    });
+    const inPlot = (box: { x: number; y: number; w: number; h: number }) => (
+      box.x >= plot.l - 2
+      && box.x + box.w <= plot.r + 6
+      && box.y >= plot.t - 2
+      && box.y + box.h <= plot.b + 6
+    );
+    const pick = ranked.find(o => {
+      const box = boxOf(o);
+      return inPlot(box) && placedBoxes.every(p => !boxesOverlap(box, p));
+    })
+      ?? ranked.find(o => inPlot(boxOf(o)))
+      ?? ranked[0]!;
+    placedBoxes.push(boxOf(pick));
+    out.push({
+      id: item.id,
+      text: item.text,
+      sub: item.sub,
+      x: pick.x,
+      y: pick.y,
+      anchor: pick.anchor,
+      fill: item.fill,
+    });
+  }
+  return out;
+}
+
+function nearScreen(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  px = 16,
+): boolean {
+  return Math.hypot(ax - bx, ay - by) < px;
+}
+
 function cfarKTicks(minM: number, maxM: number): number[] {
   const lo = Math.floor(minM * 1000);
   const hi = Math.ceil(maxM * 1000);
@@ -317,6 +449,124 @@ function pointKey(p: LiquidityFrontierPoint): string {
   return `${p.delta >= 1 - 1e-9 ? 'far' : 'open'}:${p.peakBook.toFixed(4)}`;
 }
 
+type CcyScenarioId = 'unhedged' | 'carryTarget' | 'balanced' | 'swapHedged' | 'custom';
+
+const CCY_SCENARIO_COLORS: Record<CcyScenarioId, string> = {
+  unhedged: '#94a3b8',
+  carryTarget: '#60a5fa',
+  balanced: '#f59e0b',
+  swapHedged: '#fb7185',
+  custom: '#38bdf8',
+};
+
+const SCENARIO_CHIP_TONE: Record<CcyScenarioId, { on: string; off: string }> = {
+  unhedged: {
+    on: 'border-slate-400 bg-slate-500/25 text-slate-100',
+    off: 'border-slate-600 bg-slate-800/70 text-slate-200 hover:border-slate-400 hover:bg-slate-700/80',
+  },
+  carryTarget: {
+    on: 'border-sky-400 bg-sky-500/25 text-sky-100',
+    off: 'border-sky-500/45 bg-sky-500/10 text-sky-200 hover:border-sky-400 hover:bg-sky-500/20',
+  },
+  balanced: {
+    on: 'border-amber-400 bg-amber-500/25 text-amber-100',
+    off: 'border-amber-500/45 bg-amber-500/10 text-amber-200 hover:border-amber-400 hover:bg-amber-500/20',
+  },
+  swapHedged: {
+    on: 'border-rose-400 bg-rose-500/25 text-rose-100',
+    off: 'border-rose-500/45 bg-rose-500/10 text-rose-200 hover:border-rose-400 hover:bg-rose-500/20',
+  },
+  custom: {
+    on: 'border-sky-400 bg-sky-500/25 text-sky-100',
+    off: 'border-sky-500/45 bg-sky-500/10 text-sky-200 hover:border-sky-400 hover:bg-sky-500/20',
+  },
+};
+
+interface CcyScenarioDef {
+  id: CcyScenarioId;
+  label: string;
+  point: LiquidityFrontierPoint | null;
+  disabledHint?: string;
+  displayCfarUsdM?: number;
+  displayCarryUsdYrM?: number;
+  source?: 'portfolio' | 'local';
+  plotOnLocalArm?: boolean;
+}
+
+function nearestOpenByStanding(
+  opens: readonly LiquidityFrontierPoint[],
+  standing: number,
+): LiquidityFrontierPoint | null {
+  let best: LiquidityFrontierPoint | null = null;
+  let bestD = Infinity;
+  for (const p of opens) {
+    const d = Math.abs(p.peakBook - standing);
+    if (d < bestD) {
+      bestD = d;
+      best = p;
+    }
+  }
+  return best;
+}
+
+function nearestComboOnTwins(
+  twins: readonly FrontierTwin[],
+  sectionUsdM: number,
+  target: { cfarUsdM: number; carryUsdYrM: number },
+  carryS: number,
+): { idx: number; cover: number } | null {
+  if (twins.length === 0) return null;
+  if (!Number.isFinite(target.cfarUsdM) || !Number.isFinite(target.carryUsdYrM)) {
+    return null;
+  }
+  const tx = target.cfarUsdM;
+  const tz = carryFwd(target.carryUsdYrM, carryS);
+  const xs = twins.flatMap(t => [t.open.finalCfarUsdM, t.far.finalCfarUsdM]);
+  const zs = twins.flatMap(t => [
+    carryFwd(t.open.totalCarryUsdYrM, carryS),
+    carryFwd(t.far.totalCarryUsdYrM, carryS),
+  ]);
+  const xSpan = Math.max(0.02, Math.max(...xs) - Math.min(...xs));
+  const zSpan = Math.max(0.2, Math.max(...zs) - Math.min(...zs));
+  const dist = (p: LiquidityFrontierPoint) => Math.hypot(
+    (p.finalCfarUsdM - tx) / xSpan,
+    (carryFwd(p.totalCarryUsdYrM, carryS) - tz) / zSpan,
+  );
+  let best = { idx: 0, cover: 0, d: Infinity };
+  twins.forEach((t, idx) => {
+    const covers = t.key === 'origin' ? [0] : [0, 0.25, 0.5, 0.75, 1];
+    const ySpan = t.far.totalCarryUsdYrM - t.open.totalCarryUsdYrM;
+    if (t.key !== 'origin' && Math.abs(ySpan) > 1e-9) {
+      const u = (target.carryUsdYrM - t.open.totalCarryUsdYrM) / ySpan;
+      if (u > 1e-6 && u < 1 - 1e-6) covers.push(u);
+    }
+    for (const cover of covers) {
+      const p = t.key === 'origin'
+        ? t.open
+        : priceIsoSSlice(t.open, t.far, sectionUsdM, cover);
+      const d = dist(p);
+      if (d < best.d) best = { idx, cover, d };
+    }
+  });
+  return { idx: best.idx, cover: best.cover };
+}
+
+function pointFromCarryHit(
+  origin: LiquidityFrontierPoint,
+  opens: readonly LiquidityFrontierPoint[],
+  hit: { cfarUsdM: number; carryUsdYrM: number; standing: number },
+): LiquidityFrontierPoint {
+  const near = nearestOpenByStanding(opens, hit.standing) ?? origin;
+  return {
+    ...near,
+    peakBook: hit.standing,
+    finalCfarUsdM: hit.cfarUsdM,
+    totalCarryUsdYrM: hit.carryUsdYrM,
+    cashCarryUsdYrM: hit.carryUsdYrM,
+    levered: false,
+  };
+}
+
 function samePt(a: LiquidityFrontierPoint | null, b: LiquidityFrontierPoint | null): boolean {
   if (!a || !b) return false;
   return Math.abs(a.peakBook - b.peakBook) < 1e-4
@@ -349,6 +599,8 @@ export function LiquidityFrontierModal({
   onStage,
   staged = false,
   portfolioSuggestion = null,
+  askFillMode,
+  scenarioSetpoints = {},
 }: {
   row: RowState;
   strategy: LiquidityStrategy;
@@ -363,25 +615,41 @@ export function LiquidityFrontierModal({
   onStage?: (residual: number) => void;
   staged?: boolean;
   /**
-   * This currency's Σ⁻¹μ overlay leg under the desk's active portfolio
-   * scenario (Carry Target / Balanced / Max Policy Risk / custom) — `fcyM` is
-   * H* − hold, same convention as `SweetStripSplit`'s Overlay FCY column.
-   * When present, it preselects the frontier point nearest
-   * `bookStanding + fcyM` instead of the per-currency dial default, so the
-   * modal opens where the portfolio optimizer put this currency.
+   * Portfolio efficient-frontier pick for this CCY. Prefer `cfarUsdM` +
+   * `carryUsdYrM` (the chart combo). `fcyM` is the overlay standing fallback.
    */
   portfolioSuggestion?: {
     fcyM: number;
     usdM: number;
     side: OverlaySide;
     scenarioLabel: string;
+    scenarioId?: string | null;
+    cfarUsdM?: number;
+    carryUsdYrM?: number;
   } | null;
+  askFillMode?: AskFillMode;
+  /** Named portfolio scenario setpoints for this CCY (same payload as Sweet). */
+  scenarioSetpoints?: Record<string, CcyScenarioSetpoint>;
 }) {
-  const liveS = Math.abs(bookStanding) > 0.01
-    ? bookStanding
-    : (typeof row.carry_target === 'number' && Math.abs(row.carry_target) > 0.01
-      ? row.carry_target
-      : 0);
+  const overlayFill = askFillMode === 'overlay'
+    || scenarioSetpoints.carryTarget?.askFillMode === 'overlay'
+    || (
+      portfolioSuggestion?.scenarioId != null
+      && scenarioSetpoints[portfolioSuggestion.scenarioId]?.askFillMode === 'overlay'
+    );
+  const liveS = overlayFill
+    ? 0
+    : (() => {
+      const walkS = walkStandingFromSetpoints(
+        bookStanding,
+        scenarioSetpoints,
+        portfolioSuggestion?.scenarioId,
+      );
+      if (Math.abs(walkS) > 0.01) return walkS;
+      return typeof row.carry_target === 'number' && Math.abs(row.carry_target) > 0.01
+        ? row.carry_target
+        : 0;
+    })();
   const bookK = bookCashCarryK(
     liveS, ccySpotRate(row.ccy), row.r_FCY, engineInput.shared.r_USD, row.r_OD,
   );
@@ -401,16 +669,47 @@ export function LiquidityFrontierModal({
     maxK: plotCapK,
   }), [bookK, searching, plotCapK]);
 
-  const result = useMemo(
-    () => buildLiquidityLeftEndFrontier({
+  const result = useMemo(() => {
+    const built = buildLiquidityLeftEndFrontier({
       ...engineInput,
       row,
       strategy,
       bookStanding: liveS,
       carryUsdK,
-    }),
-    [engineInput, row, strategy, liveS, carryUsdK],
-  );
+    });
+    const ask = scenarioSetpoints.carryTarget;
+    const overlayPins = askFillMode === 'overlay'
+      || ask?.askFillMode === 'overlay';
+    const ticket = overlayPins ? null : ccyModalAlignTicket(ask);
+    const aligned = alignLeftEndToCcyTicket(built, ticket);
+    // Overlay fill: chips only. Swap / Both: pin this CCY’s Total
+    // (Book+Overlay) — same Y as the chip. Never Policy VAR.
+    return {
+      ...aligned,
+      constraint: applyPortfolioFrontierTargets(
+        aligned.constraint,
+        {
+          origin: aligned.origin,
+          open: aligned.upper.filter(p => p.delta < 1e-9),
+          far: aligned.lower,
+        },
+        modalCcyTicketTargets({ overlayFill: overlayPins, ticket: ask }),
+      ),
+    };
+  }, [
+    engineInput,
+    row,
+    strategy,
+    liveS,
+    carryUsdK,
+    scenarioSetpoints.carryTarget?.bookUsdYrM,
+    scenarioSetpoints.carryTarget?.carryUsdYrM,
+    scenarioSetpoints.carryTarget?.cfarUsdM,
+    scenarioSetpoints.carryTarget?.overlayUsdYrM,
+    scenarioSetpoints.carryTarget?.bookStandingFcyM,
+    scenarioSetpoints.carryTarget?.askFillMode,
+    askFillMode,
+  ]);
 
   const twins = useMemo(() => {
     const originPair = {
@@ -465,6 +764,9 @@ export function LiquidityFrontierModal({
     result.constraint.openHit?.standing.toFixed(4) ?? 'none',
     result.constraint.hCarryUsdYrM?.toFixed(6) ?? '',
     result.constraint.vCfarUsdM?.toFixed(6) ?? '',
+    portfolioSuggestion?.scenarioId ?? '',
+    portfolioSuggestion?.cfarUsdM?.toFixed(6) ?? '',
+    portfolioSuggestion?.carryUsdYrM?.toFixed(6) ?? '',
   ].join(':');
   const autoKey = snapFrontierStandKey(
     result.dial,
@@ -472,25 +774,54 @@ export function LiquidityFrontierModal({
     twins.map(t => ({ key: t.key, standing: t.open.peakBook })),
   );
   const dialAutoIdx = indexOfTwinKey(twins, autoKey, result.constraint.openHit?.standing);
-  // Portfolio suggestion wins the initial pick when one exists — it reflects
-  // the desk's active cross-currency scenario, which the per-currency dial
-  // default (cash floor / carry target / VAR target) knows nothing about.
-  // A live manual pick (below) always overrides both.
-  const suggestedStanding = portfolioSuggestion && Math.abs(portfolioSuggestion.fcyM) > 0.01
-    ? bookStanding + portfolioSuggestion.fcyM
+  const suggestedStanding = !overlayFill && Math.abs(liveS) > 0.01
+    ? liveS
     : null;
   const suggestedIdx = suggestedStanding != null
     ? indexOfTwinStanding(twins, suggestedStanding)
     : -1;
-  const autoIdx = suggestedIdx >= 0 ? suggestedIdx : dialAutoIdx;
+  // Do not snap portfolio ($9.8M, +$1.6M) onto the local CCY walk —
+  // that picks a far Δ=1 standing (S −91) that is not the Book strip.
+  const comboTarget = !overlayFill
+    && Math.abs(liveS) < 0.01
+    && portfolioSuggestion
+    && typeof portfolioSuggestion.cfarUsdM === 'number'
+    && Number.isFinite(portfolioSuggestion.cfarUsdM)
+    && typeof portfolioSuggestion.carryUsdYrM === 'number'
+    && Number.isFinite(portfolioSuggestion.carryUsdYrM)
+    ? {
+        cfarUsdM: portfolioSuggestion.cfarUsdM,
+        carryUsdYrM: portfolioSuggestion.carryUsdYrM,
+      }
+    : null;
+  const comboCarryS = (() => {
+    const openY = result.upper.filter(p => p.delta < 1e-9).map(p => p.cashCarryUsdYrM);
+    const farY = result.lower.map(p => p.totalCarryUsdYrM);
+    return carryAxisFromArms(
+      Math.min(0, ...openY, 0),
+      Math.max(0.012, ...openY, 0),
+      Math.min(0, ...farY, 0),
+    ).s;
+  })();
+  const comboSnap = comboTarget
+    ? nearestComboOnTwins(twins, result.cfarOriginUsdM, comboTarget, comboCarryS)
+    : null;
+  const autoIdx = comboSnap != null
+    ? comboSnap.idx
+    : (suggestedIdx >= 0 ? suggestedIdx : dialAutoIdx);
+  const autoCover = comboSnap != null ? comboSnap.cover : 0;
   const [pick, setPick] = useState<{ epoch: string; idx: number; cover: number } | null>(null);
+  const [pinnedScenario, setPinnedScenario] = useState<CcyScenarioId | null>(null);
+  useEffect(() => {
+    setPinnedScenario(null);
+  }, [portfolioSuggestion?.scenarioId, row.ccy, askFillMode]);
   const livePick = pick?.epoch === snapEpoch ? pick : null;
   const armIdx = livePick != null
     ? Math.min(twins.length - 1, Math.max(0, livePick.idx))
     : autoIdx;
   const twin = twins[armIdx] ?? twins[0]!;
   const isOrigin = twin.key === 'origin';
-  const cover = isOrigin ? 0 : (livePick?.cover ?? 0);
+  const cover = isOrigin ? 0 : (livePick?.cover ?? autoCover);
   const commit = (next: { idx?: number; cover?: number }) => {
     const idx = next.idx ?? armIdx;
     const at = twins[idx] ?? twins[0]!;
@@ -534,6 +865,178 @@ export function LiquidityFrontierModal({
       cover: p.delta >= 1 - 1e-9 ? 1 : p.delta < 1e-9 ? 0 : p.delta,
     });
   };
+
+  const opens = result.upper.filter(p => p.delta < 1e-9);
+  const askCarryY = result.constraint.hCarryUsdYrM;
+  const carryHit = askCarryY != null
+    ? interpAlong([result.origin, ...opens], askCarryY, 'carry')
+    : (result.dial === 'carry_target' ? result.constraint.openHit : null);
+  const carryTargetPoint = carryHit && Math.abs(carryHit.standing) > 1e-6
+    ? pointFromCarryHit(result.origin, opens, carryHit)
+    : (typeof row.carry_target === 'number'
+      && Number.isFinite(row.carry_target)
+      && Math.abs(row.carry_target) > 0.01
+      ? nearestOpenByStanding(opens, row.carry_target)
+      : null);
+  const balancedPoint = tangencyOnLiquidityArm([result.origin, ...opens]);
+  const fars = result.lower;
+  const hedgeHit = result.constraint.hedgeHit;
+  const swapStand = Math.abs(liveS) > 0.01
+    ? liveS
+    : (carryTargetPoint && Math.abs(carryTargetPoint.peakBook) > 1e-6
+      ? carryTargetPoint.peakBook
+      : (Math.abs(result.bookStanding) > 0.01 ? result.bookStanding : null));
+  const swapHedgedPoint = swapStand != null
+    ? nearestOpenByStanding(fars, swapStand)
+    : (result.dial === 'carry_target' && hedgeHit && Math.abs(hedgeHit.standing) > 1e-6
+      ? { ...pointFromCarryHit(result.origin, fars, hedgeHit), delta: 1, phase: 'hedged' as const }
+      : (fars.filter(p => !p.levered).at(-1) ?? null));
+  const stampPortfolio = (
+    id: CcyScenarioId,
+    local: LiquidityFrontierPoint | null,
+    fallbackHint?: string,
+  ): Pick<CcyScenarioDef, 'point' | 'disabledHint' | 'displayCfarUsdM' | 'displayCarryUsdYrM' | 'source' | 'plotOnLocalArm'> => {
+    const sp = scenarioSetpoints[id];
+    if (sp) {
+      return {
+        point: local ?? result.origin,
+        displayCfarUsdM: sp.cfarUsdM,
+        displayCarryUsdYrM: sp.carryUsdYrM,
+        source: 'portfolio',
+        plotOnLocalArm: !overlayFill,
+      };
+    }
+    return {
+      point: local,
+      source: 'local',
+      plotOnLocalArm: true,
+      disabledHint: local ? undefined : fallbackHint,
+    };
+  };
+  const ccyScenarios: CcyScenarioDef[] = [
+    {
+      id: 'unhedged',
+      label: 'Unhedged',
+      ...stampPortfolio('unhedged', result.origin),
+    },
+    {
+      id: 'carryTarget',
+      label: 'Carry Target',
+      ...stampPortfolio(
+        'carryTarget',
+        carryTargetPoint,
+        'this currency has no Target Carry / H* standing on the open arm',
+      ),
+    },
+    {
+      id: 'balanced',
+      label: 'Balanced',
+      ...stampPortfolio(
+        'balanced',
+        balancedPoint,
+        'no (0,0) tangent on this currency open arm yet',
+      ),
+    },
+    {
+      id: 'swapHedged',
+      label: 'Swap hedged',
+      point: swapHedgedPoint,
+      source: 'local',
+      plotOnLocalArm: true,
+      disabledHint: swapHedgedPoint
+        ? undefined
+        : 'no far / CIP twin on the pink tail yet',
+    },
+  ];
+  const customPoint = !overlayFill && comboSnap != null
+    ? (twins[comboSnap.idx]?.key === 'origin'
+      ? result.origin
+      : priceIsoSSlice(
+          twins[comboSnap.idx]!.open,
+          twins[comboSnap.idx]!.far,
+          result.cfarOriginUsdM,
+          comboSnap.cover,
+        ))
+    : null;
+  const namedHit = (id: CcyScenarioId) => {
+    if (id === 'unhedged') return isOrigin;
+    if (!customPoint && !selected) return false;
+    const p = id === 'carryTarget' ? carryTargetPoint
+      : id === 'balanced' ? balancedPoint
+        : id === 'swapHedged' ? swapHedgedPoint
+          : null;
+    if (!p) return false;
+    return Math.abs(selected.peakBook - p.peakBook) < 1e-3
+      && (
+        (id === 'swapHedged' && arm === 'far')
+        || (id !== 'swapHedged' && arm === 'open')
+      );
+  };
+  const comboIsNamed = customPoint != null && (
+    (Math.abs(customPoint.peakBook) < 1e-6 && comboSnap!.cover < 1e-9)
+    || (carryTargetPoint != null
+      && Math.abs(customPoint.peakBook - carryTargetPoint.peakBook) < 1e-3
+      && comboSnap!.cover < 1e-9)
+    || (balancedPoint != null
+      && Math.abs(customPoint.peakBook - balancedPoint.peakBook) < 1e-3
+      && comboSnap!.cover < 1e-9)
+    || (swapHedgedPoint != null
+      && Math.abs(customPoint.peakBook - swapHedgedPoint.peakBook) < 1e-3
+      && comboSnap!.cover > 1 - 1e-9)
+  );
+  const preferCustomChip = portfolioSuggestion?.scenarioId === 'custom'
+    && (customPoint != null || scenarioSetpoints.custom != null);
+  if (preferCustomChip) {
+    const sp = scenarioSetpoints.custom;
+    ccyScenarios.push({
+      id: 'custom',
+      label: 'Custom',
+      point: customPoint ?? result.origin,
+      displayCfarUsdM: portfolioSuggestion?.cfarUsdM ?? sp?.cfarUsdM,
+      displayCarryUsdYrM: portfolioSuggestion?.carryUsdYrM ?? sp?.carryUsdYrM,
+      source: 'portfolio',
+      plotOnLocalArm: !overlayFill,
+    });
+  }
+  const atCustomSnap = customPoint != null
+    && comboSnap != null
+    && Math.abs(selected.peakBook - customPoint.peakBook) < 1e-3
+    && Math.abs(cover - comboSnap.cover) < 1e-3;
+  const portfolioChipId: CcyScenarioId | null = (
+    portfolioSuggestion?.scenarioId === 'unhedged'
+    || portfolioSuggestion?.scenarioId === 'carryTarget'
+    || portfolioSuggestion?.scenarioId === 'balanced'
+    || portfolioSuggestion?.scenarioId === 'custom'
+  ) ? portfolioSuggestion.scenarioId : null;
+  const selectedScenarioId: CcyScenarioId | null = (() => {
+    if (overlayFill) {
+      if (pinnedScenario) return pinnedScenario;
+      if (portfolioChipId && scenarioSetpoints[portfolioChipId]) return portfolioChipId;
+    }
+    if (preferCustomChip && atCustomSnap) return 'custom';
+    if (namedHit('unhedged')) return 'unhedged';
+    if (namedHit('swapHedged')) return 'swapHedged';
+    if (namedHit('carryTarget')) return 'carryTarget';
+    if (namedHit('balanced')) return 'balanced';
+    return portfolioChipId;
+  })();
+  const applyCcyScenario = (id: CcyScenarioId, point: LiquidityFrontierPoint) => {
+    if (overlayFill && (id === 'unhedged' || id === 'carryTarget' || id === 'balanced' || id === 'custom')) {
+      setPinnedScenario(id);
+      commit({ idx: 0, cover: 0 });
+      return;
+    }
+    setPinnedScenario(null);
+    if (id === 'unhedged') {
+      commit({ idx: 0, cover: 0 });
+      return;
+    }
+    if (id === 'custom' && comboSnap != null) {
+      commit({ idx: comboSnap.idx, cover: comboSnap.cover });
+      return;
+    }
+    select(point);
+  };
   const stepArm = (dir: number) => {
     const idx = armIdx + dir;
     if (idx < 0 || idx >= twins.length) return;
@@ -541,10 +1044,23 @@ export function LiquidityFrontierModal({
   };
   /** Snap back to the portfolio optimizer's own point, undoing any manual walk/drag. */
   const matchPortfolio = () => {
+    if (overlayFill && portfolioChipId) {
+      setPinnedScenario(portfolioChipId);
+      commit({ idx: 0, cover: 0 });
+      return;
+    }
+    if (comboSnap != null) {
+      commit({ idx: comboSnap.idx, cover: comboSnap.cover });
+      return;
+    }
     if (suggestedIdx < 0) return;
     commit({ idx: suggestedIdx, cover: 0 });
   };
-  const atSuggestion = suggestedIdx >= 0 && armIdx === suggestedIdx && cover < 1e-9;
+  const atSuggestion = overlayFill
+    ? selectedScenarioId === portfolioChipId
+    : comboSnap != null
+      ? armIdx === comboSnap.idx && Math.abs(cover - comboSnap.cover) < 1e-3
+      : suggestedIdx >= 0 && armIdx === suggestedIdx && cover < 1e-9;
   const deltaVsSuggestionM = suggestedStanding != null
     ? (isOrigin ? 0 : selected.peakBook) - suggestedStanding
     : null;
@@ -575,7 +1091,6 @@ export function LiquidityFrontierModal({
 
   const dialLabel = liquidityFrontierDialLabel(result.dial);
   const openHit = result.constraint.openHit;
-  const hedgeHit = result.constraint.hedgeHit;
   const cut =
     result.dial === 'carry_target' && result.constraint.hCarryUsdYrM != null
       ? {
@@ -633,28 +1148,55 @@ export function LiquidityFrontierModal({
                 Dial · {dialLabel}
               </HeaderChip>
               <HeaderChip>
-                Book S {result.bookStanding.toFixed(1)} M · cash {fmtK(result.bookCashK / 1000)}
+                {bookStandingChipLabel(
+                  result.bookStanding,
+                  scenarioSetpoints.carryTarget?.bookStandingUsdM
+                    ?? result.bookStanding * ccySpotRate(row.ccy),
+                )} · cash {fmtK(result.bookCashK / 1000)}
               </HeaderChip>
               <HeaderChip className="text-slate-400">
                 {constraintDetail || 'No layer'}
               </HeaderChip>
-              {suggestedStanding != null && portfolioSuggestion && (
+              {portfolioSuggestion && (
+                comboSnap != null
+                || suggestedStanding != null
+                || overlayFill
+              ) && (
                 <HeaderChip
                   className={atSuggestion ? 'text-violet-300' : 'text-violet-400/70'}
                 >
-                  Portfolio · {portfolioSuggestion.scenarioLabel} → S {suggestedStanding.toFixed(1)} M
-                  {!atSuggestion && deltaVsSuggestionM != null
+                  Portfolio · {portfolioSuggestion.scenarioLabel}
+                  {portfolioSuggestion.cfarUsdM != null
+                    && portfolioSuggestion.carryUsdYrM != null
+                    ? ` → ${fmtAbsK(portfolioSuggestion.cfarUsdM)} / ${fmtSignedK(portfolioSuggestion.carryUsdYrM)}`
+                    : comboTarget
+                      ? ` → ${fmtAbsK(comboTarget.cfarUsdM)} / ${fmtSignedK(comboTarget.carryUsdYrM)}`
+                      : suggestedStanding != null
+                        ? ` → S ${suggestedStanding.toFixed(1)} M`
+                        : ''}
+                  {!atSuggestion && deltaVsSuggestionM != null && comboSnap == null
                     ? ` (${deltaVsSuggestionM >= 0 ? '+' : '−'}${Math.abs(deltaVsSuggestionM).toFixed(1)} vs pick)`
                     : ''}
                 </HeaderChip>
               )}
               <HeaderChip className={
-                selected.totalCarryUsdYrM >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                (selectedScenarioId && scenarioSetpoints[selectedScenarioId]
+                  ? scenarioSetpoints[selectedScenarioId]!.carryUsdYrM
+                  : selected.totalCarryUsdYrM) >= 0
+                  ? 'text-emerald-300' : 'text-rose-300'
               }>
-                Return {fmtSignedK(selected.totalCarryUsdYrM)}
+                Return {fmtSignedK(
+                  selectedScenarioId && scenarioSetpoints[selectedScenarioId]
+                    ? scenarioSetpoints[selectedScenarioId]!.carryUsdYrM
+                    : selected.totalCarryUsdYrM,
+                )}
               </HeaderChip>
               <HeaderChip className="text-amber-300">
-                CFaR {fmtAbsK(selected.finalCfarUsdM)}
+                CFaR {fmtAbsK(
+                  selectedScenarioId && scenarioSetpoints[selectedScenarioId]
+                    ? scenarioSetpoints[selectedScenarioId]!.cfarUsdM
+                    : selected.finalCfarUsdM,
+                )}
               </HeaderChip>
               <HeaderChip className={
                 selectedWeighted >= 0 ? 'text-sky-300' : 'text-rose-300'
@@ -727,19 +1269,64 @@ export function LiquidityFrontierModal({
           </div>
 
           <div className="mb-3 rounded-[10px] border border-slate-700 bg-slate-950 p-3">
-            <div className="mb-2 flex flex-wrap items-baseline gap-3">
-              <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <span className="mr-1 font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
                 Carry vs CFaR
               </span>
+              {ccyScenarios.map(s => {
+                const on = selectedScenarioId === s.id;
+                const tone = SCENARIO_CHIP_TONE[s.id];
+                const chipCfar = s.displayCfarUsdM ?? s.point?.finalCfarUsdM;
+                const chipCarry = s.displayCarryUsdYrM ?? s.point?.totalCarryUsdYrM;
+                const hasChip = chipCfar != null && chipCarry != null;
+                return (
+                  <button
+                    key={s.id}
+                    type="button"
+                    disabled={!hasChip}
+                    onClick={() => {
+                      if (!s.point && s.source !== 'portfolio') return;
+                      applyCcyScenario(s.id, s.point ?? result.origin);
+                    }}
+                    className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border px-2 font-mono text-[10px] font-semibold ${
+                      !hasChip
+                        ? 'cursor-not-allowed border-slate-800 bg-slate-950/40 text-slate-600'
+                        : on
+                          ? tone.on
+                          : tone.off
+                    }`}
+                    title={hasChip
+                      ? `${s.label} — ${fmtAbsK(chipCfar)} CFaR, ${fmtSignedK(chipCarry)}/yr${s.source === 'portfolio' ? ` (${row.ccy} row)` : ''}`
+                      : (s.disabledHint ?? `${s.label} is not on this arm`)}
+                  >
+                    <span
+                      className="h-2 w-2 rounded-full"
+                      style={{ background: hasChip ? CCY_SCENARIO_COLORS[s.id] : '#475569' }}
+                    />
+                    <span>{s.label}</span>
+                    {hasChip ? (
+                      <span className={`font-medium tabular-nums ${on ? 'opacity-90' : 'text-slate-500'}`}>
+                        {fmtAbsK(chipCfar)} · {fmtSignedK(chipCarry)}
+                      </span>
+                    ) : (
+                      <span className="text-slate-600">n/a</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mb-2 flex flex-wrap items-baseline gap-3">
               <span className="font-mono text-[9px] text-slate-500">
-                Origin: carry $0 @ section {fmtAbsK(result.cfarOriginUsdM)} · frame = live book
+                Origin: carry $0 @ section {fmtAbsK(result.cfarOriginUsdM)}
+                · scroll in plot to zoom · drag to pan · double-click to reset
               </span>
               <span className="ml-auto flex flex-wrap gap-2.5">
                 <Legend swatch="solid" border="border-emerald-400" label="open · cash" />
                 <Legend swatch="solid" border="border-rose-400" label="far · cash + points" />
                 <Legend swatch="dashed" border="border-slate-400" label="leveraged" />
                 <Legend swatch="solid" border="border-yellow-400" label="Δ mix at S" />
-                <Legend swatch="dot" border="border-sky-400" label="sweet spot" />
+                <Legend swatch="dashed" border="border-amber-400" label="tangent from (0,0)" />
+                <Legend swatch="dot" border="border-sky-400" label="selected" />
               </span>
             </div>
             <FrontierPlot
@@ -754,9 +1341,13 @@ export function LiquidityFrontierModal({
               bookStanding={result.bookStanding}
               zoomOut={searching}
               confidencePct={confidencePct}
+              scenarios={ccyScenarios}
+              selectedScenarioId={selectedScenarioId}
             />
             <p className="mt-1.5 font-mono text-[9px] leading-snug text-slate-500">
-              Frame is the live book and the $0-carry origin. Drag Leverage to add a dashed tail — it clips, it does not zoom the plot out.
+              Frame is the live book and the $0-carry origin. Scroll inside the plot to zoom,
+              drag to pan, double-click to reset. Drag Leverage to add a dashed tail — it
+              clips, it does not zoom the plot out.
             </p>
           </div>
 
@@ -822,11 +1413,15 @@ export function LiquidityFrontierModal({
             <ControlField
               label={portfolioSuggestion ? 'Portfolio Δ · walk' : 'Walk the frontier'}
               hint={
-                suggestedStanding != null
+                comboSnap != null
                   ? (atSuggestion
-                    ? 'at portfolio pick'
-                    : `${deltaVsSuggestionM! >= 0 ? '+' : '−'}${Math.abs(deltaVsSuggestionM!).toFixed(1)} M vs ${portfolioSuggestion!.scenarioLabel}`)
-                  : (arm === 'mix' ? 'same S · Δ held' : arm === 'far' ? 'far arm' : 'open arm')
+                    ? `at ${portfolioSuggestion!.scenarioLabel} CFaR/carry`
+                    : `off ${portfolioSuggestion!.scenarioLabel} CFaR/carry`)
+                  : suggestedStanding != null
+                    ? (atSuggestion
+                      ? 'at portfolio pick'
+                      : `${deltaVsSuggestionM! >= 0 ? '+' : '−'}${Math.abs(deltaVsSuggestionM!).toFixed(1)} M vs ${portfolioSuggestion!.scenarioLabel}`)
+                    : (arm === 'mix' ? 'same S · Δ held' : arm === 'far' ? 'far arm' : 'open arm')
               }
             >
               <button
@@ -850,12 +1445,12 @@ export function LiquidityFrontierModal({
               >
                 ›
               </button>
-              {suggestedIdx >= 0 && (
+              {(comboSnap != null || suggestedIdx >= 0) && (
                 <button
                   type="button"
                   disabled={atSuggestion}
                   onClick={matchPortfolio}
-                  title={`Snap back to the ${portfolioSuggestion!.scenarioLabel} portfolio pick, undoing any manual walk`}
+                  title={`Snap back to the ${portfolioSuggestion?.scenarioLabel ?? 'portfolio'} CFaR/carry pick`}
                   className="h-[22px] shrink-0 rounded border border-violet-500/50 bg-violet-500/10 px-1.5 font-mono text-[9px] font-semibold text-violet-200 hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Match
@@ -943,6 +1538,8 @@ function FrontierPlot({
   bookStanding,
   zoomOut,
   confidencePct,
+  scenarios = [],
+  selectedScenarioId = null,
 }: {
   origin: LiquidityFrontierPoint;
   upper: readonly LiquidityFrontierPoint[];
@@ -955,7 +1552,37 @@ function FrontierPlot({
   bookStanding: number;
   zoomOut: boolean;
   confidencePct: number;
+  scenarios?: readonly CcyScenarioDef[];
+  selectedScenarioId?: CcyScenarioId | null;
 }) {
+  const clipRaw = useId();
+  const clipId = `liq-frontier-clip-${clipRaw.replace(/:/g, '')}`;
+  const svgRef = useRef<SVGSVGElement>(null);
+  const zoomRef = useRef<{
+    W: number;
+    H: number;
+    padL: number;
+    padT: number;
+    plotW: number;
+    plotH: number;
+    xMin: number;
+    xMax: number;
+    yMin: number;
+    yMax: number;
+    carryS: number;
+    dataFrame: CarryVarPlotView;
+    preferAspect: number;
+    setView: (next: CarryVarPlotView) => void;
+  } | null>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    lastSx: number;
+    lastSy: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
+  const [view, setView] = useState<CarryVarPlotView | null>(null);
+  const [panning, setPanning] = useState(false);
   const W = 680;
   const H = 340;
   const padL = 72;
@@ -982,22 +1609,35 @@ function FrontierPlot({
     ...hedgeSolid,
     ...(selected ? [selected] : []),
     ...isoSlice,
+    ...scenarios.flatMap(s => (s.point ? [s.point] : [])),
   ];
+  const portfolioCarry = scenarios.flatMap(s => (
+    s.displayCarryUsdYrM != null ? [s.displayCarryUsdYrM] : []
+  ));
+  const portfolioCfar = scenarios.flatMap(s => (
+    s.displayCfarUsdM != null ? [s.displayCfarUsdM] : []
+  ));
   const openCash = [
     0,
     ...openSolid.map(p => p.cashCarryUsdYrM),
     ...(selected ? [selected.totalCarryUsdYrM] : []),
+    ...scenarios.flatMap(s => (s.point ? [s.point.totalCarryUsdYrM] : [])),
+    ...portfolioCarry,
     ...(zoomOut ? [constraint.openHit?.carryUsdYrM ?? 0, constraint.hCarryUsdYrM ?? 0] : []),
   ].filter(v => Number.isFinite(v));
   const farCarry = [
     0,
     ...hedgeSolid.map(p => p.totalCarryUsdYrM),
     ...(selected ? [selected.totalCarryUsdYrM] : []),
-    ...(zoomOut ? [constraint.hedgeHit?.carryUsdYrM ?? 0] : []),
+    ...scenarios.flatMap(s => (
+      s.point && s.point.delta >= 1 - 1e-9 ? [s.point.totalCarryUsdYrM] : []
+    )),
+    constraint.hedgeHit?.carryUsdYrM ?? 0,
   ].filter(v => Number.isFinite(v));
   const cfars = [
     ...framePts.map(p => p.finalCfarUsdM),
     cfarOriginUsdM,
+    ...portfolioCfar,
     ...(zoomOut ? [
       constraint.vCfarUsdM ?? 0,
       constraint.openHit?.cfarUsdM ?? 0,
@@ -1006,19 +1646,182 @@ function FrontierPlot({
   ].filter(v => Number.isFinite(v) && v >= 0);
   const x0 = Math.max(0, cfarOriginUsdM);
   const cfarHi = Math.max(x0, ...cfars);
-  const xMax = Math.max(cfarHi * 1.08, x0 + 0.025);
-  const xMin = Math.max(0, x0 - (xMax - x0) * 0.28);
+  const autoXMax = Math.max(cfarHi * 1.08, x0 + 0.025);
+  const autoXMin = Math.max(0, x0 - (autoXMax - x0) * 0.28);
   const yMaxData = Math.max(0, ...openCash, 0.012);
   const yMinOpen = Math.min(0, ...openCash);
   const yMinFar = Math.min(0, ...farCarry);
   const { s: carryS, zPos, zNeg } = carryAxisFromArms(yMinOpen, yMaxData, yMinFar);
-  const zDen = zPos - zNeg;
+  let autoYMin = carryS * Math.sinh(zNeg);
+  const autoYMax = carryS * Math.sinh(zPos);
+  const farTipY = Math.min(
+    0,
+    ...farCarry.filter(v => v < -1e-6),
+    ...scenarios.flatMap(s => (
+      s.point && s.point.totalCarryUsdYrM < -1e-6 ? [s.point.totalCarryUsdYrM] : []
+    )),
+  );
+  if (farTipY < autoYMin - 1e-9) {
+    autoYMin = farTipY - Math.max(Math.abs(farTipY) * 0.12, 0.006);
+  }
+  const autoFrame: CarryVarPlotView = {
+    xMin: autoXMin,
+    xMax: autoXMax,
+    yMin: autoYMin,
+    yMax: autoYMax,
+  };
+  const worldPts = [origin, ...open, ...hedged, ...isoSlice, ...(selected ? [selected] : [])];
+  const allCfar = [
+    ...worldPts.map(p => p.finalCfarUsdM),
+    cfarOriginUsdM,
+    constraint.vCfarUsdM ?? 0,
+    constraint.openHit?.cfarUsdM ?? 0,
+    constraint.hedgeHit?.cfarUsdM ?? 0,
+  ].filter(v => Number.isFinite(v) && v >= 0);
+  const allCarry = [
+    ...worldPts.map(p => p.totalCarryUsdYrM),
+    0,
+    constraint.openHit?.carryUsdYrM ?? 0,
+    constraint.hedgeHit?.carryUsdYrM ?? 0,
+    constraint.hCarryUsdYrM ?? 0,
+  ].filter(Number.isFinite);
+  const yCoreMin = Math.min(autoFrame.yMin, ...allCarry, 0);
+  const yCoreMax = Math.max(autoFrame.yMax, ...allCarry, 0.012);
+  const zCore0 = carryFwd(yCoreMin, carryS);
+  const zCore1 = carryFwd(yCoreMax, carryS);
+  const zCorePad = Math.max(zCore1 - zCore0, 0.55);
+  const dataFrame: CarryVarPlotView = {
+    xMin: 0,
+    xMax: Math.max(autoFrame.xMax, ...allCfar, 0.05) * 1.2,
+    yMin: carryS * Math.sinh(zCore0 - zCorePad),
+    yMax: carryS * Math.sinh(zCore1 + zCorePad),
+  };
+
+  useEffect(() => {
+    setView(null);
+  }, [cfarOriginUsdM, bookStanding, confidencePct]);
+
+  const xMin = view?.xMin ?? autoFrame.xMin;
+  const xMax = view?.xMax ?? autoFrame.xMax;
+  const yMin = view?.yMin ?? autoFrame.yMin;
+  const yMax = view?.yMax ?? autoFrame.yMax;
+  const zMin = carryFwd(yMin, carryS);
+  const zMax = carryFwd(yMax, carryS);
+  const zDen = zMax - zMin;
   const xDen = xMax - xMin;
   const x = (v: number) => padL + (xDen > 1e-12 ? ((v - xMin) / xDen) * plotW : 0);
-  const y = (v: number) => padT + (1 - (carryFwd(v, carryS) - zNeg) / zDen) * plotH;
+  const y = (v: number) => padT + (1 - (carryFwd(v, carryS) - zMin) / (zDen || 1)) * plotH;
   const y0 = y(0);
-  const yTickMin = carryS * Math.sinh(zNeg);
-  const yTickMax = carryS * Math.sinh(zPos);
+  const yTickMin = yMin;
+  const yTickMax = yMax;
+  const originInX = x0 >= xMin - 1e-9 && x0 <= xMax + 1e-9;
+  const zeroInY = yMin <= 1e-12 && yMax >= -1e-12;
+  const autoZ0 = carryFwd(autoFrame.yMin, carryS);
+  const autoZ1 = carryFwd(autoFrame.yMax, carryS);
+  const preferAspect = (autoFrame.xMax - autoFrame.xMin)
+    / Math.max(autoZ1 - autoZ0, 1e-9);
+
+  zoomRef.current = {
+    W, H, padL, padT, plotW, plotH, xMin, xMax, yMin, yMax, carryS, dataFrame,
+    preferAspect, setView,
+  };
+
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      const z = zoomRef.current;
+      if (!z) return;
+      const pt = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+      if (!pt || !inPlotRect(pt.sx, pt.sy, z.padL, z.padT, z.plotW, z.plotH)) {
+        return;
+      }
+      e.preventDefault();
+      const raw = e.deltaMode === 1
+        ? e.deltaY * 16
+        : e.deltaMode === 2
+          ? Math.sign(e.deltaY) * z.plotH
+          : e.deltaY;
+      if (raw === 0) return;
+      const factor = Math.exp(Math.max(-12, Math.min(12, raw)) * (e.ctrlKey ? 0.0035 : 0.002));
+      if (Math.abs(factor - 1) < 0.001) return;
+      const xSpan = z.xMax - z.xMin;
+      const ax = z.xMin + ((pt.sx - z.padL) / z.plotW) * xSpan;
+      const zLo = carryFwd(z.yMin, z.carryS);
+      const zHi = carryFwd(z.yMax, z.carryS);
+      const az = zHi - ((pt.sy - z.padT) / z.plotH) * (zHi - zLo);
+      z.setView(clampCarryVarPlotView(
+        {
+          xMin: ax - (ax - z.xMin) * factor,
+          xMax: ax + (z.xMax - ax) * factor,
+          yMin: z.carryS * Math.sinh(az - (az - zLo) * factor),
+          yMax: z.carryS * Math.sinh(az + (zHi - az) * factor),
+        },
+        z.dataFrame,
+        z.carryS,
+        { x: ax, z: az },
+        z.preferAspect,
+      ));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const endPan = (e: PointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    if (drag.moved) {
+      suppressClickRef.current = true;
+      queueMicrotask(() => { suppressClickRef.current = false; });
+    }
+    dragRef.current = null;
+    setPanning(false);
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+  };
+
+  const onPlotPointerDown = (e: PointerEvent<SVGSVGElement>) => {
+    if (e.button !== 0) return;
+    const z = zoomRef.current;
+    const el = svgRef.current;
+    if (!z || !el) return;
+    const pt = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+    if (!pt || !inPlotRect(pt.sx, pt.sy, z.padL, z.padT, z.plotW, z.plotH)) return;
+    if (snapPointNear(pt.sx, pt.sy)) return;
+    dragRef.current = { pointerId: e.pointerId, lastSx: pt.sx, lastSy: pt.sy, moved: false };
+  };
+
+  const onPlotPointerMove = (e: PointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current;
+    const z = zoomRef.current;
+    const el = svgRef.current;
+    if (!drag || !z || !el || drag.pointerId !== e.pointerId) return;
+    const pt = svgLocalXY(el, e.clientX, e.clientY, z.W, z.H);
+    if (!pt) return;
+    const dSx = pt.sx - drag.lastSx;
+    const dSy = pt.sy - drag.lastSy;
+    if (!drag.moved && Math.hypot(dSx, dSy) < 3) return;
+    if (!drag.moved) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* already captured */ }
+    }
+    drag.moved = true;
+    drag.lastSx = pt.sx;
+    drag.lastSy = pt.sy;
+    if (!panning) setPanning(true);
+    const xSpan = z.xMax - z.xMin;
+    const zLo = carryFwd(z.yMin, z.carryS);
+    const zHi = carryFwd(z.yMax, z.carryS);
+    const zSpan = zHi - zLo;
+    z.setView(clampCarryVarPlotView(
+      {
+        xMin: z.xMin - (dSx / z.plotW) * xSpan,
+        xMax: z.xMax - (dSx / z.plotW) * xSpan,
+        yMin: z.carryS * Math.sinh(zLo + (dSy / z.plotH) * zSpan),
+        yMax: z.carryS * Math.sinh(zHi + (dSy / z.plotH) * zSpan),
+      },
+      z.dataFrame,
+      z.carryS,
+    ));
+  };
   const toPath = (pts: readonly LiquidityFrontierPoint[]) =>
     pts
       .map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.finalCfarUsdM).toFixed(1)},${y(p.totalCarryUsdYrM).toFixed(1)}`)
@@ -1029,8 +1832,16 @@ function FrontierPlot({
   const hedgeLevPath = hedgeSolid.length > 0
     ? [hedgeSolid[hedgeSolid.length - 1]!, ...hedgeLev]
     : [origin, ...hedgeLev];
-  const bookPt = openSolid[openSolid.length - 1] ?? null;
-  const bookFar = hedgeSolid[hedgeSolid.length - 1] ?? null;
+  const nearBookS = (pts: readonly LiquidityFrontierPoint[]) => {
+    if (pts.length === 0) return null;
+    if (!(Math.abs(bookStanding) > 0.01)) return pts[pts.length - 1] ?? null;
+    return pts.reduce((best, p) => (
+      Math.abs(p.peakBook - bookStanding) < Math.abs(best.peakBook - bookStanding)
+        ? p : best
+    ));
+  };
+  const bookPt = nearBookS(openSolid);
+  const bookFar = nearBookS(hedgeSolid);
   const xTickRaw = cfarKTicks(xMin, xMax);
   if (xMin <= 1e-9 && !xTickRaw.some(v => Math.abs(v) < 1e-9)) xTickRaw.unshift(0);
   if (x0 > 0 && !xTickRaw.some(v => Math.abs(v * 1000 - x0 * 1000) < 0.51)) {
@@ -1082,6 +1893,207 @@ function FrontierPlot({
       )
     : [];
   const isoDots = isoMixDotPoints(isoSlice).filter(inView);
+  const plotBox = { l: padL, t: padT, r: W - padR, b: H - padB };
+  const labelDrafts: PlotLabelDraft[] = [];
+  const labelAnchors: { ax: number; ay: number }[] = [];
+  const takeLabel = (draft: PlotLabelDraft) => {
+    if (labelAnchors.some(a => nearScreen(a.ax, a.ay, draft.ax, draft.ay, 16))) return;
+    labelAnchors.push({ ax: draft.ax, ay: draft.ay });
+    labelDrafts.push(draft);
+  };
+  if (originInX && zeroInY) {
+    takeLabel({
+      id: 'origin',
+      text: 'carry $0',
+      sub: `section ${fmtAbsK(x0)}`,
+      ax: x(x0),
+      ay: y0,
+      fill: '#e2e8f0',
+      prefer: 'below',
+    });
+  }
+  const swapSc = scenarios.find(s => s.id === 'swapHedged');
+  if (swapSc?.point && inView(swapSc.point)) {
+    takeLabel({
+      id: 'swapHedged',
+      text: `swap hedged ${fmtSignedK(swapSc.point.totalCarryUsdYrM)}`,
+      ax: x(swapSc.point.finalCfarUsdM),
+      ay: y(swapSc.point.totalCarryUsdYrM),
+      fill: '#fb7185',
+      prefer: 'below',
+    });
+  }
+  const scenarioPlotXy = (s: CcyScenarioDef): { x: number; y: number } | null => {
+    if (
+      typeof s.displayCfarUsdM === 'number' && Number.isFinite(s.displayCfarUsdM)
+      && typeof s.displayCarryUsdYrM === 'number' && Number.isFinite(s.displayCarryUsdYrM)
+    ) {
+      return { x: s.displayCfarUsdM, y: s.displayCarryUsdYrM };
+    }
+    if (!s.point) return null;
+    return { x: s.point.finalCfarUsdM, y: s.point.totalCarryUsdYrM };
+  };
+  const askXy = (() => {
+    const s = scenarios.find(sc => sc.id === 'carryTarget');
+    return s ? scenarioPlotXy(s) : null;
+  })();
+  if (askXy && !(zoomOut && constraint.hCarryUsdYrM != null)) {
+    takeLabel({
+      id: 'carryTargetLine',
+      text: `Carry Target ${fmtSignedK(askXy.y)}`,
+      ax: W - padR - 4,
+      ay: y(askXy.y),
+      fill: '#60a5fa',
+      prefer: 'left',
+    });
+  } else if (zoomOut && constraint.hCarryUsdYrM != null) {
+    takeLabel({
+      id: 'targetCarryLine',
+      text: `Target Carry ${fmtSignedK(constraint.hCarryUsdYrM)}`,
+      ax: W - padR - 4,
+      ay: y(constraint.hCarryUsdYrM),
+      fill: '#fbbf24',
+      prefer: 'left',
+    });
+  }
+  if (zoomOut && constraint.vCfarUsdM != null) {
+    takeLabel({
+      id: 'targetVar',
+      text: `Target VAR ${fmtAbsK(constraint.vCfarUsdM)}`,
+      ax: x(constraint.vCfarUsdM),
+      ay: padT + 10,
+      fill: '#38bdf8',
+      prefer: 'right',
+    });
+  }
+  const selSc = scenarios.find(s => s.id === selectedScenarioId);
+  const selXy = selSc ? scenarioPlotXy(selSc) : null;
+  if (
+    selSc
+    && selXy
+    && selXy.x >= xMin - 1e-6
+    && selXy.x <= xMax + 1e-6
+    && selSc.id !== 'unhedged'
+    && selSc.id !== 'swapHedged'
+  ) {
+    takeLabel({
+      id: `sel-${selSc.id}`,
+      text: selSc.label,
+      ax: x(selXy.x),
+      ay: y(selXy.y),
+      fill: CCY_SCENARIO_COLORS[selSc.id],
+      prefer: 'above',
+    });
+  }
+  const bookLabelPt = bookPt;
+  if (
+    bookPt
+    && Math.abs(bookStanding) > 0.01
+    && inView(bookPt)
+    && bookLabelPt
+  ) {
+    takeLabel({
+      id: 'bookS',
+      text: `book S ${bookStanding.toFixed(1)}`,
+      ax: x(bookLabelPt.finalCfarUsdM),
+      ay: y(bookLabelPt.totalCarryUsdYrM),
+      fill: '#e2e8f0',
+      prefer: 'below',
+    });
+  }
+  if (zoomOut && constraint.openHit) {
+    takeLabel({
+      id: 'openHit',
+      text: `open S ${constraint.openHit.standing.toFixed(1)} · ${fmtK(constraint.openHit.carryUsdYrM)}`,
+      ax: x(constraint.openHit.cfarUsdM),
+      ay: y(constraint.openHit.carryUsdYrM),
+      fill: '#e2e8f0',
+      prefer: 'above',
+    });
+  }
+  if (zoomOut && constraint.hedgeHit) {
+    takeLabel({
+      id: 'farHit',
+      text: `far S ${constraint.hedgeHit.standing.toFixed(1)} · ${fmtK(constraint.hedgeHit.carryUsdYrM)}`,
+      ax: x(constraint.hedgeHit.cfarUsdM),
+      ay: y(constraint.hedgeHit.carryUsdYrM),
+      fill: '#e2e8f0',
+      prefer: 'below',
+    });
+  }
+  if (zoomOut && tip && !constraint.openHit) {
+    takeLabel({
+      id: 'openTip',
+      text: `open S ${tip.peakBook.toFixed(1)}`,
+      ax: x(tip.finalCfarUsdM),
+      ay: y(tip.totalCarryUsdYrM),
+      fill: '#34d399',
+      prefer: 'above',
+    });
+  }
+  if (zoomOut && tipLo && !constraint.hedgeHit) {
+    takeLabel({
+      id: 'farTip',
+      text: `far S ${tipLo.peakBook.toFixed(1)}`,
+      ax: x(tipLo.finalCfarUsdM),
+      ay: y(tipLo.totalCarryUsdYrM),
+      fill: '#fb7185',
+      prefer: 'below',
+    });
+  }
+  const plotLabels = placePlotLabels(labelDrafts, plotBox);
+  const snapPointNear = (sx: number, sy: number) => {
+    let best: LiquidityFrontierPoint | null = null;
+    let bestD = 12;
+    for (const s of scenarios) {
+      if (!s.point) continue;
+      const d = Math.hypot(x(s.point.finalCfarUsdM) - sx, y(s.point.totalCarryUsdYrM) - sy);
+      if (d <= bestD) {
+        bestD = d;
+        best = s.point;
+      }
+    }
+    if (best) return best;
+    const candidates: LiquidityFrontierPoint[] = [
+      origin,
+      ...openInView,
+      ...hedgeInView,
+      ...isoDots,
+    ];
+    for (const p of candidates) {
+      const d = Math.hypot(x(p.finalCfarUsdM) - sx, y(p.totalCarryUsdYrM) - sy);
+      if (d <= bestD) {
+        bestD = d;
+        best = p;
+      }
+    }
+    return best;
+  };
+  const pickNearestAt = (clientX: number, clientY: number) => {
+    const el = svgRef.current;
+    const z = zoomRef.current;
+    if (!el || !z) return null;
+    const loc = svgLocalXY(el, clientX, clientY, z.W, z.H);
+    if (!loc) return null;
+    const named = snapPointNear(loc.sx, loc.sy);
+    if (named) return named;
+    const walk = [
+      origin,
+      ...open,
+      ...hedged,
+      ...isoSlice,
+    ];
+    let best: LiquidityFrontierPoint | null = null;
+    let bestD = 22;
+    for (const p of walk) {
+      const d = Math.hypot(x(p.finalCfarUsdM) - loc.sx, y(p.totalCarryUsdYrM) - loc.sy);
+      if (d < bestD) {
+        bestD = d;
+        best = p;
+      }
+    }
+    return best;
+  };
 
   const hitCircle = (
     p: LiquidityFrontierPoint,
@@ -1101,6 +2113,7 @@ function FrontierPlot({
           className="cursor-pointer"
           onClick={e => {
             e.stopPropagation();
+            if (suppressClickRef.current) return;
             onSelect(p);
           }}
           onMouseEnter={() => setHover({ p, kind })}
@@ -1118,7 +2131,11 @@ function FrontierPlot({
       </g>
     );
   };
+  const hoverScenario = hover
+    ? scenarios.find(s => s.point && samePt(s.point, hover.p))
+    : null;
   const hoverKindLabel = hover == null ? ''
+    : hoverScenario ? hoverScenario.label
     : hover.kind === 'origin' ? 'origin'
     : hover.kind === 'mix' ? `mix Δ ${(1 - hover.p.delta).toFixed(2)}`
     : hover.kind;
@@ -1129,10 +2146,36 @@ function FrontierPlot({
     : null;
 
   return (
-    <div className="relative">
-    <svg viewBox={`0 0 ${W} ${H}`} className="block w-full overflow-hidden rounded-md border border-slate-800 bg-slate-950/50">
+    <div className="relative" style={{ overscrollBehavior: 'contain' }}>
+      {view && (
+        <button
+          type="button"
+          onClick={() => setView(null)}
+          className="absolute left-2 top-2 z-10 font-mono text-[9px] text-sky-400 hover:text-sky-300"
+        >
+          reset zoom
+        </button>
+      )}
+    <svg
+      ref={svgRef}
+      viewBox={`0 0 ${W} ${H}`}
+      className="block w-full touch-none select-none overflow-hidden rounded-md border border-slate-800 bg-slate-950/50 outline-none focus:outline-none"
+      tabIndex={0}
+      role="img"
+      aria-label="Carry versus CFaR. Scroll to zoom, drag to pan, double-click to reset."
+      onDoubleClick={() => setView(null)}
+      onPointerDown={onPlotPointerDown}
+      onPointerMove={onPlotPointerMove}
+      onPointerUp={endPan}
+      onPointerCancel={endPan}
+      onClick={e => {
+        if (suppressClickRef.current) return;
+        const nearest = pickNearestAt(e.clientX, e.clientY);
+        if (nearest) onSelect(nearest);
+      }}
+    >
       <defs>
-        <clipPath id="liq-frontier-clip">
+        <clipPath id={clipId}>
           <rect x={padL} y={padT} width={plotW} height={plotH} />
         </clipPath>
       </defs>
@@ -1180,29 +2223,35 @@ function FrontierPlot({
           </text>
         </g>
       ))}
-      <line
-        x1={x(x0)}
-        y1={padT}
-        x2={x(x0)}
-        y2={H - padB}
-        stroke="#334155"
-        strokeWidth={1}
+      {originInX && (
+        <line
+          x1={x(x0)}
+          y1={padT}
+          x2={x(x0)}
+          y2={H - padB}
+          stroke="#334155"
+          strokeWidth={1}
+        />
+      )}
+      {zeroInY && (
+        <line
+          x1={padL}
+          y1={y0}
+          x2={W - padR}
+          y2={y0}
+          stroke="#94a3b8"
+          strokeWidth={1.2}
+        />
+      )}
+      <rect
+        x={padL}
+        y={padT}
+        width={plotW}
+        height={plotH}
+        fill="transparent"
+        className={panning ? 'cursor-grabbing' : 'cursor-grab'}
       />
-      <line
-        x1={padL}
-        y1={y0}
-        x2={W - padR}
-        y2={y0}
-        stroke="#94a3b8"
-        strokeWidth={1.2}
-      />
-      <text x={x(x0) + 8} y={y0 + 12} fontSize={8} fill="#e2e8f0">
-        carry $0
-      </text>
-      <text x={x(x0) + 8} y={y0 + 23} fontSize={8} fill="#94a3b8">
-        section {fmtAbsK(x0)}
-      </text>
-      <g clipPath="url(#liq-frontier-clip)">
+      <g clipPath={`url(#${clipId})`}>
       {openSolid.length > 0 && (
         <path d={toPath([origin, ...openSolid])} fill="none" stroke="#34d399" strokeWidth={1.8} />
       )}
@@ -1227,6 +2276,47 @@ function FrontierPlot({
       {hedgeLevPath.length > 1 && (
         <path d={toPath(hedgeLevPath)} fill="none" stroke="#fb7185" strokeWidth={1.4} strokeDasharray="5 4" />
       )}
+      {(() => {
+        const balanced = scenarios.find(s => s.id === 'balanced');
+        const bxy = balanced ? scenarioPlotXy(balanced) : null;
+        if (!bxy) return null;
+        const ox0 = x(0);
+        const oy0 = y(0);
+        const tx = x(bxy.x);
+        const ty = y(bxy.y);
+        const den = tx - ox0;
+        if (!(Math.abs(den) > 1e-6)) return null;
+        const slope = (ty - oy0) / den;
+        const xL = padL;
+        const xR = padL + plotW;
+        return (
+          <path
+            d={`M${xL.toFixed(1)},${(oy0 + slope * (xL - ox0)).toFixed(1)} L${xR.toFixed(1)},${(oy0 + slope * (xR - ox0)).toFixed(1)}`}
+            fill="none"
+            stroke="#f59e0b"
+            strokeWidth={1.15}
+            strokeDasharray="5 4"
+            opacity={0.85}
+          />
+        );
+      })()}
+      {(() => {
+        if (!askXy || (zoomOut && constraint.hCarryUsdYrM != null)) return null;
+        return (
+          <g>
+            <line
+              x1={padL}
+              y1={y(askXy.y)}
+              x2={W - padR}
+              y2={y(askXy.y)}
+              stroke="#60a5fa"
+              strokeWidth={1.1}
+              strokeDasharray="5 4"
+              opacity={0.9}
+            />
+          </g>
+        );
+      })()}
       {zoomOut && constraint.openHit && constraint.hedgeHit && (
         <line
           x1={x(constraint.openHit.cfarUsdM)}
@@ -1250,9 +2340,6 @@ function FrontierPlot({
             strokeWidth={1.2}
             strokeDasharray="4 3"
           />
-          <text x={W - padR - 4} y={y(constraint.hCarryUsdYrM) - 4} textAnchor="end" fontSize={8} fill="#fbbf24">
-            Target Carry {fmtSignedK(constraint.hCarryUsdYrM)}
-          </text>
         </g>
       )}
       {zoomOut && constraint.vCfarUsdM != null && (
@@ -1266,9 +2353,6 @@ function FrontierPlot({
             strokeWidth={1.2}
             strokeDasharray="4 3"
           />
-          <text x={x(constraint.vCfarUsdM) + 4} y={padT + 10} fontSize={8} fill="#38bdf8">
-            Target VAR {fmtAbsK(constraint.vCfarUsdM)}
-          </text>
         </g>
       )}
       {zoomOut && constraint.openHit && (
@@ -1281,14 +2365,6 @@ function FrontierPlot({
             stroke="#fbbf24"
             strokeWidth={2}
           />
-          <text
-            x={x(constraint.openHit.cfarUsdM) + 7}
-            y={y(constraint.openHit.carryUsdYrM) - 6}
-            fontSize={8}
-            fill="#e2e8f0"
-          >
-            open S {constraint.openHit.standing.toFixed(1)} · {fmtK(constraint.openHit.carryUsdYrM)}
-          </text>
         </g>
       )}
       {zoomOut && constraint.hedgeHit && (
@@ -1301,14 +2377,6 @@ function FrontierPlot({
             stroke="#fbbf24"
             strokeWidth={2}
           />
-          <text
-            x={x(constraint.hedgeHit.cfarUsdM) + 7}
-            y={y(constraint.hedgeHit.carryUsdYrM) + 12}
-            fontSize={8}
-            fill="#e2e8f0"
-          >
-            far S {constraint.hedgeHit.standing.toFixed(1)} · {fmtK(constraint.hedgeHit.carryUsdYrM)}
-          </text>
         </g>
       )}
       {hedgeInView.map((p, i) => (
@@ -1325,7 +2393,52 @@ function FrontierPlot({
         hitCircle(p, '#facc15', 3, `m-${p.delta.toFixed(4)}:${i}`, 'mix')
       ))}
       {hitCircle(origin, '#f8fafc', 6.5, 'origin', 'origin')}
-      {selected && Math.abs(selected.peakBook) > 1e-6 && (
+      {scenarios.map(s => {
+        const xy = scenarioPlotXy(s);
+        if (!xy) return null;
+        const fill = CCY_SCENARIO_COLORS[s.id];
+        const on = selectedScenarioId === s.id;
+        const p = s.point;
+        return (
+          <g key={`sc-${s.id}`}>
+            <circle
+              cx={x(xy.x)}
+              cy={y(xy.y)}
+              r={11}
+              fill="transparent"
+              className={p ? 'cursor-pointer' : undefined}
+              onPointerDown={e => e.stopPropagation()}
+              onClick={e => {
+                e.stopPropagation();
+                if (suppressClickRef.current || !p) return;
+                onSelect(p);
+              }}
+              onMouseEnter={() => {
+                if (!p) return;
+                setHover({
+                  p,
+                  kind: s.id === 'unhedged' ? 'origin' : s.id === 'swapHedged' ? 'far' : 'open',
+                });
+              }}
+              onMouseLeave={() => setHover(null)}
+            />
+            <circle
+              cx={x(xy.x)}
+              cy={y(xy.y)}
+              r={on ? 6.5 : 5}
+              fill={on ? '#38bdf8' : fill}
+              stroke={on ? '#e0f2fe' : '#0b1220'}
+              strokeWidth={on ? 1.5 : 1}
+              className="pointer-events-none"
+            />
+          </g>
+        );
+      })}
+      {selected && Math.abs(selected.peakBook) > 1e-6 && !(
+        selXy
+        && Math.abs(selected.finalCfarUsdM - selXy.x) < 1e-4
+        && Math.abs(selected.totalCarryUsdYrM - selXy.y) < 1e-4
+      ) && (
         <circle
           cx={x(selected.finalCfarUsdM)}
           cy={y(selected.totalCarryUsdYrM)}
@@ -1356,28 +2469,33 @@ function FrontierPlot({
               strokeWidth={1.5}
             />
           )}
-          <text
-            x={x((bookFar ?? bookPt).finalCfarUsdM)}
-            y={y((bookFar ?? bookPt).totalCarryUsdYrM) + 18}
-            textAnchor="middle"
-            fontSize={8}
-            fill="#e2e8f0"
-          >
-            book S {bookStanding.toFixed(1)}
-          </text>
         </g>
       )}
-      {zoomOut && tip && !constraint.openHit && (
-        <text x={x(tip.finalCfarUsdM) + 8} y={y(tip.totalCarryUsdYrM) - 6} fontSize={8} fill="#34d399">
-          open S {tip.peakBook.toFixed(1)}
-        </text>
-      )}
-      {zoomOut && tipLo && !constraint.hedgeHit && (
-        <text x={x(tipLo.finalCfarUsdM) + 8} y={y(tipLo.totalCarryUsdYrM) + 12} fontSize={8} fill="#fb7185">
-          far S {tipLo.peakBook.toFixed(1)}
-        </text>
-      )}
       </g>
+      {plotLabels.map(lab => (
+        <g key={lab.id} className="pointer-events-none">
+          <text
+            x={lab.x}
+            y={lab.y}
+            textAnchor={lab.anchor}
+            fontSize={8}
+            fill={lab.fill}
+          >
+            {lab.text}
+          </text>
+          {lab.sub && (
+            <text
+              x={lab.x}
+              y={lab.y + 11}
+              textAnchor={lab.anchor}
+              fontSize={8}
+              fill="#94a3b8"
+            >
+              {lab.sub}
+            </text>
+          )}
+        </g>
+      ))}
     </svg>
       {hoverTip && (
         <div className="pointer-events-none absolute right-2 top-2 rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[9px] font-semibold text-slate-200">

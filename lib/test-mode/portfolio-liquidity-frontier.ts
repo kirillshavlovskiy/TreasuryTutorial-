@@ -24,6 +24,7 @@ import {
 } from '@/lib/test-mode/var-confidence';
 import {
   bookCashCarryK,
+  carryEarnOrientedStanding,
   isoSSliceAlphas,
   leftEndOriginPoint,
   priceIsoSSlice,
@@ -208,7 +209,9 @@ export function regimePortfolioCfar(
 
 const SQRT_21 = Math.sqrt(21);
 
-/** Overlay FCY (H* − hold) + Swap Near. Not Swap Book / far outstanding. */
+/** Overlay FCY (H* − hold) + Swap Near. Not Swap Book / far outstanding.
+ *  Hedge-table Notional does not use this (never Overlay + Book S).
+ */
 export function overlayPlusNearFcyM(overlayFcyM: number, swapNearFcyM: number): number {
   const a = Number.isFinite(overlayFcyM) ? overlayFcyM : 0;
   const b = Number.isFinite(swapNearFcyM) ? swapNearFcyM : 0;
@@ -334,9 +337,13 @@ const DEFAULT_MAX_SCALE_BOOK = 1.4;
 
 function collectScales(overlayMode: boolean, sweetT = 1, maxScale?: number): number[] {
   const set = new Set<number>([0, 1]);
-  const n = overlayMode ? 48 : 36;
+  // Overlay matches the CCY modal: dense near the origin, then a long
+  // standing walk — not a handful of uniform chords.
+  const n = overlayMode ? 64 : 36;
   for (let i = 1; i <= n; i++) set.add(i / n);
-  for (const t of [0.01, 0.02, 0.04, 0.06, 0.08]) set.add(t);
+  for (const t of [0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08, 0.12]) {
+    set.add(t);
+  }
   if (overlayMode) {
     set.add(-1);
     for (let i = 1; i <= 16; i++) set.add(-i / 16);
@@ -399,6 +406,11 @@ export function buildPortfolioLiquidityFrontier(input: {
    * Default 1 — live is the cap. The sweet marker sits at this scale.
    */
   overlaySweetT?: number;
+  /**
+   * Open-arm upper scale only (overlay fill past the 3× mix). Far CIP
+   * stays on the short rate-vol walk — it does not inherit this.
+   */
+  maxScale?: number;
 }): PortfolioLiquidityFrontier {
   const overlayMap = input.overlayFcyByCcy;
   const overlayMode = overlayMap != null && Object.keys(overlayMap).length > 0;
@@ -411,7 +423,15 @@ export function buildPortfolioLiquidityFrontier(input: {
   // stay on the old multi-ccy curve.
   const books = input.result.byCcy.filter(c => rowByCcy.has(c.ccy)).map(c => {
     const row = rowByCcy.get(c.ccy);
-    const standing = signedPeakStanding(c.plan);
+    const rawStanding = signedPeakStanding(c.plan);
+    // Walk the swap-allocation book on the side that earns carry vs USD —
+    // a payer FCY held long prints a rising cost as if it were income.
+    const standing = row
+      ? carryEarnOrientedStanding(
+        rawStanding, ccySpotRate(row.ccy),
+        row.r_FCY, input.engine.shared.r_USD, row.r_OD,
+      )
+      : rawStanding;
     const overlayFcy = overlayMap?.[c.ccy];
     const sectionUsdM = sectionCfarUsdM(input.engine.cfarNetByCcyUsd, c.ccy);
     const bookCashK = row
@@ -524,26 +544,51 @@ export function buildPortfolioLiquidityFrontier(input: {
     return { armOpen, armFar };
   };
 
-  const defaultMaxScale = overlayMode ? DEFAULT_MAX_SCALE_OVERLAY : DEFAULT_MAX_SCALE_BOOK;
+  const requestedMax = typeof input.maxScale === 'number' && Number.isFinite(input.maxScale) && input.maxScale > 0
+    ? input.maxScale
+    : null;
+  const openDefaultScale = requestedMax
+    ?? (overlayMode ? DEFAULT_MAX_SCALE_OVERLAY : DEFAULT_MAX_SCALE_BOOK);
+  // Pink far is rate-vol / swap-points CFaR on the short CIP walk.
+  // Overlay fill may stretch green past t = 1; far must not follow.
+  const farDefaultScale = overlayMode
+    ? DEFAULT_MAX_SCALE_OVERLAY
+    : DEFAULT_MAX_SCALE_BOOK;
   const policyMaxUsd = POLICY_VAR_LIMITS[POLICY_VAR_LIMITS.length - 1]!.usd;
-  let openScale = defaultMaxScale;
-  const { armOpen: open0, armFar: far0 } = buildArms(openScale);
+  let openScale = openDefaultScale;
+  const { armOpen: open0 } = buildArms(openScale);
   let open = open0;
   // Book-scale only: open arm must reach the top policy rung ($20M) so
-  // Max Carry is a CFaR-fill. Overlay scale 1 is already the VAR cap.
-  const hardCeilingScale = defaultMaxScale * 12;
+  // Max Carry is a CFaR-fill. Overlay fill passes maxScale when Ask is
+  // past the 3× mix.
+  const hardCeilingScale = (overlayMode ? DEFAULT_MAX_SCALE_OVERLAY : DEFAULT_MAX_SCALE_BOOK) * 12;
   const openCfarHi = (arm: readonly PortfolioFrontierPoint[]) =>
     Math.max(0, ...arm.map(p => p.cfarUsdM).filter(Number.isFinite));
   if (!overlayMode) {
     for (let i = 0; i < 6 && openScale < hardCeilingScale; i++) {
       if (openCfarHi(open) >= policyMaxUsd - 1e-6) break;
+      // Stop chasing the $20M rung once the arm has rolled over into
+      // falling carry — those points are dominated (below the efficient
+      // envelope). A single- or few-name filtered universe never reaches
+      // the rung, so without this the arm dives to k = 16.8 for nothing
+      // and buries the useful region in a long negative-carry tail.
+      const tail = [...open]
+        .filter(p => p.scale > 1 - 1e-6 && Number.isFinite(p.carryUsdYrM))
+        .sort((a, b) => a.scale - b.scale);
+      const rolledOver = tail.length >= 2
+        && tail[tail.length - 1]!.carryUsdYrM < tail[tail.length - 2]!.carryUsdYrM
+        && tail.some((p, idx) => (
+          idx > 0 && p.carryUsdYrM <= 0 && tail[idx - 1]!.carryUsdYrM > 0
+        ));
+      if (rolledOver) break;
       openScale = Math.min(hardCeilingScale, openScale * 1.8);
       open = buildArms(openScale).armOpen;
     }
   }
-  // Far-arm CIP chase is independent — do not reuse that scale for green.
+  // Far-arm CIP chase is independent — do not reuse overlay-fill scale.
+  let farScale = farDefaultScale;
+  const { armFar: far0 } = buildArms(farScale);
   let far = far0;
-  let farScale = defaultMaxScale;
   for (let i = 0; i < 5 && farScale < hardCeilingScale; i++) {
     const tail = [...far]
       .filter(p => p.scale > 1 - 1e-6 && Number.isFinite(p.carryUsdYrM))
@@ -639,7 +684,10 @@ export function priceBooksAtScale(input: {
     const row = rowByCcy.get(c.ccy);
     if (!row) continue;
     seen.add(c.ccy);
-    const standing = signedPeakStanding(c.plan);
+    const standing = carryEarnOrientedStanding(
+      signedPeakStanding(c.plan), ccySpotRate(row.ccy),
+      row.r_FCY, input.engine.shared.r_USD, row.r_OD,
+    );
     books.push({
       ccy: c.ccy,
       standing,
@@ -806,6 +854,39 @@ export function priceRegimeChartCfar(input: {
   };
 }
 
+type CarryFrontierPt = {
+  k: number;
+  portfolioVarUsd: number;
+  totalCarryUsdYr: number;
+  floorBoundCcys: string[];
+  levered?: boolean;
+};
+
+/**
+ * Book-scale arm only: keep points up to the carry peak, then the
+ * descending run only until carry first drops to/through $0 (that
+ * zero-crossing point is kept so the curve visibly returns to the axis).
+ * Everything past it is dominated — drop it. Overlay walks are returned
+ * untouched (they are already bounded at the mix cap).
+ */
+function trimDominatedBookTail(
+  pts: CarryFrontierPt[],
+  walk: 'overlay' | 'book-scale',
+): CarryFrontierPt[] {
+  if (walk === 'overlay' || pts.length < 3) return pts;
+  let peakIdx = 0;
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i]!.totalCarryUsdYr > pts[peakIdx]!.totalCarryUsdYr) peakIdx = i;
+  }
+  // Peak is at (or near) the end — nothing dominated to trim.
+  if (peakIdx >= pts.length - 2) return pts;
+  let cut = pts.length - 1;
+  for (let i = peakIdx + 1; i < pts.length; i++) {
+    if (pts[i]!.totalCarryUsdYr <= 0) { cut = i; break; }
+  }
+  return pts.slice(0, cut + 1);
+}
+
 /**
  * Same standing walk as the per-currency left-end: S(t) = t × S_book.
  * Conservative is t = 1 on that arm — not a second pricer after a kink.
@@ -829,20 +910,25 @@ export function toPortfolioCarryFrontier(
     levered: p.levered,
   });
   const originX = origin.portfolioVarUsd;
-  const opens = [...liq.open]
-    .filter(p => (
-      (liq.walk === 'overlay' ? p.scale >= -1 - 1e-9 : p.scale > 1e-9)
-      && Number.isFinite(p.cfarUsdM)
-      && p.cfarUsdM >= originX - 1e-6
-    ))
+  const opensRaw = [...liq.open]
+    .filter(p => {
+      if (!Number.isFinite(p.cfarUsdM)) return false;
+      if (liq.walk === 'overlay') return p.scale >= -1e-9;
+      return p.scale > 1e-9 && p.cfarUsdM >= originX - 1e-6;
+    })
     .sort((a, b) => a.scale - b.scale)
     .map(toPt);
+  // Book-scale: drop the strictly-dominated deep tail. Once carry has
+  // peaked and fallen back below the origin carry ($0), further points sit
+  // under the efficient envelope — on a filtered universe that can't reach
+  // the $20M rung they otherwise run out to k ≈ 16.8 and bury the chart.
+  const opens = trimDominatedBookTail(opensRaw, liq.walk);
   const fars = [...liq.far]
-    .filter(p => (
-      (liq.walk === 'overlay' ? p.scale >= -1 - 1e-9 : p.scale > 1e-9)
-      && Number.isFinite(p.cfarUsdM)
-      && p.cfarUsdM >= originX - 1e-6
-    ))
+    .filter(p => {
+      if (!Number.isFinite(p.cfarUsdM)) return false;
+      if (liq.walk === 'overlay') return p.scale >= -1e-9;
+      return p.scale > 1e-9 && p.cfarUsdM >= originX - 1e-6;
+    })
     .sort((a, b) => a.scale - b.scale)
     .map(toPt);
   const points = [origin, ...opens];
@@ -868,6 +954,50 @@ export function toPortfolioCarryFrontier(
     // already priced at fixed, meaningful scales — S(t) fractions/multiples
     // of the book — not an arbitrary sampling grid to interpolate between).
     tangencyIndex: frontierTangencyIndex(points, origin.portfolioVarUsd, origin.totalCarryUsdYr),
+  };
+}
+
+/**
+ * Swap fill: the FIXED operating book (k = 1) walked by HEDGE COVERAGE, not
+ * notional. `liq.mix` is the open→far iso-S slice at the live standing;
+ * cover 0 = fully open (Unhedged), cover 1 = far leg on (hedged). Remap to
+ * k = 1 − cover so k = 0 is the hedged end and k = 1 is fully open, and the
+ * scenario helpers (Unhedged / Balanced / Carry Target / Max Policy Risk)
+ * read it the same way as the book-scale walk.
+ */
+export function toSwapHedgeCoverageFrontier(
+  liq: PortfolioLiquidityFrontier,
+): PortfolioCarryFrontier | null {
+  const originX = Math.max(0, liq.origin.cfarUsdM);
+  const pts = [...liq.mix]
+    .filter(p => Number.isFinite(p.cfarUsdM) && Number.isFinite(p.carryUsdYrM))
+    .map(p => ({
+      k: 1 - p.cover,
+      portfolioVarUsd: p.cfarUsdM,
+      totalCarryUsdYr: p.carryUsdYrM,
+      floorBoundCcys: [] as string[],
+      levered: false,
+    }))
+    .sort((a, b) => a.k - b.k);
+  if (pts.length === 0) return null;
+  const origin = {
+    k: 0,
+    portfolioVarUsd: originX > 1e-9 ? originX : pts[0]!.portfolioVarUsd,
+    totalCarryUsdYr: 0,
+    floorBoundCcys: [] as string[],
+    levered: false,
+  };
+  const points = [origin, ...pts.filter(p => p.k > 1e-9)];
+  return {
+    points,
+    farPoints: [origin],
+    sweetSpotIndex: -1,
+    nearestClampCcy: null,
+    nearestClampVarUsd: null,
+    walk: 'book-scale',
+    tangencyIndex: frontierTangencyIndex(
+      points, origin.portfolioVarUsd, origin.totalCarryUsdYr,
+    ),
   };
 }
 

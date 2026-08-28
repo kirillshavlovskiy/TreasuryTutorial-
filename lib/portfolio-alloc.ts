@@ -22,7 +22,8 @@ import {
 const SQRT_21 = Math.sqrt(21);
 const RIDGE = 1e-8;
 /** Rate-differential materiality scale (decimal, 15bp) — see solveCarryVarUsd. */
-const MATERIALITY_MU = 0.0015;
+export const OVERLAY_MATERIALITY_MU = 0.0015;
+const MATERIALITY_MU = OVERLAY_MATERIALITY_MU;
 /**
  * Max gross notional per currency, as a multiple of the active VAR cap —
  * see solveCarryVarUsd's pin-and-resolve loop. A correlated Σ⁻¹μ solve can
@@ -36,6 +37,12 @@ const MATERIALITY_MU = 0.0015;
  * $20M policy cap was still an unreasonable multiple.)
  */
 export const OVERLAY_MAX_LEG_LEVERAGE = 3;
+/**
+ * Carry-target fill may walk past 3× when Policy VAR still has room.
+ * 12× is the old desk ceiling — enough for ~$1.3M overlay on an $11.6M cap
+ * at EUR debit (~1.3%), without dropping the per-name bound entirely.
+ */
+export const OVERLAY_CARRY_TARGET_MAX_LEG_LEVERAGE = 12;
 /**
  * Second, independent ceiling: a leg's overlay notional also can't exceed
  * this multiple of that CURRENCY's own real base book (|basesFcy_i| ×
@@ -109,6 +116,12 @@ export interface CarryVarAllocInput {
    * sweet spot) must never set this — the whole point is to cap them.
    */
   skipLeverageCap?: boolean;
+  /**
+   * Per-name notional cap as a multiple of Policy VAR. Default 3.
+   * Carry-target fill may pass {@link OVERLAY_CARRY_TARGET_MAX_LEG_LEVERAGE}
+   * when 3× cannot reach the ask and Policy VAR still has room.
+   */
+  maxLegLeverage?: number;
 }
 
 export interface CarryVarAllocResult {
@@ -162,6 +175,10 @@ export interface EfficientCarryLeg {
    * column; usdM/fcyM are notional, not risk.
    */
   componentVarUsdM: number;
+  /** Book base (M FCY) so a scaled t can reprice the credit/debit split. */
+  baseFcyM?: number;
+  rOdPct?: number;
+  rUsdPct?: number;
 }
 
 export interface EfficientCarryVarFrontier {
@@ -334,6 +351,12 @@ function solveCarryVarUsd(input: CarryVarAllocInput): CarryVarSolve | null {
     if (Math.abs(pin[i]!) > 1e-12) continue;
     if (CORR_CURRENCIES.indexOf(ccys[i]!) < 0) continue;
     if (!CURRENCY_PARAMS[ccys[i]!]) continue;
+    // Dust μ on an empty book must not enter Σ⁻¹μ. A 0.3bp GBP with
+    // baseFcy=0 was filling 3×VAR as a "harvest long" offset so EUR could
+    // sit at −$43M — $1k of carry, $43M of fake notional.
+    const dust = Math.abs(mu[i]!) < MATERIALITY_MU;
+    const bookKnownEmpty = basesFcy != null && Math.abs(basesFcy[i] ?? 0) < 1e-6;
+    if (dust && bookKnownEmpty) continue;
     freeIdx.push(i);
   }
   const pinnedOnly = (): CarryVarSolve => {
@@ -419,7 +442,12 @@ function solveCarryVarUsd(input: CarryVarAllocInput): CarryVarSolve | null {
   // budget because one low-vol leg needed a huge notional to matter for
   // VAR at all.
   if (kVar > 1e-12 && !input.skipLeverageCap) {
-    const capLeverageUsdM = cap * MAX_LEG_LEVERAGE;
+    const lev = (
+      typeof input.maxLegLeverage === 'number'
+      && Number.isFinite(input.maxLegLeverage)
+      && input.maxLegLeverage > 0
+    ) ? input.maxLegLeverage : MAX_LEG_LEVERAGE;
+    const capLeverageUsdM = cap * lev;
     if (capLeverageUsdM > 0) {
       const wAtKVar = addScaled(pin, dir, kVar);
       freeIdx.forEach((i) => {
@@ -431,7 +459,12 @@ function solveCarryVarUsd(input: CarryVarAllocInput): CarryVarSolve | null {
           // A missing/zero trough proxy must not zero the leg. PAY names
           // often have cash+payout ≤ 0 — that used to drop PLN/GBP and
           // leave a ~$5M EUR-only overlay.
-          if (baseUsdM > 1e-6) {
+          // Harvest legs (short PAY / long EARN) size from Policy VAR, not
+          // 2× cash. A 1.3M EUR OD buffer was clipping the short at −2.52M
+          // FCY while the row still printed the funding-book's ~$1M carry.
+          const harvest = Math.abs(mu[i]!) >= MATERIALITY_MU
+            && ((mu[i]! < 0 && w < 0) || (mu[i]! > 0 && w > 0));
+          if (baseUsdM > 1e-6 && !harvest) {
             ceilingUsdM = Math.min(ceilingUsdM, baseUsdM * MAX_BASE_MULTIPLE);
           }
         }
@@ -524,13 +557,22 @@ export function allocateCarryVarUsd(input: CarryVarAllocInput): CarryVarAllocRes
 export function overlayBookBaseFcyM(row: {
   cash: number;
   payout: number;
+  collections?: number;
   carry_target?: number | null;
+  cash_floor?: number;
+  /** Unhedged FX book (M FCY). RowState.spot is this — not the FX rate. */
+  fxExposureM?: number;
 }): number {
+  const trough = row.cash + row.payout;
+  const close = trough + (row.collections ?? 0);
   return Math.max(
     Math.abs(row.cash),
     Math.abs(row.payout),
-    Math.abs(row.cash + row.payout),
+    Math.abs(trough),
+    Math.abs(close),
     Math.abs(row.carry_target ?? 0),
+    Math.abs(row.cash_floor ?? 0),
+    Math.abs(row.fxExposureM ?? 0),
   );
 }
 
@@ -572,6 +614,9 @@ function legsFromUsd(
       fcyM,
       side: overlaySide(usdM),
       carryUsdYrM: usdM * legCarryRate(mu[i]!, finalFcy, rOd?.[i], r_USD),
+      ...(basesFcy ? { baseFcyM: basesFcy[i] } : {}),
+      ...(rOd ? { rOdPct: rOd[i] } : {}),
+      ...(r_USD != null ? { rUsdPct: r_USD } : {}),
     };
   }).sort((a, b) => Math.abs(b.usdM) - Math.abs(a.usdM));
 }
@@ -580,6 +625,17 @@ function legsFromUsd(
  * Σ⁻¹μ ray at fraction `t` of the Policy VAR fill (t = 0 hold, t = 1 cap).
  * Weights are linear on the ray; component VAR is recomputed at the scaled book.
  */
+/** Overlay carry at a scaled notional — reprice the credit/debit split when the leg has a book base. */
+export function overlayLegCarryAtUsd(l: EfficientCarryLeg, usdM: number): number {
+  if (l.baseFcyM == null || l.rOdPct == null || l.rUsdPct == null) {
+    if (Math.abs(l.usdM) < 1e-12) return 0;
+    return l.carryUsdYrM * (usdM / l.usdM);
+  }
+  const spot = CURRENCY_PARAMS[l.ccy]?.spot ?? 1;
+  const fcyM = spot > 1e-12 ? usdM / spot : 0;
+  return usdM * legCarryRate(l.mu, l.baseFcyM + fcyM, l.rOdPct, l.rUsdPct);
+}
+
 export function scaleOverlayLegs(
   legs: readonly EfficientCarryLeg[],
   t: number,
@@ -598,7 +654,7 @@ export function scaleOverlayLegs(
       ...l,
       usdM,
       fcyM: l.fcyM * s,
-      carryUsdYrM: l.carryUsdYrM * s,
+      carryUsdYrM: overlayLegCarryAtUsd(l, usdM),
       componentVarUsdM: varByCcy.get(l.ccy) ?? l.componentVarUsdM * s,
       side: overlaySide(usdM),
     };

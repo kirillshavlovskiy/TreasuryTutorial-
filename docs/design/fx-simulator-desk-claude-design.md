@@ -171,7 +171,7 @@ ZONES (top → bottom)
    uncertainty (%) · Exposure period pills 0m/1m/3m/6m/9m/1y · right actions
    "Forecast profile…" (disabled at 0m, violet "custom" badge) + "Reset table"
 3. Layers row: Min floor [gear + count badge] · Payout σ buffer · Carry target ·
-   Portfolio VAR; then (FX tab only) Hedging strategy: Swap only / +Fwd / +Option
+   Portfolio VAR; then (FX tab only) Hedging strategy: Swap Strip / Fwd Strip / Option Strip
 4. Conditional strips: per-CCY min-floor panel (gear) · violet Portfolio VAR
    sensitivity-limit band (presets + slider + overlay readouts)
 5. Book table — 9 column bands: RATES gray · FX POSITION white · LIQUIDITY sky ·

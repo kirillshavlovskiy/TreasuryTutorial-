@@ -1,5 +1,5 @@
 /**
- * Swap + Forward Δ — Cash Carry gross forward, CIP reallocation, and
+ * Fwd Strip Δ — Cash Carry near-strip forward and
  * liquidity-book isolation (remaining far never enters liquidityCycles).
  */
 import { describe, expect, it } from 'vitest';
@@ -70,14 +70,12 @@ function planCycle(cycleIndex: number, standing: number): LiquidityCycleProjecti
   } as unknown as LiquidityCycleProjection;
 }
 
-describe('Swap+Fwd Δ — carry reallocation', () => {
-  it('gross forward carry rises exactly as retained CIP falls (matched curves)', () => {
+describe('Fwd Strip Δ — near-only outright', () => {
+  it('CIP stays 0; outright points rise with Δ', () => {
     const E = 20;
     const S = 8;
     const r_FCY = 1.49;
     const r_USD = 3.50;
-    const spot = fcyToUsdM(1, 'CAD');
-    const fullCip = fundingSwapCipPointsUsdYr(S, spot, r_FCY, r_USD);
 
     const carries = [0, 0.5, 1].map(delta =>
       resolveStrategyHedge('SWAP_FWD', {
@@ -95,15 +93,17 @@ describe('Swap+Fwd Δ — carry reallocation', () => {
       }),
     );
 
-    expect(carries[0]!.cipCarryUsdYr).toBeCloseTo(fullCip, 9);
-    expect(carries[1]!.cipCarryUsdYr).toBeCloseTo(fullCip * 0.5, 9);
+    expect(carries[0]!.cipCarryUsdYr).toBeCloseTo(0, 9);
+    expect(carries[1]!.cipCarryUsdYr).toBeCloseTo(0, 9);
     expect(carries[2]!.cipCarryUsdYr).toBeCloseTo(0, 9);
+    expect(carries[0]!.remainingFarLocalM).toBeCloseTo(0, 6);
+    expect(carries[1]!.remainingFarLocalM).toBeCloseTo(0, 6);
 
     expect(Math.abs(carries[2]!.fwdCarryUsdYr)).toBeGreaterThan(
       Math.abs(carries[0]!.fwdCarryUsdYr),
     );
-    expect(carries[0]!.hedgeCarryUsdYr).toBeCloseTo(carries[1]!.hedgeCarryUsdYr, 6);
-    expect(carries[1]!.hedgeCarryUsdYr).toBeCloseTo(carries[2]!.hedgeCarryUsdYr, 6);
+    expect(carries[0]!.hedgeCarryUsdYr).toBeCloseTo(0, 6);
+    expect(carries[2]!.hedgeCarryUsdYr).toBeCloseTo(carries[2]!.fwdCarryUsdYr, 6);
   });
 
   it('Cash Carry FWD pts rise with Δ when overlay forward is injected', () => {
@@ -274,15 +274,17 @@ describe('Swap+Fwd Δ — liquidity-book isolation', () => {
     const overlay = allocateSwapForwardOverlay({
       exposureLocalM: 10,
       swapNearLocalM: 5,
-      delta: 0.5,
+      delta: 0.25,
     });
     expect(Math.abs(overlay.remainingFarLocalM)).toBeGreaterThan(0);
+    // Δ ≠ ½ so −ΔS and −(1−Δ)S are distinct — extras must be the outright only.
+    expect(overlay.forwardLocalM).not.toBeCloseTo(overlay.remainingFarLocalM, 6);
 
     const extras = analyticsForwardsFromOverlays({
       overlayByCcy: { EUR: overlay },
       forecastMonths: 6,
     });
-    // Only the outright forward is emitted — never RemainingFar.
+    // Only the outright buffer far is emitted — never RemainingFar.
     expect(extras).toHaveLength(1);
     expect(extras[0]!.amountLocalM).toBeCloseTo(overlay.forwardLocalM, 9);
     expect(extras[0]!.amountLocalM).not.toBeCloseTo(

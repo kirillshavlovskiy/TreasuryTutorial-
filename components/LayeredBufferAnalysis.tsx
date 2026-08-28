@@ -38,7 +38,7 @@ const LAYER_DEFS: LayerDef[] = [
     layers: FORECAST_ACCURACY_LAYERS,
     label: 'Forecast accuracy',
     formula: 'Payout σ → H*',
-    hint: 'Payout-σ sizes the funding swap. FX Net CFaR is USD P&L — not Swap Near.',
+    hint: 'Payout-σ sizes Swap Near. FX Net CFaR reserves USD after hedge cover — not extra FCY.',
     activeColor: '#0ea5e9',
     textColor: 'text-sky-700',
     bg: 'bg-sky-50 border-sky-200',
@@ -749,8 +749,9 @@ export function LayeredBufferAnalysis({
         if (!usdRow) return null;
         const reserved = usdRow.raw_sum ?? usdRow.cash_threshold;
         const fcySwapUsd = sumFcySwapNearUsd(layerRows.map(r => ({ ccy: r.ccy, swapNear: r.swap_needed })));
-        const available = (usdRow as { usd_available_for_fcy?: number }).usd_available_for_fcy ?? Math.max(0, usdCash - reserved);
-        const shortfall = (usdRow as { usd_fcy_shortfall?: number }).usd_fcy_shortfall ?? Math.max(0, Math.max(0, fcySwapUsd) - available);
+        const cfarReserved = usdRow.usd_cfar_reserved ?? 0;
+        const available = usdRow.usd_available_for_fcy ?? Math.max(0, usdCash - reserved - cfarReserved);
+        const shortfall = usdRow.usd_fcy_shortfall ?? Math.max(0, Math.max(0, fcySwapUsd) - available);
         const binding = (usdRow as { budget_binding?: boolean }).budget_binding ?? shortfall > 0.001;
         const stressBinding = (usdRow as { usd_stress_binding?: boolean }).usd_stress_binding;
         const stressTrimmed = layerRows.filter(r => (r as { usd_stress_trim?: boolean }).usd_stress_trim);
@@ -760,8 +761,8 @@ export function LayeredBufferAnalysis({
         return (
           <div className={`rounded-lg border px-4 py-3 text-xs space-y-2 ${binding ? 'bg-orange-50 border-orange-300' : 'bg-slate-50 border-slate-200'}`}>
             <div className="font-semibold text-gray-700">
-              USD liquidity constraint
-              <span className="font-normal text-gray-400 ml-1">— payout buffer reserved first; then FCY collateral</span>
+              USD capital waterfall
+              <span className="font-normal text-gray-400 ml-1">— WC then residual CFaR; leftover funds FCY swaps</span>
               <span className={`ml-2 font-medium ${liquidityMode === 'stress' ? 'text-orange-700' : 'text-green-700'}`}>
                 {liquidityMode === 'stress' ? 'STRESS rebalance' : 'NORMAL optimization'}
               </span>
@@ -792,12 +793,13 @@ export function LayeredBufferAnalysis({
                 USD sufficient — full portfolio optimization (incl. sell low-yield PAY / receive USD)
               </div>
             )}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 font-mono">
+            <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 font-mono">
               <div><span className="text-gray-500">LP cash</span><div className="font-bold">${f2(usdCash)}M</div></div>
-              <div><span className="text-gray-500">Reserved (H* USD)</span><div className="font-bold text-amber-800">${f2(reserved)}M</div><div className="text-gray-400 font-sans text-[10px]">|payout| + min floor + σ buffer</div></div>
-              <div><span className="text-gray-500">Available for FCY</span><div className={`font-bold ${available < Math.max(0, fcySwapUsd) ? 'text-orange-700' : 'text-green-700'}`}>${f2(available)}M</div></div>
-              <div><span className="text-gray-500">FCY swap need</span><div className="font-bold">${f2(fcySwapUsd)}M</div></div>
-              <div><span className="text-gray-500">USD funding leg</span><div className="font-bold">${f2(usdRow.swap_needed)}M</div>{binding && <div className="text-red-600 font-sans font-semibold">Shortfall ${f2(shortfall)}M</div>}</div>
+              <div><span className="text-gray-500">WC reserved</span><div className="font-bold text-amber-800">${f2(reserved)}M</div><div className="text-gray-400 font-sans text-[10px]">payout σ / H_USD</div></div>
+              <div><span className="text-gray-500">CFaR reserved</span><div className="font-bold text-sky-800">${f2(cfarReserved)}M</div><div className="text-gray-400 font-sans text-[10px]">FX-only Net after cover</div></div>
+              <div><span className="text-gray-500">Leftover</span><div className={`font-bold ${available < Math.max(0, fcySwapUsd) ? 'text-orange-700' : 'text-green-700'}`}>${f2(available)}M</div></div>
+              <div><span className="text-gray-500">FCY consumed</span><div className="font-bold">${f2(Math.max(0, fcySwapUsd))}M</div></div>
+              <div><span className="text-gray-500">Shortfall</span><div className={`font-bold ${shortfall > 0.001 ? 'text-red-600' : 'text-gray-500'}`}>${f2(shortfall)}M</div></div>
             </div>
           </div>
         );
@@ -853,7 +855,13 @@ export function LayeredBufferAnalysis({
             const anyBudgetBinding = layerRows.some(r => (r as { budget_binding?: boolean }).budget_binding);
             const anyVarTrim = layerRows.some(r => (r as { var_trim?: boolean }).var_trim);
             const anyProblem = anyBudgetBinding || anyStressTrim || anyVarTrim;
-            const fcyBudget = computeFcyCollateralBudget(usdCash, layerRows.find(r => r.ccy === 'USD')?.raw_sum ?? 0);
+            const usdLayer = layerRows.find(r => r.ccy === 'USD');
+            const fcyBudget = computeFcyCollateralBudget(
+              usdCash,
+              usdLayer?.raw_sum ?? 0,
+              usdLayer?.usd_cfar_reserved ?? 0,
+              usdPayout,
+            );
             const statusColor = anyProblem ? 'bg-amber-50 border border-amber-200' : 'bg-green-50 border border-green-200';
             return (
               <div className={`flex items-center flex-wrap gap-3 rounded px-3 py-1.5 text-xs ${statusColor}`}>
@@ -888,7 +896,13 @@ export function LayeredBufferAnalysis({
           {/* Key metrics row */}
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
             {(() => {
-              const fcyBudget = computeFcyCollateralBudget(usdCash, layerRows.find(r => r.ccy === 'USD')?.raw_sum ?? 0);
+              const usdLayer = layerRows.find(r => r.ccy === 'USD');
+              const fcyBudget = computeFcyCollateralBudget(
+                usdCash,
+                usdLayer?.raw_sum ?? 0,
+                usdLayer?.usd_cfar_reserved ?? 0,
+                usdPayout,
+              );
               const usdCommitted = activeLayers.has('carryOptim')
                 ? layerRows.reduce((sum, r) => {
                     const p = CURRENCY_PARAMS[r.ccy];

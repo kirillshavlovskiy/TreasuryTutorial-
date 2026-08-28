@@ -366,6 +366,7 @@ describe('buildPortfolioLiquidityFrontier', () => {
     const f = toPortfolioCarryFrontier(liq);
     const tabSum = 0.36 + 0.22;
     expect(liq.origin.cfarUsdM).toBeCloseTo(tabSum, 8);
+    expect(liq.origin.cfarUsdM).not.toBeCloseTo(Math.hypot(0.36, 0.22), 4);
     expect(f.points[0]!.portfolioVarUsd).toBeCloseTo(tabSum, 8);
     expect(f.points[0]!.totalCarryUsdYr).toBeCloseTo(0, 8);
     expect(f.farPoints[0]!.portfolioVarUsd).toBeCloseTo(tabSum, 8);
@@ -426,7 +427,11 @@ describe('buildPortfolioLiquidityFrontier', () => {
       expect(far!.cfarUsdM).toBeGreaterThanOrEqual(tabSum - 1e-6);
       expect(open.cfarUsdM).toBeGreaterThanOrEqual(tabSum - 1e-6);
       expect(far!.cfarUsdM).toBeLessThan(open.cfarUsdM - 0.001);
+      expect(far!.carryUsdYrM).toBeLessThan(open.carryUsdYrM - 1e-9);
     }
+    const farHold = liq.far.find(p => Math.abs(p.scale - 1) < 1e-6);
+    expect(farHold).toBeDefined();
+    expect(farHold!.carryUsdYrM).toBeLessThan(0);
     const plotTwins = f.points.filter(p => (
       p.k > 0.25 && f.farPoints.some(q => Math.abs(q.k - p.k) < 1e-6)
     ));
@@ -548,7 +553,7 @@ describe('buildPortfolioLiquidityFrontier', () => {
       overlayFcyByCcy: { EUR: -12, GBP: 8 },
     });
     expect(port.walk).toBe('overlay');
-    expect(port.open.length).toBeGreaterThan(8);
+    expect(port.open.length).toBeGreaterThan(30);
     expect(port.sweetScale).toBe(1);
   });
 
@@ -676,6 +681,33 @@ describe('buildPortfolioLiquidityFrontier', () => {
     expect(mix0.carryUsdYrM).toBeCloseTo(liveOpen!.carryUsdYrM, 5);
     expect(mix1.cfarUsdM).toBeCloseTo(liveFar!.cfarUsdM, 5);
     expect(mix1.carryUsdYrM).toBeCloseTo(liveFar!.carryUsdYrM, 5);
+  });
+
+  it('overlay maxScale stretches open only — far CIP stays on the rate-vol walk', () => {
+    const results = evaluateLiquidityStrategies(stratInput);
+    const rolling = results.find(r => r.strategy.id === 'rollingProgramme')!;
+    const port = buildPortfolioLiquidityFrontier({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows,
+      engine,
+      overlayFcyByCcy: { EUR: -12, GBP: 8 },
+      overlaySweetT: 0,
+      maxScale: 8,
+    });
+    const openHi = Math.max(...port.open.map(p => p.scale));
+    const farHi = Math.max(...port.far.map(p => p.scale));
+    expect(openHi).toBeGreaterThanOrEqual(8 - 1e-6);
+    expect(farHi).toBeLessThan(8 - 0.5);
+    const farHold = port.far.find(p => Math.abs(p.scale - 1) < 1e-6);
+    expect(farHold).toBeDefined();
+    const farXhi = Math.max(...port.far.map(p => p.cfarUsdM));
+    const openXhi = Math.max(...port.open.map(p => p.cfarUsdM));
+    expect(farXhi).toBeLessThan(openXhi * 0.6);
+    expect(farXhi).toBeLessThan(farHold!.cfarUsdM * 4 + 0.25);
+    const chart = toPortfolioCarryFrontier(port);
+    expect(chart.walk).toBe('overlay');
+    expect(chart.points.filter(p => p.k > 0.5).length).toBeGreaterThan(3);
   });
 
   it('overlay CFaR vs carry is a curve, not the linear VAR/μ chord', () => {

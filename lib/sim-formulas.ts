@@ -14,7 +14,8 @@ export type SimFieldKey =
   | 'troughCash' | 'cycleNetFlow' | 'totalCash' | 'totalCashUSD'
   | 'targetLpCash' | 'targetLpCashUSD'
   | 'swapNear' | 'swapUSD' | 'lpSwap' | 'lpSwapUSD' | 'cycleEnd' | 'cycleEndUSD'
-  | 'fwdHedgeUSD' | 'optionHedgeUSD';
+  | 'fwdHedgeFCY' | 'hedgeDelta' | 'fwdHedgeUSD' | 'optionHedgeUSD'
+  | 'cipCarry' | 'hedgeCarry' | 'hedgeCash' | 'bufferCarry';
 
 export interface SimFieldDef {
   key: SimFieldKey;
@@ -48,8 +49,15 @@ export const SIM_FIELDS: SimFieldDef[] = [
   { key: 'lpSwapUSD',     label: 'LP+Swap $USD',       section: 'swap',      defaultFormula: 'lpSwap * spotRate' },
   { key: 'cycleEnd',      label: 'Cycle End',          section: 'swap',      defaultFormula: 'modelCycleEnd' },
   { key: 'cycleEndUSD',   label: 'Cycle End $USD',     section: 'swap',      defaultFormula: 'cycleEnd * spotRate' },
-  { key: 'fwdHedgeUSD',   label: 'Fwd Hedge $USD',     section: 'hedge',     defaultFormula: 'fwdNotional * spotRate' },
+  { key: 'fwdHedgeFCY',   label: 'Fwd Hedge',          section: 'hedge',     defaultFormula: 'fwdNotional' },
+  // Model Δ lives in the base scope — empty default means "use that value".
+  { key: 'hedgeDelta',    label: 'Δ',                  section: 'hedge',     defaultFormula: '' },
+  { key: 'fwdHedgeUSD',   label: 'USD Hedge',          section: 'hedge',     defaultFormula: 'fwdHedgeFCY * spotRate' },
   { key: 'optionHedgeUSD', label: 'Option Hedge $USD', section: 'hedge',     defaultFormula: 'optNotional * optDelta * spotRate' },
+  { key: 'cipCarry',      label: 'CIP',                section: 'hedge',     defaultFormula: '' },
+  { key: 'hedgeCarry',    label: 'Hedge Carry',        section: 'hedge',     defaultFormula: 'cipCarry' },
+  { key: 'hedgeCash',     label: 'Hedge Cash',         section: 'carry',     defaultFormula: '' },
+  { key: 'bufferCarry',   label: 'Buffer Carry',       section: 'hedge',     defaultFormula: '' },
 ];
 
 export const SIM_FIELD_BY_KEY: Record<SimFieldKey, SimFieldDef> =
@@ -139,9 +147,18 @@ export const AVAILABLE_REFS: { name: string; desc: string }[] = [
   { name: 'spotRate',       desc: 'USD per 1 FCY' },
   { name: 'netFxFCY',       desc: 'Net FX book (M FCY)' },
   { name: 'netFxForecast',  desc: 'Cycle-end net FX forecast (M FCY)' },
-  { name: 'fwdNotional',    desc: 'Model forward notional (M FCY)' },
-  { name: 'optNotional',    desc: 'Model option notional (M FCY)' },
+  { name: 'fwdNotional',    desc: 'Buffer fwd hedge shown in Fwd Hedge (M FCY, − = sell FCY far)' },
+  { name: 'optNotional',    desc: 'Option notional replacing the buffer far (M FCY)' },
   { name: 'optDelta',       desc: 'Option delta' },
+  { name: 'remainingFar',   desc: 'Unreplaced swap far (M FCY)' },
+  { name: 'bufferHedge',    desc: 'Buffer hedge = −standing (swap far). 0 if naked spot' },
+  { name: 'fwdHedgeFCY',    desc: 'Fwd / buffer hedge (M FCY, − = sell FCY far)' },
+  { name: 'hedgeDelta',     desc: 'Hedge ratio Δ (0–1) — Fwd Strip near fraction, or Option Strip δ' },
+  { name: 'fwdCarryUsd',    desc: 'Outright forward points ($M)' },
+  { name: 'cipCarry',       desc: 'Retained far-leg CIP ($M)' },
+  { name: 'hedgeCarry',     desc: 'Hedged-swap far-leg CIP — same $M as Liquidity CIP ($M)' },
+  { name: 'hedgeCash',      desc: 'Predetermined staged FWD-points cash ($M)' },
+  { name: 'bufferCarry',    desc: 'Buffer carry — cash Δr on the standing swap ($M)' },
   { name: 'modelTrough',    desc: 'Model trough cash — dated path low including FX settlement, no funding swap (M FCY)' },
   { name: 'modelCycleNet',  desc: 'Model closing balance — cycle-1 close across all forecast lines, before the swap (M FCY)' },
   { name: 'modelCycleEnd',  desc: 'Model cycle-end cash — last close on the dated path after hedge settlement and the term far-leg repayment (M FCY)' },

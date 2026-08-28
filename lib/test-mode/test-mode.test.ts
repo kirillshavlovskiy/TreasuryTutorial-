@@ -59,8 +59,14 @@ import {
   proposeHigherVarHedge,
   rowsForSelectedCurrencies,
   scoreTask01,
+  scoreTask02,
+  expectedTask02CarryUsdM,
   seedNordtechWorkspace,
   simSeedForEntity,
+  mergedEntityForecastProfile,
+  task02ForecastProfile,
+  TASK02_CARRY_CCYS,
+  TASK02_FORECAST_MONTHS,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
   TASK01_REQUIRED_FX_INPUTS,
@@ -68,6 +74,10 @@ import {
   type VarSetup,
 } from '@/lib/test-mode';
 import { usdToFcyM } from '@/lib/fx-buffer';
+import {
+  buildEfficientCarryVarFrontier,
+  overlayBookBaseFcyM,
+} from '@/lib/portfolio-alloc';
 import { periodFlowSumLocalM, periodFxFlowSumLocalM } from '@/lib/forecast-profile';
 import {
   createDashboard,
@@ -198,6 +208,160 @@ describe('NordTech seed exposures', () => {
       1.9 + 1.2 * 12,
       6,
     );
+  });
+
+  it('Task 01 seed stays EUR + GBP on GmbH and no MXN on US', () => {
+    const entities = seedNordtechWorkspace().entities;
+    const de = entities.find(e => classifyNordtechEntity(e) === 'DE')!;
+    const us = entities.find(e => classifyNordtechEntity(e) === 'US')!;
+    expect(simSeedForEntity(de).rows.map(r => r.ccy)).toEqual(['EUR', 'GBP']);
+    expect(simSeedForEntity(us).rows).toHaveLength(0);
+    const book = consolidateEntityBooks(entities);
+    expect(book.rows.map(r => r.ccy).sort()).toEqual(['EUR', 'GBP', 'PLN']);
+  });
+
+  it('Task 02 seed adds GBP cash, JPY overdraft and MXN LatAm cash', () => {
+    const entities = seedNordtechWorkspace().entities;
+    const de = entities.find(e => classifyNordtechEntity(e) === 'DE')!;
+    const us = entities.find(e => classifyNordtechEntity(e) === 'US')!;
+    const deSeed = simSeedForEntity(de, '02');
+    const usSeed = simSeedForEntity(us, '02');
+    expect(deSeed.rows.map(r => r.ccy)).toEqual(['EUR', 'GBP', 'JPY']);
+    expect(deSeed.rows.find(r => r.ccy === 'GBP')!.spot).toBeCloseTo(2.0, 6);
+    expect(deSeed.rows.find(r => r.ccy === 'JPY')!.spot).toBeCloseTo(-900, 6);
+    expect(usSeed.rows.map(r => r.ccy)).toEqual(['MXN']);
+    expect(usSeed.rows[0]!.spot).toBeCloseTo(90, 6);
+    const book = consolidateEntityBooks(entities, '02');
+    expect(book.rows.map(r => r.ccy).sort()).toEqual([...TASK02_CARRY_CCYS].sort());
+  });
+
+  it('Task 02 forecast ships NWC, profit, spend and debt on every exposure', () => {
+    const entities = seedNordtechWorkspace().entities;
+    const fp = mergedEntityForecastProfile(entities, '02');
+    const full = task02ForecastProfile();
+    for (const ccy of TASK02_CARRY_CCYS) {
+      const ex = fp.extrasByCcy[ccy];
+      expect(ex, ccy).toBeDefined();
+      expect(ex).toEqual(full.extrasByCcy[ccy]);
+      expect(
+        Math.abs(ex!.nwcIn) + Math.abs(ex!.nwcOut),
+        `${ccy} NWC`,
+      ).toBeGreaterThan(0);
+    }
+    expect(fp.extrasByCcy.EUR.debtOut).toBeLessThan(0);
+    expect(fp.extrasByCcy.MXN.debtOut).toBeLessThan(0);
+    expect(fp.extrasByCcy.JPY.debtOut).toBeLessThan(0);
+    expect(fp.flatGrowthByCcy?.MXN?.nwcIn).toBeGreaterThan(0);
+    expect(fp.flatGrowthByCcy?.JPY?.nwcOut).toBeGreaterThan(0);
+
+    const book = consolidateEntityBooks(entities, '02');
+    const byCcy = Object.fromEntries(book.rows.map(r => [r.ccy, r]));
+    expect(byCcy.EUR!.collections).toBeCloseTo(1.2, 6);
+    expect(byCcy.EUR!.payout).toBeCloseTo(-0.45, 6);
+    expect(byCcy.GBP!.collections).toBeGreaterThan(0);
+    expect(byCcy.GBP!.payout).toBeLessThan(0);
+    expect(byCcy.PLN!.collections).toBeGreaterThan(0);
+    expect(byCcy.PLN!.payout).toBeCloseTo(-1.8, 6);
+    expect(byCcy.MXN!.collections).toBeGreaterThan(0);
+    expect(byCcy.MXN!.payout).toBeLessThan(0);
+    expect(byCcy.JPY!.collections).toBeGreaterThan(0);
+    expect(byCcy.JPY!.payout).toBeLessThan(0);
+  });
+
+  it('Task 02 overlay frontier longs MXN and shorts JPY at a funded sweet spot', () => {
+    const book = consolidateEntityBooks(seedNordtechWorkspace().entities, '02');
+    const rows = book.rows.filter(r => TASK02_CARRY_CCYS.includes(r.ccy as typeof TASK02_CARRY_CCYS[number]));
+    const rUsd = 3.5;
+    const fr = buildEfficientCarryVarFrontier({
+      ccys: rows.map(r => r.ccy),
+      mu: rows.map(r => (r.r_FCY - rUsd) / 100),
+      varCapUsdM: 10,
+      basesFcy: rows.map(r => overlayBookBaseFcyM(r)),
+      rOd: rows.map(r => r.r_OD),
+      r_USD: rUsd,
+    });
+    expect(fr).not.toBeNull();
+    const mxn = fr!.legs.find(l => l.ccy === 'MXN');
+    const jpy = fr!.legs.find(l => l.ccy === 'JPY');
+    expect(mxn?.side).toBe('long');
+    expect(jpy?.side).toBe('short');
+    expect(fr!.sweet.carryUsdYrM).toBeGreaterThan(0);
+    expect(fr!.sweet.varUsdM).toBeGreaterThan(0);
+    expect(fr!.legs.some(l => l.side === 'long')).toBe(true);
+    expect(fr!.legs.some(l => l.side === 'short')).toBe(true);
+  });
+});
+
+function answersForTask02(
+  extras: Partial<ReturnType<typeof emptyAnswers>> = {},
+) {
+  const exp = expectedTask02CarryUsdM();
+  const k = (usdM: number) => String(Math.round(usdM * 1000 * 10) / 10);
+  return {
+    ...emptyAnswers(),
+    carryForecastMonths: String(TASK02_FORECAST_MONTHS),
+    carryEurUsdK: k(exp.byCcy.EUR),
+    carryGbpUsdK: k(exp.byCcy.GBP),
+    carryPlnUsdK: k(exp.byCcy.PLN),
+    carryMxnUsdK: k(exp.byCcy.MXN),
+    carryJpyUsdK: k(exp.byCcy.JPY),
+    carryAllCcyUsdK: k(exp.allCcy),
+    carryEarnCcy: exp.earnCcy,
+    carryPayCcy: exp.payCcy,
+    ...extras,
+  };
+}
+
+describe('Task 02 scoring — five-currency do-nothing carry', () => {
+  it('reference book has five exposures and distinct EARN vs PAY', () => {
+    const exp = expectedTask02CarryUsdM();
+    expect(Object.keys(exp.byCcy).sort()).toEqual([...TASK02_CARRY_CCYS].sort());
+    expect(exp.earnCcy).not.toBe(exp.payCcy);
+    expect(exp.byCcy[exp.earnCcy]).toBeGreaterThan(exp.byCcy[exp.payCcy]);
+    expect(exp.byCcy.EUR).toBeGreaterThan(0);
+    expect(exp.byCcy.MXN).toBeGreaterThan(0);
+    expect(exp.allCcy).toBeCloseTo(
+      TASK02_CARRY_CCYS.reduce((s, c) => s + exp.byCcy[c], 0),
+      8,
+    );
+  });
+
+  it('passes when do-nothing $K and EARN/PAY match the Cash Carry engine', () => {
+    const result = scoreTask02(completeWorkspace(), answersForTask02(), true);
+    expect(result.pass).toBe(true);
+  });
+
+  it('rejects a wrong MXN carry and a swapped EARN/PAY pair', () => {
+    const exp = expectedTask02CarryUsdM();
+    const wrongMxn = scoreTask02(
+      completeWorkspace(),
+      answersForTask02({ carryMxnUsdK: String(exp.byCcy.MXN * 1000 + 80) }),
+      true,
+    );
+    expect(wrongMxn.checks.find(c => c.id === 'carryMxn')!.pass).toBe(false);
+    expect(wrongMxn.pass).toBe(false);
+
+    const swapped = scoreTask02(
+      completeWorkspace(),
+      answersForTask02({
+        carryEarnCcy: exp.payCcy,
+        carryPayCcy: exp.earnCcy,
+      }),
+      true,
+    );
+    expect(swapped.checks.find(c => c.id === 'carryEarn')!.pass).toBe(false);
+    expect(swapped.checks.find(c => c.id === 'carryPay')!.pass).toBe(false);
+  });
+
+  it('requires Tf = 12 and Group FX opened', () => {
+    const tf = scoreTask02(
+      completeWorkspace(),
+      answersForTask02({ carryForecastMonths: '6' }),
+      true,
+    );
+    expect(tf.checks.find(c => c.id === 'carryTf')!.pass).toBe(false);
+    const closed = scoreTask02(completeWorkspace(), answersForTask02(), false);
+    expect(closed.checks.find(c => c.id === 'groupDashboard')!.pass).toBe(false);
   });
 });
 

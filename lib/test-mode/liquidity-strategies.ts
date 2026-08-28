@@ -34,6 +34,7 @@
 
 import { fundedPlanFor } from '@/lib/dashboard-model';
 import {
+  allocateResidualSwapForwardOverlay,
   analyticsForwardsFromOverlays,
   clampHedgeDelta,
   type SwapForwardOverlay,
@@ -317,36 +318,27 @@ function residualRiskOverlay(
   row: RowState,
   plan: readonly LiquidityCycleProjection[],
   delta: number,
+  r_USD: number,
 ): SwapForwardOverlay {
-  const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
   // `delta` here is the frontier's own convention (1 = open/nothing hedged,
-  // 0 = far/fully hedged). forwardLocalM/remainingFarLocalM etc. below are
-  // self-consistent with THAT convention and stay unchanged — they're the
-  // real notional amounts. But the stored `delta:` field feeds
-  // retainedFundingPlanByCcy (via displayedCfarAtResidual →
-  // displayedNetFromFx), which is proven (see its own test) to expect the
-  // OPPOSITE hedge-coverage convention (Δ=1 = fully hedged). Storing
-  // `residual` there directly made a fully-open position (nothing hedged)
-  // read as fully hedged, retaining ZERO of its real funding-swap CFaR
-  // bridge instead of all of it — see overlayDeltaStub's matching fix.
-  const residual = clampHedgeDelta(delta);
-  const E = fxBookNetLocalM(row);
+  // 0 = far/fully hedged). Stored overlay.delta is hedge coverage (1−residual)
+  // for CIP retention / CFaR bridge. Both-pay (PLN) buy-forwards are rewritten
+  // as a sell of |Swap Near| — same rule as allocateSwapForwardOverlay.
   const S = plan[0]?.swap_needed ?? 0;
   const standing = plan.reduce(
     (best, p) => (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
     0,
   );
-  const net = E + S;
-  return {
-    delta: 1 - residual,
-    exposureLocalM: E,
+  return allocateResidualSwapForwardOverlay({
+    exposureLocalM: fxBookNetLocalM(row),
     swapNearLocalM: S,
     swapStandingLocalM: standing,
-    forwardLocalM: dust(-(1 - residual) * net),
-    remainingFarLocalM: dust(-residual * S),
-    residualNearLocalM: dust(residual * S),
-    finalNetLocalM: dust(residual * net),
-  };
+    residual: delta,
+    r_FCY: row.r_FCY,
+    r_USD,
+    r_OD: row.r_OD,
+    spot: ccySpotRate(row.ccy),
+  });
 }
 
 function displayedCfarAtResidual(
@@ -363,7 +355,7 @@ function displayedCfarAtResidual(
   for (const c of result.byCcy) {
     const row = rowByCcy.get(c.ccy);
     if (!row) continue;
-    overlays[c.ccy] = residualRiskOverlay(row, c.plan, delta);
+    overlays[c.ccy] = residualRiskOverlay(row, c.plan, delta, input.shared.r_USD);
   }
   const fx = fxHedgeMcCfarByCcy({
     rows: input.rows,
@@ -597,6 +589,38 @@ export function strategyBookCarryK(
   const swap = byCcy.reduce((s, c) => s + usdMToCarryK(c.swapInterestUsdYrM), 0);
   const cip = byCcy.reduce((s, c) => s + usdMToCarryK(c.swapPointsUsdYrM), 0);
   return { cash, hedge, swap, cip, total: cash + hedge + swap + cip };
+}
+
+/**
+ * Regime-table carry stack. Cash Carry is the Cash Carry tab All-CCY total
+ * (desk cash + FWD) — identical on every programme. Unhedged has no funding
+ * swap, so Swap / CIP are 0 and Total = Cash Carry (columns add).
+ */
+export function regimeTableCarryUsdM(input: {
+  unhedged: boolean;
+  book: Pick<ReturnType<typeof strategyBookCarryK>, 'cash' | 'hedge' | 'swap' | 'cip' | 'total'>;
+  /** Cash Carry tab All-CCY Total ($M). */
+  cashCarryTabUsdM?: number | null;
+  /**
+   * Overlay μ on the live mix ($M/yr). Never pass levered plot Y
+   * (`k × standing`) — that is the Carry Target chart badge, not the strip.
+   */
+  overlayCarryUsdYr?: number | null;
+}): { cash: number; swap: number; cip: number; total: number } {
+  const tab = input.cashCarryTabUsdM;
+  const cash = typeof tab === 'number' && Number.isFinite(tab)
+    ? tab
+    : (input.book.cash + input.book.hedge) / 1000;
+  if (input.unhedged) {
+    return { cash, swap: 0, cip: 0, total: cash };
+  }
+  const swap = input.book.swap / 1000;
+  const cip = input.book.cip / 1000;
+  const overlay = typeof input.overlayCarryUsdYr === 'number'
+    && Number.isFinite(input.overlayCarryUsdYr)
+    ? input.overlayCarryUsdYr
+    : 0;
+  return { cash, swap, cip, total: cash + swap + cip + overlay };
 }
 
 export function swapLegScheduleWithCarry(

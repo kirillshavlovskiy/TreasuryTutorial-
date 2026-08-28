@@ -644,6 +644,21 @@ export function fundingSwapCashDeltaUsdYr(
   return standingSwap * ((fcyRate - r_USD) / 100) * spot;
 }
 
+/**
+ * True when long credit *and* short/OD both pay vs USD (PLN straddling r_USD).
+ * Cash can stay a cost; the only earn is selling FCY far (CIP). A buy-forward
+ * would print cash PAY + points PAY.
+ */
+export function bothSidesPayVsUsd(
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+  r_OD?: number,
+): boolean {
+  return fundingSwapCashDeltaUsdYr(1, spot, r_FCY, r_USD, r_OD) < -1e-12
+    && fundingSwapCashDeltaUsdYr(-1, spot, r_FCY, r_USD, r_OD) < -1e-12;
+}
+
 /** One cycle's overlay as a month fraction of the annual rate (sums across M1…MT). */
 export function fundingSwapMonthCarryUsdM(
   standingSwap: number,
@@ -810,6 +825,84 @@ export function fundingSwapCarryLegs(input: {
     return sum;
   })();
   return { cashUsdM, fcyOnUsdM };
+}
+
+/**
+ * Split `total` across `raw` in the same shape. Σ out === total (last month
+ * eats IEEE remainder). Empty / zero shape parks the whole total on M1.
+ */
+export function allocateToTotal(raw: readonly number[], total: number): number[] {
+  const n = raw.length;
+  if (n === 0) return [];
+  const t = Number.isFinite(total) ? total : 0;
+  const s = raw.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
+  if (Math.abs(s) < 1e-15) {
+    return raw.map((_, i) => (i === 0 ? t : 0));
+  }
+  const out = raw.map(v => t * ((Number.isFinite(v) ? v : 0) / s));
+  const drift = t - out.reduce((a, b) => a + b, 0);
+  out[n - 1] += drift;
+  return out;
+}
+
+/**
+ * One visible cycle's Buffer Carry — same booking rules as
+ * {@link fundingSwapCarryLegs}. Desk month rows must sum back to the header.
+ */
+export function fundingSwapMonthBufferUsdM(input: {
+  plan: readonly {
+    standing_swap: number;
+    far_leg?: number;
+    cycleIndex?: number;
+    swap_needed?: number;
+  }[];
+  cycleIndex: number;
+  ccy: string;
+  r_FCY: number;
+  r_USD: number;
+  r_OD?: number;
+  forecastMonths?: number;
+  bookingMode?: 'rolling' | 'term' | 'stripTerm';
+}): number {
+  const plan = input.plan;
+  if (!plan.length) return 0;
+  const i = input.cycleIndex;
+  const p = plan[i];
+  if (!p) return 0;
+  const spot = ccySpotRate(input.ccy);
+
+  if (input.bookingMode === 'stripTerm') {
+    const horizon = Math.max(1, input.forecastMonths ?? plan.length);
+    const notional = p.swap_needed ?? p.standing_swap;
+    if (Math.abs(notional) < 1e-9) return 0;
+    const tenor = Math.max(0, horizon - (p.cycleIndex ?? i));
+    if (tenor < 1e-9) return 0;
+    return fundingSwapCashDeltaUsdYr(
+      notional, spot, input.r_FCY, input.r_USD, input.r_OD,
+    ) * (tenor / FUNDING_SWAP_MONTHS_PA);
+  }
+
+  const term = input.bookingMode
+    ? input.bookingMode === 'term'
+    : plan.some(x => Math.abs(x.far_leg ?? 0) > 0.001);
+  if (term) {
+    const standing = plan[0]!.standing_swap;
+    const tenor = Math.max(
+      fundingSwapFarSettleMonths(plan, input.forecastMonths ?? plan.length),
+      input.forecastMonths ?? 0,
+      plan.length,
+    );
+    const n = Math.max(1, tenor);
+    if (i < 0 || i >= Math.min(n, plan.length)) return 0;
+    const header = fundingSwapCashDeltaUsdYr(
+      standing, spot, input.r_FCY, input.r_USD, input.r_OD,
+    ) * (n / FUNDING_SWAP_MONTHS_PA);
+    return header / Math.min(n, plan.length);
+  }
+
+  return fundingSwapMonthCarryUsdM(
+    p.standing_swap, spot, input.r_FCY, input.r_USD, input.r_OD, 'cashDelta',
+  );
 }
 
 /**
@@ -1081,6 +1174,44 @@ export function sumFcySwapNearUsd(swaps: { ccy: string; swapNear: number }[]): n
     }, 0);
 }
 
+export interface UsdCapitalAllocation {
+  usd_peak: number;
+  /** Working-capital reserve — payout-σ H_USD (not the maintain-peak target). */
+  wc_reserve: number;
+  /** Residual FX-only Net CFaR (USD M), after hedge cover. Sum, not RSS. */
+  cfar_reserve: number;
+  /** WC + CFaR — ring-fenced from leftover FCY collateral. */
+  protected: number;
+  /** Peak − protected. Default FCY funding sleeve. */
+  leftover: number;
+  /** Peak − CFaR. PAY cheap OD may dip WC up to this ceiling. */
+  wc_dip_ceiling: number;
+}
+
+/**
+ * Enterprise USD waterfall: WC (payout σ) + residual CFaR, then leftover for FCY.
+ * CFaR is a cash-path shortfall against the same pot — reserve the sum, not RSS.
+ */
+export function allocateUsdCapital(
+  usdCash_M: number,
+  wcReserve_M: number,
+  cfarReserveUsd_M = 0,
+  usdPayout_M = 0,
+): UsdCapitalAllocation {
+  const usd_peak = usdCash_M + usdPayout_M;
+  const wc_reserve = Math.max(0, wcReserve_M);
+  const cfar_reserve = Math.max(0, cfarReserveUsd_M);
+  const protectedAmt = wc_reserve + cfar_reserve;
+  return {
+    usd_peak,
+    wc_reserve,
+    cfar_reserve,
+    protected: protectedAmt,
+    leftover: Math.max(0, usd_peak - protectedAmt),
+    wc_dip_ceiling: Math.max(0, usd_peak - cfar_reserve),
+  };
+}
+
 export interface UsdLiquidityResult {
   payout_buffer: number;
   fcy_swap_usd: number;
@@ -1101,6 +1232,9 @@ export interface UsdLiquidityResult {
   /** FCY net USD funding exceeds envelope allowed by USD target. */
   fcy_envelope_shortfall: number;
   budget_binding: boolean;
+  cfar_reserve: number;
+  usd_protected: number;
+  wc_dip_ceiling: number;
 }
 
 /**
@@ -1119,7 +1253,8 @@ export function computeUsdLiquidityTarget(
 
 /**
  * USD liquidity — FCY swaps fund from / pay to USD; USD leg is the mechanical offset.
- * swapNear = −Σ(FCY swap × spot). H_USD is the payout σ reserve target only.
+ * swapNear = −Σ(FCY swap × spot). H_USD is the payout σ reserve; leftover after
+ * WC + residual CFaR is the default FCY collateral sleeve.
  */
 export function deriveUsdLiquidity(
   payoutBuffer_M: number,
@@ -1127,17 +1262,18 @@ export function deriveUsdLiquidity(
   usdCash_M: number,
   usdPayout_M = 0,
   formulaLayersActive = true,
+  cfarReserveUsd_M = 0,
 ): UsdLiquidityResult {
-  const usd_peak = usdCash_M + usdPayout_M;
+  const alloc = allocateUsdCapital(usdCash_M, payoutBuffer_M, cfarReserveUsd_M, usdPayout_M);
   const reserved_for_payout = payoutBuffer_M;
-  const cash_threshold = computeUsdLiquidityTarget(payoutBuffer_M, usd_peak, formulaLayersActive);
+  const cash_threshold = computeUsdLiquidityTarget(payoutBuffer_M, alloc.usd_peak, formulaLayersActive);
   /** FCY net swap $USD — each FCY leg consumes USD (buy) or pays USD (sell). */
-  const implied_fcy_swap_usd = formulaLayersActive ? usd_peak - cash_threshold : 0;
+  const implied_fcy_swap_usd = formulaLayersActive ? alloc.usd_peak - cash_threshold : 0;
 
   /** USD leg is always the mechanical offset of FCY swaps. */
   const swapNear = -fcySwapNearUsd_M;
 
-  const available_for_fcy = Math.max(0, usd_peak - reserved_for_payout);
+  const available_for_fcy = alloc.leftover;
   const fcy_funding_need = Math.max(0, fcySwapNearUsd_M);
   const fcy_funding_shortfall = Math.max(0, fcy_funding_need - available_for_fcy);
   const fcy_envelope_gap = formulaLayersActive
@@ -1152,7 +1288,7 @@ export function deriveUsdLiquidity(
     payout_buffer: payoutBuffer_M,
     fcy_swap_usd: fcySwapNearUsd_M,
     cash_threshold,
-    usd_peak,
+    usd_peak: alloc.usd_peak,
     implied_fcy_swap_usd,
     swapNear,
     usd_cash_M: usdCash_M,
@@ -1162,15 +1298,20 @@ export function deriveUsdLiquidity(
     fcy_envelope_gap,
     fcy_envelope_shortfall,
     budget_binding: fcy_funding_shortfall > 0.001 || fcy_envelope_shortfall > 0.001,
+    cfar_reserve: alloc.cfar_reserve,
+    usd_protected: alloc.protected,
+    wc_dip_ceiling: alloc.wc_dip_ceiling,
   };
 }
 
-/** USD LP cash available to collateralise FCY buffers after reserving payout σ buffer. */
+/** USD leftover after WC (payout σ) and residual CFaR — default FCY collateral. */
 export function computeFcyCollateralBudget(
   usdCash_M: number,
   usdPayoutBuffer_M: number,
+  cfarReserveUsd_M = 0,
+  usdPayout_M = 0,
 ): number {
-  return Math.max(0, usdCash_M - usdPayoutBuffer_M);
+  return allocateUsdCapital(usdCash_M, usdPayoutBuffer_M, cfarReserveUsd_M, usdPayout_M).leftover;
 }
 
 export interface UsdLiquidityAssessment {
@@ -1179,20 +1320,27 @@ export interface UsdLiquidityAssessment {
   /** USD cash short of payout reservation */
   usd_payout_gap: number;
   available_for_fcy: number;
+  cfar_reserve: number;
+  usd_protected: number;
   /** 'normal' = full optimization; 'stress' = FCY targets force-trimmed */
   mode: 'normal' | 'stress';
 }
 
-/** Step 1 — USD priority: reserve payout buffer before FCY collateral. */
+/** Step 1 — USD priority: reserve WC then residual CFaR before FCY collateral. */
 export function assessUsdLiquidityPriority(
   usdCash_M: number,
   usdPayoutBuffer_M: number,
+  cfarReserveUsd_M = 0,
+  usdPayout_M = 0,
 ): UsdLiquidityAssessment {
+  const alloc = allocateUsdCapital(usdCash_M, usdPayoutBuffer_M, cfarReserveUsd_M, usdPayout_M);
   return {
     payout_buffer: usdPayoutBuffer_M,
     usd_cash_M: usdCash_M,
     usd_payout_gap: Math.max(0, usdPayoutBuffer_M - usdCash_M),
-    available_for_fcy: computeFcyCollateralBudget(usdCash_M, usdPayoutBuffer_M),
+    available_for_fcy: alloc.leftover,
+    cfar_reserve: alloc.cfar_reserve,
+    usd_protected: alloc.protected,
     mode: 'normal',
   };
 }
@@ -1307,6 +1455,7 @@ export function enforceUsdLiquidityStress(
   r_USD: number,
   formulaLayersActive: boolean,
   usdPayout_M = 0,
+  cfarReserveUsd_M = 0,
 ): {
   rows: FcyStressResult[];
   fcySwapNearUsd: number;
@@ -1339,7 +1488,7 @@ export function enforceUsdLiquidityStress(
   function liquidityFrom(results: FcyStressResult[]): UsdLiquidityResult {
     const fcyUsd = sumFcySwapNearUsd(results.map(r => ({ ccy: r.ccy, swapNear: r.swap_needed })));
     return deriveUsdLiquidity(
-      usdPayoutBuffer_M, fcyUsd, usdCash_M, usdPayout_M, formulaLayersActive,
+      usdPayoutBuffer_M, fcyUsd, usdCash_M, usdPayout_M, formulaLayersActive, cfarReserveUsd_M,
     );
   }
 
@@ -1373,6 +1522,12 @@ export function enforceUsdLiquidityStress(
     for (const row of trimCandidates) {
       const dir = carryDirFromDeltaR(r_USD, row.r_FCY);
       if (!forFunding && dir === 'pay' && isExpensiveOverdraft(row.r_OD, r_USD)) continue;
+      // PAY cheap OD may dip WC. Only trim it when FCY need would eat CFaR capital.
+      if (forFunding && dir === 'pay' && allowsNegativeLp(row.r_OD, r_USD)) {
+        const liq = liquidityFrom(buildResults());
+        const need = Math.max(0, liq.fcy_swap_usd);
+        if (need <= liq.wc_dip_ceiling + ENVELOPE_TOL) continue;
+      }
       const current = thresholds.get(row.ccy)!;
       const optTh = optimized.get(row.ccy)!;
       const floor = forFunding ? fundingTrimFloor(row) : usdStressTrimFloor(row, optTh, r_USD);

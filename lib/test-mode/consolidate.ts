@@ -59,7 +59,10 @@ function mergeRows(rows: RowState[]): RowState {
  * Build the parent-company consolidated FX book by summing every NordTech
  * subsidiary seed (and any live entity identity match) by currency.
  */
-export function consolidateEntityBooks(entities: Entity[]): ConsolidatedBook {
+export function consolidateEntityBooks(
+  entities: Entity[],
+  taskId?: string,
+): ConsolidatedBook {
   const byCcy = new Map<string, RowState[]>();
   const sourcesByCcy: Record<string, string[]> = {};
   let usdCash = 0;
@@ -68,7 +71,7 @@ export function consolidateEntityBooks(entities: Entity[]): ConsolidatedBook {
   let usdCollections = 0;
 
   for (const e of entities) {
-    const seed = simSeedForEntity(e);
+    const seed = simSeedForEntity(e, taskId);
     usdCash += seed.usdCash;
     usdNonLpCash += seed.usdNonLpCash;
     usdPayout += seed.usdParams.payout;
@@ -106,12 +109,13 @@ export function consolidateEntityBooks(entities: Entity[]): ConsolidatedBook {
 export function computeConsolidatedRisk(
   entities: Entity[],
   setupOrConfidence: VarSetup | VarConfidencePct = 95,
+  taskId?: string,
 ): CurrencyRiskRow[] {
   const setup: VarSetup =
     typeof setupOrConfidence === 'number'
       ? { ...DEFAULT_VAR_SETUP, confidencePct: setupOrConfidence }
       : setupOrConfidence;
-  const book = consolidateEntityBooks(entities);
+  const book = consolidateEntityBooks(entities, taskId);
   // Build synthetic ladder inputs from consolidated stock/flow fields.
   const accounts = book.rows.flatMap(r => {
     const out: Parameters<typeof computeStockLadder>[0] = [];
@@ -177,7 +181,7 @@ export function computeConsolidatedRisk(
   // USD hub from parent cash / payroll (not a mismatch bar, but shown for context).
   const us = entities.find(e => classifyNordtechEntity(e) === 'US');
   if (us) {
-    const seed = simSeedForEntity(us);
+    const seed = simSeedForEntity(us, taskId);
     if (Math.abs(seed.usdCash) > 1e-9) {
       accounts.push({
         id: 'usd-cash', seedKey: 'usd-cash', entityId: us.id,

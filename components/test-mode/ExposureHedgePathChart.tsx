@@ -802,8 +802,9 @@ export function ExposureHedgePathChart({
         startM,
         pathEndM,
         matchedEqualVarLocalM,
+        ccy,
       ),
-    [selectedBasis, startM, pathEndM, matchedEqualVarLocalM],
+    [selectedBasis, startM, pathEndM, matchedEqualVarLocalM, ccy],
   );
 
   /** Bullet cover under the selected regime × cover %. */
@@ -1102,6 +1103,7 @@ export function ExposureHedgePathChart({
         startM,
         pathEndM,
         matchedEqualVarLocalM,
+        ccy,
       ) * scale;
     if (Math.abs(amount) < 1e-12) return [];
     return [
@@ -1391,6 +1393,7 @@ export function ExposureHedgePathChart({
           startM,
           pathEndM,
           matchedEqualVarLocalM,
+          ccy,
         );
     const beT =
       Math.abs(coverForBe) > 1e-9
@@ -1978,6 +1981,7 @@ export function ExposureHedgePathChart({
         startM,
         pathEndM,
         matchedEqualVarLocalM,
+        ccy,
       );
 
   // Bullet only: sync Decision % when Cash/VN/Target or structure changes.
@@ -2043,6 +2047,7 @@ export function ExposureHedgePathChart({
             startM,
             pathEndM,
             matchedEqualVarLocalM,
+            ccy,
           );
     const values = [
       ...path.map(p => p.exposureM),
@@ -2938,6 +2943,7 @@ export function ExposureHedgePathChart({
                   startM,
                   pathEndM,
                   matchedEqualVarLocalM,
+                  ccy,
                 );
             const n0 = useStrip ? stripEdges[0]!.hedgeLocalM : n;
             return (
@@ -4484,6 +4490,7 @@ export function ExposureHedgePathChart({
                 startM,
                 pathEndM,
                 matchedEqualVarLocalM,
+                ccy,
               );
               return (
                 <button

@@ -17,13 +17,13 @@ export default async function TaskPage({
   if (!email || email === TEST_GUEST_EMAIL) redirect('/test');
 
   const { taskId } = await params;
-  if (taskId !== '01') notFound();
+  if (taskId !== '01' && taskId !== '02') notFound();
 
   const sp = await searchParams;
   const practice = sp.mode === 'practice';
   const mode = practice ? 'practice' : 'curriculum';
   // Separate local + server slots so curriculum Validate progress stays intact.
-  const storageTaskId = practice ? 'practice' : '01';
+  const storageTaskId = practice ? 'practice' : taskId;
   const userKey = practice ? `test:${email}:practice` : `test:${email}`;
 
   return (

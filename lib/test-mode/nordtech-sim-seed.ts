@@ -8,8 +8,10 @@ import {
 import type { Entity } from '@/lib/workspace-store';
 import {
   DEFAULT_FORECAST_PROFILE,
+  EMPTY_FORECAST_EXTRAS,
   forecastProfileWithStoreReceivables,
   type ForecastCashExtras,
+  type ForecastFlowField,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
 
@@ -97,12 +99,87 @@ export const TASK01_REQUIRED_DECISION_LAYERS = ['hedging'] as const;
 
 export const TASK01_REQUIRED_ANALYTICAL_LAYERS = ['riskMetrics'] as const;
 
-export function simSeedForEntity(entity: Entity): EntitySimSeed {
+/** Task 02 Cash Carry book — five FX exposures, same three legal entities. */
+export const TASK02_CARRY_CCYS = ['EUR', 'GBP', 'PLN', 'MXN', 'JPY'] as const;
+
+export const TASK02_FORECAST_MONTHS = 12;
+
+export const TASK02_REQUIRED_FX_INPUTS = TASK01_REQUIRED_FX_INPUTS;
+export const TASK02_REQUIRED_DECISION_LAYERS = TASK01_REQUIRED_DECISION_LAYERS;
+export const TASK02_REQUIRED_ANALYTICAL_LAYERS = TASK01_REQUIRED_ANALYTICAL_LAYERS;
+
+export function isTask02(taskId?: string | null): boolean {
+  return taskId === '02';
+}
+
+function extras(partial: Partial<ForecastCashExtras>): ForecastCashExtras {
+  return { ...EMPTY_FORECAST_EXTRAS, ...partial };
+}
+
+/**
+ * Task 02 company forecast — every exposure has profit, spend, NWC and
+ * (where the story needs it) debt. MoM growth on NWC / revenue / opex so
+ * Analytics and the overlay frontier see a growing long-high / short-low book.
+ *
+ *   MXN  EARN vs USD (6.19%) — LatAm cash + NWC build (overlay long)
+ *   GBP  slight EARN (3.57%) — UK ops
+ *   PLN  near-USD (3.41%) — payroll short + PL billing
+ *   EUR  PAY (1.78%) — ops pile + AR collect + debt amortize
+ *   JPY  PAY (0.45%) — Asia OD + supplier spend / debt (overlay short)
+ */
+export function task02ForecastProfile(): ForecastProfileState {
+  return {
+    ...DEFAULT_FORECAST_PROFILE,
+    extrasByCcy: {
+      EUR: extras({ nwcIn: 0.25, nwcOut: -0.12, debtOut: -0.15 }),
+      GBP: extras({ nwcIn: 0.08, nwcOut: -0.05 }),
+      PLN: extras({ nwcIn: 0.18, nwcOut: -0.10 }),
+      MXN: extras({ nwcIn: 2.8, nwcOut: -1.1, debtOut: -0.9 }),
+      JPY: extras({ nwcIn: 12, nwcOut: -22, debtOut: -28 }),
+    },
+    flatGrowthByCcy: {
+      EUR: { collections: 0.025, nwcIn: 0.02, payout: 0.015 },
+      GBP: { collections: 0.015, nwcIn: 0.01 },
+      PLN: { collections: 0.02, nwcIn: 0.03 },
+      MXN: { collections: 0.04, nwcIn: 0.035, payout: 0.02 },
+      JPY: { payout: 0.02, nwcOut: 0.025, debtOut: 0.015 },
+    },
+  };
+}
+
+/** Entity-scoped slice so each legal-entity seed only ships its own CCYs. */
+export function task02ForecastFor(
+  currencies: readonly string[],
+): ForecastProfileState {
+  const full = task02ForecastProfile();
+  const extrasByCcy: Record<string, ForecastCashExtras> = {};
+  const flatGrowthByCcy: Record<string, Partial<Record<ForecastFlowField, number>>> = {};
+  for (const ccy of currencies) {
+    const key = ccy.trim().toUpperCase();
+    const ex = full.extrasByCcy[key];
+    if (ex) extrasByCcy[key] = ex;
+    const growth = full.flatGrowthByCcy?.[key];
+    if (growth) flatGrowthByCcy[key] = growth;
+  }
+  return { ...DEFAULT_FORECAST_PROFILE, extrasByCcy, flatGrowthByCcy };
+}
+
+export function simSeedForEntity(entity: Entity, taskId?: string): EntitySimSeed {
   const { name, base } = entityIdentity(entity);
 
   if (name.includes('poland') || name.includes('krak') || base === 'PLN') {
-    const pln = makeSimRow('pl-1', 'PLN', 0, 0, 0, 0, -1.8, 0, 0);
-    // Payroll accrual as FX liability short (and monthly payout flow).
+    // Payroll short; Task 02 adds PL billing profit so NWC / carry have a path.
+    const pln = makeSimRow(
+      'pl-1',
+      'PLN',
+      0,
+      0,
+      0,
+      0,
+      -1.8,
+      isTask02(taskId) ? 0.55 : 0,
+      0,
+    );
     pln.nonCash = -1.8;
     return {
       rows: [pln],
@@ -111,6 +188,7 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
       usdParams: { ...INITIAL_USD_PARAMS },
       currencyFilter: ['PLN'],
       profileCurrencies: ['PLN'],
+      forecastProfile: isTask02(taskId) ? task02ForecastFor(['PLN']) : undefined,
     };
   }
 
@@ -123,34 +201,60 @@ export function simSeedForEntity(entity: Entity): EntitySimSeed {
     // Cash FX (spot) + receivables − venture debt → Net FX / Exp stock = 1.9.
     // Store AR collects 0.2/month over the 12-month cash / FX / liquidity
     // forecast; venture debt is repaid after that projection.
-    const eur = makeSimRow('de-1', 'EUR', 2.5, 0, 0, 2.5, 0, 1.2, 0);
+    const eur = makeSimRow(
+      'de-1',
+      'EUR',
+      2.5,
+      0,
+      0,
+      2.5,
+      isTask02(taskId) ? -0.45 : 0,
+      1.2,
+      0,
+    );
     eur.nonCashAsset = 2.4; // EU receivables (FX Risk → Non-cash Asset)
     eur.ir_liab_notional = 3.0; // venture debt (FX POSITION → Debt)
     eur.ir_liab_rate = 0;
     // UK reseller stake = equity investment asset in GBP (not a USD liability).
-    const gbp = makeSimRow('de-2', 'GBP', 0, 0, 0, 0, 0, 0, 0);
+    const gbp = makeSimRow(
+      'de-2',
+      'GBP',
+      isTask02(taskId) ? 2.0 : 0,
+      0,
+      0,
+      isTask02(taskId) ? 2.0 : 0,
+      isTask02(taskId) ? -0.20 : 0,
+      isTask02(taskId) ? 0.35 : 0,
+      0,
+    );
     gbp.ir_invest_notional = 0.5;
     gbp.ir_invest_rate = 0;
+    // Task 02: JPY Asia supplier OD — low-yield PAY book the overlay shorts.
+    const jpy = makeSimRow('de-jpy', 'JPY', -900, 0, 0, -900, -55, 25, 0);
     return {
-      rows: [eur, gbp],
+      rows: isTask02(taskId) ? [eur, gbp, jpy] : [eur, gbp],
       usdCash: 0,
       usdNonLpCash: 0,
       usdParams: { ...INITIAL_USD_PARAMS },
-      currencyFilter: ['EUR', 'GBP'],
-      profileCurrencies: ['EUR', 'GBP'],
-      // Store AR 0.2/month × 12m into cash + FX + liquidity; debt repaid after Tf.
-      forecastProfile: forecastProfileWithStoreReceivables(['EUR']),
+      currencyFilter: isTask02(taskId) ? ['EUR', 'GBP', 'JPY'] : ['EUR', 'GBP'],
+      profileCurrencies: isTask02(taskId) ? ['EUR', 'GBP', 'JPY'] : ['EUR', 'GBP'],
+      forecastProfile: isTask02(taskId)
+        ? task02ForecastFor(['EUR', 'GBP', 'JPY'])
+        : forecastProfileWithStoreReceivables(['EUR']),
     };
   }
 
   // Default / NordTech US — USD hub
+  // Task 02: MXN LatAm cash — high-yield EARN book the overlay longs.
+  const mxn = makeSimRow('us-mxn', 'MXN', 90, 0, 0, 90, -3.2, 5.5, 0);
   return {
-    rows: [],
+    rows: isTask02(taskId) ? [mxn] : [],
     usdCash: 6.0,
     usdNonLpCash: 0,
     usdParams: { ...INITIAL_USD_PARAMS, payout: -0.8, collections: 0 },
-    currencyFilter: [], // USD-only book (no FCY rows)
-    profileCurrencies: ['USD'],
+    currencyFilter: isTask02(taskId) ? ['MXN'] : [],
+    profileCurrencies: isTask02(taskId) ? ['MXN'] : ['USD'],
+    forecastProfile: isTask02(taskId) ? task02ForecastFor(['MXN']) : undefined,
   };
 }
 
@@ -176,12 +280,14 @@ export function classifyNordtechEntity(
 /** Merge per-entity default cash / FX / liquidity extras for a consolidated desk. */
 export function mergedEntityForecastProfile(
   entities: readonly Entity[],
+  taskId?: string,
 ): ForecastProfileState {
   const extrasByCcy: Record<string, ForecastCashExtras> = {};
+  const flatGrowthByCcy: Record<string, Partial<Record<ForecastFlowField, number>>> = {};
   for (const e of entities) {
-    const extras = simSeedForEntity(e).forecastProfile?.extrasByCcy;
-    if (!extras) continue;
-    Object.assign(extrasByCcy, extras);
+    const fp = simSeedForEntity(e, taskId).forecastProfile;
+    if (fp?.extrasByCcy) Object.assign(extrasByCcy, fp.extrasByCcy);
+    if (fp?.flatGrowthByCcy) Object.assign(flatGrowthByCcy, fp.flatGrowthByCcy);
   }
-  return { ...DEFAULT_FORECAST_PROFILE, extrasByCcy };
+  return { ...DEFAULT_FORECAST_PROFILE, extrasByCcy, flatGrowthByCcy };
 }

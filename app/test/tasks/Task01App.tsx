@@ -61,6 +61,8 @@ import {
   saveSandboxPersistent,
   subscribeSandboxPersist,
   scoreTask01,
+  scoreTask02,
+  isTask02,
   parseRateVolBpYr,
   serializeRateVolOverride,
   serializeVolOverride,
@@ -182,6 +184,13 @@ const STEPS: { id: TaskStepId; label: string }[] = [
   { id: 'readVar', label: 'Identify VaR at Δ = 1 for your setup' },
 ];
 
+const TASK02_STEPS: { id: TaskStepId; label: string }[] = [
+  { id: 'buildWorkspace', label: 'Group FX + entity dashboards + FX profiles' },
+  { id: 'openCashCarry', label: 'Open Cash Carry and set Tf = 12 months' },
+  { id: 'readCarryByCcy', label: 'Read do-nothing carry for EUR · GBP · PLN · MXN · JPY' },
+  { id: 'readCarryTotal', label: 'All CCY Σ + largest EARN / PAY' },
+];
+
 function ProfileTypeIcon({
   type,
   size = 14,
@@ -269,6 +278,7 @@ export function Task01App({
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
   const [modal, setModal] = useState<'none' | 'dashboard' | 'profile'>('none');
   const [showValidate, setShowValidate] = useState(false);
+  const [answersOpen, setAnswersOpen] = useState(false);
   /** Entity (+ group-scope) hedge books — rolled into consolidated FX metrics. */
   const [hedgesByEntityId, setHedgesByEntityId] = useState<
     Record<string, EntityHedgeBook>
@@ -634,14 +644,22 @@ export function Task01App({
     });
   };
 
-  const answersReady = answersComplete(answers);
+  const task02 = isTask02(taskId);
+  const taskSteps = task02 ? TASK02_STEPS : STEPS;
+  const answersReady = task02 ? answersCompleteTask02(answers) : answersComplete(answers);
 
   const runValidate = () => {
-    if (!answersComplete(answers)) return;
+    if (task02 ? !answersCompleteTask02(answers) : !answersComplete(answers)) {
+      setAnswersOpen(true);
+      return;
+    }
+    setAnswersOpen(true);
     // Persist Task 01 layer defaults so score matches UI (tabs shown via fallback).
     const ws = ensureTask01FxLayers(workspace);
     const groupOpened = Boolean(state.group.dashboard?.opened);
-    const result = scoreTask01(ws, answers, groupOpened);
+    const result = task02
+      ? scoreTask02(ws, answers, groupOpened)
+      : scoreTask01(ws, answers, groupOpened);
     let nextProgress = progress;
     if (result.checks.find(c => c.id === 'entities')?.pass
       && result.checks.find(c => c.id === 'groupDashboard')?.pass
@@ -652,15 +670,35 @@ export function Task01App({
       && result.checks.find(c => c.id === 'analyticalLayers')?.pass) {
       nextProgress = markStep(nextProgress, 'buildWorkspace');
     }
-    if (result.checks.find(c => c.id === 'answerCcy')?.pass
-      && result.checks.find(c => c.id === 'answerAmount')?.pass) {
-      nextProgress = markStep(nextProgress, 'largestMismatch');
-    }
-    if (result.checks.find(c => c.id === 'answerConfidence')?.pass) {
-      nextProgress = markStep(nextProgress, 'setVarConfidence');
-    }
-    if (result.checks.find(c => c.id === 'answerVar')?.pass) {
-      nextProgress = markStep(nextProgress, 'readVar');
+    if (task02) {
+      if (result.checks.find(c => c.id === 'carryTf')?.pass) {
+        nextProgress = markStep(nextProgress, 'openCashCarry');
+      }
+      if (
+        ['carryEur', 'carryGbp', 'carryPln', 'carryMxn', 'carryJpy'].every(
+          id => result.checks.find(c => c.id === id)?.pass,
+        )
+      ) {
+        nextProgress = markStep(nextProgress, 'readCarryByCcy');
+      }
+      if (
+        result.checks.find(c => c.id === 'carryAll')?.pass
+        && result.checks.find(c => c.id === 'carryEarn')?.pass
+        && result.checks.find(c => c.id === 'carryPay')?.pass
+      ) {
+        nextProgress = markStep(nextProgress, 'readCarryTotal');
+      }
+    } else {
+      if (result.checks.find(c => c.id === 'answerCcy')?.pass
+        && result.checks.find(c => c.id === 'answerAmount')?.pass) {
+        nextProgress = markStep(nextProgress, 'largestMismatch');
+      }
+      if (result.checks.find(c => c.id === 'answerConfidence')?.pass) {
+        nextProgress = markStep(nextProgress, 'setVarConfidence');
+      }
+      if (result.checks.find(c => c.id === 'answerVar')?.pass) {
+        nextProgress = markStep(nextProgress, 'readVar');
+      }
     }
     update({
       ...state,
@@ -671,7 +709,7 @@ export function Task01App({
     setShowValidate(true);
   };
 
-  const firstPendingStep = STEPS.find(s => progress.steps[s.id] !== 'done')?.id;
+  const firstPendingStep = taskSteps.find(s => progress.steps[s.id] !== 'done')?.id;
 
   return (
     <main className={`mx-auto px-6 py-8 ${wide ? 'max-w-screen-2xl' : 'max-w-6xl'}`}>
@@ -700,12 +738,16 @@ export function Task01App({
           <h1 className="text-xl font-semibold tracking-tight">
             {isPractice
               ? 'NordTech — Self practice'
-              : 'SIGMA TASK 01 — Map the Book'}
+              : task02
+                ? 'SIGMA TASK 02 — Price the Carry'
+                : 'SIGMA TASK 01 — Map the Book'}
           </h1>
           <p className="mt-1 text-xs text-slate-500">
             {isPractice
               ? 'Explore entity books, Group FX, VaR regimes and hedge booking without Validate rails.'
-              : 'Build entity dashboards → find the largest mismatch → configure VaR in Analytics (confidence · horizon · exposure) → read VaR at Δ = 1 for that setup.'}
+              : task02
+                ? 'Build entity dashboards → open Group FX Cash Carry → set Tf = 12m → read unhedged do-nothing carry for EUR · GBP · PLN · MXN · JPY (NWC, profit, spend and debt are already in the forecast).'
+                : 'Build entity dashboards → find the largest mismatch → configure VaR in Analytics (confidence · horizon · exposure) → read VaR at Δ = 1 for that setup.'}
           </p>
           <p className="mt-1 text-[11px] text-slate-600">
             {dbSyncError
@@ -719,15 +761,29 @@ export function Task01App({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {!isPractice && (
-            <button
-              type="button"
-              onClick={runValidate}
-              disabled={!answersReady}
-              title={answersReady ? 'Validate answers' : 'Fill all answer fields first'}
-              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Validate
-            </button>
+            <>
+              <button
+                type="button"
+                aria-expanded={answersOpen}
+                aria-controls="task-answers-panel"
+                onClick={() => setAnswersOpen(open => !open)}
+                className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
+              >
+                {answersOpen ? 'Hide answers' : 'Your answers'}
+              </button>
+              <button
+                type="button"
+                onClick={runValidate}
+                title={
+                  answersReady
+                    ? 'Validate answers'
+                    : 'Open answers and fill required fields'
+                }
+                className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
+              >
+                Validate
+              </button>
+            </>
           )}
           <button
             type="button"
@@ -742,6 +798,7 @@ export function Task01App({
                 setDashboardId(null);
                 setActiveProfileId(null);
                 setShowValidate(false);
+                setAnswersOpen(false);
               })();
             }}
             className="rounded-md border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"
@@ -753,7 +810,7 @@ export function Task01App({
 
       {!isPractice && (
         <ol className="sticky top-0 z-10 mt-6 flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-950/95 p-3 backdrop-blur">
-          {STEPS.map((s, i) => {
+          {taskSteps.map((s, i) => {
             const done = progress.steps[s.id] === 'done';
             const current = !done && s.id === firstPendingStep;
             return (
@@ -779,7 +836,7 @@ export function Task01App({
 
       <div
         className={`mt-6 grid gap-6 ${
-          isPractice ? '' : 'lg:grid-cols-[1fr_300px]'
+          !isPractice && answersOpen ? 'lg:grid-cols-[1fr_300px]' : ''
         }`}
       >
         <div className="min-w-0">
@@ -794,6 +851,7 @@ export function Task01App({
 
           {view === 'group' ? (
             <GroupConsolidatedView
+              taskId={taskId}
               varSetup={varSetup}
               onVarSetupChange={setVarSetup}
               entities={consolidatedEntities}
@@ -854,6 +912,7 @@ export function Task01App({
             />
           ) : (
             <DashboardView
+              taskId={taskId}
               entity={entity}
               dashboard={dashboard}
               activeProfileId={activeProfileId}
@@ -945,12 +1004,29 @@ export function Task01App({
           )}
         </div>
 
-        {!isPractice && (
-          <aside className="space-y-4 lg:sticky lg:top-16 lg:self-start">
-            <AnswersPanel
-              answers={answers}
-              onChange={next => update({ ...state, answers: next })}
-            />
+        {!isPractice && answersOpen && (
+          <aside
+            id="task-answers-panel"
+            className="space-y-4 lg:sticky lg:top-16 lg:self-start"
+          >
+            <button
+              type="button"
+              onClick={() => setAnswersOpen(false)}
+              className="w-full rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+            >
+              Hide answers
+            </button>
+            {task02 ? (
+              <Task02AnswersPanel
+                answers={answers}
+                onChange={next => update({ ...state, answers: next })}
+              />
+            ) : (
+              <AnswersPanel
+                answers={answers}
+                onChange={next => update({ ...state, answers: next })}
+              />
+            )}
             <button
               type="button"
               onClick={runValidate}
@@ -967,8 +1043,9 @@ export function Task01App({
             )}
             {state.lastScore && showValidate && <TaskScore result={state.lastScore} />}
             <p className="text-[11px] leading-relaxed text-slate-500">
-              Finish entity dashboards → mismatch → Analytics setup → VaR at Δ = 1. Answers must
-              match your chosen confidence / horizon / exposure (±5%).
+              {task02
+                ? 'Finish entity dashboards → Group FX Cash Carry @ Tf = 12m. Answers must match do-nothing carry (±5%).'
+                : 'Finish entity dashboards → mismatch → Analytics setup → VaR at Δ = 1. Answers must match your chosen confidence / horizon / exposure (±5%).'}
             </p>
           </aside>
         )}
@@ -995,11 +1072,12 @@ export function Task01App({
 
       {modal === 'profile' && entity && dashboard && (
         <ProfileWizard
+          taskId={taskId}
           entity={entity}
           existingTypes={dashboard.riskProfiles.map(p => p.type)}
           onClose={() => setModal('none')}
           onCreate={input => {
-            const seed = simSeedForEntity(entity);
+            const seed = simSeedForEntity(entity, taskId);
             const currencies =
               input.currencies.length > 0
                 ? input.currencies
@@ -1047,6 +1125,88 @@ function answersComplete(answers: TaskAnswers): boolean {
     && answers.varExposureBasis.trim().length > 0
     && answers.varHorizon.trim().length > 0
     && answers.eurVarUsdK.trim().length > 0
+  );
+}
+
+function answersCompleteTask02(answers: TaskAnswers): boolean {
+  return (
+    (answers.carryForecastMonths ?? '').trim().length > 0
+    && (answers.carryEurUsdK ?? '').trim().length > 0
+    && (answers.carryGbpUsdK ?? '').trim().length > 0
+    && (answers.carryPlnUsdK ?? '').trim().length > 0
+    && (answers.carryMxnUsdK ?? '').trim().length > 0
+    && (answers.carryJpyUsdK ?? '').trim().length > 0
+    && (answers.carryAllCcyUsdK ?? '').trim().length > 0
+    && (answers.carryEarnCcy ?? '').trim().length > 0
+    && (answers.carryPayCcy ?? '').trim().length > 0
+  );
+}
+
+function Task02AnswersPanel({
+  answers,
+  onChange,
+}: {
+  answers: TaskAnswers;
+  onChange: (a: TaskAnswers) => void;
+}) {
+  const ready = answersCompleteTask02(answers);
+  const field = (
+    label: string,
+    hint: string,
+    key: keyof TaskAnswers,
+    placeholder: string,
+  ) => (
+    <label className="mt-2 block text-[11px] text-slate-400">
+      {label}
+      <span className="mt-0.5 block text-[10px] text-slate-600">{hint}</span>
+      <input
+        value={answers[key]}
+        onChange={e => onChange({ ...answers, [key]: e.target.value })}
+        placeholder={placeholder}
+        className="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-white"
+      />
+    </label>
+  );
+  return (
+    <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+      <h3 className="text-sm font-semibold text-white">Your answers</h3>
+      <p className="mt-1 text-[11px] text-slate-500">
+        Group FX → Analytics → Cash Carry. Unhedged Do nothing @ Tf = 12m, in $K.
+        The path already includes NWC, profit, expenditures and debt.
+        {!ready && (
+          <span className="mt-1 block text-amber-400/90">All fields required.</span>
+        )}
+      </p>
+      {field(
+        'Forecast period Tf (months)',
+        'Cash Carry period pills — use 12 months',
+        'carryForecastMonths',
+        '12',
+      )}
+      {field('EUR do-nothing carry ($K)', 'Do nothing column', 'carryEurUsdK', '$K')}
+      {field('GBP do-nothing carry ($K)', 'Do nothing column', 'carryGbpUsdK', '$K')}
+      {field('PLN do-nothing carry ($K)', 'Do nothing column', 'carryPlnUsdK', '$K')}
+      {field('MXN do-nothing carry ($K)', 'Do nothing column', 'carryMxnUsdK', '$K')}
+      {field('JPY do-nothing carry ($K)', 'Do nothing column', 'carryJpyUsdK', '$K')}
+      {field(
+        'All CCY Σ do-nothing ($K)',
+        'Footer row on Cash carry · all currencies',
+        'carryAllCcyUsdK',
+        '$K',
+      )}
+      {field(
+        'Largest EARN currency',
+        'Most positive Do nothing carry',
+        'carryEarnCcy',
+        'CCY',
+      )}
+      {field(
+        'Largest PAY currency',
+        'Most negative / smallest Do nothing carry',
+        'carryPayCcy',
+        'CCY',
+      )}
+    </div>
   );
 }
 
@@ -1215,6 +1375,7 @@ function Breadcrumb({
 }
 
 function GroupConsolidatedView({
+  taskId,
   entities,
   allEntities,
   groupDashboardName,
@@ -1225,6 +1386,7 @@ function GroupConsolidatedView({
   hedgesByEntityId,
   onHedgesByEntityIdChange,
 }: {
+  taskId?: string;
   entities: Entity[];
   allEntities: Entity[];
   groupDashboardName: string;
@@ -1237,14 +1399,17 @@ function GroupConsolidatedView({
     SetStateAction<Record<string, EntityHedgeBook>>
   >;
 }) {
-  const book = useMemo(() => consolidateEntityBooks(entities), [entities]);
+  const book = useMemo(
+    () => consolidateEntityBooks(entities, taskId),
+    [entities, taskId],
+  );
   const groupForecast = useMemo(
-    () => mergedEntityForecastProfile(entities),
-    [entities],
+    () => mergedEntityForecastProfile(entities, taskId),
+    [entities, taskId],
   );
   const risk = useMemo(
-    () => computeConsolidatedRisk(entities, varSetup),
-    [entities, varSetup],
+    () => computeConsolidatedRisk(entities, varSetup, taskId),
+    [entities, varSetup, taskId],
   );
   const decision = [...TASK01_REQUIRED_DECISION_LAYERS];
   const analytical = [...TASK01_REQUIRED_ANALYTICAL_LAYERS];
@@ -2044,6 +2209,7 @@ function DashboardsView({
 }
 
 function DashboardView({
+  taskId,
   entity,
   dashboard,
   activeProfileId,
@@ -2060,6 +2226,7 @@ function DashboardView({
   hedgeBook,
   onHedgeBookChange,
 }: {
+  taskId?: string;
   entity: Entity;
   dashboard: Dashboard;
   activeProfileId: string | null;
@@ -2086,10 +2253,10 @@ function DashboardView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dashboard.id, profiles.length]);
 
-  const seed = useMemo(() => simSeedForEntity(entity), [entity]);
+  const seed = useMemo(() => simSeedForEntity(entity, taskId), [entity, taskId]);
   const entityRisk = useMemo(
-    () => computeConsolidatedRisk([entity], varSetup),
-    [entity, varSetup],
+    () => computeConsolidatedRisk([entity], varSetup, taskId),
+    [entity, varSetup, taskId],
   );
   const [analyticsBook, setAnalyticsBook] = useState<{
     rows: RowState[];
@@ -2777,11 +2944,13 @@ function NameModal({
 }
 
 function ProfileWizard({
+  taskId,
   entity,
   existingTypes = [],
   onClose,
   onCreate,
 }: {
+  taskId?: string;
   entity: Entity;
   /** Asset classes already on this dashboard — cannot be added again. */
   existingTypes?: RiskProfileType[];
@@ -2795,7 +2964,7 @@ function ProfileWizard({
     analyticalLayers: AnalyticalLayer[];
   }) => void;
 }) {
-  const seed = simSeedForEntity(entity);
+  const seed = simSeedForEntity(entity, taskId);
   const taken = new Set(existingTypes);
   const defaultTypes: RiskProfileType[] = taken.has('fx') ? [] : ['fx'];
   const [types, setTypes] = useState<RiskProfileType[]>(defaultTypes);

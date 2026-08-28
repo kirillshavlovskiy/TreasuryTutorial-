@@ -145,7 +145,9 @@ export function hedgeBasisNotionalLocalM(
   stockM: number,
   endExposureM: number,
   equalVarHedgeLocalM: number,
+  ccy?: string,
 ): number {
+  void ccy;
   const sign =
     Math.abs(endExposureM) > 1e-12
       ? endExposureM >= 0
@@ -360,6 +362,7 @@ export function resyncHedgeRatiosToNearestRegime(
       r.stockHedgeLocalM,
       r.targetHedgeLocalM,
       r.equalVarHedgeLocalM,
+      r.ccy,
     );
     const newRatio = Math.min(
       1,

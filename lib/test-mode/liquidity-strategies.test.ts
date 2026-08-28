@@ -34,6 +34,7 @@ import {
   hedgeableCfarUsdM,
   probabilityWeightedReturnUsdM,
   weightedReturnByResidualDelta,
+  regimeTableCarryUsdM,
   strategyBookCarryK,
   strategyForRegime,
   swapLegScheduleWithCarry,
@@ -407,6 +408,65 @@ describe('the interest ledger adds up', () => {
   });
 });
 
+describe('PLN overdraft — basis-risk cover earns on the forward', () => {
+  /**
+   * PLN straddles USD (r_FCY < r_USD < r_OD): unfunded cash pays OD, but a
+   * covering long (buy near to fill the trough) sells PLN far and must earn
+   * CIP. Basis-risk coverage is that far / outright forward — not a buy.
+   */
+  const plnOd = (): RowState => ({
+    ...INITIAL_ROWS.find(r => r.ccy === 'PLN')!,
+    cash: 2,
+    payout: -20,
+    collections: 4,
+    fcastFX: 0,
+    cash_floor: 6,
+    carry_target: 0,
+    r_FCY: 3.41,
+    r_OD: 4.41,
+  });
+  const plnShared: SharedGlobals = {
+    r_USD: 3.50,
+    σ_P: 0.1,
+    days: 3,
+    forecastMonths: 12,
+  };
+
+  it('strip-to-term: cash can stay OD-pay; CIP on the covering book is an earn', () => {
+    const results = evaluateLiquidityStrategies({
+      rows: [plnOd()],
+      forecastProfile: profileWith({
+        sizingBasis: 'horizon',
+        bookingMode: 'stripTerm',
+      }),
+      months: 12,
+      shared: plnShared,
+    });
+    const strip = pick(results, 'stripToTerm').byCcy[0]!;
+    expect(strip.bookNow).toBeGreaterThan(0);
+    expect(strip.cashCarryUsdYrM).toBeLessThan(0);
+    expect(strip.swapPointsUsdYrM).toBeGreaterThan(0);
+    expect(strip.swapInterestUsdYrM + strip.swapPointsUsdYrM)
+      .toBeGreaterThan(strip.swapInterestUsdYrM);
+  });
+
+  it('term swap: same — covering long sells PLN far, CIP is not a buy', () => {
+    const results = evaluateLiquidityStrategies({
+      rows: [plnOd()],
+      forecastProfile: profileWith({
+        sizingBasis: 'horizon',
+        bookingMode: 'term',
+      }),
+      months: 12,
+      shared: plnShared,
+    });
+    const term = pick(results, 'termSwap').byCcy[0]!;
+    expect(term.bookNow).toBeGreaterThan(0);
+    expect(term.cashCarryUsdYrM).toBeLessThan(0);
+    expect(term.swapPointsUsdYrM).toBeGreaterThan(0);
+  });
+});
+
 describe('swapLegScheduleWithCarry', () => {
   it('prices each cycle on the standing book — same basis as Swap cash / CIP', () => {
     const rows = swapLegScheduleWithCarry(
@@ -753,5 +813,36 @@ describe('the desk strip is what Analytics prices on the live regime', () => {
     expect(live.byCcy[0]!.plan).toEqual(deskPlan);
     // Counterfactuals still recompute — they are not the desk strip.
     expect(pick(results, 'termSwap').byCcy[0]!.plan).not.toEqual(deskPlan);
+  });
+});
+
+describe('regimeTableCarryUsdM', () => {
+  const book = { cash: 400, hedge: 56, swap: -32, cip: 21, total: 445 };
+
+  it('Unhedged: Cash Carry = tab, Swap/CIP = 0, Total = Cash', () => {
+    const stack = regimeTableCarryUsdM({
+      unhedged: true,
+      book,
+      cashCarryTabUsdM: 0.4185,
+    });
+    expect(stack.cash).toBeCloseTo(0.4185, 8);
+    expect(stack.swap).toBe(0);
+    expect(stack.cip).toBe(0);
+    expect(stack.total).toBeCloseTo(0.4185, 8);
+    expect(stack.total).toBeCloseTo(stack.cash + stack.swap + stack.cip, 8);
+  });
+
+  it('funded Total is live cash+swap+CIP+overlay μ, not levered plot Y', () => {
+    const stack = regimeTableCarryUsdM({
+      unhedged: false,
+      book,
+      cashCarryTabUsdM: 0.4185,
+      overlayCarryUsdYr: 0.067,
+    });
+    expect(stack.cash).toBeCloseTo(0.4185, 8);
+    expect(stack.swap).toBeCloseTo(-0.032, 8);
+    expect(stack.cip).toBeCloseTo(0.021, 8);
+    expect(stack.total).toBeCloseTo(0.4185 - 0.032 + 0.021 + 0.067, 8);
+    expect(stack.total).not.toBeCloseTo(1.0, 1);
   });
 });

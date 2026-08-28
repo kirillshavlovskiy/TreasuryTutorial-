@@ -8,6 +8,7 @@ import {
   buildLiquidityLeftEndFrontier,
   carryFwd,
   priceLiquidityStanding,
+  applyPortfolioFrontierTargets,
   type LiquidityFrontierInput,
 } from '@/lib/test-mode/liquidity-frontier';
 import {
@@ -16,10 +17,25 @@ import {
   maxVarWithinPolicyPoint,
   localCarryCfarSlope,
   carryTargetOnArm,
+  efficientCarryVarEnvelope,
+  frontierMonotoneStats,
+  plotCarryVarArm,
+  plotFarCarryArm,
+  plotStandingCarryArm,
+  chartOpenPath,
+  chartPresetPointForScenario,
+  chartFrontierStroke,
+  chartPathTrace,
+  collapseNearVerticalRuns,
+  thinScreenCollocated,
+  splitOverlayFillOpenArm,
   DEFAULT_DESK_TARGET_CARRY_USD_YR,
   orderedLiquidityScenarioPoints,
   tangencyByParallelDerivative,
   tangencyFromTrueZero,
+  pricedBalancedVertex,
+  pricedCarryTargetVertex,
+  plotCarryS,
   tangencyFromOrigin,
   modalDefaultCarryUsdK,
   mixFundingAndOverlay,
@@ -28,6 +44,10 @@ import {
   pickConservativeFundingBook,
   portfolioFrontierFromLeftEnd,
   unhedgedSectionCfarUsdM,
+  alignLeftEndToCcyTicket,
+  bookStandingChipLabel,
+  ccyModalAlignTicket,
+  modalCcyTicketTargets,
 } from '@/lib/test-mode/portfolio-modal-align';
 
 const eur = INITIAL_ROWS.find(r => r.ccy === 'EUR')!;
@@ -343,7 +363,7 @@ describe('maxVarWithinPolicyPoint', () => {
     expect(o.maxCarry!.portfolioVarUsd).toBeLessThanOrEqual(20 + 1e-6);
   });
 
-  it('does not pin Unhedged to a larger CFaR-tab Σ the walk never starts at', () => {
+  it('pins Unhedged origin to chart originCfarUsd when provided', () => {
     const pts = [
       pt(0, 0.21, 0),
       pt(1, 0.55, 0.23),
@@ -356,7 +376,7 @@ describe('maxVarWithinPolicyPoint', () => {
       policyCapUsd: 20,
       originCfarUsd: 0.359,
     });
-    expect(o.origin!.portfolioVarUsd).toBeCloseTo(0.21, 8);
+    expect(o.origin!.portfolioVarUsd).toBeCloseTo(0.359, 8);
     expect(o.origin!.totalCarryUsdYr).toBe(0);
     expect(o.conservative!.portfolioVarUsd).toBeGreaterThan(o.origin!.portfolioVarUsd);
   });
@@ -401,25 +421,34 @@ describe('maxVarWithinPolicyPoint', () => {
     }
   });
 
-  it('places Carry Target on the open-arm interpolant at the ask', () => {
+  it('places Carry Target on the live book (k ≤ 1), not leveraged k > 1', () => {
     const pts = [
       pt(0, 0.50, 0),
       pt(1, 1.00, 0.20),
       pt(2, 4.00, 0.60),
       pt(3, 10.0, 1.00),
     ];
-    const hit = carryTargetOnArm(pts, 0.40);
+    const hit = carryTargetOnArm(pts.filter(p => p.k <= 1 + 1e-6), 0.10);
     expect(hit).not.toBeNull();
-    expect(hit!.totalCarryUsdYr).toBeCloseTo(0.40, 8);
-    expect(hit!.portfolioVarUsd).toBeCloseTo(2.50, 8);
+    expect(hit!.totalCarryUsdYr).toBeCloseTo(0.10, 8);
+    expect(hit!.k).toBeLessThanOrEqual(1 + 1e-6);
     expect(carryTargetOnArm(pts, 2.00)).toBeNull();
-    const o = orderedLiquidityScenarioPoints({
+    const onBook = orderedLiquidityScenarioPoints({
+      points: pts,
+      conservative: pts[1],
+      policyCapUsd: 20,
+      carryTargetUsdYr: 0.10,
+    });
+    expect(onBook.carryTarget!.totalCarryUsdYr).toBeCloseTo(0.10, 8);
+    expect(onBook.carryTarget!.k).toBeLessThanOrEqual(1 + 1e-6);
+    const pastHold = orderedLiquidityScenarioPoints({
       points: pts,
       conservative: pts[1],
       policyCapUsd: 20,
       carryTargetUsdYr: 0.40,
     });
-    expect(o.carryTarget!.portfolioVarUsd).toBeCloseTo(hit!.portfolioVarUsd, 8);
+    expect(pastHold.carryTarget!.totalCarryUsdYr).toBeCloseTo(0.40, 8);
+    expect(pastHold.carryTarget!.k).toBeGreaterThan(1);
   });
 
   it('interpolates Carry Target from Unhedged when k=0 already has program carry', () => {
@@ -521,6 +550,133 @@ describe('maxVarWithinPolicyPoint', () => {
     expect(o.maxCarry!.portfolioVarUsd).toBeLessThanOrEqual(5 + 1e-6);
   });
 
+  it('Balanced is a priced walk vertex, not k×holdY at book-hold X', () => {
+    const pts = [
+      pt(0, 1.085, 0.556),
+      pt(0.26, 1.220, 0.171),
+      pt(1, 1.626, 0.666),
+      pt(4, 5.20, 1.10),
+    ];
+    const bal = pricedBalancedVertex(pts, 1.085);
+    expect(bal).not.toBeNull();
+    expect(pts.some(p => (
+      Math.abs(p.k - bal!.k) < 1e-9
+      && Math.abs(p.portfolioVarUsd - bal!.portfolioVarUsd) < 1e-8
+      && Math.abs(p.totalCarryUsdYr - bal!.totalCarryUsdYr) < 1e-8
+    ))).toBe(true);
+    expect(Math.abs(bal!.totalCarryUsdYr - 0.171)).toBeGreaterThan(1e-3);
+  });
+
+  it('Swap lift Balanced is the first priced off-origin vertex, not $171k', () => {
+    const pts = [
+      pt(0, 1.085, 0.556),
+      pt(0.03, 1.086, 0.559),
+      pt(1, 1.626, 0.666),
+      pt(9.47, 11.516, 1.599),
+    ];
+    const bal = pricedBalancedVertex(pts, 1.085);
+    expect(bal).toMatchObject({ k: 0.03, portfolioVarUsd: 1.086, totalCarryUsdYr: 0.559 });
+  });
+
+  it('Balanced touch is stable — plotCarryS, not zoom display carryS', () => {
+    const pts = [
+      pt(0, 1.085, 0.556),
+      pt(0.03, 1.086, 0.559),
+      pt(0.26, 1.220, 0.171),
+      pt(1, 1.626, 0.666),
+      pt(9.47, 11.516, 1.599),
+    ];
+    const stable = pricedBalancedVertex(pts, 1.085);
+    const zoomed = pricedBalancedVertex(pts, 1.085, 0.012);
+    expect(stable).toMatchObject({ k: 0.03, portfolioVarUsd: 1.086, totalCarryUsdYr: 0.559 });
+    expect(zoomed).toMatchObject(stable!);
+    const stroke = chartOpenPath(
+      plotStandingCarryArm(pts).map(p => ({
+        x: p.portfolioVarUsd,
+        y: p.totalCarryUsdYr,
+      })),
+      1.085,
+      true,
+    );
+    expect(stroke[0]).toMatchObject({ x: 1.085, y: 0 });
+    expect(stroke.some(p => (
+      Math.abs(p.x - stable!.portfolioVarUsd) < 1e-6
+      && Math.abs(p.y - stable!.totalCarryUsdYr) < 1e-6
+    ))).toBe(true);
+  });
+
+  it('Carry Target on chart walk matches pricedCarryTargetVertex at Ask Y', () => {
+    const pts = [
+      pt(0, 1.085, 0.556),
+      pt(0.03, 1.086, 0.559),
+      pt(1, 1.626, 0.666),
+    ];
+    const ask = 0.032;
+    const ct = pricedCarryTargetVertex(pts, 1.085, ask);
+    expect(ct).not.toBeNull();
+    expect(ct!.totalCarryUsdYr).toBeCloseTo(ask, 6);
+    expect(ct!.portfolioVarUsd).toBeLessThan(1.2);
+    expect(ct!.portfolioVarUsd).toBeGreaterThan(1.085);
+    const stroke = chartOpenPath(
+      plotStandingCarryArm(pts).map(p => ({
+        x: p.portfolioVarUsd,
+        y: p.totalCarryUsdYr,
+      })),
+      1.085,
+      true,
+    );
+    const balanced = pricedBalancedVertex(pts, 1.085);
+    expect(balanced!.portfolioVarUsd).not.toBeCloseTo(1.626, 2);
+    expect(stroke[0]).toMatchObject({ x: 1.085, y: 0 });
+  });
+
+  it('scenario presets share plotCarryS — balanced unchanged when carry target reframes', () => {
+    const pts = [
+      pt(0, 1.085, 0.556),
+      pt(0.03, 1.086, 0.559),
+      pt(1, 1.626, 0.666),
+    ];
+    const s = plotCarryS(pts);
+    const bal = pricedBalancedVertex(pts, 1.085, s);
+    const ct = pricedCarryTargetVertex(pts, 1.085, 0.032);
+    expect(bal).toMatchObject({ k: 0.03, portfolioVarUsd: 1.086 });
+    expect(ct!.totalCarryUsdYr).toBeCloseTo(0.032, 6);
+    expect(pricedBalancedVertex(pts, 1.085, s)).toMatchObject(bal!);
+  });
+
+  it('ordered presets honor chart originCfarUsd over walk k=0 X', () => {
+    const pts = [
+      pt(0, 0.556, 0.1),
+      pt(0.03, 1.086, 0.559),
+      pt(1, 1.626, 0.666),
+    ];
+    const chartOrigin = 1.085;
+    const walkOrigin = orderedLiquidityScenarioPoints({
+      points: pts,
+      policyCapUsd: 20,
+      originCfarUsd: pts[0]!.portfolioVarUsd,
+      carryTargetUsdYr: 0.032,
+    });
+    const chartOriginPresets = orderedLiquidityScenarioPoints({
+      points: pts,
+      policyCapUsd: 20,
+      originCfarUsd: chartOrigin,
+      carryTargetUsdYr: 0.032,
+    });
+    expect(chartOriginPresets.carryTarget!.portfolioVarUsd).toBeGreaterThan(
+      walkOrigin.carryTarget!.portfolioVarUsd,
+    );
+    expect(chartOriginPresets.carryTarget!.totalCarryUsdYr).toBeCloseTo(0.032, 6);
+    expect(chartPresetPointForScenario({
+      scenarioId: 'carryTarget',
+      points: pts,
+      originX: chartOrigin,
+      policyCapUsd: 20,
+      confidencePct: 95,
+      carryTargetUsdYr: 0.032,
+    })).toMatchObject(chartOriginPresets.carryTarget!);
+  });
+
   it('re-targets when the policy cap moves from $20M to $5M', () => {
     const pts = [
       pt(0, 0.5, 0.2),
@@ -531,6 +687,265 @@ describe('maxVarWithinPolicyPoint', () => {
     expect(maxVarWithinPolicyPoint(pts, 20)?.portfolioVarUsd).toBeCloseTo(20, 8);
     expect(maxVarWithinPolicyPoint(pts, 5)?.portfolioVarUsd).toBeCloseTo(5, 8);
     expect(maxVarWithinPolicyPoint(pts, 10)?.portfolioVarUsd).toBeCloseTo(10, 8);
+  });
+});
+
+describe('efficientCarryVarEnvelope', () => {
+  const pt = (
+    k: number,
+    portfolioVarUsd: number,
+    totalCarryUsdYr: number,
+  ) => ({ k, portfolioVarUsd, totalCarryUsdYr, floorBoundCcys: [] as string[] });
+
+  it('drops the RSS bow (more CFaR, less carry than a neighbour)', () => {
+    const pts = [
+      pt(0, 0.634, 0),
+      pt(0.3, 1.20, 0.040),
+      pt(0.45, 1.50, 0.035), // jag: X up, Y down — dominated
+      pt(0.6, 1.35, 0.055),
+      pt(1, 2.125, 0.114),
+    ];
+    const stats = frontierMonotoneStats(pts);
+    expect(stats.xBacktracks).toBe(1);
+    expect(stats.yDips).toBe(1);
+    const env = efficientCarryVarEnvelope(pts);
+    expect(env.map(p => p.k)).toEqual([0, 0.3, 0.6, 1]);
+    expect(env.every((p, i) => i === 0 || p.portfolioVarUsd >= env[i - 1]!.portfolioVarUsd - 1e-12)).toBe(true);
+    expect(env.every((p, i) => i === 0 || p.totalCarryUsdYr >= env[i - 1]!.totalCarryUsdYr - 1e-12)).toBe(true);
+  });
+
+  it('plot arm is walk order — envelope is not the stroke (keeps $0 at the same CFaR)', () => {
+    const pts = [
+      pt(0, 3.5, 0),
+      pt(1, 3.5, 8.4),
+      pt(16, 3.5, 141),
+    ];
+    expect(efficientCarryVarEnvelope(pts)).toHaveLength(1);
+    expect(plotCarryVarArm(pts).map(p => p.k)).toEqual([0, 1, 16]);
+    expect(plotCarryVarArm(pts)).toEqual(plotStandingCarryArm(pts));
+  });
+
+  it('does not invent a $0 → huge-Y stem when the first priced sample is the lift', () => {
+    const skyline = [
+      { x: 1.086, y: 0.556 },
+      { x: 1.20, y: 0.70 },
+      { x: 1.40, y: 1.599 },
+    ];
+    const swapped = chartOpenPath(skyline, 1.086, true);
+    expect(swapped[0]).toEqual({ x: 1.086, y: 0 });
+    expect(swapped[1]).not.toEqual({ x: 1.086, y: 0.556 });
+    expect(swapped.some(p => Math.abs(p.x - 1.20) < 1e-9 && Math.abs(p.y - 0.70) < 1e-9)).toBe(true);
+    const fromZero = chartOpenPath(
+      [{ x: 1.086, y: 0 }, { x: 1.10, y: 0.003 }, { x: 1.20, y: 0.40 }],
+      1.086,
+      true,
+    );
+    expect(fromZero[0]).toEqual({ x: 1.086, y: 0 });
+    expect(fromZero[1]).toEqual({ x: 1.10, y: 0.003 });
+  });
+
+  it('chartFrontierStroke is chartOpenPath — no fill arg, no hull, no stem filter', () => {
+    expect(chartFrontierStroke).toBe(chartOpenPath);
+    const skyline = [
+      { x: 1.086, y: 0 },
+      { x: 1.20, y: 0.14 },
+      { x: 1.577, y: 0.556 },
+      { x: 1.577, y: 0.774 },
+      { x: 5.685, y: 0.666 },
+      { x: 5.690, y: 0.720 },
+      { x: 15.60, y: 1.599 },
+    ];
+    expect(chartFrontierStroke(skyline, 1.086, true)).toEqual(
+      chartOpenPath(skyline, 1.086, true),
+    );
+  });
+
+  it('overlay pin connects green to unhedged $0 when the skyline starts at the orange peak', () => {
+    const skyline = [
+      { x: 1.086, y: 0.50 },
+      { x: 1.20, y: 0.62 },
+      { x: 3.50, y: 0.90 },
+      { x: 11.50, y: 1.599 },
+    ];
+    const pinned = chartOpenPath(skyline, 1.086, true);
+    expect(pinned[0]).toEqual({ x: 1.086, y: 0 });
+    expect(pinned.some(p => Math.abs(p.x - 1.086) < 1e-9 && Math.abs(p.y - 0.50) < 1e-9)).toBe(false);
+    expect(pinned.some(p => Math.abs(p.x - 1.20) < 1e-9 && Math.abs(p.y - 0.62) < 1e-9)).toBe(true);
+  });
+
+  it('keeps a $300k CFaR run with distinct X — default collapse is not a %-of-span skyline', () => {
+    const stack = [
+      { x: 1.086, y: 0 },
+      { x: 1.0862, y: 0.08 },
+      { x: 1.160, y: 0.20 },
+      { x: 1.250, y: 0.32 },
+      { x: 1.390, y: 0.50 },
+      { x: 2.10, y: 0.80 },
+      { x: 4.50, y: 1.20 },
+    ];
+    const out = collapseNearVerticalRuns(stack);
+    expect(out).toHaveLength(stack.length);
+    expect(out[0]).toEqual({ x: 1.086, y: 0 });
+    expect(out.filter(p => p.x > 1.086 && p.x < 1.40)).toHaveLength(4);
+  });
+
+  it('collapses only a true same-CFaR stack when given an explicit tol', () => {
+    const stack = [
+      { x: 1.086, y: 0.215 },
+      { x: 1.0862, y: 0.28 },
+      { x: 1.087, y: 0.40 },
+      { x: 1.088, y: 0.55 },
+      { x: 1.40, y: 1.20 },
+      { x: 2.10, y: 1.599 },
+    ];
+    const out = collapseNearVerticalRuns(stack, 0.01);
+    expect(out).toHaveLength(3);
+    expect(out[0]).toEqual({ x: 1.086, y: 0.215 });
+    expect(out[1]).toEqual({ x: 1.40, y: 1.20 });
+    expect(out[2]).toEqual({ x: 2.10, y: 1.599 });
+  });
+
+  it('standing arm keeps unhedged $0 that the max-carry envelope drops', () => {
+    const pts = [
+      pt(0, 1.086, 0),
+      pt(0.2, 1.086, 0.12),
+      pt(0.5, 1.086, 0.28),
+      pt(1, 1.086, 0.50),
+      pt(2, 3.50, 0.90),
+      pt(8, 11.50, 1.599),
+    ];
+    expect(efficientCarryVarEnvelope(pts)[0]?.totalCarryUsdYr).toBeGreaterThan(0.2);
+    const arm = plotStandingCarryArm(pts);
+    expect(arm[0]).toMatchObject({ portfolioVarUsd: 1.086, totalCarryUsdYr: 0 });
+    expect(arm).toHaveLength(pts.length);
+    const overlay = chartOpenPath(
+      arm.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr })),
+      1.086,
+      true,
+    );
+    expect(overlay[0]).toEqual({ x: 1.086, y: 0 });
+    expect(overlay.length).toBe(pts.length);
+  });
+
+  it('thinScreenCollocated drops only pixels that sit on top of each other', () => {
+    const pts = [
+      { x: 1.086, y: 0 },
+      { x: 1.086, y: 0 },
+      { x: 1.20, y: 0.20 },
+      { x: 1.50, y: 0.40 },
+    ];
+    const thinned = thinScreenCollocated(pts, v => v * 100, v => v * 100, 2);
+    expect(thinned).toHaveLength(3);
+    expect(thinned[0]).toEqual({ x: 1.086, y: 0 });
+    expect(thinned[1]).toEqual({ x: 1.20, y: 0.20 });
+  });
+
+  it('overlay and swap strokes both pin $0 and keep every walk-order sample', () => {
+    const overlay = [
+      pt(0, 1.086, 0),
+      pt(0.2, 1.10, 0.08),
+      pt(0.5, 1.18, 0.16),
+      pt(1, 1.40, 0.28),
+      pt(4, 3.20, 0.70),
+      pt(12, 11.0, 1.50),
+    ];
+    const swap = [
+      pt(-1, 1.086, 0),
+      pt(-0.8, 1.10, 0.08),
+      pt(-0.5, 1.30, 0.28),
+      pt(0, 1.58, 0.56),
+      pt(0.5, 1.70, 0.78),
+      pt(1, 1.90, 0.96),
+      pt(4, 3.20, 1.20),
+      pt(12, 11.0, 1.60),
+    ];
+    for (const pts of [overlay, swap]) {
+      const arm = plotStandingCarryArm(pts);
+      const drawn = chartOpenPath(
+        arm.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr })),
+        1.086,
+        true,
+      );
+      expect(drawn[0]).toEqual({ x: 1.086, y: 0 });
+      expect(drawn.length).toBeGreaterThanOrEqual(pts.length);
+      expect(drawn.filter(p => p.x > 1.086 + 1e-6).length).toBeGreaterThanOrEqual(4);
+    }
+  });
+
+  it('chartPathTrace pins overlay at $0 and keeps the standing walk', () => {
+    const pts = [
+      pt(0, 1.085, 0),
+      pt(0.15, 1.092, 0.235),
+      pt(0.30, 1.110, 0.252),
+      pt(0.50, 1.150, 0.280),
+      pt(1, 1.626, 0.329),
+      pt(4, 4.50, 0.80),
+      pt(12, 15.20, 1.599),
+    ];
+    const overlay = chartPathTrace(pts, 1.085, true);
+    expect(overlay.pinApplied).toBe(true);
+    expect(overlay.liftedOrigin).toBe(false);
+    expect(overlay.drawn[0]).toEqual({ x: 1.085, y: 0 });
+    expect(overlay.nDrawn).toBeLessThanOrEqual(overlay.nSkyline);
+    expect(overlay.nDrawn).toBeGreaterThanOrEqual(3);
+    expect(overlay.drawn.every((p, i) => i === 0 || p.x > overlay.drawn[i - 1]!.x + 1e-12)).toBe(true);
+    expect(overlay.drawn.some(p => Math.abs(p.x - 1.092) < 1e-9 && p.y > 0.2)).toBe(true);
+    const bookScale = [
+      pt(0, 1.085, 0.556),
+      pt(0.5, 1.35, 0.610),
+      pt(1, 1.626, 0.666),
+      pt(4, 4.50, 0.80),
+      pt(12, 15.20, 1.599),
+    ];
+    const swapped = chartPathTrace(bookScale, 1.085, true);
+    const swapStroke = chartFrontierStroke(
+      plotStandingCarryArm(bookScale).map(p => ({
+        x: p.portfolioVarUsd,
+        y: p.totalCarryUsdYr,
+      })),
+      1.085,
+      true,
+    );
+    expect(swapped.drawn).toEqual(swapStroke);
+    expect(swapped.drawn).toEqual(chartOpenPath(
+      plotStandingCarryArm(bookScale).map(p => ({
+        x: p.portfolioVarUsd,
+        y: p.totalCarryUsdYr,
+      })),
+      1.085,
+      true,
+    ));
+    expect(swapped.drawn[0]).toEqual({ x: 1.085, y: 0 });
+  });
+
+  it('splits overlay-fill green at the first k=1 hold', () => {
+    const pts = [
+      pt(0, 1.086, 0),
+      pt(0.5, 1.30, 0.055),
+      pt(1, 1.626, 0.110),
+      pt(1, 2.40, 0.80),
+      pt(1, 4.028, 1.599),
+    ];
+    const { approach, overlay } = splitOverlayFillOpenArm(pts);
+    expect(approach.map(p => p.totalCarryUsdYr)).toEqual([0, 0.055, 0.110]);
+    expect(overlay[0]!.totalCarryUsdYr).toBeCloseTo(0.110, 8);
+    expect(overlay[overlay.length - 1]!.totalCarryUsdYr).toBeCloseTo(1.599, 8);
+    const dBook = (approach[2]!.totalCarryUsdYr - approach[0]!.totalCarryUsdYr)
+      / (approach[2]!.portfolioVarUsd - approach[0]!.portfolioVarUsd);
+    const dOv = (overlay[overlay.length - 1]!.totalCarryUsdYr - overlay[0]!.totalCarryUsdYr)
+      / (overlay[overlay.length - 1]!.portfolioVarUsd - overlay[0]!.portfolioVarUsd);
+    expect(dOv).toBeGreaterThan(dBook);
+  });
+
+  it('far CIP walk keeps the negative tail the max-carry envelope drops', () => {
+    const far = [
+      pt(0, 1.086, 0),
+      pt(0.5, 1.30, -0.040),
+      pt(1, 1.55, -0.087),
+      pt(2, 2.10, -0.160),
+    ];
+    expect(efficientCarryVarEnvelope(far).every(p => p.totalCarryUsdYr >= -1e-12)).toBe(true);
+    expect(plotFarCarryArm(far).map(p => p.totalCarryUsdYr)).toEqual([0, -0.040, -0.087, -0.160]);
   });
 });
 
@@ -545,5 +960,137 @@ describe('pickConservativeFundingBook', () => {
 
   it('returns null when no funded H* book exists', () => {
     expect(pickConservativeFundingBook([{ strategy: { id: 'unfunded' } }])).toBeNull();
+  });
+});
+
+describe('alignLeftEndToCcyTicket', () => {
+  const origin = {
+    delta: 0, multiple: 0, phase: 'unfunded' as const, intensity: 0,
+    bufferM: 0, carryM: 0, cashCarryUsdYrM: 0, swapCashUsdYrM: 0,
+    cipUsdYrM: 0, hedgeCarryUsdYrM: 0, totalCarryUsdYrM: 0,
+    finalCfarUsdM: 0.411, peakBook: 0, levered: false,
+  };
+  const openMid = {
+    ...origin, phase: 'hedged' as const, peakBook: 26.45, carryM: 26.45,
+    multiple: 26.45, cashCarryUsdYrM: 0.53, totalCarryUsdYrM: 0.53,
+    finalCfarUsdM: 3.5,
+  };
+  const openBook = {
+    ...origin, phase: 'hedged' as const, peakBook: 79.36, carryM: 79.36,
+    multiple: 79.36, cashCarryUsdYrM: 1.6, totalCarryUsdYrM: 1.5,
+    finalCfarUsdM: 10.5,
+  };
+  const farBook = {
+    ...openBook, delta: 1, phase: 'hedged' as const,
+    totalCarryUsdYrM: -0.203, cashCarryUsdYrM: 1.6, cipUsdYrM: -1.803,
+    finalCfarUsdM: 0.717,
+  };
+
+  function left(): import('@/lib/test-mode/liquidity-frontier').LiquidityLeftEndResult {
+    return {
+      dial: 'var_target',
+      walk: 'carry_pair',
+      cfarOriginUsdM: 0.411,
+      origin,
+      upper: [openMid, openBook],
+      lower: [farBook],
+      curve: [origin, openMid, openBook],
+      points: [openMid, openBook, farBook],
+      applied: openBook,
+      constraint: {
+        dial: 'var_target',
+        hCarryUsdYrM: 1.6,
+        vCfarUsdM: 0.717,
+        openHit: { cfarUsdM: 10.5, carryUsdYrM: 1.5, standing: 79.36 },
+        hedgeHit: { cfarUsdM: 0.717, carryUsdYrM: -0.203, standing: 79.36 },
+      },
+      bookStanding: 79.36,
+      bookCashK: 1600,
+    };
+  }
+
+  const eurTicket = {
+    cfarUsdM: 8.7,
+    carryUsdYrM: 2.3,
+    bookUsdYrM: 1.6,
+    overlayUsdYrM: 0.716,
+    bookStandingFcyM: 79.36,
+    bookStandingUsdM: 92.9,
+  };
+
+  it('lands Book S on EUR Total CFaR / Total carry — not Book-only $10.5M / $1.5M', () => {
+    const aligned = alignLeftEndToCcyTicket(left(), eurTicket);
+    const book = aligned.upper.find(p => Math.abs(p.peakBook - 79.36) < 1e-6)!;
+    expect(book.finalCfarUsdM).toBeCloseTo(8.7, 8);
+    expect(book.totalCarryUsdYrM).toBeCloseTo(2.3, 8);
+    expect(aligned.origin.finalCfarUsdM).toBeCloseTo(0.411, 8);
+    expect(aligned.origin.totalCarryUsdYrM).toBeCloseTo(0, 8);
+    const mid = aligned.upper.find(p => Math.abs(p.peakBook - 26.45) < 1e-6)!;
+    expect(mid.totalCarryUsdYrM).toBeGreaterThan(0.53);
+    expect(mid.totalCarryUsdYrM).toBeLessThan(2.3);
+    expect(mid.finalCfarUsdM).toBeLessThan(8.7);
+  });
+
+  it('adds overlay Y on the far twin without mixing Book Y and Total Y on chips', () => {
+    const aligned = alignLeftEndToCcyTicket(left(), eurTicket);
+    const far = aligned.lower.find(p => Math.abs(p.peakBook - 79.36) < 1e-6)!;
+    expect(far.totalCarryUsdYrM).toBeCloseTo(-0.203 + 0.716, 8);
+    expect(far.finalCfarUsdM).toBeCloseTo(0.717, 8);
+  });
+
+  it('leaves overlay-fill (S = 0) walks untouched', () => {
+    const src = left();
+    expect(alignLeftEndToCcyTicket(src, {
+      ...eurTicket, bookStandingFcyM: 0,
+    })).toBe(src);
+    expect(ccyModalAlignTicket({ ...eurTicket, bookStandingFcyM: 0 })).toBeNull();
+  });
+
+  it('chip, Target Carry line, and selected Book S share Total CFaR / Total carry', () => {
+    const aligned = alignLeftEndToCcyTicket(left(), eurTicket);
+    const pinned = applyPortfolioFrontierTargets(
+      aligned.constraint,
+      {
+        origin: aligned.origin,
+        open: aligned.upper.filter(p => p.delta < 1e-9),
+        far: aligned.lower,
+      },
+      modalCcyTicketTargets({ overlayFill: false, ticket: eurTicket }),
+    );
+    expect(pinned.hCarryUsdYrM).toBeCloseTo(2.3, 8);
+    expect(pinned.vCfarUsdM).toBeCloseTo(8.7, 8);
+    expect(pinned.vCfarUsdM).not.toBeCloseTo(0.717, 2);
+    expect(pinned.vCfarUsdM).not.toBeCloseTo(18.5, 1);
+    expect(pinned.openHit!.carryUsdYrM).toBeCloseTo(2.3, 3);
+    expect(pinned.openHit!.cfarUsdM).toBeCloseTo(8.7, 3);
+    expect(pinned.openHit!.standing).toBeCloseTo(79.36, 5);
+  });
+});
+
+describe('modalCcyTicketTargets', () => {
+  it('pins Swap/Both Target Carry + Target VAR to the CCY row, not Policy VAR / far leftover', () => {
+    const t = modalCcyTicketTargets({
+      overlayFill: false,
+      ticket: { cfarUsdM: 8.7, carryUsdYrM: 2.3 },
+    });
+    expect(t.carryUsdYrM).toBeCloseTo(2.3, 8);
+    expect(t.cfarUsdM).toBeCloseTo(8.7, 8);
+    expect(t.pinVar).toBe(true);
+    expect(t.cfarUsdM).not.toBeCloseTo(18.5, 1);
+    expect(t.cfarUsdM).not.toBeCloseTo(0.717, 2);
+  });
+
+  it('does not stamp overlay-fill chips onto an origin walk', () => {
+    expect(modalCcyTicketTargets({
+      overlayFill: true,
+      ticket: { cfarUsdM: 15, carryUsdYrM: 1.599 },
+    })).toEqual({ carryUsdYrM: null, cfarUsdM: null, pinVar: false });
+  });
+});
+
+describe('bookStandingChipLabel', () => {
+  it('labels Book S as FCY and Book $ as USD', () => {
+    expect(bookStandingChipLabel(79.36, 92.9)).toBe('Book S 79.4 M · Book $92.9M');
+    expect(bookStandingChipLabel(79.36, 0)).toBe('Book S 79.4 M');
   });
 });

@@ -6,6 +6,7 @@ import type {
   HedgePathSummaryMetrics,
 } from '@/components/test-mode/ExposureHedgePathChart';
 import type { PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
+import { notionalWeightsFromAmounts } from '@/lib/test-mode/rolling-hedge';
 
 /** Cover / Legs / Resid / BE (+ optional module chips) in the sticky hedge-modal header. */
 export type HedgeStagingChip = {
@@ -15,6 +16,37 @@ export type HedgeStagingChip = {
   title?: string | null;
   tone: string;
 };
+
+/** Staged strip settles / weights so FX Risk · Decision replay Cash Carry. */
+export function scheduleFromPreparedProfile(
+  staged: PreparedHedgeProfile | undefined,
+): {
+  ends: number[] | null;
+  weights: number[] | null;
+  stripLegCount: number | null;
+} {
+  if (!staged || staged.structure !== 'strip' || staged.legs.length < 2) {
+    return { ends: null, weights: null, stripLegCount: null };
+  }
+  const ends = staged.legs.map(l =>
+    Math.max(0.05, l.settleMonths ?? l.endMonth),
+  );
+  const amounts = staged.legs.map((l, i) => {
+    if (
+      typeof l.tradeNotionalLocalM === 'number'
+      && Number.isFinite(l.tradeNotionalLocalM)
+    ) {
+      return l.tradeNotionalLocalM;
+    }
+    const prev = i > 0 ? staged.legs[i - 1]!.hedgeLocalM : 0;
+    return l.hedgeLocalM - prev;
+  });
+  return {
+    ends,
+    weights: notionalWeightsFromAmounts(amounts),
+    stripLegCount: ends.length,
+  };
+}
 
 /** True when the path-chart draft no longer matches the staged package. */
 export function pathChartDraftDirty(
@@ -145,10 +177,10 @@ export function HedgeStagingHeader({
             <button
               type="button"
               onClick={onReset}
-              title="Clear staged package — Decision and Liquidity drop this CCY"
-              className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
+              title="Drop this staged package from Decision / Cash Carry / Liquidity"
+              className="rounded border border-rose-600/50 bg-rose-500/15 px-2 py-1 text-[10px] font-semibold text-rose-200 hover:bg-rose-500/25"
             >
-              Reset
+              Unstage
             </button>
           ) : null}
           <button

@@ -125,3 +125,44 @@ describe('migrateFormulaOverrides', () => {
     expect(resolved.values.lpSwap).toBe(17);
   });
 });
+
+describe('hedge formula fields', () => {
+  const scope = {
+    fwdNotional: -10,
+    optNotional: 0,
+    optDelta: 0.5,
+    spotRate: 1.1,
+    hedgeDelta: 0.4,
+    fwdCarryUsd: 0.02,
+    cipCarry: 0.01,
+    hedgeCash: 0.003,
+    bufferCarry: 0.004,
+    cash: 0, swapNear: 0, modelTarget: 0, modelTrough: 0,
+    modelCycleNet: 0, modelCycleEnd: 0, modelCycleFlow: 0,
+  };
+
+  it('defaults FCY hedge from the model notional and USD = FCY × spot', () => {
+    const resolved = resolveSimRow(scope, {});
+    expect(resolved.errors.fwdHedgeFCY).toBeUndefined();
+    expect(resolved.errors.fwdHedgeUSD).toBeUndefined();
+    expect(resolved.values.fwdHedgeFCY).toBeCloseTo(-10, 9);
+    expect(resolved.values.fwdHedgeUSD).toBeCloseTo(-11, 9);
+    expect(resolved.values.hedgeDelta).toBeCloseTo(0.4, 9);
+  });
+
+  it('lets Δ drive USD hedge when FCY is rewritten from Δ', () => {
+    const resolved = resolveSimRow(scope, {
+      fwdHedgeFCY: 'fwdNotional * hedgeDelta',
+    });
+    expect(resolved.values.fwdHedgeFCY).toBeCloseTo(-4, 9);
+    expect(resolved.values.fwdHedgeUSD).toBeCloseTo(-4.4, 9);
+  });
+
+  it('Hedge Carry is the liquidity-model far-leg CIP', () => {
+    const resolved = resolveSimRow(scope, {});
+    expect(resolved.values.hedgeCarry).toBeCloseTo(0.01, 9);
+    const overrideCip = resolveSimRow(scope, { cipCarry: '0.05' });
+    expect(overrideCip.values.cipCarry).toBeCloseTo(0.05, 9);
+    expect(overrideCip.values.hedgeCarry).toBeCloseTo(0.05, 9);
+  });
+});

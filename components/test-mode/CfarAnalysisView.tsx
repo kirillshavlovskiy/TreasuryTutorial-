@@ -67,7 +67,11 @@ import {
   fwdCarryFromSwapPointsUsdM,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
-import { stripHedgeLegCarryUsdM } from '@/lib/fx-hedge';
+import {
+  coverFromTradeLocalM,
+  stripHedgeLegCarryUsdM,
+  tradeFromCoverLocalM,
+} from '@/lib/fx-hedge';
 import { CURRENCY_PARAMS, type RowState } from '@/lib/fx-buffer';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -127,6 +131,8 @@ function fmtCarryK(usdM: number): string {
 /**
  * Per-leg path carry — FWD CIP/points + FCY/USD overnight interest.
  * Same engine as Cash Carry tick-trades Carry column.
+ * `notionalLocalM` is book cover (long +). Market CIP takes cover; strip
+ * cash legs take the hedge trade (−cover).
  */
 function legCarryBreakdown(
   ccy: string,
@@ -158,7 +164,7 @@ function legCarryBreakdown(
     bundle: marketRates,
   });
   return stripHedgeLegCarryUsdM({
-    notionalLocalM,
+    notionalLocalM: tradeFromCoverLocalM(notionalLocalM),
     ccy,
     recognizeMonths: 0,
     settleMonths: settle,
@@ -738,7 +744,7 @@ export function CfarAnalysisView({
           if (extra && Math.abs(extra.amountLocalM) > 1e-9) {
             hedgeSettleSchedule = [{
               settleMonths: extra.settleMonths,
-              notionalLocalM: extra.amountLocalM,
+              notionalLocalM: coverFromTradeLocalM(extra.amountLocalM),
             }];
           }
         }

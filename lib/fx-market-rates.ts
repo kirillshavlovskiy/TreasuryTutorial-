@@ -108,7 +108,7 @@ export function usdMarketPair(ccy: string): string {
   return isUsdPerFcyQuoted(c) ? `${c}USD` : `USD${c}`;
 }
 
-function fcyCcyOf(
+export function fcyCcyOf(
   bundle: Pick<FxMarketRatesBundle, 'pair' | 'baseCcy' | 'quoteCcy'>,
 ): string {
   const desk = (bundle.baseCcy || '').toUpperCase();

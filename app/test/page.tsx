@@ -20,6 +20,18 @@ const TASKS = [
       'Identify VaR at Δ = 1 for your setup and Validate (±5%)',
     ],
   },
+  {
+    id: '02',
+    title: 'SIGMA TASK 02 — Price the Carry',
+    episode: 'E02 — Five Currency Carry Book',
+    time: '~20 minutes',
+    steps: [
+      'Create FX dashboard + profile on each legal entity',
+      'Open Group FX → Analytics → Cash Carry (NWC · profit · spend · debt)',
+      'Set forecast Tf = 12 months (leave hedges off)',
+      'Read do-nothing carry for EUR · GBP · PLN · MXN · JPY and Validate (±5%)',
+    ],
+  },
 ] as const;
 
 function modeCardClass(active: boolean): string {

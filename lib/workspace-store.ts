@@ -59,7 +59,7 @@ export type OptMetric = 'minFloor' | 'payoutBuffer' | 'carryTarget' | 'portfolio
 export const OPT_METRICS: { id: OptMetric; label: string; layer: LayerId; description: string }[] = [
   { id: 'minFloor',     label: 'Min Floor',      layer: 'floorH',       description: 'Hard per-currency minimum cash floor.' },
   { id: 'payoutBuffer', label: 'Payout Buffer',  layer: 'sigmaP',       description: 'Forecast-uncertainty (σ_P) safety margin on payouts.' },
-  { id: 'cfarCover',    label: 'CFaR Cover',     layer: 'cfarCover',    description: 'FX-hedge Net CFaR readout (USD P&L). Does not size the funding swap — payout-σ does.' },
+  { id: 'cfarCover',    label: 'CFaR Cover',     layer: 'cfarCover',    description: 'FX-hedge Net CFaR reserves USD after cover. Does not size the funding swap — payout-σ does.' },
   { id: 'carryTarget',  label: 'Buffer Carry Target',   layer: 'carryOptim',   description: 'Steer Target LP Cash so Buffer Carry (funding-swap cash Δr vs USD) hits the ask.' },
   { id: 'portfolioVar', label: 'Portfolio VaR',  layer: 'portfolioDiv', description: 'Diversified portfolio VaR budget across currencies.' },
 ];

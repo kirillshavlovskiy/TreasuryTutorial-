@@ -197,7 +197,12 @@ export interface SimRowComputed {
 }
 
 export interface UsdRowComputed extends SimRowComputed {
+  /** Working-capital reserve (payout-σ H_USD). */
   usd_reserved: number;
+  /** Residual FX-only Net CFaR reserved in USD after hedge cover. */
+  usd_cfar_reserved: number;
+  /** WC + CFaR. */
+  usd_protected: number;
   usd_available_for_fcy: number;
   usd_fcy_shortfall: number;
   usd_envelope_shortfall: number;
@@ -549,6 +554,7 @@ export function computeSimdUsdRow(
   fcySwapNearUsd: number,
   syncedThreshold?: number,
   syncedSwap?: number,
+  cfarReserveUsd = 0,
 ): UsdRowComputed {
   const cashPos = r.cash + r.nonLpCash;
   const peak_cash = cashPos + r.payout;
@@ -562,7 +568,7 @@ export function computeSimdUsdRow(
     r.payout, r.cash_floor, shared.σ_P, usdActiveLayers(activeLayers),
   ).cash_threshold;
   const derived = deriveUsdLiquidity(
-    payoutBuffer, fcySwapNearUsd, r.cash, r.payout, formulaLayersActive,
+    payoutBuffer, fcySwapNearUsd, r.cash, r.payout, formulaLayersActive, cfarReserveUsd,
   );
 
   const cash_threshold_pre_swap = syncedThreshold ?? derived.cash_threshold;
@@ -619,6 +625,8 @@ export function computeSimdUsdRow(
     floatNim: 0,
     funding_binding,
     usd_reserved: derived.reserved_for_payout,
+    usd_cfar_reserved: derived.cfar_reserve,
+    usd_protected: derived.usd_protected,
     usd_available_for_fcy: derived.available_for_fcy,
     usd_fcy_shortfall: derived.fcy_funding_shortfall,
     usd_envelope_shortfall: derived.fcy_envelope_shortfall,
@@ -675,6 +683,8 @@ export interface LayerTargetRow extends Pass1Row {
   var_trim_from?: number;
   usd_available_for_fcy?: number;
   usd_fcy_shortfall?: number;
+  usd_cfar_reserved?: number;
+  usd_protected?: number;
   usd_stress_binding?: boolean;
   usd_payout_gap?: number;
   usd_liquidity_mode?: 'normal' | 'stress';
@@ -707,9 +717,9 @@ export interface DashboardInputs {
    */
   hedgeSettleByCcy?: HedgeSettleByCcy;
   /**
-   * Per-CCY Net CFaR in USD M — FX-hedge residual only. The CFaR cover layer
-   * converts this to FCY and sizes the funding swap. Must not include liquidity
-   * buffer funding or this swap, or the two modules loop.
+   * Per-CCY Net CFaR in USD M — FX-hedge residual only (no funding-swap bridge).
+   * When `cfarCover` is on this sum reserves USD capital. It does not size
+   * FCY H* or Swap Near. Must not include the funding swap, or the books loop.
    */
   cfarNetByCcyUsd?: Record<string, number>;
   /**
@@ -785,6 +795,15 @@ function cfarCoverFcyFor(ccy: string, netByCcy?: Record<string, number>): number
   const usd = netByCcy?.[ccy];
   if (typeof usd !== 'number' || !Number.isFinite(usd) || usd <= 0.001) return 0;
   return usdToFcyM(usd, ccy);
+}
+
+/** Residual FX-only Net CFaR sum — USD capital reserve when `cfarCover` is on. */
+export function cfarReserveUsdM(
+  activeLayers: Set<LayerId>,
+  netByCcy?: Record<string, number>,
+): number {
+  if (!activeLayers.has('cfarCover') || !netByCcy) return 0;
+  return Object.values(netByCcy).reduce((s, v) => s + (Number.isFinite(v) && v > 0 ? v : 0), 0);
 }
 
 function liquidityLadderFor(
@@ -925,7 +944,10 @@ export function computeLayerTargets(
   const portOptCarryAdj: Record<string, number> = {};
 
   const usdPayoutBuffer = pass1Usd.raw_sum;
-  const usdPriority = assessUsdLiquidityPriority(usdCash, usdPayoutBuffer);
+  const cfarReserveUsd = cfarReserveUsdM(activeLayers, input.cfarNetByCcyUsd);
+  const usdPriority = assessUsdLiquidityPriority(
+    usdCash, usdPayoutBuffer, cfarReserveUsd, usdParams.payout,
+  );
   const fcyCollateralBudget = usdPriority.available_for_fcy;
 
   if (portfolioActive) {
@@ -1039,6 +1061,7 @@ export function computeLayerTargets(
   );
   const preStressLiquidity = deriveUsdLiquidity(
     usdPayoutBuffer, preStressSwapUsd, usdCash, usdParams.payout, formulaLayersActive,
+    cfarReserveUsd,
   );
   const needsStressRebalance = preStressLiquidity.budget_binding;
 
@@ -1064,6 +1087,7 @@ export function computeLayerTargets(
       shared.r_USD,
       formulaLayersActive,
       usdParams.payout,
+      cfarReserveUsd,
     )
     : null;
 
@@ -1129,6 +1153,7 @@ export function computeLayerTargets(
 
   const usdDerived = deriveUsdLiquidity(
     pass1Usd.raw_sum, fcySwapNearUsd, usdCash, usdParams.payout, formulaLayersActive,
+    cfarReserveUsd,
   );
   const usdCash_threshold = formulaLayersActive ? usdDerived.cash_threshold : pass1Usd.peak_cash;
   const usdSwap_needed = formulaLayersActive ? usdDerived.swapNear : -fcySwapNearUsd;
@@ -1150,6 +1175,8 @@ export function computeLayerTargets(
     budget_binding: usdDerived.budget_binding,
     usd_available_for_fcy: usdDerived.available_for_fcy,
     usd_fcy_shortfall: usdDerived.fcy_funding_shortfall,
+    usd_cfar_reserved: usdDerived.cfar_reserve,
+    usd_protected: usdDerived.usd_protected,
     usd_stress_binding: stress?.stress_binding ?? false,
     usd_payout_gap: usdPriority.usd_payout_gap,
     usd_liquidity_mode: needsStressRebalance ? 'stress' : 'normal',
@@ -1285,6 +1312,7 @@ export function computeDashboardModel(input: DashboardInputs): DashboardModel {
     ...computeSimdUsdRow(
       usdState, input.shared, input.activeLayers, fcySwapNearUsd,
       usdLayer?.cash_threshold_raw, swapByCcy['USD'],
+      cfarReserveUsdM(input.activeLayers, input.cfarNetByCcyUsd),
     ),
   };
 

@@ -1,9 +1,16 @@
+import { NORDTECH_ENTITIES } from '@/lib/test-mode/fixtures/nordtech-accounts';
 import { withinTolerance } from '@/lib/test-mode/fixtures/nordtech-reference';
+import { buildCashForecastCarryComparison } from '@/lib/test-mode/cash-carry-analytics';
+import { consolidateEntityBooks } from '@/lib/test-mode/consolidate';
+import { emptyMarketRatesForCcy } from '@/lib/fx-market-rates';
 import {
   classifyNordtechEntity,
+  mergedEntityForecastProfile,
   TASK01_REQUIRED_ANALYTICAL_LAYERS,
   TASK01_REQUIRED_DECISION_LAYERS,
   TASK01_REQUIRED_FX_INPUTS,
+  TASK02_CARRY_CCYS,
+  TASK02_FORECAST_MONTHS,
 } from '@/lib/test-mode/nordtech-sim-seed';
 import type {
   ScoreCheck,
@@ -19,6 +26,7 @@ import {
 import type {
   AnalyticalLayer,
   DecisionLayer,
+  Entity,
   FxInput,
   Workspace,
 } from '@/lib/workspace-store';
@@ -46,6 +54,16 @@ const HINTS = {
     'In Analytics choose confidence (90/95/99), VaR analysis horizon (vol √T), and VaR profile (Simple / Time-weighted / Growth path). Set forecast period on FX Risk. Copy those into Your answers.',
   varAmt:
     'Enter EUR VaR at Δ = 1 ($K) that matches your Analytics setup (±5%). Read it from Risk Metrics / Analytics at Δ = 1 — not from a guessed template.',
+  carryTf:
+    'On Group FX → Analytics → Cash Carry set forecast period Tf to 12 months. Do-nothing carry is the unhedged Total / Do nothing column.',
+  carryByCcy:
+    'Read Do nothing carry @ 12m ($K) for EUR, GBP, PLN, MXN and JPY from Cash Carry · all currencies. Enter each in $K (±5%). Leave hedges off — this task scores the unhedged book.',
+  carryTotal:
+    'All CCY footer Σ is the sum of the five do-nothing carries at Tf = 12m. Enter it in $K (±5%).',
+  carryEarn:
+    'Largest EARN is the currency with the most positive Do nothing carry at 12m. Read the Cash Carry table — rate × growing cash can beat a higher-yield smaller pile.',
+  carryPay:
+    'Largest PAY is the currency with the most negative (or smallest) Do nothing carry at 12m — read the table, do not guess from the rate alone.',
 } as const;
 
 function profileHasRequiredInputs(inputs: FxInput[] | undefined): boolean {
@@ -367,4 +385,278 @@ export function scoreTask01(
 
   const pass = checks.every(c => c.pass);
   return { pass, checks, hints: [...new Set(hints)] };
+}
+
+function nordtechSeedEntities(): Entity[] {
+  return NORDTECH_ENTITIES.map(e => ({
+    id: e.id,
+    name: e.legalName,
+    baseCurrency: e.functionalCurrency,
+    description: e.description,
+    createdAt: '',
+    dashboards: [],
+  }));
+}
+
+export interface Task02CarryReference {
+  byCcy: Record<(typeof TASK02_CARRY_CCYS)[number], number>;
+  allCcy: number;
+  earnCcy: (typeof TASK02_CARRY_CCYS)[number];
+  payCcy: (typeof TASK02_CARRY_CCYS)[number];
+}
+
+/**
+ * Hidden Task 02 reference — unhedged do-nothing cash carry @ Tf = 12m
+ * from the same Cash Carry engine the Analytics table uses (LP overnight).
+ */
+export function expectedTask02CarryUsdM(): Task02CarryReference {
+  const entities = nordtechSeedEntities();
+  const book = consolidateEntityBooks(entities, '02');
+  const forecast = mergedEntityForecastProfile(entities, '02');
+  const byCcy = {} as Task02CarryReference['byCcy'];
+  for (const ccy of TASK02_CARRY_CCYS) {
+    const cmp = buildCashForecastCarryComparison({
+      ccy,
+      bookRows: book.rows,
+      forecastProfile: forecast,
+      forecastMonths: TASK02_FORECAST_MONTHS,
+      marketRates: emptyMarketRatesForCcy(ccy),
+    });
+    byCcy[ccy] = cmp?.categories.unhedgedIncomeUsdM ?? 0;
+  }
+  const allCcy = TASK02_CARRY_CCYS.reduce((sum, ccy) => sum + byCcy[ccy], 0);
+  let earnCcy: (typeof TASK02_CARRY_CCYS)[number] = TASK02_CARRY_CCYS[0];
+  let payCcy: (typeof TASK02_CARRY_CCYS)[number] = TASK02_CARRY_CCYS[0];
+  for (const ccy of TASK02_CARRY_CCYS) {
+    if (byCcy[ccy] > byCcy[earnCcy]) earnCcy = ccy;
+    if (byCcy[ccy] < byCcy[payCcy]) payCcy = ccy;
+  }
+  return { byCcy, allCcy, earnCcy, payCcy };
+}
+
+function usdKFromAnswer(raw: string): number | null {
+  const n = parseNum(raw);
+  if (n === null) return null;
+  // Students enter $K; accept a raw $M figure when |n| < 1.
+  return Math.abs(n) >= 1 ? n / 1000 : n;
+}
+
+function scoreNordtechStructure(
+  workspace: Workspace,
+  groupDashboardOpened: boolean,
+): { checks: ScoreCheck[]; hints: string[] } {
+  const checks: ScoreCheck[] = [];
+  const hints: string[] = [];
+
+  const classes = workspace.entities.map(classifyNordtechEntity);
+  const entitiesOk =
+    classes.includes('US') && classes.includes('DE') && classes.includes('PL');
+  checks.push({
+    id: 'entities',
+    label: 'Three NordTech entities (US · GmbH · Poland)',
+    pass: entitiesOk,
+    expected: 'NordTech US, GmbH, Poland',
+    actual: workspace.entities.map(e => e.name ?? '(unnamed)').join(', ') || '(none)',
+    hint: entitiesOk ? undefined : HINTS.entities,
+  });
+
+  checks.push({
+    id: 'groupDashboard',
+    label: 'Parent consolidated Group FX dashboard opened',
+    pass: groupDashboardOpened,
+    expected: 'Group FX opened',
+    actual: groupDashboardOpened ? 'Opened' : 'Not opened yet',
+    hint: groupDashboardOpened ? undefined : HINTS.group,
+  });
+
+  const byClass = {
+    US: workspace.entities.find(e => classifyNordtechEntity(e) === 'US'),
+    DE: workspace.entities.find(e => classifyNordtechEntity(e) === 'DE'),
+    PL: workspace.entities.find(e => classifyNordtechEntity(e) === 'PL'),
+  };
+
+  const dashOk = (['US', 'DE', 'PL'] as const).every(c => {
+    const e = byClass[c];
+    return e && e.dashboards.length >= 1;
+  });
+  checks.push({
+    id: 'dashboards',
+    label: 'Dashboard created per entity',
+    pass: !!dashOk,
+    expected: '≥1 dashboard on US, GmbH, Poland',
+    actual: (['US', 'DE', 'PL'] as const)
+      .map(c => `${c}:${byClass[c]?.dashboards.length ?? 0}`)
+      .join(' '),
+    hint: dashOk ? undefined : HINTS.dashboards,
+  });
+
+  const profileOk = (['US', 'DE', 'PL'] as const).every(c => {
+    const e = byClass[c];
+    if (!e) return false;
+    return e.dashboards.some(d => d.riskProfiles.some(p => p.type === 'fx'));
+  });
+  checks.push({
+    id: 'fxProfiles',
+    label: 'FX risk profile on each entity dashboard',
+    pass: !!profileOk,
+    expected: 'FX profile on each entity',
+    actual: profileOk ? 'OK' : 'Missing FX profile on one or more entities',
+    hint: profileOk ? undefined : HINTS.profiles,
+  });
+
+  const inputsOk = (['US', 'DE', 'PL'] as const).every(c => {
+    const e = byClass[c];
+    if (!e) return false;
+    return e.dashboards.some(d =>
+      d.riskProfiles.some(
+        p => p.type === 'fx' && profileHasRequiredInputs(p.fxConfig?.inputs),
+      ),
+    );
+  });
+  checks.push({
+    id: 'fxInputs',
+    label: 'FX Risk input on each entity profile',
+    pass: !!inputsOk,
+    expected: TASK01_REQUIRED_FX_INPUTS.join(', '),
+    actual: inputsOk ? 'OK' : 'Missing FX Risk (fxExposure)',
+    hint: inputsOk ? undefined : HINTS.fxInputs,
+  });
+
+  const decisionOk = (['US', 'DE', 'PL'] as const).every(c => {
+    const e = byClass[c];
+    if (!e) return false;
+    return e.dashboards.some(d =>
+      d.riskProfiles.some(
+        p =>
+          p.type === 'fx' &&
+          profileHasRequiredDecisionLayers(p.fxConfig?.decisionLayers),
+      ),
+    );
+  });
+  checks.push({
+    id: 'decisionLayers',
+    label: 'Decision layer: Hedging Decision',
+    pass: !!decisionOk,
+    expected: TASK01_REQUIRED_DECISION_LAYERS.join(', '),
+    actual: decisionOk ? 'OK' : 'Missing Hedging Decision layer',
+    hint: decisionOk ? undefined : HINTS.decisionLayers,
+  });
+
+  const analyticalOk = (['US', 'DE', 'PL'] as const).every(c => {
+    const e = byClass[c];
+    if (!e) return false;
+    return e.dashboards.some(d =>
+      d.riskProfiles.some(
+        p =>
+          p.type === 'fx' &&
+          profileHasRequiredAnalyticalLayers(p.fxConfig?.analyticalLayers),
+      ),
+    );
+  });
+  checks.push({
+    id: 'analyticalLayers',
+    label: 'Analytical layer: Risk Metrics (VaR)',
+    pass: !!analyticalOk,
+    expected: TASK01_REQUIRED_ANALYTICAL_LAYERS.join(', '),
+    actual: analyticalOk ? 'OK' : 'Missing Risk Metrics analytical layer',
+    hint: analyticalOk ? undefined : HINTS.analyticalLayers,
+  });
+
+  for (const c of checks) {
+    if (!c.pass && c.hint) hints.push(c.hint);
+  }
+  return { checks, hints };
+}
+
+/**
+ * Validate Task 02: same NordTech workspace, then unhedged do-nothing
+ * carry @ 12m for EUR · GBP · PLN · MXN · JPY (±5%).
+ */
+export function scoreTask02(
+  workspace: Workspace,
+  answers: TaskAnswers,
+  groupDashboardOpened = false,
+): TaskScoreResult {
+  const structure = scoreNordtechStructure(workspace, groupDashboardOpened);
+  const checks: ScoreCheck[] = [...structure.checks];
+  const hints: string[] = [...structure.hints];
+  const expected = expectedTask02CarryUsdM();
+
+  const tf = parseNum(answers.carryForecastMonths ?? '');
+  const tfOk = tf !== null && Math.abs(tf - TASK02_FORECAST_MONTHS) < 0.01;
+  checks.push({
+    id: 'carryTf',
+    label: 'Answer: Cash Carry forecast period Tf',
+    pass: tfOk,
+    expected: `${TASK02_FORECAST_MONTHS} months`,
+    actual: tf === null ? '(blank/invalid)' : `${tf}`,
+    hint: tfOk ? undefined : HINTS.carryTf,
+  });
+
+  const carryFields: {
+    id: string;
+    ccy: (typeof TASK02_CARRY_CCYS)[number];
+    raw: string;
+  }[] = [
+    { id: 'carryEur', ccy: 'EUR', raw: answers.carryEurUsdK ?? '' },
+    { id: 'carryGbp', ccy: 'GBP', raw: answers.carryGbpUsdK ?? '' },
+    { id: 'carryPln', ccy: 'PLN', raw: answers.carryPlnUsdK ?? '' },
+    { id: 'carryMxn', ccy: 'MXN', raw: answers.carryMxnUsdK ?? '' },
+    { id: 'carryJpy', ccy: 'JPY', raw: answers.carryJpyUsdK ?? '' },
+  ];
+  for (const field of carryFields) {
+    const usdM = usdKFromAnswer(field.raw);
+    const want = expected.byCcy[field.ccy];
+    const ok = usdM !== null && withinTolerance(usdM, want);
+    checks.push({
+      id: field.id,
+      label: `Answer: ${field.ccy} do-nothing carry @ 12m ($K)`,
+      pass: ok,
+      expected: `~$${(want * 1000).toFixed(1)}K (±5%)`,
+      actual:
+        usdM === null
+          ? '(blank/invalid)'
+          : `$${(usdM * 1000).toFixed(1)}K`,
+      hint: ok ? undefined : HINTS.carryByCcy,
+    });
+  }
+
+  const allM = usdKFromAnswer(answers.carryAllCcyUsdK ?? '');
+  const allOk = allM !== null && withinTolerance(allM, expected.allCcy);
+  checks.push({
+    id: 'carryAll',
+    label: 'Answer: All CCY do-nothing carry @ 12m ($K)',
+    pass: allOk,
+    expected: `~$${(expected.allCcy * 1000).toFixed(1)}K (±5%)`,
+    actual:
+      allM === null ? '(blank/invalid)' : `$${(allM * 1000).toFixed(1)}K`,
+    hint: allOk ? undefined : HINTS.carryTotal,
+  });
+
+  const earn = (answers.carryEarnCcy ?? '').trim().toUpperCase();
+  const earnOk = earn === expected.earnCcy;
+  checks.push({
+    id: 'carryEarn',
+    label: 'Answer: largest EARN carry currency',
+    pass: earnOk,
+    expected: expected.earnCcy,
+    actual: earn || '(blank)',
+    hint: earnOk ? undefined : HINTS.carryEarn,
+  });
+
+  const pay = (answers.carryPayCcy ?? '').trim().toUpperCase();
+  const payOk = pay === expected.payCcy;
+  checks.push({
+    id: 'carryPay',
+    label: 'Answer: largest PAY carry currency',
+    pass: payOk,
+    expected: expected.payCcy,
+    actual: pay || '(blank)',
+    hint: payOk ? undefined : HINTS.carryPay,
+  });
+
+  for (const c of checks) {
+    if (!c.pass && c.hint) hints.push(c.hint);
+  }
+  return { pass: checks.every(c => c.pass), checks, hints: [...new Set(hints)] };
 }

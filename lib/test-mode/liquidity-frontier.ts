@@ -15,6 +15,7 @@
 
 import { fundedPlanFor } from '@/lib/dashboard-model';
 import {
+  allocateResidualSwapForwardOverlay,
   clampHedgeDelta,
   fwdHedgeCarryFromMarketUsd,
   type SwapForwardOverlay,
@@ -40,6 +41,7 @@ import {
 } from '@/lib/test-mode/liquidity-strategies';
 import { monthlyVolForSetup, type VarSetup } from '@/lib/test-mode/var-setup';
 import {
+  bothSidesPayVsUsd,
   ccySpotRate,
   fundingSwapCarryLegs,
   fundingSwapCashDeltaUsdYr,
@@ -337,26 +339,23 @@ function overlayFor(
   row: RowState,
   plan: readonly LiquidityCycleProjection[],
   delta: number,
+  r_USD: number,
 ): SwapForwardOverlay {
-  const dust = (v: number) => (Math.abs(v) < 0.005 ? 0 : v);
-  const residual = clampHedgeDelta(delta);
-  const E = fxBookNetLocalM(row);
   const S = plan[0]?.swap_needed ?? 0;
   const standing = plan.reduce(
     (best, p) => (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
     0,
   );
-  const net = E + S;
-  return {
-    delta: 1 - residual,
-    exposureLocalM: E,
+  return allocateResidualSwapForwardOverlay({
+    exposureLocalM: fxBookNetLocalM(row),
     swapNearLocalM: S,
     swapStandingLocalM: standing,
-    forwardLocalM: dust(-(1 - residual) * net),
-    remainingFarLocalM: dust(-residual * S),
-    residualNearLocalM: dust(residual * S),
-    finalNetLocalM: dust(residual * net),
-  };
+    residual: delta,
+    r_FCY: row.r_FCY,
+    r_USD,
+    r_OD: row.r_OD,
+    spot: ccySpotRate(row.ccy),
+  });
 }
 
 function pricePoint(
@@ -384,7 +383,7 @@ function pricePoint(
     floor: trial.cash_floor,
     hedgeSettle: input.hedgeSettleByCcy?.[trial.ccy],
   });
-  const overlay = overlayFor(trial, plan, delta);
+  const overlay = overlayFor(trial, plan, delta, input.shared.r_USD);
   const spot = ccySpotRate(trial.ccy);
   const cashCarryUsdYrM = unfundedCashCarryUsdYr(
     ladder, spot, trial.r_FCY, trial.r_OD, input.shared.r_USD,
@@ -625,6 +624,32 @@ export function bookCashCarryK(
   return Math.abs(fundingSwapCashDeltaUsdYr(standing, spot, r_FCY, r_USD, r_OD)) * 1000;
 }
 
+/**
+ * Orient a funding-swap standing to the side that EARNS carry vs USD:
+ * hold long when long earns (r_FCY > r_USD), short when short earns (payer
+ * FCY). When neither side earns (both pay — an FCY straddling r_USD via its
+ * OD rate) the raw funding direction is kept. Only the sign changes; the
+ * magnitude (the book size the strip allocates) is untouched.
+ *
+ * The carry/CFaR frontier is a carry-vs-risk trade-off — a payer book walked
+ * long prints a rising COST as if it were income. Orienting the walked
+ * standing to the earn side gives the strip its proper direction and a
+ * genuinely positive carry axis.
+ */
+export function carryEarnOrientedStanding(
+  rawStanding: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+  r_OD?: number,
+): number {
+  const mag = Math.abs(rawStanding);
+  if (mag < 1e-9) return rawStanding;
+  if (bothSidesPayVsUsd(spot, r_FCY, r_USD, r_OD)) return rawStanding;
+  const longEarns = fundingSwapCashDeltaUsdYr(1, spot, r_FCY, r_USD, r_OD) >= 0;
+  return mag * (longEarns ? 1 : -1);
+}
+
 /** Standing S (M FCY) that prints `cashUsdYr` on the cash-Δr book. */
 export function standingFromCashCarryUsdYr(
   cashUsdYr: number,
@@ -657,10 +682,7 @@ export function frontierCashCarrySign(
   r_USD: number,
   r_OD?: number,
 ): 1 | -1 {
-  const perLong = fundingSwapCashDeltaUsdYr(1, spot, r_FCY, r_USD, r_OD);
-  const perShort = fundingSwapCashDeltaUsdYr(-1, spot, r_FCY, r_USD, r_OD);
-  if (perLong > 1e-12 || perShort > 1e-12) return 1;
-  return -1;
+  return bothSidesPayVsUsd(spot, r_FCY, r_USD, r_OD) ? -1 : 1;
 }
 
 /** S for a +$K cash step: earn-side invert, else pay-side invert (PLN). */
@@ -676,6 +698,21 @@ export function standingForCashCarryStep(
   const earn = standingFromCashCarryUsdYr(mag, spot, r_FCY, r_USD, r_OD);
   if (Math.abs(earn) > 1e-6) return earn;
   return standingFromCashCarryUsdYr(-mag, spot, r_FCY, r_USD, r_OD);
+}
+
+/**
+ * Scale the live Book S: `S(k) = bookS × k / bookCashK`.
+ * Same sign as the strip (EUR long +79 stays long). Earn-side invert is
+ * a second walk and must not replace the ticket.
+ */
+export function standingAlongLiveBook(
+  cashK: number,
+  bookStanding: number,
+  bookCashK: number,
+): number | null {
+  if (!(Math.abs(bookStanding) > 0.01) || !(bookCashK > 0.2)) return null;
+  if (!(Number.isFinite(cashK) && cashK > 0.2)) return 0;
+  return bookStanding * (cashK / bookCashK);
 }
 
 /** Open-arm Y is always the cash action on the + side. */
@@ -705,6 +742,41 @@ export const CARRY_LOG_S = 0.012;
 export function carryFwd(usdM: number, s: number = CARRY_LOG_S): number {
   const v = usdM / Math.max(s, 1e-6);
   return Math.log(v + Math.sqrt(v * v + 1));
+}
+
+/**
+ * Per-currency Balanced: supporting-ray touch from true (0, 0) on the
+ * open arm. Same rule as the portfolio plot — maximise asinh(carry)/CFaR.
+ */
+export function tangencyOnLiquidityArm(
+  pts: readonly LiquidityFrontierPoint[],
+  carryS?: number,
+): LiquidityFrontierPoint | null {
+  const arm = pts
+    .filter(p => (
+      Number.isFinite(p.finalCfarUsdM)
+      && Number.isFinite(p.totalCarryUsdYrM)
+      && p.finalCfarUsdM > 1e-9
+      && Math.abs(p.delta) < 1e-9
+      && !p.levered
+    ))
+    .sort((a, b) => a.finalCfarUsdM - b.finalCfarUsdM || a.peakBook - b.peakBook);
+  if (arm.length === 0) return null;
+  const yHi = Math.max(0.012, ...arm.map(p => p.totalCarryUsdYrM));
+  const yLo = Math.min(0, ...arm.map(p => p.totalCarryUsdYrM));
+  const s = Math.max(carryS ?? Math.max(0.012, yHi, Math.abs(yLo) * 1.2), 1e-6);
+  let best = arm[0]!;
+  let bestRatio = -Infinity;
+  for (const p of arm) {
+    const z = carryFwd(p.totalCarryUsdYrM, s);
+    if (!Number.isFinite(z)) continue;
+    const ratio = z / p.finalCfarUsdM;
+    if (ratio > bestRatio + 1e-15) {
+      bestRatio = ratio;
+      best = p;
+    }
+  }
+  return bestRatio > -Infinity ? best : null;
 }
 
 /**
@@ -871,9 +943,9 @@ export interface LiquidityFrontierHit {
 
 export interface LiquidityFrontierConstraint {
   dial: LiquidityFrontierDial;
-  /** Horizontal — Target Carry (open-book cash). */
+  /** Horizontal — Target Carry (portfolio ask / this CCY’s share). */
   hCarryUsdYrM: number | null;
-  /** Vertical — live Net CFaR / VAR. */
+  /** Vertical — Target VAR (this CCY’s CFaR at the selected scenario). */
   vCfarUsdM: number | null;
   openHit: LiquidityFrontierHit | null;
   hedgeHit: LiquidityFrontierHit | null;
@@ -974,6 +1046,111 @@ export function interpAlong(
   return null;
 }
 
+function nearestFrontierHit(
+  pts: readonly LiquidityFrontierPoint[],
+  key: (p: LiquidityFrontierPoint) => number,
+  at: number,
+): LiquidityFrontierHit | null {
+  if (pts.length === 0) return null;
+  let best = pts[0]!;
+  let bestD = Math.abs(key(best) - at);
+  for (const p of pts) {
+    const d = Math.abs(key(p) - at);
+    if (d < bestD) {
+      best = p;
+      bestD = d;
+    }
+  }
+  return {
+    cfarUsdM: best.finalCfarUsdM,
+    carryUsdYrM: best.totalCarryUsdYrM,
+    standing: best.peakBook,
+  };
+}
+
+function hitAtStanding(
+  pts: readonly LiquidityFrontierPoint[],
+  standing: number,
+): LiquidityFrontierHit | null {
+  return nearestFrontierHit(pts, p => p.peakBook, standing);
+}
+
+/**
+ * Pin Target Carry / Target VAR to the portfolio model (this CCY’s
+ * setpoint), not the local H* standing walk.
+ *
+ * Carry Y = this name’s share of the desk Ask / selected Carry Target.
+ * VAR X = this name’s CFaR at the selected scenario (Policy VAR / mode).
+ * Hits snap onto the local arms when the value is on them; the line
+ * values stay at the portfolio numbers even when off-arm.
+ *
+ * Portfolio book-scale CFaR (Swap chart X) is not a local Target VAR.
+ * Pass `pinVar: false` so the CCY modal keeps Book-S hits and only
+ * draws Target Carry when that Y is on the cash arm.
+ */
+export function applyPortfolioFrontierTargets(
+  constraint: LiquidityFrontierConstraint,
+  arms: {
+    origin: LiquidityFrontierPoint;
+    open: readonly LiquidityFrontierPoint[];
+    far: readonly LiquidityFrontierPoint[];
+  },
+  targets: {
+    carryUsdYrM?: number | null;
+    cfarUsdM?: number | null;
+    pinVar?: boolean;
+  },
+): LiquidityFrontierConstraint {
+  const carryY = typeof targets.carryUsdYrM === 'number'
+    && Number.isFinite(targets.carryUsdYrM)
+    && Math.abs(targets.carryUsdYrM) > 1e-9
+    ? targets.carryUsdYrM
+    : null;
+  const cfarX = typeof targets.cfarUsdM === 'number'
+    && Number.isFinite(targets.cfarUsdM)
+    && targets.cfarUsdM > 1e-9
+    ? targets.cfarUsdM
+    : null;
+  const showCarry = carryY != null;
+  const showVar = targets.pinVar !== false
+    && constraint.dial === 'var_target'
+    && cfarX != null;
+  if (!showCarry && !showVar) return constraint;
+
+  const openWithOrigin = [arms.origin, ...arms.open];
+  const farWithOrigin = [arms.origin, ...arms.far];
+  const carryOpen = showCarry
+    ? (interpAlong(openWithOrigin, carryY, 'carry')
+      ?? nearestFrontierHit(openWithOrigin, p => p.totalCarryUsdYrM, carryY))
+    : null;
+  const varOpen = showVar
+    ? (interpAlong(openWithOrigin, cfarX, 'cfar')
+      ?? nearestFrontierHit(openWithOrigin, p => p.finalCfarUsdM, cfarX))
+    : null;
+  const varFar = showVar
+    ? (interpAlong(farWithOrigin, cfarX, 'cfar')
+      ?? nearestFrontierHit(farWithOrigin, p => p.finalCfarUsdM, cfarX))
+    : null;
+  const carryOnArm = carryOpen != null
+    && Math.abs(carryOpen.carryUsdYrM - carryY!) <= 0.05;
+  const carryFar = carryOnArm && carryOpen
+    ? (hitAtStanding(arms.far, carryOpen.standing)
+      ?? interpAlong(farWithOrigin, carryOpen.carryUsdYrM, 'carry'))
+    : null;
+
+  return {
+    dial: constraint.dial,
+    hCarryUsdYrM: showCarry ? carryY : constraint.hCarryUsdYrM,
+    vCfarUsdM: showVar ? cfarX : (constraint.dial === 'var_target' ? constraint.vCfarUsdM : null),
+    openHit: showVar
+      ? (varOpen ?? constraint.openHit)
+      : (carryOnArm ? carryOpen : constraint.openHit),
+    hedgeHit: showVar
+      ? (varFar ?? constraint.hedgeHit)
+      : (carryOnArm ? (carryFar ?? constraint.hedgeHit) : constraint.hedgeHit),
+  };
+}
+
 /**
  * Price one residual-risk step. Swap standing and swap CFaR are Δ × book.
  * Overlay hedge is (1−Δ) of the full book — not an empty k = 0 plan.
@@ -997,7 +1174,7 @@ function priceResidualDelta(
     floor: row.cash_floor,
     hedgeSettle: input.hedgeSettleByCcy?.[row.ccy],
   });
-  const overlay = overlayFor(row, fullPlan, residual);
+  const overlay = overlayFor(row, fullPlan, residual, input.shared.r_USD);
   const spot = ccySpotRate(row.ccy);
   const cashCarryUsdYrM = unfundedCashCarryUsdYr(
     ladder, spot, row.r_FCY, row.r_OD, input.shared.r_USD,
@@ -1362,9 +1539,10 @@ export function buildLiquidityLeftEndFrontier(
   const points: LiquidityFrontierPoint[] = [];
 
   for (const k of stepsK) {
-    const standing = standingForCashCarryStep(
-      k, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
-    );
+    const standing = standingAlongLiveBook(k, liveS, bookCashK)
+      ?? standingForCashCarryStep(
+        k, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
+      );
     if (Math.abs(standing) < 1e-6) continue;
     const priced = priceStanding(standing);
     const openCashUsdYr = frontierOpenCashUsdYr(priced.cashUsdYr);
@@ -1604,7 +1782,7 @@ export function buildLiquidityFrontier(
       fxByDelta.set(delta, {});
       continue;
     }
-    const overlay = overlayFor(input.row, coverPlan, delta);
+    const overlay = overlayFor(input.row, coverPlan, delta, input.shared.r_USD);
     fxByDelta.set(delta, fxHedgeMcCfarByCcy({
       rows: [input.row],
       setup: input.setup,

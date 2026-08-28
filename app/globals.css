@@ -98,6 +98,7 @@
 .sim-dark .bg-purple-50   { background-color: rgba(168,85,247,0.12); }
 .sim-dark .bg-purple-100  { background-color: rgba(168,85,247,0.20); }
 .sim-dark .bg-emerald-50  { background-color: rgba(16,185,129,0.12); }
+.sim-dark [class*="bg-emerald-50/"] { background-color: rgba(16,185,129,0.12); }
 .sim-dark .bg-emerald-100 { background-color: rgba(16,185,129,0.20); }
 .sim-dark .bg-green-50    { background-color: rgba(34,197,94,0.12); }
 .sim-dark .bg-green-100   { background-color: rgba(34,197,94,0.20); }

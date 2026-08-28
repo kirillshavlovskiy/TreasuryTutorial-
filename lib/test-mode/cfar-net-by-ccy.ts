@@ -21,6 +21,7 @@ import {
 import { resolveMarketRatesForCcy, type FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import {
   analyticsForwardsFromOverlays,
+  coverFromTradeLocalM,
   retainedFundingPlanByCcy,
   type SwapForwardOverlay,
 } from '@/lib/fx-hedge';
@@ -149,7 +150,8 @@ export function hedgeSettleScheduleForCfar(
   if (extraForward && Math.abs(extraForward.amountLocalM) > 1e-9) {
     return [{
       settleMonths: extraForward.settleMonths,
-      notionalLocalM: extraForward.amountLocalM,
+      // Extra is a hedge trade (sell −). MC settle is cover-signed (long +).
+      notionalLocalM: coverFromTradeLocalM(extraForward.amountLocalM),
     }];
   }
   return [];
@@ -335,6 +337,14 @@ export function fxOnlyNetByCcyUsdM(
 export function sumNetCfarUsdM(byCcy: Record<string, number> | undefined): number {
   if (!byCcy) return 0;
   return Object.values(byCcy).reduce((s, v) => s + (Number.isFinite(v) ? v : 0), 0);
+}
+
+/**
+ * USD capital reserve from an FX-only Net CFaR map (cover sizing, no swap bridge).
+ * Sum, not RSS — cash-path shortfalls can bind together against the same pot.
+ */
+export function fxOnlyCfarReserveUsdM(byCcy: Record<string, number> | undefined): number {
+  return Math.max(0, sumNetCfarUsdM(byCcy));
 }
 
 /**

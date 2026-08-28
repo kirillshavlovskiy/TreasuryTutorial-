@@ -4,6 +4,7 @@ import {
   displayedCfarUsdMFromFxNet,
   fxHedgeMcCfarByCcy,
   fxHedgeNetCfarByCcyUsdM,
+  hedgeSettleScheduleForCfar,
 } from '@/lib/test-mode/cfar-net-by-ccy';
 import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
@@ -146,5 +147,21 @@ describe('displayedCfarUsdMFromFxNet — swap Net, not linear in carry', () => {
     );
     expect(withCarry).toBeLessThan(noCarry);
     expect(withCarry).toBeGreaterThan(fx);
+  });
+});
+
+describe('hedgeSettleScheduleForCfar — extra overlay is trade-signed', () => {
+  it('sell-PLN extra settles as a long cover (delivers FCY), not a buy', () => {
+    const sched = hedgeSettleScheduleForCfar(
+      [],
+      undefined,
+      'PLN',
+      SETUP,
+      12,
+      { ccy: 'PLN', amountLocalM: -21.6, settleMonths: 12 },
+    );
+    expect(sched).toHaveLength(1);
+    expect(sched[0]!.notionalLocalM).toBeCloseTo(21.6, 9);
+    expect(sched[0]!.settleMonths).toBe(12);
   });
 });

@@ -29,7 +29,7 @@ import {
   type LiquidityFrontierPoint,
   type LiquidityLeftEndResult,
 } from '@/lib/test-mode/liquidity-frontier';
-import type { LiquidityStrategy } from '@/lib/test-mode/liquidity-strategies';
+import { cfarTailProbability, type LiquidityStrategy } from '@/lib/test-mode/liquidity-strategies';
 import { sumNetCfarUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
 
 /**
@@ -352,6 +352,276 @@ export function buildSoloCcyAlignedFrontier(input: {
 export const DEFAULT_DESK_TARGET_CARRY_USD_YR = 32 / 1000;
 
 /**
+ * Efficient skyline on the Total-Carry / Port-CFaR plane.
+ *
+ * The book-scale walk is a parametric trace in k. Diversified CFaR is not
+ * monotone in k (RSS bow on t < 1), so joining samples in sweep order draws
+ * dominated points — the jag around ~$1.5M. Sweep richest carry first and
+ * keep a point only when it beats every richer point on risk. Result is
+ * ascending carry / ascending CFaR so a line through it cannot double back.
+ */
+export function efficientCarryVarEnvelope(
+  points: readonly PortfolioCarryFrontierPoint[],
+): PortfolioCarryFrontierPoint[] {
+  const finite = points.filter(p => (
+    Number.isFinite(p.portfolioVarUsd) && Number.isFinite(p.totalCarryUsdYr)
+  ));
+  if (finite.length <= 1) return finite;
+  const byCarryDesc = [...finite].sort((a, b) => (
+    b.totalCarryUsdYr - a.totalCarryUsdYr
+    || a.portfolioVarUsd - b.portfolioVarUsd
+  ));
+  const keep: PortfolioCarryFrontierPoint[] = [];
+  let bestX = Number.POSITIVE_INFINITY;
+  for (const p of byCarryDesc) {
+    if (p.portfolioVarUsd < bestX - 1e-9) {
+      keep.push(p);
+      bestX = p.portfolioVarUsd;
+    }
+  }
+  return keep.reverse();
+}
+
+/**
+ * CCY modal arm: every priced sample in walk order (k).
+ * Do not run the max-carry envelope — that drops unhedged $0 at the
+ * same CFaR and leaves the orange gap at the k-stack peak.
+ */
+function walkOrderArm(
+  points: readonly PortfolioCarryFrontierPoint[],
+): PortfolioCarryFrontierPoint[] {
+  return points
+    .filter(p => (
+      Number.isFinite(p.portfolioVarUsd) && Number.isFinite(p.totalCarryUsdYr)
+    ))
+    .sort((a, b) => a.k - b.k || a.portfolioVarUsd - b.portfolioVarUsd);
+}
+
+/** @deprecated use plotStandingCarryArm — envelope is not the drawn stroke. */
+export function plotCarryVarArm(
+  points: readonly PortfolioCarryFrontierPoint[],
+): PortfolioCarryFrontierPoint[] {
+  return walkOrderArm(points);
+}
+
+/** Open / cash arm — same walk-order samples the CCY modal strokes. */
+export function plotStandingCarryArm(
+  points: readonly PortfolioCarryFrontierPoint[],
+): PortfolioCarryFrontierPoint[] {
+  return walkOrderArm(points);
+}
+
+/** Far / CIP arm — same walk, signed cash + points. */
+export function plotFarCarryArm(
+  points: readonly PortfolioCarryFrontierPoint[],
+): PortfolioCarryFrontierPoint[] {
+  return walkOrderArm(points);
+}
+
+export function frontierMonotoneStats(
+  points: readonly PortfolioCarryFrontierPoint[],
+): { n: number; xBacktracks: number; yDips: number; envelopeN: number } {
+  let xBacktracks = 0;
+  let yDips = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!;
+    const b = points[i]!;
+    if (b.portfolioVarUsd < a.portfolioVarUsd - 1e-9) xBacktracks += 1;
+    if (b.totalCarryUsdYr < a.totalCarryUsdYr - 1e-9) yDips += 1;
+  }
+  return {
+    n: points.length,
+    xBacktracks,
+    yDips,
+    envelopeN: efficientCarryVarEnvelope(points).length,
+  };
+}
+
+/** Live book samples from origin → hold (k ≤ 1). */
+export function liveBookArm<T extends { k: number }>(
+  points: readonly T[],
+): T[] {
+  return points.filter(p => Number.isFinite(p.k) && p.k >= -1e-12 && p.k <= 1 + 1e-6);
+}
+
+/**
+ * Drop vertices that sit on the same CFaR (true stack). Distinct X —
+ * even a $1k step — stays. Do not use a % of the axis span: that
+ * collapsed a $300k run into one vertex and drew the 9-dot polyline.
+ */
+export function collapseNearVerticalRuns(
+  pts: readonly { x: number; y: number }[],
+  xTol?: number,
+): { x: number; y: number }[] {
+  if (pts.length <= 2) return [...pts];
+  const explicitX = typeof xTol === 'number' && Number.isFinite(xTol);
+  const xBand = explicitX ? xTol : 1e-6;
+  const out: { x: number; y: number }[] = [];
+  for (const p of pts) {
+    const prev = out[out.length - 1];
+    if (!prev) {
+      out.push(p);
+      continue;
+    }
+    const sameX = Math.abs(p.x - prev.x) <= xBand;
+    // Default: a vertical standing walk (same CFaR, rising carry) is
+    // the overlay stem — keep it. Explicit xTol is the old X-only fold.
+    if (!sameX || (!explicitX && Math.abs(p.y - prev.y) > 1e-9)) out.push(p);
+  }
+  const last = pts[pts.length - 1]!;
+  const tail = out[out.length - 1]!;
+  if (last !== tail) {
+    if (out.length === 1 || Math.abs(last.x - tail.x) > xBand) out.push(last);
+    else if (explicitX) out[out.length - 1] = last;
+    else if (Math.abs(last.y - tail.y) > 1e-9) out.push(last);
+  }
+  return out;
+}
+
+/**
+ * Screen-space thin only when two vertices land on the same pixel
+ * (both axes). A 16px X-only decimate is what stripped the overlay
+ * arm down to a handful of chords.
+ */
+export function thinScreenCollocated(
+  pts: readonly { x: number; y: number }[],
+  screenX: (worldX: number) => number,
+  screenY: (worldY: number) => number,
+  minPx = 2,
+): { x: number; y: number }[] {
+  if (pts.length <= 2) return [...pts];
+  const px = Math.max(1, minPx);
+  const out = [pts[0]!];
+  for (let i = 1; i < pts.length - 1; i += 1) {
+    const prev = out[out.length - 1]!;
+    const p = pts[i]!;
+    if (
+      Math.abs(screenX(p.x) - screenX(prev.x)) >= px
+      || Math.abs(screenY(p.y) - screenY(prev.y)) >= px
+    ) {
+      out.push(p);
+    }
+  }
+  const last = pts[pts.length - 1]!;
+  const tail = out[out.length - 1]!;
+  if (Math.abs(last.x - tail.x) > 1e-12 || Math.abs(last.y - tail.y) > 1e-12) {
+    out.push(last);
+  }
+  return out;
+}
+
+/**
+ * Modal stroke: first vertex is unhedged (originX, $0), then every
+ * priced sample. No envelope, collapse, or decimate — the CCY modal
+ * is `toPath([origin, ...openSolid])`.
+ *
+ * Do not invent a vertical stem: when the first priced sample is already
+ * a huge Y at the origin X (overlay t=1 dumped onto k=0), drop that lift
+ * and keep the rest. The walk itself must start at $0 with small steps.
+ */
+export function chartOpenPath(
+  skyline: readonly { x: number; y: number }[],
+  originX: number,
+  pinUnhedgedZero: boolean,
+): { x: number; y: number }[] {
+  const samples = skyline.filter(p => (
+    Number.isFinite(p.x) && Number.isFinite(p.y)
+  ));
+  if (originX <= 1e-9 || !pinUnhedgedZero) return [...samples];
+  const rest = samples.filter(p => Math.hypot(p.x - originX, p.y) > 1e-4);
+  const first = rest[0];
+  const dumpedLift = first != null
+    && Math.abs(first.x - originX) <= 1e-3
+    && Math.abs(first.y) > 0.20
+    && !rest.some(p => Math.abs(p.y) > 1e-6 && Math.abs(p.y) < Math.abs(first.y) * 0.25);
+  const kept = dumpedLift
+    ? rest.filter(p => Math.abs(p.x - originX) > 1e-3 || Math.abs(p.y) <= 0.20)
+    : rest;
+  return [{ x: originX, y: 0 }, ...kept];
+}
+
+/** Same as `chartOpenPath`. No fill arg, no hull, no stem filter. */
+export const chartFrontierStroke = chartOpenPath;
+
+export type ChartPathTrace = {
+  nRaw: number;
+  nSkyline: number;
+  nDrawn: number;
+  originX: number;
+  originY: number;
+  liftedOrigin: boolean;
+  pinApplied: boolean;
+  nearOriginTol: number;
+  nNearOrigin: number;
+  nearOriginDx: number;
+  nearOriginDy: number;
+  hookRisk: boolean;
+  rawHead: { k: number; x: number; y: number }[];
+  drawn: { x: number; y: number }[];
+};
+
+/**
+ * Drawn stroke = origin ($0 @ unhedged CFaR) + monotone walk samples.
+ */
+export function chartPathTrace(
+  points: readonly PortfolioCarryFrontierPoint[],
+  originX: number,
+  pinUnhedgedZero: boolean,
+): ChartPathTrace {
+  const skyline = plotStandingCarryArm(points);
+  const xy = skyline.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr }));
+  const drawn = chartFrontierStroke(xy, originX, pinUnhedgedZero);
+  const xs = points.map(p => p.portfolioVarUsd);
+  const span = xs.length > 0 ? Math.max(...xs) - Math.min(...xs) : 0;
+  const nearOriginTol = Math.max(0.08, span * 0.02);
+  const originPt = skyline.find(p => Math.abs(p.portfolioVarUsd - originX) <= 1e-3)
+    ?? skyline[0];
+  const originY = pinUnhedgedZero && originX > 1e-9
+    ? 0
+    : (originPt?.totalCarryUsdYr ?? 0);
+  const liftedOrigin = !pinUnhedgedZero
+    && Number.isFinite(originPt?.totalCarryUsdYr)
+    && Math.abs(originPt!.totalCarryUsdYr) > 1e-3;
+  const pinApplied = Boolean(pinUnhedgedZero && originX > 1e-9);
+  const near = skyline.filter(p => Math.abs(p.portfolioVarUsd - originX) <= nearOriginTol);
+  const nearXs = near.map(p => p.portfolioVarUsd);
+  const nearYs = near.map(p => p.totalCarryUsdYr);
+  const nearOriginDx = nearXs.length > 0 ? Math.max(...nearXs) - Math.min(...nearXs) : 0;
+  const nearOriginDy = nearYs.length > 0 ? Math.max(...nearYs) - Math.min(...nearYs) : 0;
+  return {
+    nRaw: points.length,
+    nSkyline: skyline.length,
+    nDrawn: drawn.length,
+    originX,
+    originY,
+    liftedOrigin,
+    pinApplied,
+    nearOriginTol,
+    nNearOrigin: near.length,
+    nearOriginDx,
+    nearOriginDy,
+    hookRisk: near.length >= 3 && nearOriginDx <= nearOriginTol && nearOriginDy > 0.02,
+    rawHead: skyline.slice(0, 6).map(p => ({
+      k: p.k,
+      x: p.portfolioVarUsd,
+      y: p.totalCarryUsdYr,
+    })),
+    drawn: drawn.slice(0, 8),
+  };
+}
+
+export function splitOverlayFillOpenArm<T extends { k: number }>(
+  points: readonly T[],
+): { approach: T[]; overlay: T[] } {
+  const holdIdx = points.findIndex(p => Number.isFinite(p.k) && Math.abs(p.k - 1) < 1e-6);
+  if (holdIdx < 0) return { approach: [...points], overlay: [] };
+  return {
+    approach: points.slice(0, holdIdx + 1),
+    overlay: points.slice(holdIdx),
+  };
+}
+
+/**
  * Open-arm point whose cash carry matches a desk Target Carry ($M/yr).
  * Interpolates the segment that straddles the ask. Off-arm asks return null.
  */
@@ -591,6 +861,141 @@ export function tangencyFromTrueZero(
 }
 
 /**
+ * Balanced on the chart: supporting-ray touch among **priced walk vertices
+ * that the stroke draws**. The pin ($0 @ unhedged CFaR) is not a ticket.
+ * Overlay dumped onto k=0 at origin X is not a ticket. Do not lerp.
+ */
+export function pricedBalancedVertex(
+  points: readonly PortfolioCarryFrontierPoint[],
+  originX: number,
+  carryS?: number,
+): PortfolioCarryFrontierPoint | null {
+  const skyline = plotStandingCarryArm(points);
+  const drawn = chartOpenPath(
+    skyline.map(p => ({ x: p.portfolioVarUsd, y: p.totalCarryUsdYr })),
+    originX,
+    true,
+  );
+  const priced: PortfolioCarryFrontierPoint[] = [];
+  for (const s of drawn) {
+    const hit = skyline.find(p => (
+      Math.abs(p.portfolioVarUsd - s.x) < 1e-6
+      && Math.abs(p.totalCarryUsdYr - s.y) < 1e-6
+    ));
+    if (!hit) continue;
+    if (Math.abs(hit.totalCarryUsdYr) < 1e-9) continue;
+    priced.push(hit);
+  }
+  if (priced.length > 0) return tangencyFromTrueZero(priced, carryS);
+  const off = skyline.filter(p => (
+    p.portfolioVarUsd > originX + 1e-6
+    && Math.abs(p.totalCarryUsdYr) > 1e-9
+  ));
+  if (off.length > 0) return tangencyFromTrueZero(off, carryS);
+  const live = skyline.filter(p => (
+    p.k > 1e-12 && Math.abs(p.totalCarryUsdYr) > 1e-9
+  ));
+  return tangencyFromTrueZero(live, carryS);
+}
+
+/**
+ * Carry Target on the chart: Ask Y on the same search arm as preset chips
+ * ($0 @ chart origin, then priced walk samples). Matches `chartOpenPath` pin.
+ */
+export function pricedCarryTargetVertex(
+  points: readonly PortfolioCarryFrontierPoint[],
+  originX: number,
+  targetUsdYr: number,
+): PortfolioCarryFrontierPoint | null {
+  if (!Number.isFinite(targetUsdYr)) return null;
+  const arm = points
+    .filter(p => (
+      Number.isFinite(p.portfolioVarUsd)
+      && Number.isFinite(p.totalCarryUsdYr)
+      && p.k >= -1 - 1e-12
+    ))
+    .sort((a, b) => a.k - b.k || a.portfolioVarUsd - b.portfolioVarUsd);
+  const originCfar = Math.max(0, originX);
+  const origin: PortfolioCarryFrontierPoint = {
+    k: 0,
+    portfolioVarUsd: originCfar,
+    totalCarryUsdYr: 0,
+    floorBoundCcys: [],
+  };
+  const searchArm = [
+    origin,
+    ...arm.filter(p => p.portfolioVarUsd > originCfar + 1e-6 || p.k > 1e-12),
+  ];
+  return carryTargetOnArm(searchArm, targetUsdYr);
+}
+
+export type ChartPresetScenarioId =
+  | 'unhedged'
+  | 'carryTarget'
+  | 'balanced'
+  | 'maxCarry'
+  | 'maxReturn';
+
+/**
+ * Chart / chip / selection preset — same origin X and plotCarryS as
+ * PortfolioCarryVarFrontierPlot so auto-wiring and click-back stay aligned.
+ */
+export function chartPresetPointForScenario(input: {
+  scenarioId: ChartPresetScenarioId;
+  points: readonly PortfolioCarryFrontierPoint[];
+  originX: number;
+  policyCapUsd: number;
+  confidencePct: number;
+  carryTargetUsdYr?: number | null;
+  conservative?: PortfolioCarryFrontierPoint | null;
+  carryS?: number;
+  tailProb?: number;
+}): PortfolioCarryFrontierPoint | null {
+  const pts = input.points;
+  const originX = Math.max(0, input.originX);
+  const s = input.carryS ?? plotCarryS(pts);
+  const ordered = orderedLiquidityScenarioPoints({
+    points: pts,
+    conservative: input.conservative,
+    policyCapUsd: input.policyCapUsd,
+    originCfarUsd: originX,
+    carryS: s,
+    carryTargetUsdYr: input.carryTargetUsdYr,
+  });
+  switch (input.scenarioId) {
+    case 'unhedged':
+      return ordered.origin;
+    case 'carryTarget': {
+      const ask = typeof input.carryTargetUsdYr === 'number' && Number.isFinite(input.carryTargetUsdYr)
+        ? input.carryTargetUsdYr
+        : DEFAULT_DESK_TARGET_CARRY_USD_YR;
+      return pricedCarryTargetVertex(pts, originX, ask) ?? ordered.carryTarget;
+    }
+    case 'balanced':
+      return pricedBalancedVertex(pts, originX, s) ?? ordered.balanced;
+    case 'maxCarry':
+      return ordered.maxCarry;
+    case 'maxReturn': {
+      const tail = input.tailProb ?? cfarTailProbability(input.confidencePct);
+      if (pts.length === 0) return null;
+      let bestIdx = 0;
+      let bestScore = pts[0]!.totalCarryUsdYr - pts[0]!.portfolioVarUsd * tail;
+      pts.forEach((p, i) => {
+        const score = p.totalCarryUsdYr - p.portfolioVarUsd * tail;
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      });
+      if (bestIdx === pts.length - 1 && pts.length > 1) return null;
+      return pts[bestIdx] ?? null;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
  * Open-arm presets: $0-carry origin, optional Carry Target, Balanced,
  * Max Policy Risk. Balanced is the (0, 0) supporting-ray touch.
  */
@@ -611,7 +1016,11 @@ export function orderedLiquidityScenarioPoints(input: {
   maxCarry: PortfolioCarryFrontierPoint | null;
 } {
   const arm = input.points
-    .filter(p => Number.isFinite(p.portfolioVarUsd) && Number.isFinite(p.totalCarryUsdYr) && p.k >= -1e-12)
+    .filter(p => (
+      Number.isFinite(p.portfolioVarUsd)
+      && Number.isFinite(p.totalCarryUsdYr)
+      && p.k >= -1 - 1e-12
+    ))
     .sort((a, b) => a.k - b.k || a.portfolioVarUsd - b.portfolioVarUsd);
   const empty = {
     origin: null, conservative: null, carryTarget: null, balanced: null, maxCarry: null,
@@ -619,7 +1028,13 @@ export function orderedLiquidityScenarioPoints(input: {
   if (arm.length === 0) return empty;
 
   const walkOrigin = arm[0]!;
-  const originCfar = Math.max(0, walkOrigin.portfolioVarUsd);
+  const originCfar = (
+    typeof input.originCfarUsd === 'number'
+    && Number.isFinite(input.originCfarUsd)
+    && input.originCfarUsd > 1e-9
+  )
+    ? Math.max(0, input.originCfarUsd)
+    : Math.max(0, walkOrigin.portfolioVarUsd);
   const origin: PortfolioCarryFrontierPoint = {
     k: 0,
     portfolioVarUsd: originCfar,
@@ -634,7 +1049,7 @@ export function orderedLiquidityScenarioPoints(input: {
     : afterOrigin.find(p => Math.abs(p.k - 1) < 1e-6)
       ?? afterOrigin[0]
       ?? null;
-  const balanced = tangencyFromTrueZero(arm, input.carryS);
+  const balanced = pricedBalancedVertex(arm, originCfar, input.carryS);
   const ask = typeof input.carryTargetUsdYr === 'number' && Number.isFinite(input.carryTargetUsdYr)
     ? input.carryTargetUsdYr
     : DEFAULT_DESK_TARGET_CARRY_USD_YR;
@@ -646,7 +1061,17 @@ export function orderedLiquidityScenarioPoints(input: {
     origin,
     ...arm.filter(p => p.portfolioVarUsd > originCfar + 1e-6 || p.k > 1e-12),
   ];
-  const carryTarget = carryTargetOnArm(searchArm, ask);
+  let carryTarget = carryTargetOnArm(searchArm, ask);
+  if (!carryTarget && searchArm.length > 0) {
+    const hi = searchArm.reduce((best, p) => (
+      p.totalCarryUsdYr >= best.totalCarryUsdYr ? p : best
+    ));
+    const lo = searchArm.reduce((best, p) => (
+      p.totalCarryUsdYr <= best.totalCarryUsdYr ? p : best
+    ));
+    if (ask >= hi.totalCarryUsdYr - 1e-12) carryTarget = hi;
+    else if (ask <= lo.totalCarryUsdYr + 1e-12) carryTarget = lo;
+  }
   if (!book) {
     return { origin, conservative: null, carryTarget, balanced, maxCarry: null };
   }
@@ -691,4 +1116,180 @@ export function overlayKToModalXy(
   );
   const priced = priceLiquidityStanding({ ...engine, row }, standing, bookK);
   return { x: priced.cfarOpenUsdM, y: priced.open.totalCarryUsdYrM };
+}
+
+/** CCY-row ticket the modal must land on (not Port. CFaR / Policy VAR). */
+export type CcyModalTicket = {
+  cfarUsdM: number;
+  carryUsdYrM: number;
+  bookUsdYrM: number;
+  overlayUsdYrM: number;
+  bookStandingFcyM: number;
+  bookStandingUsdM?: number;
+};
+
+export function ccyModalAlignTicket(
+  sp: {
+    cfarUsdM: number;
+    carryUsdYrM: number;
+    bookUsdYrM: number;
+    overlayUsdYrM: number;
+    bookStandingFcyM: number;
+    bookStandingUsdM?: number;
+  } | null | undefined,
+): CcyModalTicket | null {
+  if (!sp) return null;
+  if (!(Math.abs(sp.bookStandingFcyM) > 0.01)) return null;
+  if (!Number.isFinite(sp.cfarUsdM) || !Number.isFinite(sp.carryUsdYrM)) return null;
+  return {
+    cfarUsdM: sp.cfarUsdM,
+    carryUsdYrM: sp.carryUsdYrM,
+    bookUsdYrM: sp.bookUsdYrM,
+    overlayUsdYrM: sp.overlayUsdYrM,
+    bookStandingFcyM: sp.bookStandingFcyM,
+    bookStandingUsdM: sp.bookStandingUsdM,
+  };
+}
+
+/**
+ * Target Carry / Target VAR cuts for the CCY modal.
+ * Swap / Both: this name’s Total carry and Total CFaR (same as the chip).
+ * Overlay fill: chips only — do not stamp portfolio X/Y onto an origin walk.
+ * Never Policy VAR.
+ */
+export function modalCcyTicketTargets(input: {
+  overlayFill: boolean;
+  ticket?: Pick<CcyModalTicket, 'cfarUsdM' | 'carryUsdYrM'> | null;
+}): {
+  carryUsdYrM: number | null;
+  cfarUsdM: number | null;
+  pinVar: boolean;
+} {
+  if (input.overlayFill || !input.ticket) {
+    return { carryUsdYrM: null, cfarUsdM: null, pinVar: false };
+  }
+  const carry = Number.isFinite(input.ticket.carryUsdYrM)
+    ? input.ticket.carryUsdYrM
+    : null;
+  const cfar = Number.isFinite(input.ticket.cfarUsdM) && input.ticket.cfarUsdM > 1e-9
+    ? input.ticket.cfarUsdM
+    : null;
+  return {
+    carryUsdYrM: carry != null && Math.abs(carry) > 1e-9 ? carry : null,
+    cfarUsdM: cfar,
+    pinVar: cfar != null,
+  };
+}
+
+function sameSignStanding(a: number, b: number): boolean {
+  if (Math.abs(a) < 1e-6 || Math.abs(b) < 1e-6) return true;
+  return Math.sign(a) === Math.sign(b);
+}
+
+function nearestStandingPoint(
+  pts: readonly LiquidityFrontierPoint[],
+  standing: number,
+): LiquidityFrontierPoint | null {
+  let best: LiquidityFrontierPoint | null = null;
+  let bestD = Infinity;
+  for (const p of pts) {
+    const d = Math.abs(p.peakBook - standing);
+    if (d < bestD) {
+      bestD = d;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/**
+ * Land the live Book S vertex on this CCY’s table ticket (Total CFaR, Total
+ * carry = Book + Overlay). Same standing walk — not a second overlay sweep.
+ *
+ * Approach samples with the book’s sign morph toward the ticket; origin stays
+ * unhedged. Far arm gets overlay Y only (CIP shape stays).
+ */
+export function alignLeftEndToCcyTicket(
+  left: LiquidityLeftEndResult,
+  ticket: CcyModalTicket | null | undefined,
+): LiquidityLeftEndResult {
+  if (!ticket) return left;
+  const bookS = ticket.bookStandingFcyM;
+  if (!(Math.abs(bookS) > 0.01)) return left;
+  const opens = left.upper.filter(p => p.delta < 1e-9);
+  const atBook = nearestStandingPoint(opens, bookS);
+  if (!atBook || !sameSignStanding(atBook.peakBook, bookS)) return left;
+  if (Math.abs(atBook.peakBook - bookS) > Math.max(1, 0.2 * Math.abs(bookS))) {
+    return left;
+  }
+  const dX = ticket.cfarUsdM - atBook.finalCfarUsdM;
+  const dYOpen = ticket.carryUsdYrM - atBook.totalCarryUsdYrM;
+  const dYFar = Number.isFinite(ticket.overlayUsdYrM) ? ticket.overlayUsdYrM : 0;
+  if (Math.abs(dX) < 1e-6 && Math.abs(dYOpen) < 1e-6 && Math.abs(dYFar) < 1e-6) {
+    return left;
+  }
+  const uOf = (standing: number): number => {
+    if (!sameSignStanding(standing, bookS) || Math.abs(standing) < 1e-6) return 0;
+    return Math.min(1, Math.abs(standing) / Math.abs(bookS));
+  };
+  const mapOpen = (p: LiquidityFrontierPoint): LiquidityFrontierPoint => {
+    const u = uOf(p.peakBook);
+    if (u < 1e-12) return p;
+    return {
+      ...p,
+      finalCfarUsdM: Math.max(0, p.finalCfarUsdM + u * dX),
+      totalCarryUsdYrM: p.totalCarryUsdYrM + u * dYOpen,
+    };
+  };
+  const mapFar = (p: LiquidityFrontierPoint): LiquidityFrontierPoint => {
+    const u = uOf(p.peakBook);
+    if (u < 1e-12 || Math.abs(dYFar) < 1e-12) return p;
+    return {
+      ...p,
+      totalCarryUsdYrM: p.totalCarryUsdYrM + u * dYFar,
+    };
+  };
+  const upper = left.upper.map(p => (p.delta < 1e-9 ? mapOpen(p) : p));
+  const lower = left.lower.map(mapFar);
+  const points = left.points.map(p => (p.delta < 1e-9 ? mapOpen(p) : mapFar(p)));
+  const openLine = upper.filter(p => p.delta < 1e-9);
+  const stamped = nearestStandingPoint(openLine, bookS);
+  const openHit = stamped
+    ? {
+        cfarUsdM: stamped.finalCfarUsdM,
+        carryUsdYrM: stamped.totalCarryUsdYrM,
+        standing: stamped.peakBook,
+      }
+    : left.constraint.openHit;
+  const farAt = nearestStandingPoint(lower, bookS);
+  const hedgeHit = farAt && sameSignStanding(farAt.peakBook, bookS)
+    ? {
+        cfarUsdM: farAt.finalCfarUsdM,
+        carryUsdYrM: farAt.totalCarryUsdYrM,
+        standing: farAt.peakBook,
+      }
+    : left.constraint.hedgeHit;
+  return {
+    ...left,
+    upper,
+    lower,
+    points,
+    curve: [left.origin, ...openLine],
+    applied: openLine[openLine.length - 1] ?? left.applied,
+    constraint: {
+      ...left.constraint,
+      openHit,
+      hedgeHit,
+    },
+  };
+}
+
+/** Header: Book S is FCY, Book $ is USD. Never label FCY as $. */
+export function bookStandingChipLabel(
+  standingFcyM: number,
+  standingUsdM: number,
+): string {
+  const fcy = `Book S ${standingFcyM.toFixed(1)} M`;
+  if (!(Math.abs(standingUsdM) > 0.05)) return fcy;
+  return `${fcy} · Book $${Math.abs(standingUsdM).toFixed(1)}M`;
 }

@@ -40,6 +40,7 @@ import type {
   HedgeStrategy,
   SwapForwardOverlay,
 } from '@/lib/fx-hedge';
+import type { OptimizerOverlayDesk } from '@/lib/test-mode/solution-pick';
 import { analyticsForwardsFromOverlays } from '@/lib/fx-hedge';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -62,6 +63,7 @@ import {
   withNonCashFxConversion,
 } from '@/lib/test-mode/cash-carry-analytics';
 import { fxHedgeNetCfarByCcyUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
+import { mergeResidualOverlays } from '@/lib/test-mode/liquidity-strip-stage';
 import {
   DEFAULT_VAR_SETUP,
   computeAnalyticsVarUsdM,
@@ -339,6 +341,47 @@ export function Simulator({
         desk,
       }),
   );
+  /** Selected Liquidity-regime Net CFaR (funding book + modeled Δ). */
+  const [strategyCfarByCcy, setStrategyCfarByCcy] = useState<Record<string, number>>({});
+  const setStrategyCfarByCcyIfChanged = useCallback((next: Record<string, number>) => {
+    setStrategyCfarByCcy(prev => {
+      const keys = Object.keys(next);
+      if (
+        keys.length === Object.keys(prev).length
+        && keys.every(k => Math.abs((prev[k] ?? 0) - (next[k] ?? 0)) < 1e-9)
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, []);
+  const [optimizerOverlayByCcy, setOptimizerOverlayByCcy] = useState<
+    Record<string, OptimizerOverlayDesk>
+  >({});
+  const setOptimizerOverlayIfChanged = useCallback((
+    next: Record<string, OptimizerOverlayDesk>,
+  ) => {
+    setOptimizerOverlayByCcy(prev => {
+      const keys = Object.keys(next);
+      if (
+        keys.length === Object.keys(prev).length
+        && keys.every(k => {
+          const a = prev[k];
+          const b = next[k];
+          return (
+            a != null
+            && b != null
+            && Math.abs(a.forwardLocalM - b.forwardLocalM) < 1e-9
+            && Math.abs(a.carryUsdYrM - b.carryUsdYrM) < 1e-9
+            && Math.abs(a.componentVarUsdM - b.componentVarUsdM) < 1e-9
+          );
+        })
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, []);
 
   const deskSnapshotRef = useRef<EntityHedgeDeskState>({ ...(desk ?? {}) });
   const onDeskChangeRef = useRef(onDeskChange);
@@ -558,8 +601,10 @@ export function Simulator({
     [rows, shared.forecastMonths, bookedHedges, preparedByCcy, varSetup, forecastProfile],
   );
 
-  // FX-hedge Net CFaR (MC size+timing) including staged packages — CFaR cover
-  // sizes off this number. The funding swap is not an input (no loop).
+  // FX-only Net CFaR — same MC inputs as the CFaR tab (rates, staged
+  // packages, overlay forwards) but no funding-swap plan, so cover cannot
+  // loop through Swap Near. Displayed Net (with the live book) is computed
+  // after the dashboard plan exists.
   const cfarNetByCcyUsd = useMemo(
     () => fxHedgeNetCfarByCcyUsdM({
       rows,
@@ -567,8 +612,18 @@ export function Simulator({
       forecastProfile,
       bookedHedges,
       preparedByCcy,
+      marketRatesByCcy,
+      ratesScopeId,
+      extraForwards: analyticsForwardsFromOverlays({
+        overlayByCcy: swapForwardOverlayByCcy,
+        forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
+      }),
+      swapForwardOverlayByCcy,
     }),
-    [rows, varSetup, forecastProfile, bookedHedges, preparedByCcy],
+    [
+      rows, varSetup, forecastProfile, bookedHedges, preparedByCcy,
+      marketRatesByCcy, ratesScopeId, swapForwardOverlayByCcy, shared.forecastMonths,
+    ],
   );
 
   const dashboard = useMemo(
@@ -611,20 +666,50 @@ export function Simulator({
     [dashboard.fcyComputed],
   );
 
+  const modeledOverlays = useMemo(
+    () => mergeResidualOverlays(swapForwardOverlayByCcy, residualByCcy),
+    [swapForwardOverlayByCcy, residualByCcy],
+  );
+
   const analyticsExtraForwards = useMemo(
     () =>
       analyticsForwardsFromOverlays({
-        overlayByCcy: swapForwardOverlayByCcy,
+        overlayByCcy: modeledOverlays,
         planByCcy: livePlanByCcy,
         forecastMonths: shared.forecastMonths ?? varSetup.forecastMonths ?? 12,
       }),
     [
-      swapForwardOverlayByCcy,
+      modeledOverlays,
       livePlanByCcy,
       shared.forecastMonths,
       varSetup.forecastMonths,
     ],
   );
+
+  // Prefer the selected Liquidity-regime map (funding book + Δ). Fallback is
+  // the same MC as the CFaR tab on the live plan + residual overlays.
+  const computedDisplayedCfarByCcy = useMemo(
+    () => fxHedgeNetCfarByCcyUsdM({
+      rows,
+      setup: varSetup,
+      forecastProfile,
+      bookedHedges,
+      preparedByCcy,
+      marketRatesByCcy,
+      ratesScopeId,
+      fundingPlanByCcy: livePlanByCcy,
+      swapForwardOverlayByCcy: modeledOverlays,
+      extraForwards: analyticsExtraForwards,
+    }),
+    [
+      rows, varSetup, forecastProfile, bookedHedges, preparedByCcy,
+      marketRatesByCcy, ratesScopeId, livePlanByCcy, modeledOverlays,
+      analyticsExtraForwards,
+    ],
+  );
+  const displayedCfarNetByCcyUsd = Object.keys(strategyCfarByCcy).length > 0
+    ? strategyCfarByCcy
+    : computedDisplayedCfarByCcy;
 
   const cashForecastCarryByCcy = useMemo(
     () =>
@@ -663,8 +748,12 @@ export function Simulator({
     for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
       map[ccy] = split.fwdUsdM;
     }
+    for (const [ccy, o] of Object.entries(optimizerOverlayByCcy)) {
+      if (!Number.isFinite(o.carryUsdYrM) || Math.abs(o.carryUsdYrM) < 1e-12) continue;
+      map[ccy] = (map[ccy] ?? 0) + o.carryUsdYrM;
+    }
     return map;
-  }, [preparedByCcy, cashForecastCarryByCcy]);
+  }, [preparedByCcy, cashForecastCarryByCcy, optimizerOverlayByCcy]);
   const stagedCarryByMonthByCcyUsdM = useMemo(() => {
     const map: Record<string, { cashUsdM: number; fwdUsdM: number }[]> = {};
     for (const [ccy, split] of Object.entries(cashForecastCarryByCcy)) {
@@ -701,7 +790,7 @@ export function Simulator({
       };
     }
     // Swap+Fwd desk overlay: gross forward VaR + economically net residual/VaR.
-    if (hedgeStrategy === 'SWAP_FWD') {
+    if (hedgeStrategy === 'SWAP_FWD' || hedgeStrategy === 'SWAP_FWD_OPT') {
       for (const row of rows) {
         if (row.ccy === 'USD') continue;
         const overlay = swapForwardOverlayByCcy[row.ccy];
@@ -820,6 +909,7 @@ export function Simulator({
               stagedCashCarryByCcyUsdM={stagedCashCarryByCcyUsdM}
               stagedCarryByMonthByCcyUsdM={stagedCarryByMonthByCcyUsdM}
               cfarNetByCcyUsd={cfarNetByCcyUsd}
+              displayedCfarNetByCcyUsd={displayedCfarNetByCcyUsd}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
               forecastProfile={forecastProfile}
@@ -846,6 +936,7 @@ export function Simulator({
               onOptionDeltaByCcyChange={setOptionDeltaPersist}
               onSwapForwardOverlayByCcyChange={setSwapForwardOverlayPersist}
               onDeskCipByCcyChange={setDeskCipByCcyUsdM}
+              optimizerOverlayByCcy={optimizerOverlayByCcy}
               marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={ratesScopeId}
             />
@@ -986,6 +1077,10 @@ export function Simulator({
                     onResidualByCcyChange?: (next: Record<string, number>) => void;
                     portfolioScenarioId?: string | null;
                     onPortfolioScenarioIdChange?: (id: string | null) => void;
+                    onStrategyCfarByCcyChange?: (byCcy: Record<string, number>) => void;
+                    onOptimizerOverlayByCcyChange?: (
+                      next: Record<string, OptimizerOverlayDesk>,
+                    ) => void;
                   }>,
                   {
                     bookRows: rows,
@@ -1011,6 +1106,8 @@ export function Simulator({
                     onResidualByCcyChange: setResidualPersist,
                     portfolioScenarioId,
                     onPortfolioScenarioIdChange: setPortfolioScenarioPersist,
+                    onStrategyCfarByCcyChange: setStrategyCfarByCcyIfChanged,
+                    onOptimizerOverlayByCcyChange: setOptimizerOverlayIfChanged,
                   },
                 )
               : (analyticsPanel ?? (
@@ -1061,6 +1158,7 @@ export function Simulator({
               stagedCashCarryByCcyUsdM={stagedCashCarryByCcyUsdM}
               stagedCarryByMonthByCcyUsdM={stagedCarryByMonthByCcyUsdM}
               cfarNetByCcyUsd={cfarNetByCcyUsd}
+              displayedCfarNetByCcyUsd={displayedCfarNetByCcyUsd}
               varSetup={varSetup}
               onVarSetupChange={onVarSetupChange}
               forecastProfile={forecastProfile}
@@ -1086,6 +1184,7 @@ export function Simulator({
               onOptionDeltaByCcyChange={setOptionDeltaPersist}
               onSwapForwardOverlayByCcyChange={setSwapForwardOverlayPersist}
               onDeskCipByCcyChange={setDeskCipByCcyUsdM}
+              optimizerOverlayByCcy={optimizerOverlayByCcy}
               marketRatesByCcy={marketRatesByCcy}
               ratesScopeId={ratesScopeId}
             />

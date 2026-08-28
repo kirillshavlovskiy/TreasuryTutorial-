@@ -6,11 +6,13 @@ import { DEFAULT_LIQUIDITY_TIMING, type LiquidityTiming } from '@/lib/liquidity-
 import { liquidityStrategyMeta } from '@/lib/test-mode/liquidity-strategies';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
 import {
+  applyPortfolioFrontierTargets,
   buildLiquidityFrontier,
   buildLiquidityLeftEndFrontier,
   cfarAtZeroDelta,
   standingFromCashCarryUsdYr,
   standingForCashCarryStep,
+  standingAlongLiveBook,
   frontierCashCarrySign,
   frontierFarPointsUsdYr,
   carryAxisFromArms,
@@ -18,6 +20,7 @@ import {
   farSettleExposureCfarUsdM,
   farSettleUnwindCfarUsdM,
   bookCashCarryK,
+  carryEarnOrientedStanding,
   carryStepsToMaxK,
   carryStepStrideK,
   frontierCarryDotsK,
@@ -40,6 +43,7 @@ import {
   liquidityFrontierWalk,
   liquidityFrontierRays,
   liquidityFrontierSkyline,
+  tangencyOnLiquidityArm,
   type LiquidityFrontierInput,
   type LiquidityFrontierPoint,
 } from '@/lib/test-mode/liquidity-frontier';
@@ -319,6 +323,20 @@ describe('standingFromCashCarryUsdYr', () => {
     expect(built.upper.every(p => p.totalCarryUsdYrM > 0)).toBe(true);
   });
 
+  it('carryEarnOrientedStanding shorts a payer book, keeps an earner long, magnitude intact', () => {
+    // EUR payer (r_FCY < r_USD): long pays → orient short.
+    expect(carryEarnOrientedStanding(90, 1.17, 2.0, 4.33, 2.5)).toBeCloseTo(-90, 6);
+    expect(carryEarnOrientedStanding(-90, 1.17, 2.0, 4.33, 2.5)).toBeCloseTo(-90, 6);
+    // GBP / MXN earner (r_FCY > r_USD): long earns → stay long.
+    expect(carryEarnOrientedStanding(50, 1.27, 4.5, 4.33, 4.6)).toBeCloseTo(50, 6);
+    expect(carryEarnOrientedStanding(100, 0.05, 9.0, 4.33, 10)).toBeCloseTo(100, 6);
+    // Both sides pay (FCY straddling r_USD via OD) → keep the funding direction.
+    expect(carryEarnOrientedStanding(20, ccySpotRate('PLN'), 3.41, 3.50, 4.41)).toBeCloseTo(20, 6);
+    // A payer book, once oriented, prints positive open-arm carry.
+    expect(bookCashCarryK(carryEarnOrientedStanding(90, 1.17, 2.0, 4.33, 2.5), 1.17, 2.0, 4.33, 2.5))
+      .toBeGreaterThan(0);
+  });
+
   it('far Y = cash + points; open is |cash| so pay-side CIP is not forced negative', () => {
     // Deposit mid: points = −cash → far nets to $0 under open |cash|.
     expect(frontierFarPointsUsdYr(-0.005, 0.005)).toBeCloseTo(-0.005, 10);
@@ -330,6 +348,32 @@ describe('standingFromCashCarryUsdYr', () => {
     // Earn-side open: add-on is raw points.
     expect(frontierFarPointsUsdYr(0.04, -0.02)).toBe(-0.02);
     expect(frontierFarPointsUsdYr(-0.005, -0.12)).toBeCloseTo(-0.13, 10);
+  });
+});
+
+describe('standingAlongLiveBook', () => {
+  it('keeps EUR long Book S — earn invert is a second walk', () => {
+    const eur = INITIAL_ROWS.find(r => r.ccy === 'EUR')!;
+    const liveS = 79.36;
+    const spot = ccySpotRate('EUR');
+    const bookK = bookCashCarryK(liveS, spot, eur.r_FCY, shared.r_USD, eur.r_OD);
+    expect(bookK).toBeGreaterThan(1);
+    const earn = standingForCashCarryStep(bookK, spot, eur.r_FCY, shared.r_USD, eur.r_OD);
+    expect(earn).toBeLessThan(0);
+    expect(standingAlongLiveBook(bookK, liveS, bookK)).toBeCloseTo(liveS, 8);
+    expect(standingAlongLiveBook(bookK / 2, liveS, bookK)).toBeCloseTo(liveS / 2, 8);
+    const built = buildLiquidityLeftEndFrontier(input({
+      row: { ...eur, cash_floor: 2, carry_target: liveS },
+      bookStanding: liveS,
+      cfarNetByCcyUsd: { EUR: 0.411 },
+      carryUsdK: [Math.max(1, bookK / 2), bookK],
+      activeLayers: new Set<LayerId>(['portfolioDiv']),
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, forecastUncertainty1m: 0.3 },
+    }));
+    const opens = built.upper.filter(p => p.delta < 1e-9);
+    expect(opens.length).toBeGreaterThan(0);
+    expect(opens.every(p => p.peakBook > 0)).toBe(true);
+    expect(opens.some(p => Math.abs(p.peakBook - liveS) < 0.05)).toBe(true);
   });
 });
 
@@ -537,6 +581,77 @@ describe('buildLiquidityLeftEndFrontier', () => {
     expect(built.constraint.openHit!.cfarUsdM).toBeCloseTo(built.constraint.vCfarUsdM!, 5);
     expect(built.constraint.openHit!.carryUsdYrM)
       .toBeGreaterThan(built.constraint.hedgeHit!.carryUsdYrM);
+  });
+
+  it('pins Target Carry / Target VAR to portfolio setpoints, not H* cash', () => {
+    const built = buildLiquidityLeftEndFrontier(input({
+      row: row({ cash_floor: 0, carry_target: -20 }),
+      activeLayers: new Set<LayerId>(['carryOptim']),
+      cfarNetByCcyUsd: { GBP: 0.361 },
+      carryUsdK: [10, 20, 40],
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, forecastUncertainty1m: 0.3 },
+    }));
+    const hStarY = built.constraint.hCarryUsdYrM;
+    expect(hStarY).not.toBeNull();
+    const askY = 0.032;
+    const pinned = applyPortfolioFrontierTargets(
+      built.constraint,
+      {
+        origin: built.origin,
+        open: built.upper.filter(p => p.delta < 1e-9),
+        far: built.lower,
+      },
+      { carryUsdYrM: askY },
+    );
+    expect(pinned.hCarryUsdYrM).toBeCloseTo(askY, 8);
+    expect(pinned.hCarryUsdYrM).not.toBeCloseTo(hStarY!, 3);
+    expect(pinned.vCfarUsdM).toBeNull();
+    expect(pinned.openHit).not.toBeNull();
+    expect(pinned.openHit!.carryUsdYrM).toBeCloseTo(askY, 3);
+
+    const varBuilt = buildLiquidityLeftEndFrontier(input({
+      row: row({ cash_floor: 0, carry_target: -20 }),
+      activeLayers: new Set<LayerId>(['portfolioDiv']),
+      cfarNetByCcyUsd: { GBP: 0.361 },
+      carryUsdK: [10, 20, 40, 80],
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, forecastUncertainty1m: 0.3 },
+    }));
+    const hStarX = varBuilt.constraint.vCfarUsdM;
+    expect(hStarX).not.toBeNull();
+    const varOpen = varBuilt.upper.filter(p => p.delta < 1e-9);
+    const farHi = Math.max(...varBuilt.lower.map(p => p.finalCfarUsdM), varBuilt.origin.finalCfarUsdM);
+    const sampleX = varBuilt.origin.finalCfarUsdM
+      + Math.max(0.01, farHi - varBuilt.origin.finalCfarUsdM) * 0.4;
+    const varPinned = applyPortfolioFrontierTargets(
+      varBuilt.constraint,
+      {
+        origin: varBuilt.origin,
+        open: varOpen,
+        far: varBuilt.lower,
+      },
+      { carryUsdYrM: askY, cfarUsdM: sampleX },
+    );
+    expect(varPinned.hCarryUsdYrM).toBeCloseTo(askY, 8);
+    expect(varPinned.vCfarUsdM).toBeCloseTo(sampleX, 8);
+    expect(varPinned.vCfarUsdM).not.toBeCloseTo(hStarX!, 3);
+    expect(varPinned.openHit!.cfarUsdM).toBeCloseTo(sampleX, 3);
+    expect(varPinned.hedgeHit!.cfarUsdM).toBeCloseTo(sampleX, 3);
+
+    const offArmX = varBuilt.origin.finalCfarUsdM + 9.2;
+    const keepBookS = applyPortfolioFrontierTargets(
+      varBuilt.constraint,
+      {
+        origin: varBuilt.origin,
+        open: varOpen,
+        far: varBuilt.lower,
+      },
+      { carryUsdYrM: 1.4, cfarUsdM: offArmX, pinVar: false },
+    );
+    expect(keepBookS.vCfarUsdM).toBeCloseTo(varBuilt.constraint.vCfarUsdM!, 8);
+    expect(keepBookS.vCfarUsdM).not.toBeCloseTo(offArmX, 3);
+    expect(keepBookS.openHit?.standing).toBeCloseTo(
+      varBuilt.constraint.openHit!.standing, 5,
+    );
   });
 
   it('draws the open arm when cash Δr is negative on both sides (PLN)', () => {
@@ -756,7 +871,44 @@ describe('liquidityFrontierSkyline', () => {
   });
 });
 
+describe('tangencyOnLiquidityArm', () => {
+  it('picks the open-arm sample with the steepest asinh(carry)/CFaR from (0,0)', () => {
+    const origin = pt(0.4, 0, { peakBook: 0 });
+    const early = pt(0.45, 0.01, { peakBook: 4 });
+    const knee = pt(0.55, 0.04, { peakBook: 12 });
+    const tail = pt(0.9, 0.05, { peakBook: 28 });
+    expect(tangencyOnLiquidityArm([origin, early, knee, tail])).toBe(knee);
+  });
+
+  it('ignores the levered tail and far-arm mix', () => {
+    const open = pt(0.5, 0.03, { peakBook: 10 });
+    const mix = pt(0.48, 0.08, { peakBook: 10, delta: 0.4 });
+    const lev = pt(1.2, 0.2, { peakBook: 40, levered: true });
+    expect(tangencyOnLiquidityArm([open, mix, lev])).toBe(open);
+  });
+});
+
 describe('priceLiquidityStanding', () => {
+  it('PLN long Book S Buffer is |cash Δr|; Swap-hedged far nets deposit CIP to ~$0', () => {
+    const pln = INITIAL_ROWS.find(r => r.ccy === 'PLN')!;
+    const standing = 317.45;
+    const priced = priceLiquidityStanding(input({
+      row: { ...pln, r_FCY: 3.41, r_OD: 4.41, cash_floor: 0, carry_target: standing },
+      shared: { r_USD: 3.50, σ_P: 0.1, days: 3, forecastMonths: 12 },
+      months: 12,
+      cfarNetByCcyUsd: { PLN: 0.22 },
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 12, forecastUncertainty1m: 0.3 },
+    }), standing);
+    const signed = standing * ((3.41 - 3.50) / 100) * ccySpotRate('PLN');
+    expect(priced.cashUsdYr).toBeCloseTo(signed, 6);
+    expect(priced.cashUsdYr).toBeLessThan(0);
+    expect(priced.open.totalCarryUsdYrM).toBeCloseTo(Math.abs(priced.cashUsdYr), 6);
+    expect(priced.open.totalCarryUsdYrM * 1000).toBeCloseTo(79, 0);
+    expect(priced.far.totalCarryUsdYrM)
+      .toBeCloseTo(priced.cashUsdYr + priced.pointsUsdYr, 6);
+    expect(priced.far.totalCarryUsdYrM).toBeCloseTo(0, 3);
+  });
+
   it('open CFaR vs |S| is RSS with the section, not a straight VAR ray', () => {
     const base = input({
       row: row({ cash_floor: 0, carry_target: 0 }),

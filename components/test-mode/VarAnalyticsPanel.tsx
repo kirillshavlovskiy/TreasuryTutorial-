@@ -17,6 +17,7 @@ import {
   chipsFromPathSummary,
   HedgeStagingHeader,
   pathChartDraftDirty,
+  scheduleFromPreparedProfile,
 } from '@/components/test-mode/HedgeStagingHeader';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -72,6 +73,7 @@ import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
 import { CashCarryAnalyticsView } from '@/components/test-mode/CashCarryAnalyticsView';
 import { CfarAnalysisView } from '@/components/test-mode/CfarAnalysisView';
 import { LiquidityAnalyticsView } from '@/components/test-mode/LiquidityAnalyticsView';
+import type { OptimizerOverlayDesk } from '@/lib/test-mode/solution-pick';
 import {
   assignImpliedCarryFromSwapPoints,
   sumCashCarryTotalUsdM,
@@ -203,6 +205,8 @@ interface VarAnalyticsPanelProps {
   onResidualByCcyChange?: (next: Record<string, number>) => void;
   portfolioScenarioId?: string | null;
   onPortfolioScenarioIdChange?: (id: string | null) => void;
+  onStrategyCfarByCcyChange?: (byCcy: Record<string, number>) => void;
+  onOptimizerOverlayByCcyChange?: (next: Record<string, OptimizerOverlayDesk>) => void;
 }
 
 function fmtVarK(usdM: number): string {
@@ -395,6 +399,8 @@ export function VarAnalyticsPanel({
   onResidualByCcyChange,
   portfolioScenarioId,
   onPortfolioScenarioIdChange,
+  onStrategyCfarByCcyChange,
+  onOptimizerOverlayByCcyChange,
 }: VarAnalyticsPanelProps) {
   /** Live FX Risk table stock/flow — not entity seed (e.g. EUR 1.9). */
   const risk = useMemo(
@@ -797,6 +803,10 @@ export function VarAnalyticsPanel({
   const chartBar = chartCcy
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
     : undefined;
+  const stagedChartSchedule = useMemo(
+    () => scheduleFromPreparedProfile(chartCcy ? preparedByCcy[chartCcy] : undefined),
+    [chartCcy, preparedByCcy],
+  );
   /** Non-USD exposures available for the VaR evolution chart. */
   const evolutionCcys = useMemo(
     () =>
@@ -879,7 +889,7 @@ export function VarAnalyticsPanel({
       );
       target = edges[edges.length - 1]?.hedgeLocalM ?? 0;
     } else {
-      target = hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq);
+      target = hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartRow.ccy);
     }
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
@@ -962,10 +972,11 @@ export function VarAnalyticsPanel({
             ratesScopeId,
           ),
           bulletSettleMonths: defaultTf,
+          ccy: chartRow.ccy,
         },
       );
-      onPreparedByCcyChange(
-        setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+      onPreparedByCcyChange(prev =>
+        setPreparedHedgeForCcy(prev, chartRow.ccy, {
           ...profile,
           preparedFor: 'var',
         }),
@@ -995,7 +1006,7 @@ export function VarAnalyticsPanel({
       flowsForCcy ?? flows,
     ).amountLocalM;
     const target =
-      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartRow.ccy) * coverPct;
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -1020,10 +1031,11 @@ export function VarAnalyticsPanel({
           ratesScopeId,
         ),
         bulletSettleMonths: bulletSettle,
+        ccy: chartRow.ccy,
       },
     );
-    onPreparedByCcyChange(
-      setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
+    onPreparedByCcyChange(prev =>
+      setPreparedHedgeForCcy(prev, chartRow.ccy, {
         ...profile,
         preparedFor: 'var',
       }),
@@ -1448,6 +1460,9 @@ export function VarAnalyticsPanel({
           onResidualByCcyChange={onResidualByCcyChange}
           portfolioScenarioId={portfolioScenarioId}
           onPortfolioScenarioIdChange={onPortfolioScenarioIdChange}
+          onStrategyCfarByCcyChange={onStrategyCfarByCcyChange}
+          onOptimizerOverlayByCcyChange={onOptimizerOverlayByCcyChange}
+          cashCarryTabUsdM={cashCarryTabUsdM}
         />
       ) : perspective !== 'fxRisk' ? (
         <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
@@ -2363,12 +2378,27 @@ export function VarAnalyticsPanel({
                       pathSummaryMetrics,
                     ),
                   )}
-                  prepareAction={pathPrepareAction}
+                  prepareAction={
+                    pathPrepareAction
+                    ?? (onPreparedByCcyChange
+                      ? {
+                          label: 'Stage hedging strategy',
+                          title: 'Stage this path — then Book under this CCY',
+                          disabled: false,
+                          run: () =>
+                            bookHedgeProfile({
+                              structure: effectiveStructure,
+                              basis: pathBasis,
+                              edges: [],
+                            }),
+                        }
+                      : null)
+                  }
                   onReset={
                     chartCcy && preparedByCcy[chartCcy] && onPreparedByCcyChange
                       ? () =>
-                          onPreparedByCcyChange(
-                            clearPreparedHedgeForCcy(preparedByCcy, chartCcy),
+                          onPreparedByCcyChange(prev =>
+                            clearPreparedHedgeForCcy(prev, chartCcy),
                           )
                       : undefined
                   }
@@ -2426,10 +2456,13 @@ export function VarAnalyticsPanel({
                   }
                 }}
                 stripLegCount={
-                  chartRow
+                  stagedChartSchedule.stripLegCount
+                  ?? (chartRow
                     ? (stripLegCountByCcy[chartRow.ccy] ?? null)
-                    : null
+                    : null)
                 }
+                scheduleEndMonths={stagedChartSchedule.ends}
+                scheduleHedgeWeights={stagedChartSchedule.weights}
                 onStripLegCountChange={n => {
                   if (!chartRow) return;
                   setStripLegCountByCcy(prev => ({

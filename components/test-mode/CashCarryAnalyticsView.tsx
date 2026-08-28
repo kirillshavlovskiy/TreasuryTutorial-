@@ -3865,7 +3865,11 @@ export function CashCarryAnalyticsView({
           hedgeRatio: coverPct,
           settleMonths: settle,
         },
-        { marketRates, bulletSettleMonths: Math.max(0.25, settle || defaultTf) },
+        {
+          marketRates,
+          bulletSettleMonths: Math.max(0.25, settle || defaultTf),
+          ccy: chartCcy,
+        },
       );
     }
 
@@ -3897,11 +3901,11 @@ export function CashCarryAnalyticsView({
         cashDeliveryAt: 'periodEnd',
         settleSkew: settleSkewFromCenterOfMass(score.centerOfMass),
       },
-      { marketRates, bulletSettleMonths: defaultTf },
+      { marketRates, bulletSettleMonths: defaultTf, ccy: chartCcy },
     );
   };
 
-  /** Lock shape → draft + path schedule, and stage to prepared book (Neon). */
+  /** Lock shape → local draft + path schedule. Stage in the header sends it. */
   const applyStripShapeAroundWam = (score: StripShapeScore) => {
     if (Math.abs(score.hedgeDeltaLocalM) < 1e-12) return;
     const locked = {
@@ -3917,21 +3921,9 @@ export function CashCarryAnalyticsView({
     const pinned = draftFromShapeScore(score, pathBasis);
     commitProfileDraft(pinned, { markDirty: true });
 
-    const stagePinned = (session: ProfileSession) => {
+    const rememberPinned = (session: ProfileSession) => {
       if (!chartCcy) return;
       persistProfileSession(chartCcy, session);
-      // Apply shape must hit preparedByCcy / DB — otherwise reload loses the
-      // whole Prebook process (session used to live only in a React ref).
-      if (onPreparedByCcyChange) {
-        lastStagedPkgSigRef.current = '';
-        onPreparedByCcyChange(
-          setPreparedHedgeForCcy(preparedByCcy, chartCcy, {
-            ...pinned,
-            preparedFor: 'carry',
-          }),
-        );
-        setProfileDraftDirty(false);
-      }
     };
 
     if (score.structure === 'bullet' || score.legCount <= 1) {
@@ -3945,9 +3937,9 @@ export function CashCarryAnalyticsView({
         Math.round(score.wamMonths > 1e-12 ? score.wamMonths : 1),
       );
       setSelectedSettleMonths(appliedWam);
-      stagePinned({
+      rememberPinned({
         draft: pinned,
-        dirty: false,
+        dirty: true,
         appliedShape: locked,
         appliedShapeScore: score,
         shapePreview: locked,
@@ -3981,9 +3973,9 @@ export function CashCarryAnalyticsView({
       Math.round(score.wamMonths > 1e-12 ? score.wamMonths : 1),
     );
     setSelectedSettleMonths(appliedWam);
-    stagePinned({
+    rememberPinned({
       draft: pinned,
-      dirty: false,
+      dirty: true,
       appliedShape: locked,
       appliedShapeScore: score,
       shapePreview: locked,
@@ -4123,6 +4115,7 @@ export function CashCarryAnalyticsView({
         {
           marketRates,
           bulletSettleMonths: defaultTf,
+          ccy: chartCcy,
         },
       );
       // Local draft only — do NOT echo settleEnds/weights into parent
@@ -4168,7 +4161,7 @@ export function CashCarryAnalyticsView({
       pathFlows ?? flows,
     ).amountLocalM;
     const target =
-      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartCcy) * coverPct;
     const settle = Math.max(
       0.25,
       Math.min(defaultTf, chartBulletSettle ?? defaultTf),
@@ -4184,9 +4177,10 @@ export function CashCarryAnalyticsView({
         cashDeliveryAt,
         settleMonths: settle,
       },
-      {
+        {
         marketRates,
         bulletSettleMonths: settle,
+        ccy: chartCcy,
       },
     );
     commitProfileDraft(profile);
@@ -6228,7 +6222,7 @@ export function CashCarryAnalyticsView({
                                         : ''
                                   }`}
                                   onClick={() => applyStripShapeAroundWam(c)}
-                                  title="Apply this strip locally · Stage in the header to send to Decision and Liquidity"
+                                  title="Apply this shape as a local draft — Stage in the header to send it to Decision"
                                 >
                                   <td className="py-1.5 pr-2 text-slate-500">
                                     {i + 1}

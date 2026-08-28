@@ -42,6 +42,9 @@ export function defaultTaskProgress(taskId = '01'): TaskProgress {
       largestMismatch: 'pending',
       setVarConfidence: 'pending',
       readVar: 'pending',
+      openCashCarry: 'pending',
+      readCarryByCcy: 'pending',
+      readCarryTotal: 'pending',
     },
   };
 }
@@ -61,6 +64,15 @@ export function emptyAnswers(): TaskAnswers {
     varRateVol: '',
     varAveragingConvention: 'midMonth',
     eurVarUsdK: '',
+    carryForecastMonths: '',
+    carryEurUsdK: '',
+    carryGbpUsdK: '',
+    carryPlnUsdK: '',
+    carryMxnUsdK: '',
+    carryJpyUsdK: '',
+    carryAllCcyUsdK: '',
+    carryEarnCcy: '',
+    carryPayCcy: '',
   };
 }
 

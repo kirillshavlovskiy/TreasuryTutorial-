@@ -5,8 +5,11 @@ import {
   allocateCarryVarUsd,
   buildEfficientCarryVarFrontier,
   joinOverlayStripWeights,
+  l1Weights,
   overlayBookBaseFcyM,
+  overlayLegCarryAtUsd,
   scaleOverlayLegs,
+  type EfficientCarryLeg,
 } from '@/lib/portfolio-alloc';
 
 describe('allocateCarryVarUsd', () => {
@@ -24,6 +27,25 @@ describe('allocateCarryVarUsd', () => {
     expect(alloc!.wUsdM[ccys.indexOf('CAD')]).toBeCloseTo(-15, 5);
     expect(alloc!.wUsdM[ccys.indexOf('MXN')]).toBeCloseTo(15, 5);
     expect(alloc!.carryUsdYrM).toBeGreaterThan(0);
+  });
+
+  it('an ask above the 3× fill binds on the same ray once per-name leverage is raised', () => {
+    const r_USD = 3.5;
+    const ccys = ['EUR', 'PLN'] as const;
+    const mu = ccys.map(c => (CURRENCY_PARAMS[c]!.carry - r_USD) / 100);
+    const at3 = allocateCarryVarUsd({ ccys, mu, varCapUsdM: 11.6 })!;
+    const ask = at3.carryUsdYrM * 2.4;
+    expect(ask).toBeGreaterThan(at3.carryUsdYrM + 0.05);
+    const blocked = allocateCarryVarUsd({
+      ccys, mu, varCapUsdM: 11.6, carryTargetUsdYrM: ask,
+    })!;
+    expect(blocked.carryBinding).toBe(false);
+    const hit = allocateCarryVarUsd({
+      ccys, mu, varCapUsdM: 11.6, carryTargetUsdYrM: ask, maxLegLeverage: 12,
+    })!;
+    expect(hit.carryBinding).toBe(true);
+    expect(hit.carryUsdYrM).toBeCloseTo(ask, 3);
+    expect(Math.abs(hit.wUsdM[0]!)).toBeGreaterThan(Math.abs(at3.wUsdM[0]!) + 1);
   });
 
   it('a feasible shared carry target does not spend the whole VAR budget', () => {
@@ -184,6 +206,39 @@ describe('buildEfficientCarryVarFrontier — credit/debit split and fixed CFaR',
     expect(full[0]!.usdM).toBeCloseTo(fr.capLegs[0]!.usdM, 8);
     expect(half[0]!.usdM).toBeCloseTo(fr.capLegs[0]!.usdM * 0.5, 8);
     expect(zero.every(l => Math.abs(l.usdM) < 1e-12)).toBe(true);
+  });
+
+  it('a deeper PAY short past zero can earn less — scale t does not linearly copy cap carry', () => {
+    const r_USD = 2.0;
+    const eurMu = (CURRENCY_PARAMS.EUR!.carry - r_USD) / 100;
+    const rOd = CURRENCY_PARAMS.EUR!.r_OD;
+    const spot = CURRENCY_PARAMS.EUR!.spot;
+    const baseFcy = 2.54;
+    const midFcy = -2.00;
+    const capFcy = -4.15;
+    const midUsd = midFcy * spot;
+    const capUsd = capFcy * spot;
+    expect(eurMu).toBeLessThan(0);
+    expect(rOd).toBeGreaterThan(r_USD);
+    expect(baseFcy + midFcy).toBeGreaterThan(0);
+    expect(baseFcy + capFcy).toBeLessThan(0);
+    const cap: EfficientCarryLeg = {
+      ccy: 'EUR',
+      mu: eurMu,
+      usdM: capUsd,
+      fcyM: capFcy,
+      side: 'short',
+      carryUsdYrM: capUsd * (rOd - r_USD) / 100,
+      componentVarUsdM: 5,
+      baseFcyM: baseFcy,
+      rOdPct: rOd,
+      rUsdPct: r_USD,
+    };
+    const mid = scaleOverlayLegs([cap], midUsd / capUsd)[0]!;
+    expect(mid.usdM).toBeCloseTo(midUsd, 6);
+    expect(mid.carryUsdYrM).toBeCloseTo(midUsd * eurMu, 6);
+    expect(mid.carryUsdYrM).toBeGreaterThan(cap.carryUsdYrM * (midUsd / capUsd));
+    expect(mid.carryUsdYrM).toBeGreaterThan(cap.carryUsdYrM);
   });
 
   it('fixedCfarUsdM makes pin-only VAR the RSS of the fixed CFaRs, not zero', () => {
@@ -378,12 +433,54 @@ describe('joinOverlayStripWeights', () => {
     expect(joined.every(r => r.overlayWeight === 0)).toBe(true);
     expect(joined.reduce((s, r) => s + Math.abs(r.stripWeight), 0)).toBeCloseTo(1, 9);
   });
+
+  it('Strip w% follows live outstanding sign — not scenario Book S', () => {
+    const joined = joinOverlayStripWeights(
+      [{
+        ccy: 'EUR', mu: -0.01, usdM: -55.5, fcyM: -47.43, side: 'short',
+        carryUsdYrM: 0.716, componentVarUsdM: 1.8,
+      }],
+      [{ ccy: 'EUR', bookNow: -36.74, outstanding: -23.51 }],
+    );
+    const eur = joined.find(r => r.ccy === 'EUR')!;
+    expect(eur.overlayFcyM).toBeCloseTo(-47.43, 2);
+    expect(eur.outstanding).toBeCloseTo(-23.51, 2);
+    expect(eur.stripWeight).toBeLessThan(0);
+    expect(eur.overlayWeight).toBeLessThan(0);
+  });
 });
 
 describe('overlayBookBaseFcyM', () => {
   it('does not floor a PAY trough at 0', () => {
     expect(overlayBookBaseFcyM({ cash: 10, payout: -40 })).toBeCloseTo(40, 10);
     expect(overlayBookBaseFcyM({ cash: 20, payout: -8 })).toBeCloseTo(20, 10);
+  });
+
+  it('counts the unhedged FX book and the cash floor as buffer', () => {
+    expect(overlayBookBaseFcyM({
+      cash: 1.26, payout: 0, cash_floor: 0.4, fxExposureM: -8.2,
+    })).toBeCloseTo(8.2, 10);
+  });
+});
+
+describe('allocateCarryVarUsd — PAY harvest is not clipped to 2× cash', () => {
+  it('lets a short EUR PAY exceed 2× a 1.26M cash buffer', () => {
+    const r_USD = 4.5;
+    const eur = CURRENCY_PARAMS.EUR!;
+    const mu = (eur.carry - r_USD) / 100;
+    const alloc = allocateCarryVarUsd({
+      ccys: ['EUR'],
+      mu: [mu],
+      varCapUsdM: 10.6,
+      basesFcy: [1.26],
+      rOd: [eur.r_OD],
+      r_USD,
+    })!;
+    const usd = alloc.wUsdM[0]!;
+    const twoXCashUsd = 1.26 * eur.spot * 2;
+    expect(usd).toBeLessThan(0);
+    expect(Math.abs(usd)).toBeGreaterThan(twoXCashUsd + 0.5);
+    expect(Math.abs(usd)).toBeLessThanOrEqual(10.6 * 3 + 1e-6);
   });
 });
 
@@ -401,5 +498,173 @@ describe('allocateCarryVarUsd — zero trough does not drop a name', () => {
     const gbp = alloc.wUsdM[ccys.indexOf('GBP')]!;
     const pln = alloc.wUsdM[ccys.indexOf('PLN')]!;
     expect(Math.abs(gbp) + Math.abs(pln)).toBeGreaterThan(1);
+  });
+
+  it('does not harvest a dust-μ empty book to 3×VAR', () => {
+    const alloc = allocateCarryVarUsd({
+      ccys: ['EUR', 'GBP'],
+      mu: [-0.015, 0.00003],
+      varCapUsdM: 12,
+      basesFcy: [3.7, 0],
+      rOd: [CURRENCY_PARAMS.EUR!.r_OD, CURRENCY_PARAMS.GBP!.r_OD],
+      r_USD: 3.5,
+    })!;
+    const gbp = alloc.wUsdM[1]!;
+    expect(Math.abs(gbp)).toBeLessThan(0.05);
+    expect(Math.abs(alloc.wUsdM[0]!)).toBeGreaterThan(1);
+  });
+});
+
+describe('allocation invariants — mix, VAR, and the PAY kink', () => {
+  const rUsdPay = 2.0;
+  const eur = CURRENCY_PARAMS.EUR!;
+  const pln = CURRENCY_PARAMS.PLN!;
+
+  function payKinkCap(): EfficientCarryLeg {
+    const mu = (eur.carry - rUsdPay) / 100;
+    const capFcy = -4.15;
+    const capUsd = capFcy * eur.spot;
+    return {
+      ccy: 'EUR',
+      mu,
+      usdM: capUsd,
+      fcyM: capFcy,
+      side: 'short',
+      carryUsdYrM: capUsd * (eur.r_OD - rUsdPay) / 100,
+      componentVarUsdM: 5.5,
+      baseFcyM: 2.54,
+      rOdPct: eur.r_OD,
+      rUsdPct: rUsdPay,
+    };
+  }
+
+  it('a single PAY name is 100% short and L1 mix is ±1', () => {
+    const mu = (eur.carry - 4.5) / 100;
+    const fr = buildEfficientCarryVarFrontier({
+      ccys: ['EUR'], mu: [mu], varCapUsdM: 10,
+    })!;
+    expect(fr.capLegs).toHaveLength(1);
+    expect(fr.capLegs[0]!.side).toBe('short');
+    const w = l1Weights(fr.capLegs.map(l => l.usdM));
+    expect(w[0]).toBeCloseTo(-1, 8);
+  });
+
+  it('the ray keeps a constant mix — t only scales notionals', () => {
+    const r_USD = 3.5;
+    const ccys = ['EUR', 'MXN'] as const;
+    const mu = ccys.map(c => (CURRENCY_PARAMS[c]!.carry - r_USD) / 100);
+    const fr = buildEfficientCarryVarFrontier({ ccys, mu, varCapUsdM: 10 })!;
+    const half = scaleOverlayLegs(fr.capLegs, 0.5);
+    const cap = new Map(fr.capLegs.map(l => [l.ccy, l.usdM] as const));
+    for (const l of half) {
+      expect(l.usdM).toBeCloseTo(cap.get(l.ccy)! * 0.5, 6);
+    }
+    const wCap = l1Weights(fr.capLegs.map(l => l.usdM));
+    const wHalf = l1Weights(half.map(l => l.usdM));
+    wCap.forEach((w, i) => expect(w).toBeCloseTo(wHalf[i]!, 8));
+  });
+
+  it('overlay VAR is monotone along the ray (more t, not less risk)', () => {
+    const r_USD = 3.5;
+    const ccys = ['EUR', 'PLN'] as const;
+    const mu = ccys.map(c => (CURRENCY_PARAMS[c]!.carry - r_USD) / 100);
+    const fr = buildEfficientCarryVarFrontier({ ccys, mu, varCapUsdM: 16.7 })!;
+    for (let i = 1; i < fr.ray.length; i++) {
+      expect(fr.ray[i]!.varUsdM).toBeGreaterThanOrEqual(fr.ray[i - 1]!.varUsdM - 1e-9);
+    }
+  });
+
+  it('dropping PLN re-solves the mix — EUR is not 100% of the pair and not a zeroed slice', () => {
+    const r_USD = 3.5;
+    const pair = buildEfficientCarryVarFrontier({
+      ccys: ['EUR', 'PLN'],
+      mu: [(eur.carry - r_USD) / 100, (pln.carry - r_USD) / 100],
+      varCapUsdM: 2,
+      skipLeverageCap: true,
+    })!;
+    const solo = buildEfficientCarryVarFrontier({
+      ccys: ['EUR'],
+      mu: [(eur.carry - r_USD) / 100],
+      varCapUsdM: 2,
+      skipLeverageCap: true,
+    })!;
+    const eurPair = pair.capLegs.find(l => l.ccy === 'EUR')!;
+    const plnPair = pair.capLegs.find(l => l.ccy === 'PLN')!;
+    const wPair = l1Weights(pair.capLegs.map(l => l.usdM));
+    const eurW = wPair[pair.capLegs.findIndex(l => l.ccy === 'EUR')]!;
+    expect(Math.abs(plnPair.usdM)).toBeGreaterThan(0.05);
+    expect(Math.abs(eurW)).toBeLessThan(0.99);
+    expect(solo.capLegs[0]!.usdM).not.toBeCloseTo(eurPair.usdM, 2);
+    expect(solo.capLegs[0]!.side).toBe('short');
+    expect(eurPair.side).toBe('short');
+  });
+
+  it('diversified EUR+PLN can short more EUR than EUR-only at the same cap', () => {
+    const r_USD = 3.5;
+    const basesFcy = [2.54, 10];
+    const rOd = [eur.r_OD, pln.r_OD];
+    const pair = buildEfficientCarryVarFrontier({
+      ccys: ['EUR', 'PLN'],
+      mu: [(eur.carry - r_USD) / 100, (pln.carry - r_USD) / 100],
+      varCapUsdM: 16.7,
+      basesFcy, rOd, r_USD,
+    })!;
+    const solo = buildEfficientCarryVarFrontier({
+      ccys: ['EUR'],
+      mu: [(eur.carry - r_USD) / 100],
+      varCapUsdM: 16.7,
+      basesFcy: [2.54], rOd: [eur.r_OD], r_USD,
+    })!;
+    const eurPair = pair.capLegs.find(l => l.ccy === 'EUR')!.usdM;
+    const eurSolo = solo.capLegs[0]!.usdM;
+    expect(eurPair).toBeLessThan(0);
+    expect(eurSolo).toBeLessThan(0);
+    expect(Math.abs(eurPair)).toBeGreaterThan(Math.abs(eurSolo) - 1e-6);
+  });
+
+  it('Euler component VAR on cap legs sums to the overlay portfolio VAR', () => {
+    const r_USD = 3.5;
+    const ccys = ['EUR', 'GBP', 'PLN'] as const;
+    const mu = ccys.map(c => (CURRENCY_PARAMS[c]!.carry - r_USD) / 100);
+    const fr = buildEfficientCarryVarFrontier({ ccys, mu, varCapUsdM: 10 })!;
+    const port = computePortfolioVAR(
+      fr.capLegs.map(l => ({
+        ccy: l.ccy,
+        cashFCY: (CURRENCY_PARAMS[l.ccy]!.spot > 1e-12)
+          ? l.usdM / CURRENCY_PARAMS[l.ccy]!.spot
+          : 0,
+      })),
+    );
+    const euler = fr.capLegs.reduce((s, l) => s + l.componentVarUsdM, 0);
+    expect(euler).toBeCloseTo(port.portfolio_VAR_USD, 5);
+    expect(euler).toBeCloseTo(fr.cap.varUsdM, 4);
+  });
+
+  it('a PAY short past zero can make ray carry peak before the VAR fill', () => {
+    const cap = payKinkCap();
+    expect(2.54 + cap.fcyM).toBeLessThan(0);
+    const samples = [0, 0.25, 0.4, 0.55, 0.7, 0.85, 1].map(t => ({
+      t,
+      carry: overlayLegCarryAtUsd(cap, cap.usdM * t),
+    }));
+    const peak = samples.reduce((best, p) => (p.carry >= best.carry ? p : best));
+    expect(peak.t).toBeLessThan(1);
+    expect(peak.carry).toBeGreaterThan(samples[samples.length - 1]!.carry);
+    const credit = samples.find(p => {
+      const fcy = cap.fcyM * p.t;
+      return 2.54 + fcy > 0;
+    })!;
+    expect(credit.carry).toBeGreaterThan(overlayLegCarryAtUsd(cap, cap.usdM));
+  });
+
+  it('Σ⁻¹μ still longs EARN and shorts PAY when a third name is added', () => {
+    const r_USD = 3.5;
+    const ccys = ['EUR', 'GBP', 'MXN'] as const;
+    const mu = ccys.map(c => (CURRENCY_PARAMS[c]!.carry - r_USD) / 100);
+    const fr = buildEfficientCarryVarFrontier({ ccys, mu, varCapUsdM: 8 })!;
+    for (const l of fr.capLegs) {
+      if (l.mu > 1e-4) expect(l.side).toBe('long');
+      if (l.mu < -1e-4) expect(l.side).toBe('short');
+    }
   });
 });

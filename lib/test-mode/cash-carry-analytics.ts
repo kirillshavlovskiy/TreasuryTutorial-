@@ -19,8 +19,13 @@ import {
   monthlyInflowSeriesLocalM,
   type ForecastProfileState,
 } from '@/lib/forecast-profile';
-import { stripHedgeLegCarryUsdM, fwdCarryForExposureCoverUsdM } from '@/lib/fx-hedge';
 import {
+  coverFromTradeLocalM,
+  stripHedgeLegCarryUsdM,
+  fwdCarryForExposureCoverUsdM,
+} from '@/lib/fx-hedge';
+import {
+  fcyCcyOf,
   fwdCarryFromSwapPointsUsdM,
   fwdCarryMonthlyAccrualUsdM,
   interpolateSwapPoints,
@@ -421,6 +426,7 @@ function monthIndexForSettle(settleMonths: number, T: number): number | null {
  * Per-month FCY hedge cash flows for a CCY (prepared + booked).
  * Index 0 = M1 … T−1 = MT. Sign: + = FCY received, − = FCY delivered.
  */
+/** Desk overlay extra — hedge trade (sell FCY = −). Convert before CIP / CFaR. */
 export type AnalyticsForwardLeg = {
   ccy: string;
   amountLocalM: number;
@@ -450,7 +456,7 @@ export function hedgeCashFlowsByMonth(input: {
     const idx = monthIndexForSettle(leg.settleMonths, T);
     if (idx == null) continue;
     // Exposure-signed cover → settle delivers opposite FCY into cash.
-    flows[idx - 1]! += -leg.amountLocalM;
+    flows[idx - 1]! += -hedgeLegCoverLocalM(leg);
   }
   // Spot settles into near cash (M1) — excluded from collectHedgeLegs carry path.
   for (const t of input.bookedHedges.filter(isLiveHedgeTicket)) {
@@ -585,8 +591,7 @@ export function buildCashForecastSchedule(input: {
   // is not a 4M tenor.
   const legFwd = legs.map(leg => {
     const S = Math.max(0, leg.settleMonths);
-    const N = leg.amountLocalM;
-    return { settleMonths: S, notionalLocalM: N };
+    return { settleMonths: S, notionalLocalM: hedgeLegCoverLocalM(leg) };
   });
 
   const usdPer = fcyToUsdM(1, input.ccy);
@@ -1084,10 +1089,12 @@ export function assignImpliedCarryFromSwapPoints(
   input: {
     marketRates: FxMarketRatesBundle;
     bulletSettleMonths: number;
+    /** Book FCY — USDPLN files have baseCcy `USD`; do not use that as the pair. */
+    ccy?: string;
   },
 ): PreparedHedgeProfile {
   const { marketRates, bulletSettleMonths } = input;
-  const ccy = (marketRates.baseCcy || '').toUpperCase();
+  const ccy = (input.ccy || fcyCcyOf(marketRates)).toUpperCase();
   const overnight = resolveOvernightCashRates(marketRates, ccy || 'EUR');
 
   if (profile.structure === 'strip' && profile.legs.length > 0) {
@@ -1203,6 +1210,11 @@ type HedgeLegSample = {
   notionalKind: 'cover' | 'trade';
 };
 
+/** Book-signed cover. Feeding a sell-negative trade into the market pricer buys. */
+function hedgeLegCoverLocalM(leg: Pick<HedgeLegSample, 'amountLocalM' | 'notionalKind'>): number {
+  return leg.notionalKind === 'trade' ? -leg.amountLocalM : leg.amountLocalM;
+}
+
 /** Collect hedge legs (prepared + booked + optional desk overlay forwards). */
 function collectHedgeLegs(input: {
   bookedHedges: readonly HedgeTicket[];
@@ -1264,13 +1276,15 @@ function collectHedgeLegs(input: {
   for (const f of input.extraForwards ?? []) {
     if (preparedCcys.has(f.ccy)) continue;
     if (Math.abs(f.amountLocalM) < 1e-12) continue;
+    // Overlay forward is sell-negative. Store cover so FWD accrued / settle
+    // do not price a buy (that flipped PLN CIP to a cost).
     legs.push({
       ccy: f.ccy,
-      amountLocalM: f.amountLocalM,
+      amountLocalM: coverFromTradeLocalM(f.amountLocalM),
       settleMonths: f.settleMonths,
       recognizeMonths: 0,
       structure: 'bullet',
-      notionalKind: 'trade',
+      notionalKind: 'cover',
     });
   }
   return legs;

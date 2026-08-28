@@ -43,7 +43,10 @@ import {
   allowsNegativeLp,
   fundingSwapOverlayUsdYr,
   fundingSwapCashDeltaUsdYr,
+  bothSidesPayVsUsd,
   fundingSwapCarryLegs,
+  allocateToTotal,
+  fundingSwapMonthBufferUsdM,
   fundingSwapCipPointsUsdYr,
   computePortfolioVAR,
   optimizePortfolioCarry,
@@ -760,6 +763,14 @@ describe('deriveUsdLiquidity', () => {
     expect(d.fcy_envelope_shortfall).toBeCloseTo(0);
     expect(d.budget_binding).toBe(true);
   });
+
+  it('leftover after residual CFaR is the FCY sleeve', () => {
+    const d = deriveUsdLiquidity(20, 30, 100, 0, true, 25);
+    expect(d.cfar_reserve).toBeCloseTo(25);
+    expect(d.usd_protected).toBeCloseTo(45);
+    expect(d.available_for_fcy).toBeCloseTo(55);
+    expect(d.fcy_funding_shortfall).toBe(0);
+  });
 });
 
 describe('computeFcyCollateralBudget', () => {
@@ -835,6 +846,18 @@ describe('PLN cash + points vs USD', () => {
     expect(overlay.pointsUsdYr).toBeCloseTo(-cash, 10);
   });
 
+  it('desk Buffer +$79K on +317.45M Book S is |9 bp × Book $|, not CIP-net $0', () => {
+    const S = 317.45;
+    expect(bothSidesPayVsUsd(spot, r_FCY, r_USD, r_OD)).toBe(true);
+    const cash = fundingSwapCashDeltaUsdYr(S, spot, r_FCY, r_USD, r_OD);
+    const points = fundingSwapCipPointsUsdYr(S, spot, r_FCY, r_USD);
+    expect(S * spot).toBeCloseTo(87.3, 1);
+    expect(cash).toBeLessThan(0);
+    expect(cash).toBeCloseTo(S * ((r_FCY - r_USD) / 100) * spot, 10);
+    expect(Math.abs(cash) * 1000).toBeCloseTo(79, 0);
+    expect(cash + points).toBeCloseTo(0, 10);
+  });
+
   it('12m term Buffer Carry is annual cash Δr on M1 standing, not a 1M nest or a 6-cycle path', () => {
     const standing = 21.6;
     const annual = standing * ((r_FCY - r_USD) / 100) * spot;
@@ -908,6 +931,42 @@ describe('PLN cash + points vs USD', () => {
     });
     expect(legs.cashUsdM).toBeCloseTo(annual, 8);
     expect(legs.cashUsdM * 1000).toBeCloseTo(-5.3, 1);
+  });
+
+  it('allocateToTotal months sum exactly to the header', () => {
+    const out = allocateToTotal([1, 2, 3], 0.089);
+    expect(out.reduce((s, v) => s + v, 0)).toBeCloseTo(0.089, 12);
+    expect(allocateToTotal([0, 0, 0], 0.05)).toEqual([0.05, 0, 0]);
+  });
+
+  it('term Buffer Carry months sum to the header (not a rolling nest)', () => {
+    const standing = 21.6;
+    const plan = Array.from({ length: 12 }, (_, i) => ({
+      standing_swap: standing,
+      far_leg: i === 11 ? -standing : 0,
+      cycleIndex: i,
+    }));
+    const header = fundingSwapCarryLegs({
+      ccy: 'PLN',
+      plan,
+      r_FCY,
+      r_USD,
+      r_OD,
+      forecastMonths: 12,
+      bookingMode: 'term',
+    }).cashUsdM;
+    const months = plan.map((_, i) => fundingSwapMonthBufferUsdM({
+      plan,
+      cycleIndex: i,
+      ccy: 'PLN',
+      r_FCY,
+      r_USD,
+      r_OD,
+      forecastMonths: 12,
+      bookingMode: 'term',
+    }));
+    expect(allocateToTotal(months, header).reduce((s, v) => s + v, 0))
+      .toBeCloseTo(header, 10);
   });
 });
 

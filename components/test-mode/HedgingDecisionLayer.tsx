@@ -19,6 +19,7 @@ import {
   chipsFromPathSummary,
   HedgeStagingHeader,
   pathChartDraftDirty,
+  scheduleFromPreparedProfile,
 } from '@/components/test-mode/HedgeStagingHeader';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -520,6 +521,10 @@ export function HedgingDecisionLayer({
   const chartBar = chartCcy
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
     : undefined;
+  const stagedChartSchedule = useMemo(
+    () => scheduleFromPreparedProfile(chartCcy ? preparedByCcy[chartCcy] : undefined),
+    [chartCcy, preparedByCcy],
+  );
 
   const applyPathBasis = (
     basis: HedgePathBasisId,
@@ -562,6 +567,7 @@ export function HedgingDecisionLayer({
       startM,
       endM,
       bulletEq,
+      chartRow.ccy,
     );
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
@@ -637,6 +643,7 @@ export function HedgingDecisionLayer({
             ratesScopeId,
           ),
           bulletSettleMonths: defaultTf,
+          ccy: chartRow.ccy,
         },
       );
       setPreparedByCcy(prev =>
@@ -671,7 +678,7 @@ export function HedgingDecisionLayer({
       flowsForCcy ?? flows,
     ).amountLocalM;
     const target =
-      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartRow.ccy) * coverPct;
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -696,6 +703,7 @@ export function HedgingDecisionLayer({
           ratesScopeId,
         ),
         bulletSettleMonths,
+        ccy: chartRow.ccy,
       },
     );
     setPreparedByCcy(prev =>
@@ -927,6 +935,7 @@ export function HedgingDecisionLayer({
         ),
         bulletSettleMonths:
           varSetup.forecastMonths || horizonMonths(varSetup.horizon),
+        ccy: rollingStrip.ccy,
       },
     );
     setPreparedByCcy(prev =>
@@ -1014,7 +1023,7 @@ export function HedgingDecisionLayer({
           hedgeRatio: 0,
           settleMonths: cfg.t[0] ?? bulletTf,
         },
-        { marketRates: rates, bulletSettleMonths: bulletTf },
+        { marketRates: rates, bulletSettleMonths: bulletTf, ccy },
       );
     }
     const preset =
@@ -1049,7 +1058,7 @@ export function HedgingDecisionLayer({
         coverLocalM: cum,
         hedgeRatio: 0,
       },
-      { marketRates: rates, bulletSettleMonths: bulletTf },
+      { marketRates: rates, bulletSettleMonths: bulletTf, ccy },
     );
   };
 
@@ -1114,7 +1123,10 @@ export function HedgingDecisionLayer({
     const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
     const structure = structureFor(ccy);
     setHedgeStructure(structure);
-    commitStructured(ccy, structPctFor(ccy), structure, cfg);
+    const pct = structPctFor(ccy);
+    const usePct = pct < 1 ? 100 : pct;
+    if (pct < 1) setStructRatio(ccy, 100);
+    commitStructured(ccy, usePct, structure, cfg);
   };
 
   /** Cash / VaR-neutral / Target quick-apply — sets ratio; Restage if a package is already staged. */
@@ -1563,10 +1575,7 @@ export function HedgingDecisionLayer({
                 prepared != null
                 && previewProfile != null
                 && structuredDraftDirty(previewProfile, prepared);
-              const showStage =
-                (!prepared || draftDirty)
-                && !flat
-                && Math.abs(structPctFor(r.ccy)) >= 1e-9;
+              const showStage = !flat;
               const shapeBtn = (on: boolean) =>
                 `rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
                   on
@@ -1631,7 +1640,11 @@ export function HedgingDecisionLayer({
                     <span className="text-right font-mono text-[11px] font-semibold tabular-nums text-emerald-300">
                       {overview ? fmtVarK(overview.varTotal) : '—'}
                     </span>
-                    <span className={`truncate text-[9px] ${muted}`}>
+                    <span
+                      className={`truncate text-[9px] ${muted}`}
+                      onClick={e => e.stopPropagation()}
+                      onKeyDown={e => e.stopPropagation()}
+                    >
                       {tradeCount === 0
                         ? isStrip
                           ? `${cfg.legCount}-leg strip`
@@ -1650,6 +1663,21 @@ export function HedgingDecisionLayer({
                           ]
                             .filter(Boolean)
                             .join(' · ')}
+                      {prepared ? (
+                        <button
+                          type="button"
+                          title="Drop this staged package"
+                          onClick={e => {
+                            e.stopPropagation();
+                            discardPrepared(r.ccy);
+                          }}
+                          className="ml-1.5 rounded border border-rose-600/40 bg-rose-500/10 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-rose-200 hover:bg-rose-500/20"
+                        >
+                          {prepared.structure === 'strip' && prepared.legs.length > 1
+                            ? 'Unstage strip'
+                            : 'Unstage'}
+                        </button>
+                      ) : null}
                     </span>
                     <span className="text-right font-mono text-[11px] font-semibold tabular-nums text-sky-300">
                       {fmtLocal(r.hedgeNotionalLocalM, r.ccy)}
@@ -2130,7 +2158,7 @@ export function HedgingDecisionLayer({
                         {showStage ? (
                         <button
                           type="button"
-                          disabled={flat || Math.abs(structPctFor(r.ccy)) < 1e-9}
+                          disabled={flat}
                           title={
                             prepared
                               ? 'Restage — write this draft over the staged package'
@@ -2145,11 +2173,13 @@ export function HedgingDecisionLayer({
                         <button
                           type="button"
                           disabled={!prepared}
-                          title="Reset staged package — Decision and Liquidity drop this CCY"
+                          title="Drop this staged package from Decision / Cash Carry / Liquidity — does not cancel a booked ticket"
                           onClick={() => discardPrepared(r.ccy)}
-                          className="rounded-md border border-slate-600 px-2.5 py-1 text-[11px] font-semibold text-slate-400 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-30"
+                          className="rounded-md border border-rose-600/50 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-30"
                         >
-                          Reset
+                          {prepared?.structure === 'strip' && prepared.legs.length > 1
+                            ? `Unstage ${prepared.legs.length}-leg strip`
+                            : 'Unstage'}
                         </button>
                         <button
                           type="button"
@@ -2288,7 +2318,20 @@ export function HedgingDecisionLayer({
                       pathSummaryMetrics,
                     ),
                   )}
-                  prepareAction={pathPrepareAction}
+                  prepareAction={
+                    pathPrepareAction
+                    ?? {
+                      label: 'Stage hedging strategy',
+                      title: 'Stage this path — then Book under this CCY',
+                      disabled: false,
+                      run: () =>
+                        bookHedgeProfileFromChart({
+                          structure: effectiveStructure,
+                          basis: pathBasis,
+                          edges: [],
+                        }),
+                    }
+                  }
                   onReset={
                     chartCcy && preparedByCcy[chartCcy]
                       ? () => discardPrepared(chartCcy)
@@ -2337,6 +2380,9 @@ export function HedgingDecisionLayer({
                 )}
                 hedgeStructure={hedgeStructure}
                 onHedgeStructureChange={setHedgeStructure}
+                stripLegCount={stagedChartSchedule.stripLegCount}
+                scheduleEndMonths={stagedChartSchedule.ends}
+                scheduleHedgeWeights={stagedChartSchedule.weights}
               />
               </div>
             </div>
