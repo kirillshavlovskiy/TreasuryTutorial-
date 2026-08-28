@@ -135,49 +135,20 @@ export function buildStandingStripToTerm(
 }
 
 /**
- * Both fill funding strip. Overlay (H* − hold) stays off this ledger — it
- * books on the first spot line in the UI.
+ * Both fill funding strip = the ORIGINAL operating funding programme,
+ * unchanged. It is NOT scaled or topped-up to the scenario Book S / carry
+ * ask — that load is carried entirely by the overlay, which books as a
+ * single bullet spot on the first line in the UI (never on this ledger).
  *
- * Keep the operating legs (the real monthly funding profile) and add a FLAT
- * carry standing for the excess (`Book S − operating peak`), shaped by the
- * regime (term / rolling / strip-to-term). Scaling the operating oscillation
- * instead would time-average to ~0 and earn no rate-differential carry.
+ * `bookFcyM` / `bookingMode` are kept in the signature for call-site
+ * symmetry with the swap-fill builder but are not used here.
  */
 export function bothBookScheduleFor(
   operating: readonly LiquiditySwapLegRow[],
-  bookFcyM: number | undefined,
-  bookingMode: StandingStripMode,
+  _bookFcyM: number | undefined,
+  _bookingMode: StandingStripMode,
 ): LiquiditySwapLegRow[] {
-  if (
-    typeof bookFcyM !== 'number' || !Number.isFinite(bookFcyM)
-    || operating.length === 0
-  ) return [...operating];
-  const opPeak = signedPeakStanding(
-    operating.map(l => ({ standing_swap: l.outstanding })),
-  );
-  const carryAdd = bookFcyM - opPeak;
-  // Nothing to add (or the scenario book is smaller / opposite the operating
-  // book — the operating programme already covers it).
-  if (Math.abs(carryAdd) < NOTIONAL_DUST || carryAdd * bookFcyM < 0) {
-    return [...operating];
-  }
-  const term = Math.max(...operating.map(l => l.valueDateMonths)) + 1;
-  const carry = buildStandingStripToTerm(carryAdd, term, bookingMode);
-  const byCycle = new Map<number, LiquiditySwapLegRow>(
-    operating.map(l => [l.cycleIndex, { ...l }]),
-  );
-  for (const s of carry) {
-    const ex = byCycle.get(s.cycleIndex);
-    byCycle.set(s.cycleIndex, ex
-      ? {
-        ...ex,
-        newLeg: ex.newLeg + s.newLeg,
-        rolledForward: ex.rolledForward + s.rolledForward,
-        outstanding: ex.outstanding + s.outstanding,
-      }
-      : s);
-  }
-  return [...byCycle.values()].sort((a, b) => a.cycleIndex - b.cycleIndex);
+  return [...operating];
 }
 
 /**

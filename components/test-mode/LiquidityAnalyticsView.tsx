@@ -5241,12 +5241,17 @@ function SelectedStrategyDetail({
                 const carryUsdM = swapCarryOf(c.ccy, liveSwapCarry);
                 const bookSF = serverLeg(c.ccy)?.bookStandingFcyM ?? 0;
                 const bookSigned = serverLeg(c.ccy)?.bookSignedCashUsdYrM ?? 0;
-                // Strip legs scaled so the delivered book = the scenario Book S
-                // (Carry Target / Max Policy Risk k). Staging books this strip.
-                const scenarioSchedule = scenarioScheduleFor(
-                  c.schedule, bookSF, carryBreakdown?.askFillMode ?? askFillMode,
-                  bookingMode,
-                );
+                // The scenario funding strip, priced per leg by the backend
+                // (`carryBreakdown.byCcy[].strip`). Σ leg netUsdYr ≡ the
+                // header "Swap carry" by construction. Falls back to the local
+                // builder only when there is no server breakdown.
+                const serverStrip = serverLeg(c.ccy)?.strip;
+                const scenarioSchedule = serverStrip && serverStrip.length > 0
+                  ? serverStrip
+                  : scenarioScheduleFor(
+                    c.schedule, bookSF, carryBreakdown?.askFillMode ?? askFillMode,
+                    bookingMode,
+                  );
                 const totalCarryM = carryUsdM + overlayCarryM;
                 // CFaR of the position this strip actually builds (Book $ /
                 // Book S at the scenario k), not the unscaled live-desk book.
@@ -5508,10 +5513,62 @@ function SelectedStrategyDetail({
                           : '—'}
                       </td>
                     </tr>
-                    {open &&
-                      scenarioSchedule.map(l => {
+                    {open && overlayOnSpot && !overlayFill && mixRow && (
+                      <tr
+                        key={`${c.ccy}:overlay`}
+                        className="border-b border-violet-800/40 bg-violet-500/[0.06] text-[11px]"
+                        title="Overlay (Σ⁻¹μ mix) — booked as one bullet spot trade, separate from the funding-swap programme."
+                      >
+                        <td className="py-1.5 pl-5 pr-3 font-mono text-violet-200">Spot · overlay</td>
+                        <td className="py-1.5 pr-3 font-mono text-violet-200/90">{fmtWeight(mixRow.overlayWeight)}</td>
+                        <td className={`py-1.5 pr-3 font-mono ${moneyTone(mixRow.overlayFcyM)}`}
+                          title="Overlay Mix FCY — the bullet spot notional">
+                          {Math.abs(mixRow.overlayFcyM) > 0.001 ? fmtM(mixRow.overlayFcyM) : '—'}
+                        </td>
+                        <td className={`py-1.5 pr-3 font-mono ${moneyTone(mixRow.overlayUsdM)}`}>
+                          {Math.abs(mixRow.overlayUsdM) > 0.005 ? fmtSignedK(mixRow.overlayUsdM) : '—'}
+                        </td>
+                        <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
+                        <td className="py-1.5 pr-3 font-mono text-slate-500">bullet</td>
+                        <td className="py-1.5 pr-3 font-mono text-amber-200/80">spot</td>
+                        <td className="py-1.5 pr-3 font-mono text-slate-600">— Δ</td>
+                        <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
+                        <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
+                        <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
+                        <td className={`py-1.5 pr-3 font-mono ${
+                          Math.abs(overlayCarryM) > 0.001 ? moneyTone(overlayCarryM) : 'text-slate-600'
+                        }`}>
+                          {Math.abs(overlayCarryM) > 0.001 ? fmtSignedK(overlayCarryM) : '—'}
+                        </td>
+                        <td className={`py-1.5 pr-3 font-mono ${
+                          Math.abs(overlayCarryM) > 0.001 ? moneyTone(overlayCarryM) : 'text-slate-600'
+                        }`}>
+                          {Math.abs(overlayCarryM) > 0.001 ? fmtSignedK(overlayCarryM) : '—'}
+                        </td>
+                        <td className={`py-1.5 font-mono ${
+                          Math.abs(overlayCfarM) > 0.001 ? moneyTone(overlayCfarM) : 'text-slate-600'
+                        }`}
+                          title="Overlay Euler CFaR — negative = diversifier">
+                          {Math.abs(overlayCfarM) > 0.001 ? fmtSignedK(overlayCfarM) : '—'}
+                        </td>
+                      </tr>
+                    )}
+                    {open && (() => {
+                      // Split the scenario swap carry across the strip by each
+                      // leg's notional-time exposure (|newLeg| × tenor). Used
+                      // when the legs aren't individually pre-priced (swap-fill
+                      // synthetic strip); pre-priced legs use their own
+                      // interestUsdYr / netUsdYr.
+                      const legW = scenarioSchedule.map(
+                        l => Math.abs(l.newLeg) * Math.max(1, l.settleMonths),
+                      );
+                      const legWSum = legW.reduce((s, w) => s + w, 0);
+                      const carrySplit = (i: number) => (
+                        legWSum > 1e-9 ? carryUsdM * legW[i]! / legWSum : 0
+                      );
+                      return scenarioSchedule.map((l, li) => {
                         const onSpot = !l.preBookable && l.cycleIndex === spotCycle;
-                        const overlayHere = overlayOnSpot && onSpot;
+                        const overlayHere = false;
                         const swapFcy = stripDisplayedSwapFcyM(l, bookingMode);
                         const legNotional = {
                           fcyM: hedgeLegNotionalFcyM({
@@ -5592,54 +5649,45 @@ function SelectedStrategyDetail({
                           >
                             {Math.abs(l.outstanding * c.spot) > 0.005 ? fmtSignedK(l.outstanding * c.spot) : '—'}
                           </td>
-                          <td
-                            className={`py-1.5 pr-3 font-mono ${
-                              onSpot ? moneyTone(carryUsdM) : 'text-slate-600'
-                            }`}
-                            title={onSpot
-                              ? `|cash| on Book S ${fmtM(bookSF)}; signed ${fmtSignedK(bookSigned)}`
-                              : 'Later legs are the live strip — book(k) is not split across them'}
-                          >
-                            {onSpot ? fmtSignedK(carryUsdM) : '—'}
-                          </td>
-                          <td
-                            className={`py-1.5 pr-3 font-mono ${
-                              onSpot && Math.abs(overlayCarryM) > 0.001
-                                ? moneyTone(overlayCarryM)
-                                : 'text-slate-600'
-                            }`}
-                            title={onSpot
-                              ? 'Overlay μ(t) booked on this first spot line'
-                              : undefined}
-                          >
-                            {onSpot && Math.abs(overlayCarryM) > 0.001
-                              ? fmtSignedK(overlayCarryM)
-                              : '—'}
-                          </td>
-                          <td
-                            className={`py-1.5 pr-3 font-mono ${
-                              onSpot ? moneyTone(totalCarryM) : 'text-slate-600'
-                            }`}
-                          >
-                            {onSpot ? fmtSignedK(totalCarryM) : '—'}
-                          </td>
-                          <td
-                            className={`py-1.5 font-mono ${
-                              onSpot && Math.abs(overlayCfarM) > 0.001
-                                ? moneyTone(overlayCfarM)
-                                : 'text-slate-600'
-                            }`}
-                            title={onSpot
-                              ? 'Overlay Euler CFaR — same signed number as Sweet Overlay CFaR (negative = diversifier)'
-                              : undefined}
-                          >
-                            {onSpot && Math.abs(overlayCfarM) > 0.001
-                              ? fmtSignedK(overlayCfarM)
-                              : '—'}
-                          </td>
+                          {(() => {
+                            const legInterest = l.interestUsdYr;
+                            const legNet = l.netUsdYr;
+                            const pricedLeg = Math.abs(legInterest) > 1e-9 || Math.abs(legNet) > 1e-9;
+                            // Pre-priced leg → its own net (cash Δr + CIP points),
+                            // which sums to the header Swap carry; else the
+                            // scenario swap carry split by notional-time weight.
+                            const legCarry = pricedLeg ? legNet : carrySplit(li);
+                            return (
+                              <>
+                                <td
+                                  className={`py-1.5 pr-3 font-mono ${
+                                    Math.abs(legCarry) > 1e-9 ? moneyTone(legCarry) : 'text-slate-600'
+                                  }`}
+                                  title={pricedLeg
+                                    ? `Leg carry on ${fmtM(l.outstanding)} @ ${l.settleMonths}M — cash Δr ${fmtSignedK(legInterest)} + CIP points ${fmtSignedK(legNet - legInterest)}`
+                                    : `Scenario swap carry × leg weight (|newLeg| ${fmtM(l.newLeg)} × ${l.settleMonths}M)`}
+                                >
+                                  {Math.abs(legCarry) > 1e-9 ? fmtSignedK(legCarry) : '—'}
+                                </td>
+                                {/* Overlay carry lives on the dedicated overlay
+                                    bullet row above. */}
+                                <td className="py-1.5 pr-3 font-mono text-slate-600">—</td>
+                                <td
+                                  className={`py-1.5 pr-3 font-mono ${
+                                    Math.abs(legCarry) > 1e-9 ? moneyTone(legCarry) : 'text-slate-600'
+                                  }`}
+                                  title={pricedLeg ? 'Leg carry — same as Swap carry (overlay is its own row)' : 'Scenario swap carry share for this leg'}
+                                >
+                                  {Math.abs(legCarry) > 1e-9 ? fmtSignedK(legCarry) : '—'}
+                                </td>
+                                <td className="py-1.5 font-mono text-slate-600">—</td>
+                              </>
+                            );
+                          })()}
                         </tr>
                         );
-                      })}
+                      });
+                    })()}
                   </Fragment>
                 );
               })}

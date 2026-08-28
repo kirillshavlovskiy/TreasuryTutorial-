@@ -405,15 +405,11 @@ describe('scenarioFundingScheduleFor — overlay vs both', () => {
     expect(sched.map(l => l.newLeg)).toEqual(EUR_OPERATING.map(l => l.newLeg));
   });
 
-  it('both fill = operating legs + a flat carry standing (Book S − op peak)', () => {
+  it('both fill = the ORIGINAL funding programme, untouched (not scaled to Book S / ask)', () => {
     const sched = scenarioFundingScheduleFor(EUR_OPERATING, 48.98, 'both', 'rolling');
-    expect(peakFundingSwapBookM(sched)).toBeCloseTo(48.98, 5);
-    // Operating oscillation preserved, shifted by the flat carry add.
-    const carryAdd = 48.98 - 5.40;
-    expect(sched[0]!.outstanding).toBeCloseTo(-2.50 + carryAdd, 4);
-    expect(sched[6]!.outstanding).toBeCloseTo(5.40 + carryAdd, 4);
-    // Not a scaled copy of the operating roll.
-    expect(sched[0]!.outstanding).not.toBeCloseTo(-2.50 * (48.98 / 5.40), 1);
+    expect(sched.map(l => l.newLeg)).toEqual(EUR_OPERATING.map(l => l.newLeg));
+    expect(sched.map(l => l.outstanding)).toEqual(EUR_OPERATING.map(l => l.outstanding));
+    // The overlay carries the ask — it books as a bullet spot in the UI, not here.
   });
 });
 
@@ -443,35 +439,18 @@ describe('scenarioFundingScheduleFor — swap fill strip-to-term', () => {
 });
 
 describe('bothBookScheduleFor', () => {
-  it('leaves the operating path alone when Book S already matches the op peak', () => {
-    const sched = bothBookScheduleFor(EUR_OPERATING, 5.40, 'rolling');
-    expect(sched.map(l => l.newLeg)).toEqual(EUR_OPERATING.map(l => l.newLeg));
+  it('returns the operating funding programme unchanged — no scaling to Book S / ask', () => {
+    for (const mode of ['rolling', 'stripTerm', 'term'] as const) {
+      const sched = bothBookScheduleFor(EUR_OPERATING, 48.98, mode);
+      expect(sched.map(l => l.newLeg)).toEqual(EUR_OPERATING.map(l => l.newLeg));
+      expect(sched.map(l => l.outstanding)).toEqual(EUR_OPERATING.map(l => l.outstanding));
+    }
   });
 
-  it('rolling adds a flat carry standing — not a scaled operating roll', () => {
-    const sched = bothBookScheduleFor(EUR_OPERATING, 48.98, 'rolling');
-    expect(peakFundingSwapBookM(sched)).toBeCloseTo(48.98, 5);
-    expect(sched[0]!.outstanding).toBeCloseTo(-2.50 + (48.98 - 5.40), 4);
-    expect(sched[0]!.outstanding).not.toBeCloseTo(-2.50 * (48.98 / 5.40), 1);
-  });
-
-  it('strip-to-term still adds a standing of Book S − op peak', () => {
-    const sched = bothBookScheduleFor(EUR_OPERATING, 48.98, 'stripTerm');
-    const excess = 48.98 - 5.40;
-    expect(sched[0]!.outstanding).toBeCloseTo(-2.50 + excess / 12, 4);
-    expect(sched[0]!.newLeg).toBeCloseTo(-2.50 + excess / 12, 4);
-  });
-
-  it('strip-to-term both-fill last outstanding sits below Book S when the op peak is mid-path', () => {
-    const bookS = 48.98;
-    const sched = bothBookScheduleFor(EUR_OPERATING, bookS, 'stripTerm');
-    const last = sched[sched.length - 1]!.outstanding;
-    const peak = peakFundingSwapBookM(sched);
-    // Operating peak is mid-path (5.40 at M7); last operating is −1.60.
-    // Carry add is Book S − opPeak, so last = −1.60 + (48.98 − 5.40) = 41.98.
-    expect(last).toBeCloseTo(-1.60 + (bookS - 5.40), 4);
-    expect(Math.abs(last)).toBeLessThan(Math.abs(bookS) - 0.5);
-    expect(Math.abs(peak)).toBeLessThan(Math.abs(bookS) - 0.5);
+  it('is unaffected by the Book S argument', () => {
+    const a = bothBookScheduleFor(EUR_OPERATING, 5.40, 'rolling');
+    const b = bothBookScheduleFor(EUR_OPERATING, 999, 'rolling');
+    expect(a.map(l => l.outstanding)).toEqual(b.map(l => l.outstanding));
   });
 });
 

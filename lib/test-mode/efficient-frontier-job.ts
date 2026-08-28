@@ -35,10 +35,16 @@ import {
 } from '@/lib/portfolio-alloc';
 import {
   evaluateLiquidityStrategies,
+  swapLegScheduleWithCarry,
+  type LiquiditySwapLegRow,
   type LiquidityStrategyId,
   type LiquidityStrategyInput,
   type LiquidityStrategyResult,
 } from '@/lib/test-mode/liquidity-strategies';
+import {
+  scenarioFundingScheduleFor,
+  type StandingStripMode,
+} from '@/lib/test-mode/liquidity-strip-stage';
 import {
   chartPathTrace,
   frontierMonotoneStats,
@@ -183,6 +189,12 @@ export interface SolutionCarryLeg {
   overlayCfarUsdM: number;
   /** Euler share of ticket CFaR √(Book²+Overlay²). Σ equals totalCfarSum. */
   totalCfarUsdM: number;
+  /**
+   * The scenario funding strip, priced per leg at the scenario book.
+   * Σ leg `netUsdYr` ≡ `bookUsdYrM` by construction — the client renders
+   * this verbatim, it does not re-derive the strip.
+   */
+  strip: LiquiditySwapLegRow[];
 }
 
 export interface SolutionCarryBreakdown {
@@ -750,7 +762,14 @@ export function computeCarryBreakdown(
     scenarioId,
     fixedOverlayT,
   });
-  const k = scenarioId === 'unhedged' || overlayFill ? 0 : Math.max(0, point.k);
+  // Both fill: the funding programme is fixed at its own size (k = 1) — the
+  // overlay carries the ask. Swap / no-overlay walk k as the notional scale.
+  const bothFill = askFillMode === 'both' && !overlayFill;
+  const k = scenarioId === 'unhedged' || overlayFill
+    ? 0
+    : bothFill
+      ? 1
+      : Math.max(0, point.k);
   const legs = mv?.capLegs.length && overlayT > 1e-12
     ? scaleOverlayLegs(mv.capLegs, overlayT)
     : [];
@@ -826,9 +845,39 @@ export function computeCarryBreakdown(
     const pricedCarry = plot?.carryUsdYrM ?? 0;
     const overlayUsdYrM = overlayFill ? pricedCarry : (leg?.carryUsdYrM ?? 0);
     const row = rows.find(r => r.ccy === ccy);
-    const bookUsdYrM = overlayFill ? 0 : pricedCarry;
     const bookStandingFcyM = overlayFill ? 0 : (plot?.standing ?? 0);
     const spot = ccySpotRate(ccy);
+
+    // Scenario funding strip, priced per leg. Both fill = the operating
+    // programme verbatim (k = 1); swap fill = the synthetic strip at the
+    // scenario standing. Σ leg netUsdYr is the book carry — the header no
+    // longer diverges from the strip.
+    const opSchedule = book.byCcy.find(c => c.ccy === ccy)?.schedule ?? [];
+    const bookingMode = req.bookingMode as StandingStripMode;
+    let strip: LiquiditySwapLegRow[] = overlayFill
+      ? []
+      : scenarioFundingScheduleFor(opSchedule, bookStandingFcyM, askFillMode, bookingMode);
+    const stripPrePriced = strip.some(
+      l => Math.abs(l.interestUsdYr) > 1e-9 || Math.abs(l.pointsUsdYr) > 1e-9,
+    );
+    if (row && strip.length > 0 && !stripPrePriced) {
+      const T = strip.length;
+      strip = swapLegScheduleWithCarry(
+        strip, spot, row.r_FCY, engine.shared.r_USD, row.r_OD,
+        bookingMode === 'stripTerm'
+          ? { stripToHorizonMonths: T }
+          : bookingMode === 'term'
+            ? { farSettleMonths: T }
+            : { farSettleMonths: 1 },
+      );
+    }
+    const stripCarryUsdYrM = strip.reduce((s, l) => s + l.netUsdYr, 0);
+
+    const bookUsdYrM = overlayFill
+      ? 0
+      : bothFill && strip.length > 0
+        ? stripCarryUsdYrM
+        : pricedCarry;
     const bookSignedCashUsdYrM = row && Math.abs(bookStandingFcyM) > 1e-9
       ? fundingSwapCashDeltaUsdYr(
         bookStandingFcyM, spot, row.r_FCY, engine.shared.r_USD, row.r_OD,
@@ -859,6 +908,7 @@ export function computeCarryBreakdown(
       bookCfarUsdM,
       overlayCfarUsdM,
       totalCfarUsdM: totalCfarBy[ccy] ?? 0,
+      strip,
     });
   }
   return {
