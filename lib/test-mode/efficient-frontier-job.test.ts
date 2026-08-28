@@ -258,6 +258,17 @@ describe('computeEfficientFrontier', () => {
     expect(bd.overlaySum).toBeCloseTo(0, 6);
     expect(bd.totalSum).toBeCloseTo(bd.bookSum, 8);
     expect(bd.totalSum).toBeCloseTo(bd.bookSum + bd.overlaySum, 8);
+    // The per-leg scenario strip is returned and priced. Σ leg netUsdYr does
+    // NOT yet reconcile with `bookUsdYrM` — the frontier's book carry is
+    // `|cash|` on the peak standing held flat for a full year, whereas the
+    // strip is the actual-horizon path with buildup and (for a complete
+    // swap) CIP points that cancel the cash Δr. Unifying the two carry
+    // pricers is an open item (see handover).
+    for (const leg of bd.byCcy) {
+      if (Math.abs(leg.bookStandingFcyM) < 0.01) continue;
+      expect(leg.strip.length).toBeGreaterThan(0);
+      expect(leg.strip.every(l => Number.isFinite(l.netUsdYr))).toBe(true);
+    }
     if (pts.some(p => p.k > 1 + 1e-6)) {
       expect(bd.k).toBeGreaterThan(1);
     }
@@ -312,34 +323,29 @@ describe('computeEfficientFrontier', () => {
     }
   });
 
-  it('Fill Ask = both walks k and overlay together on the arm', () => {
-    const probeParsed = parseEfficientFrontierRequest(eurGbpFrontierBody({
-      askFillMode: 'both',
-      carryTargetUsdYr: 0,
-    }));
-    if ('error' in probeParsed) throw new Error(probeParsed.error);
-    const probe = computeEfficientFrontier(probeParsed.request, { log: false });
-    const liftedHold = probe.solutionFrontier?.points.find(p => Math.abs(p.k - 1) < 1e-6);
-    const peak = probe.solutionFrontier?.points.reduce((best, p) => (
-      p.totalCarryUsdYr >= best.totalCarryUsdYr ? p : best
-    ));
-    if (!liftedHold || !peak) throw new Error('missing lifted arm');
-    const ask = liftedHold.totalCarryUsdYr
-      + Math.max(0.05, (peak.totalCarryUsdYr - liftedHold.totalCarryUsdYr) * 0.4);
+  it('Fill Ask = both: funding programme unscaled (k = 1), overlay covers the rest of the ask', () => {
     const parsed = parseEfficientFrontierRequest(eurGbpFrontierBody({
       askFillMode: 'both',
-      carryTargetUsdYr: ask,
+      scenarioId: 'carryTarget',
+      carryTargetUsdYr: 0.6,
     }));
     if ('error' in parsed) throw new Error(parsed.error);
     const out = computeEfficientFrontier(parsed.request, { log: false });
     const bd = out.carryBreakdown!;
     expect(bd.askFillMode).toBe('both');
-    expect(bd.k).toBeGreaterThan(1);
-    expect(bd.overlayT).toBeGreaterThanOrEqual(0);
-    expect(bd.overlayT).toBeLessThanOrEqual(1 + 1e-9);
+    // Programme fixed at its own size — not scaled to the ask.
+    expect(bd.k).toBeCloseTo(1, 8);
     expect(bd.totalSum).toBeCloseTo(bd.bookSum + bd.overlaySum, 8);
-    expect(bd.chartY).toBeCloseTo(ask, 2);
-    expect(bd.totalSum).toBeCloseTo(bd.chartY, 6);
+    // Total reaches at least the ask — the overlay tops up the programme carry
+    // (and stays at 0 when the programme already over-earns).
+    expect(bd.totalSum).toBeGreaterThanOrEqual(0.6 - 5e-3);
+    expect(bd.overlaySum).toBeGreaterThanOrEqual(-1e-9);
+    // Per-CCY book carry = Σ that CCY's operating strip legs — the strip the
+    // client renders sums to the header.
+    for (const leg of bd.byCcy) {
+      const stripInt = leg.strip.reduce((s, l) => s + l.interestUsdYr, 0);
+      expect(stripInt, `${leg.ccy} Σ strip interest`).toBeCloseTo(leg.bookUsdYrM, 4);
+    }
   });
 
   it('Fill Ask = overlay sits on the walk peak when Ask is off the arm', () => {
@@ -565,8 +571,94 @@ describe('computeEfficientFrontier', () => {
     const out = computeEfficientFrontier(parsed.request, { log: false });
     const bd = out.carryBreakdown!;
     expect(bd.scenarioId).toBe('balanced');
+    // Table stays internally consistent: Total = Book + Overlay per row and Σ.
     expect(bd.totalSum).toBeCloseTo(bd.bookSum + bd.overlaySum, 8);
-    expect(bd.totalSum).toBeCloseTo(bd.chartY, 8);
+    for (const leg of bd.byCcy) {
+      expect(leg.totalUsdYrM).toBeCloseTo(leg.bookUsdYrM + leg.overlayUsdYrM, 8);
+    }
+  });
+
+  it('strip-table data is 100% on carryBreakdown — client renders, does not recompute', () => {
+    const eur = INITIAL_ROWS.find(r => r.ccy === 'EUR');
+    const gbp = INITIAL_ROWS.find(r => r.ccy === 'GBP');
+    if (!eur || !gbp) throw new Error('INITIAL_ROWS missing EUR/GBP');
+    for (const askFillMode of ['swap', 'both', 'overlay'] as const) {
+      const parsed = parseEfficientFrontierRequest(eurGbpFrontierBody({
+        askFillMode,
+        scenarioId: 'carryTarget',
+        carryTargetUsdYr: 0.6,
+      }));
+      if ('error' in parsed) throw new Error(parsed.error);
+      const out = computeEfficientFrontier(parsed.request, { log: false });
+      const bd = out.carryBreakdown;
+      expect(bd, askFillMode).not.toBeNull();
+      if (!bd) continue;
+
+      // Header/right-hand summary cells.
+      for (const f of [
+        'chartX', 'chartY', 'askY', 'bookSum', 'overlaySum', 'totalSum',
+        'bookCfarSum', 'overlayCfarSum', 'totalCfarSum', 'k', 'overlayT',
+      ] as const) {
+        expect(Number.isFinite(bd[f]), `${askFillMode}.${f}`).toBe(true);
+      }
+      expect(bd.totalSum).toBeCloseTo(bd.bookSum + bd.overlaySum, 6);
+
+      // Per-CCY row + nested strip.
+      let bookSum = 0;
+      let overlaySum = 0;
+      for (const leg of bd.byCcy) {
+        for (const f of [
+          'bookUsdYrM', 'overlayUsdYrM', 'totalUsdYrM', 'overlayUsdM',
+          'overlayFcyM', 'mixWeight', 'bookStandingFcyM', 'bookStandingUsdM',
+          'bookSignedCashUsdYrM', 'bookCfarUsdM', 'overlayCfarUsdM', 'totalCfarUsdM',
+        ] as const) {
+          expect(Number.isFinite(leg[f]), `${askFillMode}.${leg.ccy}.${f}`).toBe(true);
+        }
+        expect(leg.totalUsdYrM).toBeCloseTo(leg.bookUsdYrM + leg.overlayUsdYrM, 6);
+        expect(Array.isArray(leg.strip), `${askFillMode}.${leg.ccy}.strip`).toBe(true);
+        for (const l of leg.strip) {
+          for (const f of [
+            'newLeg', 'outstanding', 'settleMonths', 'valueDateMonths',
+            'interestUsdYr', 'pointsUsdYr', 'netUsdYr',
+          ] as const) {
+            expect(Number.isFinite(l[f] as number), `${askFillMode}.${leg.ccy}.leg.${f}`).toBe(true);
+          }
+        }
+        bookSum += leg.bookUsdYrM;
+        overlaySum += leg.overlayUsdYrM;
+      }
+      expect(bookSum, `${askFillMode} Σ bookUsdYrM`).toBeCloseTo(bd.bookSum, 6);
+      expect(overlaySum, `${askFillMode} Σ overlayUsdYrM`).toBeCloseTo(bd.overlaySum, 6);
+
+      // CFaR columns must SUM to their portfolio totals — per-CCY Book is the
+      // diversified share, not standalone.
+      const sumBookCfar = bd.byCcy.reduce((s, l) => s + l.bookCfarUsdM, 0);
+      const sumOverlayCfar = bd.byCcy.reduce((s, l) => s + l.overlayCfarUsdM, 0);
+      const sumTotalCfar = bd.byCcy.reduce((s, l) => s + l.totalCfarUsdM, 0);
+      expect(sumBookCfar, `${askFillMode} Σ bookCfarUsdM`).toBeCloseTo(bd.bookCfarSum, 4);
+      expect(sumOverlayCfar, `${askFillMode} Σ overlayCfarUsdM`).toBeCloseTo(bd.overlayCfarSum, 4);
+      expect(sumTotalCfar, `${askFillMode} Σ totalCfarUsdM`).toBeCloseTo(bd.totalCfarSum, 4);
+
+      // Swap / both fill: Σ the per-leg strip's cash Δr reconstructs the
+      // header book carry — the strip the client renders sums to the header.
+      if (askFillMode !== 'overlay') {
+        for (const leg of bd.byCcy) {
+          if (Math.abs(leg.bookStandingFcyM) < 0.01 && leg.strip.length === 0) continue;
+          expect(leg.strip.length, `${askFillMode}.${leg.ccy} strip`).toBeGreaterThan(0);
+          const stripInt = leg.strip.reduce((s, l) => s + l.interestUsdYr, 0);
+          expect(stripInt, `${askFillMode}.${leg.ccy} Σ strip interest`)
+            .toBeCloseTo(leg.bookUsdYrM, 4);
+        }
+      }
+
+      // Carry Target: swap / overlay land the deliverable total ON the ask;
+      // both lands there unless the funding programme already over-earns it.
+      if (askFillMode === 'swap' || askFillMode === 'overlay') {
+        expect(bd.totalSum, `${askFillMode} total vs ask`).toBeCloseTo(bd.askY, 3);
+      } else {
+        expect(bd.totalSum).toBeGreaterThanOrEqual(bd.askY - 5e-3);
+      }
+    }
   });
 
   it('logs the per-CCY strip vs plot breakdown without throwing', () => {

@@ -20,6 +20,7 @@ import {
   farSettleExposureCfarUsdM,
   farSettleUnwindCfarUsdM,
   bookCashCarryK,
+  carryBuildupFactor,
   carryEarnOrientedStanding,
   carryStepsToMaxK,
   carryStepStrideK,
@@ -321,6 +322,24 @@ describe('standingFromCashCarryUsdYr', () => {
     expect(built.upper.length).toBeGreaterThan(0);
     expect(built.upper.every(p => p.cashCarryUsdYrM > 0)).toBe(true);
     expect(built.upper.every(p => p.totalCarryUsdYrM > 0)).toBe(true);
+  });
+
+  it('carryBuildupFactor discounts build-up regimes, holds term flat', () => {
+    // term / undefined: whole book on at M0, held → full run-rate.
+    expect(carryBuildupFactor('term', 12)).toBe(1);
+    expect(carryBuildupFactor(undefined, 12)).toBe(1);
+    // rolling / strip-to-term build linearly → horizon-average ≈ half.
+    expect(carryBuildupFactor('stripTerm', 12)).toBeCloseTo(13 / 24, 10);
+    expect(carryBuildupFactor('rolling', 12)).toBeCloseTo(13 / 24, 10);
+    // Shorter horizon → factor nearer 1 (less time spent below the peak).
+    expect(carryBuildupFactor('stripTerm', 1)).toBe(1);
+    expect(carryBuildupFactor('stripTerm', 3)).toBeCloseTo(4 / 6, 10);
+    // Always in (0, 1].
+    for (const T of [1, 2, 6, 12, 24]) {
+      const f = carryBuildupFactor('rolling', T);
+      expect(f).toBeGreaterThan(0);
+      expect(f).toBeLessThanOrEqual(1);
+    }
   });
 
   it('carryEarnOrientedStanding shorts a payer book, keeps an earner long, magnitude intact', () => {

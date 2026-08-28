@@ -1401,7 +1401,29 @@ export type LiquidityStandingPriceInput = Pick<
   | 'marketRatesByCcy'
   | 'ratesScopeId'
   | 'cfarNetByCcyUsd'
->;
+> & {
+  /**
+   * How the standing is laid on. `term` (or omitted) = the whole book put
+   * on at M0 and held — carry is the full run-rate. `rolling` / `stripTerm`
+   * build linearly to the standing over the horizon, so the horizon-average
+   * holding — and therefore the earned carry — is roughly half.
+   */
+  bookingMode?: 'rolling' | 'term' | 'stripTerm';
+};
+
+/**
+ * Annualised-carry scale for a book that builds over the horizon instead of
+ * being held flat. Linear buildup to the peak over T months → notional-months
+ * = S·(T+1)/2 vs S·T flat → factor (T+1)/(2T). `term` holds flat → 1.
+ */
+export function carryBuildupFactor(
+  bookingMode: 'rolling' | 'term' | 'stripTerm' | undefined,
+  horizonMonths: number,
+): number {
+  if (bookingMode !== 'rolling' && bookingMode !== 'stripTerm') return 1;
+  const T = Math.max(1, Math.floor(horizonMonths));
+  return (T + 1) / (2 * T);
+}
 
 export interface LiquidityStandingPrice {
   sectionUsdM: number;
@@ -1443,9 +1465,13 @@ export function priceLiquidityStanding(
     };
   }
   const plan = farSettlePlan(standing, horizon);
+  // Build-up regimes lay the standing on gradually — the carry actually
+  // earned over the horizon is the buildup-weighted figure, not the full
+  // run-rate on the peak.
+  const buildup = carryBuildupFactor(input.bookingMode, horizon);
   const cashUsdYr = fundingSwapCashDeltaUsdYr(
     standing, spot, row.r_FCY, input.shared.r_USD, row.r_OD,
-  );
+  ) * buildup;
   const pointsUsdYr = fundingSwapPathFarCipUsdM({
     plan,
     standingFallback: standing,
@@ -1456,7 +1482,7 @@ export function priceLiquidityStanding(
     ),
     fallbackAnnualUsdYr: S =>
       fundingSwapCipPointsUsdYr(S, spot, row.r_FCY, input.shared.r_USD),
-  }) * (12 / Math.max(1, horizon));
+  }) * (12 / Math.max(1, horizon)) * buildup;
   const cfarOpenUsdM = input.setup
     ? farSettleExposureCfarUsdM(standing, horizon, row.ccy, input.setup, section)
     : section;

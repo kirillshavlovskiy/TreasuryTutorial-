@@ -5042,17 +5042,20 @@ function SelectedStrategyDetail({
     return liveUsdM;
   };
   const overlayCarryTotal = mixJoin.reduce((s, r) => s + r.overlayCarryUsdYrM, 0);
-  // Σ of each row's Book S cell — the strip running outstanding at term end
-  // (× spot), not the carryBreakdown mid-term peak, so the total matches the
-  // rows.
+  // Σ of each row's Book S cell — the backend strip's running outstanding at
+  // term end (× spot). Falls back to the local builder only with no server
+  // strip.
   const bookStandingUsdTotal = bookRows.reduce((s, c) => {
-    const bsf = serverLeg(c.ccy)?.bookStandingFcyM ?? 0;
+    const sl = serverLeg(c.ccy);
+    const bsf = sl?.bookStandingFcyM ?? 0;
+    const serverEnd = sl?.strip && sl.strip.length > 0
+      ? sl.strip[sl.strip.length - 1]!.outstanding
+      : null;
+    if (serverEnd != null) return s + serverEnd * c.spot;
     const sched = scenarioScheduleFor(
       c.schedule, bsf, carryBreakdown?.askFillMode ?? askFillMode, bookingMode,
     );
-    const end = sched.length > 0
-      ? sched[sched.length - 1]!.outstanding
-      : bsf;
+    const end = sched.length > 0 ? sched[sched.length - 1]!.outstanding : bsf;
     return s + end * c.spot;
   }, 0);
   // Σ net position (overlay $ + Book $) — matches each row's Notional USD.
@@ -5653,10 +5656,12 @@ function SelectedStrategyDetail({
                             const legInterest = l.interestUsdYr;
                             const legNet = l.netUsdYr;
                             const pricedLeg = Math.abs(legInterest) > 1e-9 || Math.abs(legNet) > 1e-9;
-                            // Pre-priced leg → its own net (cash Δr + CIP points),
-                            // which sums to the header Swap carry; else the
-                            // scenario swap carry split by notional-time weight.
-                            const legCarry = pricedLeg ? legNet : carrySplit(li);
+                            // Show the cash Δr (open-carry view). `netUsdYr` folds
+                            // in the CIP roundtrip which is ~CIP-fair for a
+                            // complete swap and would print ~$0 on a genuine
+                            // carry position. Unpriced synthetic legs → the
+                            // scenario carry split by notional-time weight.
+                            const legCarry = pricedLeg ? legInterest : carrySplit(li);
                             return (
                               <>
                                 <td
@@ -5664,7 +5669,7 @@ function SelectedStrategyDetail({
                                     Math.abs(legCarry) > 1e-9 ? moneyTone(legCarry) : 'text-slate-600'
                                   }`}
                                   title={pricedLeg
-                                    ? `Leg carry on ${fmtM(l.outstanding)} @ ${l.settleMonths}M — cash Δr ${fmtSignedK(legInterest)} + CIP points ${fmtSignedK(legNet - legInterest)}`
+                                    ? `Leg cash Δr on ${fmtM(l.outstanding)} @ ${l.settleMonths}M; CIP points ${fmtSignedK(legNet - legInterest)} (roundtrip, ~CIP-fair)`
                                     : `Scenario swap carry × leg weight (|newLeg| ${fmtM(l.newLeg)} × ${l.settleMonths}M)`}
                                 >
                                   {Math.abs(legCarry) > 1e-9 ? fmtSignedK(legCarry) : '—'}
@@ -5676,7 +5681,7 @@ function SelectedStrategyDetail({
                                   className={`py-1.5 pr-3 font-mono ${
                                     Math.abs(legCarry) > 1e-9 ? moneyTone(legCarry) : 'text-slate-600'
                                   }`}
-                                  title={pricedLeg ? 'Leg carry — same as Swap carry (overlay is its own row)' : 'Scenario swap carry share for this leg'}
+                                  title={pricedLeg ? 'Leg cash Δr — same as Swap carry (overlay is its own row)' : 'Scenario swap carry share for this leg'}
                                 >
                                   {Math.abs(legCarry) > 1e-9 ? fmtSignedK(legCarry) : '—'}
                                 </td>

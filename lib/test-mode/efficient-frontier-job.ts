@@ -743,16 +743,32 @@ export function computeCarryBreakdown(
     policyCapUsd: req.scenarioCapUsd,
   });
 
+  // Both fill: the funding programme runs unscaled at k = 1 and its real
+  // per-leg carry is the book leg; the overlay is sized to cover the rest of
+  // the ask. `Cb` = Σ the operating programme's cash Δr (same legs the strip
+  // renders).
+  const bothFill = askFillMode === 'both' && !!mv?.capLegs.length;
+  const bookProgrammeCarryUsdYrM = bothFill
+    ? book.byCcy.reduce(
+      (s, c) => s + c.schedule.reduce((ss, l) => ss + l.interestUsdYr, 0),
+      0,
+    )
+    : 0;
   const fixedOverlayT = liftOverlayT ?? (
-    result.universeFrontier
-      ? resolveAskFillLiftT({
-        askFillMode,
+    bothFill && scenarioId === 'carryTarget'
+      ? overlayTToHitCarry({
         capLegs: mv?.capLegs,
-        universePoints: result.universeFrontier.points,
-        policyCapUsd: req.scenarioCapUsd,
-        carryTargetUsdYr: req.carryTargetUsdYr,
+        targetUsdYrM: req.carryTargetUsdYr - bookProgrammeCarryUsdYrM,
       })
-      : undefined
+      : result.universeFrontier
+        ? resolveAskFillLiftT({
+          askFillMode,
+          capLegs: mv?.capLegs,
+          universePoints: result.universeFrontier.points,
+          policyCapUsd: req.scenarioCapUsd,
+          carryTargetUsdYr: req.carryTargetUsdYr,
+        })
+        : undefined
   );
   const overlayFill = askFillMode === 'overlay' && frontier.walk === 'overlay';
   const overlayT = overlayTForPoint({
@@ -762,14 +778,9 @@ export function computeCarryBreakdown(
     scenarioId,
     fixedOverlayT,
   });
-  // Both fill: the funding programme is fixed at its own size (k = 1) — the
-  // overlay carries the ask. Swap / no-overlay walk k as the notional scale.
-  const bothFill = askFillMode === 'both' && !overlayFill;
   const k = scenarioId === 'unhedged' || overlayFill
     ? 0
-    : bothFill
-      ? 1
-      : Math.max(0, point.k);
+    : bothFill ? 1 : Math.max(0, point.k);
   const legs = mv?.capLegs.length && overlayT > 1e-12
     ? scaleOverlayLegs(mv.capLegs, overlayT)
     : [];
@@ -804,16 +815,16 @@ export function computeCarryBreakdown(
       ?? point.portfolioVarUsd
     );
   const originX = frontier.points[0]?.portfolioVarUsd ?? 0;
-  const bookPort = overlayFill
+  let bookPort = overlayFill
     ? Math.max(0, originX)
     : Math.max(0, armX);
   const overlayPort = overlayFill
     ? Math.max(0, point.portfolioVarUsd)
     : overlayPortfolioVarUsdM(legs);
-  const ticket = overlayFill
+  let ticket = overlayFill
     ? overlayPort
     : Math.hypot(bookPort, Math.max(0, overlayPort));
-  const chartX = overlayFill ? overlayPort : bookPort;
+  let chartX = overlayFill ? overlayPort : bookPort;
 
   const draft: { ccy: string; bookCfarUsdM: number; overlayCfarUsdM: number }[] = [];
   for (const ccy of ccys) {
@@ -833,6 +844,19 @@ export function computeCarryBreakdown(
   const totalCfarBy = overlayFill
     ? Object.fromEntries(draft.map(r => [r.ccy, r.overlayCfarUsdM]))
     : splitTicketCfarByCcy(draft, bookPort, overlayPort);
+  // Per-CCY book CFaR shown in the table must SUM to the diversified
+  // portfolio book CFaR (`bookPort`), not stand alone. Split it by each
+  // name's standalone-abs weight — the standalone figure stays in the
+  // client tooltip.
+  const bookStandaloneAbs = draft.reduce((s, r) => s + Math.abs(r.bookCfarUsdM), 0);
+  const bookCfarByCcy: Record<string, number> = {};
+  for (const r of draft) {
+    bookCfarByCcy[r.ccy] = overlayFill
+      ? r.bookCfarUsdM
+      : bookStandaloneAbs > 1e-12
+        ? (Math.abs(r.bookCfarUsdM) / bookStandaloneAbs) * bookPort
+        : 0;
+  }
 
   const byCcy: SolutionCarryLeg[] = [];
   let bookSum = 0;
@@ -871,13 +895,15 @@ export function computeCarryBreakdown(
             : { farSettleMonths: 1 },
       );
     }
-    const stripCarryUsdYrM = strip.reduce((s, l) => s + l.netUsdYr, 0);
-
+    // Book carry = Σ the priced scenario strip's cash Δr (`interestUsdYr`),
+    // so the header never diverges from the strip legs the client renders.
+    // This is the open-carry view (not the CIP-cancelled `netUsdYr`). It can
+    // differ from the frontier's chart-Y book carry (`|cash|` on the flat
+    // peak) — the table is self-consistent; chart↔table sync is an open item.
+    const stripInterestUsdYrM = strip.reduce((s, l) => s + l.interestUsdYr, 0);
     const bookUsdYrM = overlayFill
       ? 0
-      : bothFill && strip.length > 0
-        ? stripCarryUsdYrM
-        : pricedCarry;
+      : strip.length > 0 ? stripInterestUsdYrM : pricedCarry;
     const bookSignedCashUsdYrM = row && Math.abs(bookStandingFcyM) > 1e-9
       ? fundingSwapCashDeltaUsdYr(
         bookStandingFcyM, spot, row.r_FCY, engine.shared.r_USD, row.r_OD,
@@ -885,9 +911,7 @@ export function computeCarryBreakdown(
       : 0;
     const totalUsdYrM = bookUsdYrM + overlayUsdYrM;
     const w = leg ? (mixW[legs.indexOf(leg)] ?? 0) : 0;
-    const bookCfarUsdM = overlayFill
-      ? Math.max(0, plot?.sectionUsdM ?? 0)
-      : (plot?.cfarUsdM ?? 0);
+    const bookCfarUsdM = bookCfarByCcy[ccy] ?? 0;
     const overlayCfarUsdM = overlayFill
       ? (plot?.cfarUsdM ?? 0)
       : (leg?.componentVarUsdM ?? 0);
@@ -911,6 +935,50 @@ export function computeCarryBreakdown(
       strip,
     });
   }
+
+  // Swap Carry Target: the frontier k-search runs on `|cash|`; the strip
+  // (operating-activity weighted, per-tenor) delivers a different figure at
+  // the same k. Since the strip carry is linear in the book scale, one
+  // proportional rescale of the whole book lands the deliverable carry on
+  // the ask exactly. Book S, the strip legs and CFaR scale with it.
+  if (
+    askFillMode === 'swap' && scenarioId === 'carryTarget'
+    && Math.abs(bookSum) > 1e-6
+    && bookSum * req.carryTargetUsdYr > 0
+  ) {
+    const f = req.carryTargetUsdYr / bookSum;
+    if (Number.isFinite(f) && f > 0 && Math.abs(f - 1) > 1e-4) {
+      bookSum = 0;
+      totalSum = 0;
+      let totalCfar2 = 0;
+      for (const r of byCcy) {
+        r.bookUsdYrM *= f;
+        r.totalUsdYrM = r.bookUsdYrM + r.overlayUsdYrM;
+        r.bookStandingFcyM *= f;
+        r.bookStandingUsdM *= f;
+        r.bookCfarUsdM *= f;
+        r.bookSignedCashUsdYrM *= f;
+        r.totalCfarUsdM *= f;
+        r.strip = r.strip.map(l => ({
+          ...l,
+          newLeg: l.newLeg * f,
+          rolledForward: l.rolledForward * f,
+          outstanding: l.outstanding * f,
+          interestUsdYr: l.interestUsdYr * f,
+          pointsUsdYr: l.pointsUsdYr * f,
+          netUsdYr: l.netUsdYr * f,
+        }));
+        bookSum += r.bookUsdYrM;
+        totalSum += r.totalUsdYrM;
+        totalCfar2 += r.totalCfarUsdM;
+      }
+      // FX CFaR is linear in |position| — scale the portfolio figures too.
+      bookPort *= f;
+      chartX *= f;
+      ticket = totalCfar2;
+    }
+  }
+
   return {
     scenarioId,
     k,
@@ -1075,7 +1143,7 @@ function logCurrencyLegBreakdown(
     if (Math.abs(row.bookSignedCashUsdYrM - row.bookUsdYrM) > 0.02) {
       flags.push(
         `signed cash on Book S ${money(row.bookSignedCashUsdYrM)} ≠ Buffer Carry ${money(row.bookUsdYrM)}`
-        + ` (path Σ vs single-S Δr)`,
+        + ` (peak Δr vs horizon buildup-weighted — expected for rolling / strip-to-term)`,
       );
     }
 

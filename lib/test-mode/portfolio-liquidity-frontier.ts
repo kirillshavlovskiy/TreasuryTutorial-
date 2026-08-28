@@ -480,7 +480,11 @@ export function buildPortfolioLiquidityFrontier(input: {
       return { open: originPt, far: originPt };
     }
     const priced = priceLiquidityStanding(
-      { ...input.engine, row: b.row },
+      {
+        ...input.engine,
+        row: b.row,
+        bookingMode: input.result.strategy.regime?.bookingMode,
+      },
       target,
       b.bookCashK,
     );
@@ -730,7 +734,11 @@ export function priceBooksAtScale(input: {
       };
     }
     const priced = priceLiquidityStanding(
-      { ...input.engine, row: b.row },
+      {
+        ...input.engine,
+        row: b.row,
+        bookingMode: input.result.strategy.regime?.bookingMode,
+      },
       target,
       b.bookCashK,
     );
