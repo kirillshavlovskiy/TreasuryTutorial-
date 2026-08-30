@@ -308,7 +308,10 @@ function aggregate(
     cfarUsdM: rssBasisCfarUsdM(basisUsdM, risk.portfolioUsdM),
     standaloneCfarUsdM: rssBasisCfarUsdM(basisUsdM, risk.standaloneUsdM),
     divFactor: risk.divFactor,
-    levered: legs.some(l => l.pt.levered) || scale > 1 + 1e-6,
+    // Walk scale is overlay t / book k — not per-leg cash-carry vs live
+    // book. Overlay t ≤ 1 already prints more cash than the unhedged book;
+    // inheriting that flag dashed the whole live-book arm.
+    levered: scale > 1 + 1e-6,
   };
 }
 
@@ -332,8 +335,16 @@ export function standingAtScale(
 }
 
 /** Default upper scale (VAR-cap fill = 1) walked past the cap for a bit of leverage tail. */
-const DEFAULT_MAX_SCALE_OVERLAY = 1.2;
-const DEFAULT_MAX_SCALE_BOOK = 1.4;
+export const DEFAULT_MAX_SCALE_OVERLAY = 1.2;
+export const DEFAULT_MAX_SCALE_BOOK = 1.4;
+/** Overlay dashed tail: walk this far past Ask t (floor 1.2). */
+export const OVERLAY_DASHED_TAIL_PAD = 1.25;
+
+/** Overlay t-cap both charts walk to: max(1.2, Ask-t × 1.25). */
+export function overlayWalkMaxScale(tAsk: number): number {
+  const t = Number.isFinite(tAsk) ? Math.max(0, tAsk) : 0;
+  return Math.max(DEFAULT_MAX_SCALE_OVERLAY, t * OVERLAY_DASHED_TAIL_PAD);
+}
 
 function collectScales(overlayMode: boolean, sweetT = 1, maxScale?: number): number[] {
   const set = new Set<number>([0, 1]);
@@ -564,11 +575,12 @@ export function buildPortfolioLiquidityFrontier(input: {
   let open = open0;
   // Book-scale only: open arm must reach the top policy rung ($20M) so
   // Max Carry is a CFaR-fill. Overlay fill passes maxScale when Ask is
-  // past the 3× mix.
+  // past the 3× mix. An explicit maxScale is a hard cap (CCY modal matching
+  // the parent tip) — do not keep chasing $20M past it.
   const hardCeilingScale = (overlayMode ? DEFAULT_MAX_SCALE_OVERLAY : DEFAULT_MAX_SCALE_BOOK) * 12;
   const openCfarHi = (arm: readonly PortfolioFrontierPoint[]) =>
     Math.max(0, ...arm.map(p => p.cfarUsdM).filter(Number.isFinite));
-  if (!overlayMode) {
+  if (!overlayMode && requestedMax == null) {
     for (let i = 0; i < 6 && openScale < hardCeilingScale; i++) {
       if (openCfarHi(open) >= policyMaxUsd - 1e-6) break;
       // Stop chasing the $20M rung once the arm has rolled over into
@@ -909,13 +921,14 @@ export function toPortfolioCarryFrontier(
     portfolioVarUsd: liq.origin.cfarUsdM,
     totalCarryUsdYr: 0,
     floorBoundCcys: [] as string[],
+    levered: false,
   };
   const toPt = (p: PortfolioFrontierPoint) => ({
     k: p.scale,
     portfolioVarUsd: p.cfarUsdM,
     totalCarryUsdYr: p.carryUsdYrM,
     floorBoundCcys: [] as string[],
-    levered: p.levered,
+    levered: p.scale > 1 + 1e-6,
   });
   const originX = origin.portfolioVarUsd;
   const opensRaw = [...liq.open]

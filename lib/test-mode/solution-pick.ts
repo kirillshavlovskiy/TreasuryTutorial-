@@ -457,6 +457,7 @@ export function overlayRayFrontier(
       portfolioVarUsd: Math.max(0, p.varUsdM),
       totalCarryUsdYr: p.carryUsdYrM,
       floorBoundCcys: [],
+      levered: t > 1 + 1e-6,
     });
   }
   const sweetT = Math.min(1, Math.max(0, mv.sweet.t));

@@ -209,3 +209,25 @@
 .sim-dark .sim-light-panel td {
   border-color: #e5e7eb;
 }
+
+/* Custom selected point on the CCY liquidity-frontier plot.
+   Named scenario markers (Carry Target, Balanced) stay static in their
+   chip colour — this ping is only for a desk pick / mix / walk. */
+@keyframes liq-frontier-sel-ping {
+  0% { opacity: 0.7; transform: scale(1); }
+  100% { opacity: 0; transform: scale(2.15); }
+}
+@keyframes liq-frontier-sel-halo {
+  0%, 100% { opacity: 0.22; }
+  50% { opacity: 0.08; }
+}
+.liq-frontier-sel-ring {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: liq-frontier-sel-ping 1.45s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.liq-frontier-sel-halo {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: liq-frontier-sel-halo 1.45s ease-in-out infinite;
+}

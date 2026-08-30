@@ -30,6 +30,7 @@ import {
   carryFwd,
   liquidityFrontierDial,
   liquidityFrontierDialLabel,
+  originTangentDataRay,
   signedPeakStanding,
 } from '@/lib/test-mode/liquidity-frontier';
 import {
@@ -53,6 +54,8 @@ import {
   plotFarCarryArm,
   plotStandingCarryArm,
   chartOpenPath,
+  alignedInspectMaxScale,
+  frontierWalkTipK,
   orderedLiquidityScenarioPoints,
   pickConservativeFundingBook,
   plotCarryS,
@@ -70,6 +73,7 @@ import {
   maxExpectedReturnFrontierPoint,
   normalizeSelectionPoint,
   optimizerOverlayFromLegs,
+  overlayTToHitCarry,
   persistScenarioId,
   pointForScenario,
   policyVarForSelection,
@@ -305,6 +309,20 @@ function scenarioScheduleFor(
   return scenarioFundingScheduleFor(
     baseSchedule, bookFcyM, fillMode, bookingMode ?? 'rolling',
   );
+}
+
+/** Book nest + modal share this. Override wins so the legs chapter is not a second book. */
+function resolveScenarioSchedule(
+  baseSchedule: LiquidityStrategyCcy['schedule'],
+  bookFcyM: number | undefined,
+  fillMode: AskFillMode | undefined,
+  bookingMode: StandingStripMode | undefined,
+  serverStrip: LiquidityStrategyCcy['schedule'] | undefined,
+  override: LiquidityStrategyCcy['schedule'] | undefined,
+): LiquidityStrategyCcy['schedule'] {
+  if (override) return override;
+  if (serverStrip && serverStrip.length > 0) return serverStrip;
+  return scenarioScheduleFor(baseSchedule, bookFcyM, fillMode, bookingMode);
 }
 
 /** First spot trade on the strip — overlay books here, not as a second schedule. */
@@ -993,6 +1011,10 @@ export function LiquidityAnalyticsView({
     else setLocalResidualByCcy(next);
   };
   const [lastMixResidual, setLastMixResidual] = useState<number | null>(null);
+  /** Desk edits from the frontier legs chapter — same rows the Book nest expands. */
+  const [stripOverrideByCcy, setStripOverrideByCcy] = useState<
+    Record<string, LiquidityStrategyCcy['schedule']>
+  >({});
   /** Sole selection — chart / strip / regimes / summary all read this. */
   const [selection, setSelection] = useState<PortfolioSelection | null>(null);
   const [askFillMode, setAskFillMode] = useState<AskFillMode>(DEFAULT_ASK_FILL_MODE);
@@ -1684,6 +1706,9 @@ export function LiquidityAnalyticsView({
     if (!onOptimizerOverlayByCcyChange) return;
     onOptimizerOverlayByCcyChange(deskOverlayPublishRef.current);
   }, [deskOverlaySig, onOptimizerOverlayByCcyChange]);
+  useEffect(() => {
+    setStripOverrideByCcy({});
+  }, [selectedId, askFillMode]);
 
   /** Checked sweet-spot on every funded programme — same Selection as strip / chart. */
   const regimeSolutionById = useMemo(() => {
@@ -1796,16 +1821,16 @@ export function LiquidityAnalyticsView({
     setResidualByCcy({ ...residualByCcy, [ccy]: residual });
   };
 
-  // The strip that delivers the selected scenario's Book S — rolling scales
-  // the live 1M path; term / strip-to-term stand to term.
-  const scenarioStrip = (
+  const bookScheduleFor = (
     ccy: string,
     schedule: LiquidityStrategyCcy['schedule'],
-  ) => scenarioScheduleFor(
+  ) => resolveScenarioSchedule(
     schedule,
     carryBreakdown?.byCcy.find(r => r.ccy === ccy)?.bookStandingFcyM,
     carryBreakdown?.askFillMode ?? askFillMode,
     selected?.strategy.regime?.bookingMode,
+    carryBreakdown?.byCcy.find(r => r.ccy === ccy)?.strip,
+    stripOverrideByCcy[ccy],
   );
 
   const profileForStrip = (
@@ -1856,7 +1881,7 @@ export function LiquidityAnalyticsView({
         const residual = residualForStage(c.ccy, residuals, mix);
         if (residual == null || !residualNeedsFxStage(residual)) continue;
         if (!canLiquidityStageReplace(next[c.ccy])) continue;
-        const profile = profileForStrip(c.ccy, residual, scenarioStrip(c.ccy, c.schedule));
+        const profile = profileForStrip(c.ccy, residual, bookScheduleFor(c.ccy, c.schedule));
         if (!profile) continue;
         next = setPreparedHedgeForCcy(next, c.ccy, profile);
         changed = true;
@@ -1887,6 +1912,7 @@ export function LiquidityAnalyticsView({
   const resetDeskPrograms = () => {
     setResidualByCcy({});
     setLastMixResidual(null);
+    setStripOverrideByCcy({});
     if (!onPreparedByCcyChange) return;
     onPreparedByCcyChange(prev => {
       let next = prev;
@@ -2324,6 +2350,7 @@ export function LiquidityAnalyticsView({
           portfolioLevel && lastMixResidual != null
         }
         portfolioIncludedCcys={portfolioLevel ? portfolioIncludedCcys : null}
+        stripOverrideByCcy={stripOverrideByCcy}
       />
 
       {inspectRow && (
@@ -2332,6 +2359,33 @@ export function LiquidityAnalyticsView({
           strategy={selected.strategy}
           constraintDetail={selected.constraintDetail}
           engineInput={frontierEngineInput}
+          inspectWalk={{
+            result: (
+              (carryBreakdown?.askFillMode ?? askFillMode) === 'overlay' && unfunded
+            )
+              ? unfunded
+              : selected,
+            overlayCapFcyM: mvFrontier?.capLegs.find(l => l.ccy === inspectRow.ccy)?.fcyM
+              ?? null,
+            maxScale: (() => {
+              const fill = carryBreakdown?.askFillMode ?? askFillMode;
+              const overlayCapFcyM = mvFrontier?.capLegs.find(l => l.ccy === inspectRow.ccy)?.fcyM
+                ?? null;
+              if (fill === 'overlay') {
+                return alignedInspectMaxScale({
+                  askFillMode: 'overlay',
+                  tAsk: overlayTToHitCarry({
+                    capLegs: mvFrontier?.capLegs,
+                    targetUsdYrM: carryTargetUsdYr,
+                  }),
+                  overlayCapFcyM,
+                  row: inspectRow,
+                  r_USD: frontierEngineInput.shared.r_USD,
+                });
+              }
+              return frontierWalkTipK(solutionFrontier?.points);
+            })(),
+          }}
           bookStanding={(() => {
             const ccy = inspectRow.ccy;
             const named = selection?.kind && selection.kind !== 'custom'
@@ -2364,7 +2418,7 @@ export function LiquidityAnalyticsView({
                   stageFundingStrip(
                     inspectRow.ccy,
                     residual,
-                    scenarioStrip(inspectRow.ccy, row.schedule),
+                    bookScheduleFor(inspectRow.ccy, row.schedule),
                   );
                 }
               : undefined
@@ -2437,6 +2491,28 @@ export function LiquidityAnalyticsView({
               carryUsdYrM: hasCombo ? carryUsdYrM : undefined,
             };
           })()}
+          schedule={(() => {
+            const row = selected.byCcy.find(c => c.ccy === inspectRow.ccy);
+            return row ? bookScheduleFor(inspectRow.ccy, row.schedule) : [];
+          })()}
+          bookingMode={selected.strategy.regime?.bookingMode}
+          overlayLeg={inspectOverlayLeg
+            ? {
+                fcyM: inspectOverlayLeg.fcyM,
+                usdM: inspectOverlayLeg.usdM,
+                carryUsdYrM: inspectOverlayLeg.carryUsdYrM,
+              }
+            : null}
+          onScheduleChange={next => {
+            setStripOverrideByCcy(prev => ({ ...prev, [inspectRow.ccy]: next }));
+          }}
+          onScheduleReset={() => {
+            setStripOverrideByCcy(prev => {
+              const next = { ...prev };
+              delete next[inspectRow.ccy];
+              return next;
+            });
+          }}
         />
       )}
     </div>
@@ -3592,6 +3668,35 @@ const PORTFOLIO_SCENARIO_COLORS: Record<string, string> = {
   // from every other scenario color and from the far-leg pink.
   maxCarry: '#a78bfa',
   maxReturn: '#34d399',
+  custom: '#38bdf8',
+};
+
+/** Same chip chrome as LiquidityFrontierModal SCENARIO_CHIP_TONE. */
+const PORTFOLIO_SCENARIO_CHIP_TONE: Record<string, { on: string; off: string }> = {
+  unhedged: {
+    on: 'border-slate-400 bg-slate-500/25 text-slate-100',
+    off: 'border-slate-600 bg-slate-800/70 text-slate-200 hover:border-slate-400 hover:bg-slate-700/80',
+  },
+  carryTarget: {
+    on: 'border-sky-400 bg-sky-500/25 text-sky-100',
+    off: 'border-sky-500/45 bg-sky-500/10 text-sky-200 hover:border-sky-400 hover:bg-sky-500/20',
+  },
+  balanced: {
+    on: 'border-amber-400 bg-amber-500/25 text-amber-100',
+    off: 'border-amber-500/45 bg-amber-500/10 text-amber-200 hover:border-amber-400 hover:bg-amber-500/20',
+  },
+  maxCarry: {
+    on: 'border-violet-400 bg-violet-500/25 text-violet-100',
+    off: 'border-violet-500/45 bg-violet-500/10 text-violet-200 hover:border-violet-400 hover:bg-violet-500/20',
+  },
+  maxReturn: {
+    on: 'border-emerald-400 bg-emerald-500/25 text-emerald-100',
+    off: 'border-emerald-500/45 bg-emerald-500/10 text-emerald-200 hover:border-emerald-400 hover:bg-emerald-500/20',
+  },
+  custom: {
+    on: 'border-sky-400 bg-sky-500/25 text-sky-100',
+    off: 'border-sky-500/45 bg-sky-500/10 text-sky-200 hover:border-sky-400 hover:bg-sky-500/20',
+  },
 };
 
 function cfarKTicks(minM: number, maxM: number): number[] {
@@ -3616,13 +3721,16 @@ function cfarKTicks(minM: number, maxM: number): number[] {
 }
 
 function carryLogTicks(yMin: number, yMax: number): number[] {
+  const span = Math.max(Math.abs(yMin), Math.abs(yMax), 0.01);
+  const mag = span > 0.08
+    ? [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5]
+    : span > 0.03
+      ? [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2]
+      : [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5];
   const out = [0];
-  for (let exp = -4; exp <= 2; exp += 1) {
-    for (const f of [1, 2, 5]) {
-      const m = f * 10 ** exp;
-      if (m <= yMax * 1.02 + 1e-12) out.push(m);
-      if (-m >= yMin * 1.02 - 1e-12) out.push(-m);
-    }
+  for (const m of mag) {
+    if (m <= yMax * 1.02 + 1e-12) out.push(m);
+    if (-m >= yMin * 1.02 - 1e-12) out.push(-m);
   }
   return [...new Set(out)].sort((a, b) => a - b);
 }
@@ -3640,7 +3748,9 @@ function thinTicks(
   });
   const kept: number[] = [];
   for (const v of preferred) {
-    if (kept.every(u => Math.abs(pos(u) - pos(v)) >= minGap)) kept.push(v);
+    const py = pos(v);
+    if (kept.some(u => Math.abs(pos(u) - py) < minGap)) continue;
+    kept.push(v);
   }
   return kept.sort((a, b) => a - b);
 }
@@ -3659,7 +3769,7 @@ function pickDotsAlongPolyline(
     for (let i = 1; i < n; i += 1) {
       const near = i / n < 0.4;
       const gap = near ? minGap * 0.5 : minGap;
-      if (Math.abs(pts[i]!.x - pts[last]!.x) >= gap) {
+      if (Math.hypot(pts[i]!.x - pts[last]!.x, pts[i]!.y - pts[last]!.y) >= gap) {
         all.add(i);
         last = i;
       }
@@ -3672,7 +3782,7 @@ function pickDotsAlongPolyline(
   for (let i = 1; i < n - 1; i += 1) {
     const near = i / n < 0.4;
     const gap = near ? minGap * 0.5 : minGap;
-    if (Math.abs(pts[i]!.x - pts[last]!.x) >= gap) {
+    if (Math.hypot(pts[i]!.x - pts[last]!.x, pts[i]!.y - pts[last]!.y) >= gap) {
       out.add(i);
       last = i;
       if (out.size >= maxDots - 1) break;
@@ -3700,103 +3810,38 @@ function nearestFrontierIndex(
 function SelectedFrontierMark({
   cx,
   cy,
-  label,
-  detail,
-  plotLeft,
-  plotRight,
-  plotTop,
-  plotBottom,
-  xTick,
-  yTick,
+  color = '#38bdf8',
 }: {
   cx: number;
   cy: number;
-  label: string;
-  detail: string;
-  plotLeft: number;
-  plotRight: number;
-  plotTop: number;
-  plotBottom: number;
-  xTick: string;
-  yTick: string;
+  color?: string;
 }) {
-  const flipX = cx + 14 > plotRight - 96;
-  const flipY = cy < plotTop + 28;
-  const tx = flipX ? cx - 14 : cx + 14;
-  const ty = flipY
-    ? Math.min(plotBottom - 18, cy + 20)
-    : Math.max(plotTop + 12, cy - 16);
-  // Intersection values sit just inside the plot edges (not in the axis gutters).
-  const xLabelY = plotBottom - 5;
-  const yLabelNearLeft = cx < plotLeft + 56;
-  const yLabelX = yLabelNearLeft
-    ? Math.min(plotRight - 4, cx + 12)
-    : plotLeft + 6;
-  const yLabelY = cy - 4;
   return (
     <g className="pointer-events-none">
-      <line
-        x1={cx}
-        y1={plotTop}
-        x2={cx}
-        y2={plotBottom}
-        stroke="#7dd3fc"
-        strokeWidth={1.1}
-        strokeDasharray="4 3"
-        strokeOpacity={0.7}
+      <circle
+        cx={cx}
+        cy={cy}
+        r={14}
+        fill={color}
+        className="liq-frontier-sel-halo"
       />
-      <line
-        x1={plotLeft}
-        y1={cy}
-        x2={plotRight}
-        y2={cy}
-        stroke="#7dd3fc"
-        strokeWidth={1.1}
-        strokeDasharray="4 3"
-        strokeOpacity={0.7}
+      <circle
+        cx={cx}
+        cy={cy}
+        r={11}
+        fill="none"
+        stroke={color}
+        strokeWidth={1.75}
+        className="liq-frontier-sel-ring"
       />
-      <text
-        x={cx}
-        y={xLabelY}
-        textAnchor="middle"
-        fontSize={8}
-        fontWeight={700}
-        fill="#7dd3fc"
-      >
-        {xTick}
-      </text>
-      <text
-        x={yLabelX}
-        y={yLabelY}
-        textAnchor="start"
-        fontSize={8}
-        fontWeight={700}
-        fill="#7dd3fc"
-      >
-        {yTick}
-      </text>
-      <circle cx={cx} cy={cy} r={20} fill="#38bdf8" fillOpacity={0.14} />
-      <circle cx={cx} cy={cy} r={13} fill="none" stroke="#7dd3fc" strokeWidth={2.25} />
-      <circle cx={cx} cy={cy} r={7} fill="#38bdf8" stroke="#f8fafc" strokeWidth={2} />
-      <text
-        x={tx}
-        y={ty}
-        textAnchor={flipX ? 'end' : 'start'}
-        fontSize={10}
-        fontWeight={700}
-        fill="#e0f2fe"
-      >
-        {label}
-      </text>
-      <text
-        x={tx}
-        y={ty + 12}
-        textAnchor={flipX ? 'end' : 'start'}
-        fontSize={8}
-        fill="#94a3b8"
-      >
-        {detail}
-      </text>
+      <circle
+        cx={cx}
+        cy={cy}
+        r={7}
+        fill={color}
+        stroke="#f8fafc"
+        strokeWidth={2}
+      />
     </g>
   );
 }
@@ -3864,7 +3909,7 @@ function PortfolioCarryVarFrontierPlot({
   selectedScenarioId?: PortfolioScenarioId | null;
   /** Clicked open-arm sample when no named scenario is selected. */
   customPoint?: PortfolioCarryFrontierPoint | null;
-  /** Live pick — wins over the named-scenario lookup so Earn moves the dot. */
+  /** Live custom walk. Named chips use chartPresetPoint, not this leftover. */
   selectedPoint?: PortfolioCarryFrontierPoint | null;
   scenarioDefs?: readonly PortfolioScenarioDef[];
   compact?: boolean;
@@ -3897,6 +3942,7 @@ function PortfolioCarryVarFrontierPlot({
     setView: (next: CarryVarPlotView) => void;
   } | null>(null);
   const [hover, setHover] = useState<{
+    key: string;
     label: string;
     x: number;
     y: number;
@@ -3918,7 +3964,6 @@ function PortfolioCarryVarFrontierPlot({
   const chartLogRef = useRef('');
   const pts = frontier.points;
   const farPts = frontier.farPoints ?? [];
-  const sweet = pts[frontier.sweetSpotIndex] ?? null;
   const noHedge = pts[0] ?? null;
   // Tangency portfolio — line from the true (0,0) risk-free origin, tangent
   // to the curve (argmax carry/CFaR). Distinct from `sweet` (max distance
@@ -3926,12 +3971,6 @@ function PortfolioCarryVarFrontierPlot({
   const tangency = (frontier.tangencyIndex != null && frontier.tangencyIndex >= 0)
     ? pts[frontier.tangencyIndex] ?? null
     : null;
-  let today = pts[0]!;
-  for (const p of pts) {
-    if (Math.abs(p.portfolioVarUsd - policyVAR) < Math.abs(today.portfolioVarUsd - policyVAR)) {
-      today = p;
-    }
-  }
   const scenarioDefs = scenarioDefsProp ?? portfolioScenarioDefs(
     overlayFrontier ?? frontier,
     confidencePct,
@@ -3989,11 +4028,9 @@ function PortfolioCarryVarFrontierPlot({
     }
     return projectScenarioPoint?.(p) ?? { x: p.portfolioVarUsd, y: p.totalCarryUsdYr };
   };
-  const selectedOverlayPoint = selectedScenarioId === 'custom'
-    ? (customPoint ?? null)
-    : (selectedScenarioId
-      ? (chartPresetPoint(selectedScenarioId) ?? selectedPoint ?? null)
-      : (selectedPoint ?? null));
+  const selectedOverlayPoint = selectedScenarioId
+    ? chartPresetPoint(selectedScenarioId)
+    : (selectedPoint ?? customPoint ?? null);
   const selectedXy = selectedScenarioId
     ? scenarioXy(selectedOverlayPoint, selectedScenarioId)
     : customPoint
@@ -4006,11 +4043,10 @@ function PortfolioCarryVarFrontierPlot({
   const chord = matchModalAxis || standingWalk ? null : unclampedRayChord(pts);
 
   const W = 680;
-  // Taller plot so carry (Y) has more pixels vs CFaR (X) — frontier vs tangent.
-  const H = compact ? 280 : 440;
+  const H = compact ? 280 : 340;
   const padL = 72;
   const padR = 40;
-  const padT = 28;
+  const padT = 32;
   const padB = 40;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
@@ -4033,7 +4069,7 @@ function PortfolioCarryVarFrontierPlot({
   const askOnArm = askY != null && (
     visibleOpenY.some(y => Math.abs(y - askY) <= 0.05)
     || (carryTargetTouch != null && Math.abs(carryTargetTouch.totalCarryUsdYr - askY) <= 0.05)
-    || (selectedScenarioId === 'custom'
+    || (!selectedScenarioId
       && selectedXy != null
       && Math.abs(selectedXy.y - askY) <= 0.05)
   );
@@ -4042,7 +4078,7 @@ function PortfolioCarryVarFrontierPlot({
     ...(askOnArm && askY != null ? [askY] : []),
     ...visibleOpenY,
     ...namedY,
-    ...(selectedScenarioId === 'custom' && selectedXy && Number.isFinite(selectedXy.y)
+    ...(!selectedScenarioId && selectedXy && Number.isFinite(selectedXy.y)
       ? [selectedXy.y]
       : []),
   ].filter(Number.isFinite);
@@ -4085,7 +4121,7 @@ function PortfolioCarryVarFrontierPlot({
     if (carryTargetTouch && inAutoX(carryTargetTouch.portfolioVarUsd)) {
       keepY.push(carryTargetTouch.totalCarryUsdYr);
     }
-    if (selectedScenarioId === 'custom' && selectedXy && Number.isFinite(selectedXy.y)) {
+    if (!selectedScenarioId && selectedXy && Number.isFinite(selectedXy.y)) {
       keepY.push(selectedXy.y);
     }
     emphasizeKeepY = keepY;
@@ -4146,8 +4182,6 @@ function PortfolioCarryVarFrontierPlot({
   const xDen = xMax - xMin;
   const x = (v: number) => padL + (xDen > 1e-12 ? ((v - xMin) / xDen) * plotW : 0);
   const y = (v: number) => padT + (1 - (carryFwd(v, carryS) - zMin) / (zDen || 1)) * plotH;
-  const ox0 = x(0);
-  const oy0 = y(0);
   const graze = balancedTouch;
   const y0 = y(0);
   const yTickMin = yMin;
@@ -4367,22 +4401,7 @@ function PortfolioCarryVarFrontierPlot({
   const walkPts = openWalk.length > 1
     ? openWalk
     : (overlayFrontier ?? frontier).points;
-  const selectedLabel = selectedScenarioId
-    ? (scenarioDefs.find(s => s.id === selectedScenarioId)?.label ?? selectedScenarioId)
-    : 'Custom';
-  const selectedGrossUsdM = selectedOverlayPoint?.grossOverlayUsdM ?? today?.grossOverlayUsdM;
-  const selectedNetUsdM = selectedOverlayPoint?.netOverlayUsdM ?? today?.netOverlayUsdM;
-  const selectedDetail = selectedXy
-    ? `${fmtAbsK(selectedXy.x)} · ${fmtSignedK(selectedXy.y)}/yr${
-        selectedGrossUsdM != null ? ` · FX ${fmtAbsK(selectedGrossUsdM)}` : ''
-      }${usdLegTxt(selectedNetUsdM)}`
-    : today
-      ? `${fmtAbsK(today.portfolioVarUsd)} · ${fmtSignedK(today.totalCarryUsdYr)}/yr${
-          selectedGrossUsdM != null ? ` · FX ${fmtAbsK(selectedGrossUsdM)}` : ''
-        }${usdLegTxt(selectedNetUsdM)}`
-      : '';
-  const selectedMarkXy = selectedXy
-    ?? (today ? { x: today.portfolioVarUsd, y: today.totalCarryUsdYr } : null);
+  const selectedMarkXy = selectedXy;
   const balancedCfarUsd = balancedTouch?.portfolioVarUsd
     ?? scenarioXy(
       scenarioDefs.find(s => s.id === 'balanced')?.point ?? null,
@@ -4410,9 +4429,7 @@ function PortfolioCarryVarFrontierPlot({
     return best;
   };
   const applyOpenPoint = (p: PortfolioCarryFrontierPoint) => {
-    const named = snapNamedNear(x(p.portfolioVarUsd), y(p.totalCarryUsdYr));
-    if (named && onApplyScenario) onApplyScenario(named.id, named.point, 'plot');
-    else onPickCustom?.(p);
+    onPickCustom?.(p);
   };
   const walkBy = (dir: -1 | 1) => {
     const next = walkPts[walkIdx + dir];
@@ -4436,10 +4453,14 @@ function PortfolioCarryVarFrontierPlot({
     return bestD <= 22 ? best : null;
   };
 
+  const highlightColor = selectedScenarioId
+    ? (PORTFOLIO_SCENARIO_COLORS[selectedScenarioId] ?? '#38bdf8')
+    : '#38bdf8';
+
   return (
-    <div className={`rounded-[10px] border border-slate-700 bg-slate-950 ${compact ? 'p-2' : 'p-3'}`}>
-      <div className={`flex flex-wrap items-center gap-2 ${compact ? 'mb-1' : 'mb-2 gap-2.5'}`}>
-        <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
+    <div className={`rounded-lg border border-slate-700 bg-slate-950 ${compact ? 'p-2' : 'p-3'}`}>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="mr-1 font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
           Carry vs CFaR
         </span>
         <InfoTip label="Limited universe">
@@ -4480,74 +4501,88 @@ function PortfolioCarryVarFrontierPlot({
               pan, double-click to reset.
               Dashed = unclamped Σ⁻¹μ ray. Solid peels off when a PAY short hits its
               floor. Max Policy Risk clips unless you pick it. Click a preset, a green
-              sample, or the open curve for a custom fill. ◀ ▶ steps the
+              sample, or the open curve for a custom fill. ‹ › steps the
               prerendered dots.
             </p>
           )}
         </InfoTip>
         {scenarioDefs.map(s => {
           const chipPoint = chartPresetPoint(s.id) ?? s.point;
+          const chipXy = scenarioXy(chipPoint, s.id);
+          const on = selectedScenarioId === s.id;
+          const tone = PORTFOLIO_SCENARIO_CHIP_TONE[s.id];
+          const hasChip = chipXy != null && chipPoint != null;
           return (
           <button
             key={s.id}
             type="button"
-            disabled={!chipPoint || !onApplyScenario || s.breached}
+            disabled={!hasChip || !onApplyScenario || s.breached}
             onClick={() => {
               if (!chipPoint || s.breached) return;
               onApplyScenario?.(s.id, s.id === 'unhedged'
                 ? { ...chipPoint, k: 0, portfolioVarUsd: x0, totalCarryUsdYr: 0 }
                 : chipPoint, 'chip');
             }}
-            className={`inline-flex items-center gap-1 font-mono text-[9px] ${
+            className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border px-2 font-mono text-[10px] font-semibold ${
               s.breached
-                ? 'text-rose-400'
-                : selectedScenarioId === s.id ? 'font-semibold text-amber-200' : 'text-slate-400'
-            } ${chipPoint && onApplyScenario && !s.breached ? 'hover:text-slate-200' : 'cursor-not-allowed'}`}
+                ? 'cursor-not-allowed border-rose-500/50 bg-rose-500/10 text-rose-300'
+                : !hasChip
+                  ? 'cursor-not-allowed border-slate-800 bg-slate-950/40 text-slate-600'
+                  : on
+                    ? (tone?.on ?? 'border-sky-400 bg-sky-500/25 text-sky-100')
+                    : (tone?.off ?? 'border-slate-600 bg-slate-800/70 text-slate-200 hover:border-slate-400')
+            }`}
             title={s.breached
               ? `${s.label} — POLICY BREACH: base standalone exposure alone exceeds $${s.breachTierUsd?.toFixed(0)}M, no overlay sizing fixes this`
-              : (chipPoint
+              : (chipPoint && chipXy
                 ? (s.id === 'carryTarget'
                   ? carryTargetAskHint(carryTargetUsdYr, chipPoint)
-                  : `${s.label} — ${fmtAbsK(s.id === 'unhedged' ? x0 : chipPoint.portfolioVarUsd)} CFaR, ${fmtSignedK(s.id === 'unhedged' ? 0 : chipPoint.totalCarryUsdYr)}/yr`)
+                  : `${s.label} — ${fmtAbsK(chipXy.x)} CFaR, ${fmtSignedK(chipXy.y)}/yr`)
                 : (s.disabledHint ?? 'not in this universe'))}
           >
             <span
-              className="h-1.5 w-1.5 rounded-full"
-              style={{ background: s.breached ? '#f43f5e' : (chipPoint ? PORTFOLIO_SCENARIO_COLORS[s.id] : '#475569') }}
+              className="h-2 w-2 rounded-full"
+              style={{ background: s.breached ? '#f43f5e' : (hasChip ? PORTFOLIO_SCENARIO_COLORS[s.id] : '#475569') }}
             />
-            {s.breached && '⚠ '}{s.label}
-            {selectedScenarioId === s.id && !s.breached && <span className="text-amber-300/80">sweet</span>}
-            {s.breached && <span className="text-rose-500">breach</span>}
-            {!chipPoint && !s.breached && <span className="text-slate-600">(n/a)</span>}
+            <span>{s.breached ? `⚠ ${s.label}` : s.label}</span>
+            {hasChip && chipXy ? (
+              <span className={`font-medium tabular-nums ${on ? 'opacity-90' : 'text-slate-500'}`}>
+                {fmtAbsK(chipXy.x)} · {fmtSignedK(chipXy.y)}
+              </span>
+            ) : (
+              <span className="text-slate-600">n/a</span>
+            )}
           </button>
           );
         })}
         {!selectedScenarioId && selectedMarkXy && (
-          <span className="inline-flex items-center gap-1 font-mono text-[9px] font-semibold text-sky-200">
-            <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
-            Custom
-            <span className="font-normal text-slate-500">{selectedDetail}</span>
+          <span className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-sky-400 bg-sky-500/25 px-2 font-mono text-[10px] font-semibold text-sky-100">
+            <span className="h-2 w-2 rounded-full bg-sky-400" />
+            <span>Custom</span>
+            <span className="font-medium tabular-nums opacity-90">
+              {fmtAbsK(selectedMarkXy.x)} · {fmtSignedK(selectedMarkXy.y)}
+            </span>
           </span>
         )}
         {onPickCustom && walkPts.length > 1 && (
-          <span className="inline-flex items-center overflow-hidden rounded border border-slate-700">
+          <span className="inline-flex items-center gap-1">
             <button
               type="button"
               disabled={!canWalkPrev}
-              title="Previous prerendered point"
+              title="Decrease along the open arm"
               onClick={() => walkBy(-1)}
-              className="px-1.5 py-0.5 font-mono text-[10px] text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:text-slate-700"
+              className="h-[22px] w-6 shrink-0 rounded border border-slate-700 bg-slate-900 font-mono text-[11px] font-semibold text-slate-300 hover:border-slate-500 disabled:cursor-not-allowed disabled:text-slate-600"
             >
-              ◀
+              ‹
             </button>
             <button
               type="button"
               disabled={!canWalkNext}
-              title="Next prerendered point"
+              title="Increase along the open arm"
               onClick={() => walkBy(1)}
-              className="px-1.5 py-0.5 font-mono text-[10px] text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:text-slate-700"
+              className="h-[22px] w-6 shrink-0 rounded border border-slate-700 bg-slate-900 font-mono text-[11px] font-semibold text-slate-300 hover:border-slate-500 disabled:cursor-not-allowed disabled:text-slate-600"
             >
-              ▶
+              ›
             </button>
           </span>
         )}
@@ -4556,7 +4591,7 @@ function PortfolioCarryVarFrontierPlot({
           <button
             type="button"
             onClick={onUseBalanced}
-            className="ml-auto shrink-0 rounded border border-amber-400/50 bg-amber-500/10 px-2 py-0.5 font-mono text-[9px] font-semibold text-amber-300 hover:bg-amber-500/20"
+            className="h-[22px] shrink-0 rounded border border-amber-500/50 bg-amber-500/10 px-1.5 font-mono text-[9px] font-semibold text-amber-200 hover:bg-amber-500/20"
             title={`Assign the Balanced sweet spot: ${fmtAbsK(balancedCfarUsd)} CFaR`}
           >
             use Balanced {fmtAbsK(balancedCfarUsd)}
@@ -4565,18 +4600,8 @@ function PortfolioCarryVarFrontierPlot({
       </div>
       <div className="mb-2 flex flex-wrap items-baseline gap-3">
         <span className="font-mono text-[9px] text-slate-500">
-          Origin: carry $0 @ section {noHedge ? fmtAbsK(noHedge.portfolioVarUsd) : '—'}
-          {matchModalAxis ? ' · same engine as CCY modal' : ' · log Y'} · scroll in plot to zoom · drag to pan
+          {matchModalAxis ? 'Same engine as CCY modal · ' : ''}scroll in plot to zoom · drag to pan
         </span>
-        {view && (
-          <button
-            type="button"
-            onClick={() => setView(null)}
-            className="font-mono text-[9px] text-sky-400 hover:text-sky-300"
-          >
-            reset zoom
-          </button>
-        )}
         <span className="ml-auto flex flex-wrap gap-2.5">
           <UniverseLegend swatch="solid" border="border-emerald-400" label="open · cash" />
           <UniverseLegend swatch="solid" border="border-rose-400" label="far · cash + points" />
@@ -4588,13 +4613,22 @@ function PortfolioCarryVarFrontierPlot({
         </span>
       </div>
       <div className="relative" style={{ overscrollBehavior: 'contain' }}>
+        {view && (
+          <button
+            type="button"
+            onClick={() => setView(null)}
+            className="absolute left-2 top-2 z-10 font-mono text-[9px] text-sky-400 hover:text-sky-300"
+          >
+            reset zoom
+          </button>
+        )}
         <svg
           ref={svgRef}
           viewBox={`0 0 ${W} ${H}`}
-          className="block w-full touch-none select-none overflow-hidden rounded-md bg-slate-950/50 outline-none focus:outline-none"
+          className="block w-full touch-none select-none overflow-hidden rounded-md border border-slate-800 bg-slate-950/50 outline-none focus:outline-none"
           tabIndex={0}
           role="img"
-          aria-label="Carry versus CFaR. Arrow keys step prerendered points."
+          aria-label="Carry versus CFaR. Scroll to zoom, drag to pan, double-click to reset."
           onDoubleClick={() => setView(null)}
           onPointerDown={onPlotPointerDown}
           onPointerMove={onPlotPointerMove}
@@ -4678,27 +4712,15 @@ function PortfolioCarryVarFrontierPlot({
             <line x1={padL} y1={y0} x2={W - padR} y2={y0} stroke="#94a3b8" strokeWidth={1.2} />
           )}
           {askY != null && askY > 1e-9 && (
-            <>
-              <line
-                x1={padL}
-                y1={y(askY)}
-                x2={W - padR}
-                y2={y(askY)}
-                stroke="#60a5fa"
-                strokeWidth={1.1}
-                strokeDasharray="5 4"
-                opacity={0.9}
-              />
-              <text
-                x={W - padR - 2}
-                y={y(askY) - 5}
-                textAnchor="end"
-                fontSize={8}
-                fill="#60a5fa"
-              >
-                {`Carry Target ask ${fmtSignedK(askY)}`}
-              </text>
-            </>
+            <text
+              x={W - padR - 2}
+              y={y(askY) - 5}
+              textAnchor="end"
+              fontSize={8}
+              fill="#60a5fa"
+            >
+              {`Carry Target ${fmtSignedK(askY)}`}
+            </text>
           )}
           {originInX && zeroInY && (
             <>
@@ -4706,7 +4728,7 @@ function PortfolioCarryVarFrontierPlot({
                 carry $0
               </text>
               <text x={x(x0) + 8} y={y0 + 23} fontSize={8} fill="#94a3b8">
-                unhedged {fmtAbsK(x0)}
+                section {fmtAbsK(x0)}
               </text>
             </>
           )}
@@ -4733,20 +4755,24 @@ function PortfolioCarryVarFrontierPlot({
                 ?? scenarioDefs.find(s => s.id === 'balanced')?.point
                 ?? tangency;
               if (!touch) return null;
-              const tx = x(touch.portfolioVarUsd);
-              const ty = y(touch.totalCarryUsdYr);
-              const den = tx - ox0;
-              if (!(Math.abs(den) > 1e-6)) return null;
-              const m = (ty - oy0) / den;
-              const xL = padL;
-              const xR = padL + plotW;
+              const ray = originTangentDataRay(
+                touch.portfolioVarUsd,
+                touch.totalCarryUsdYr,
+                xMax,
+              );
+              if (ray.length < 2) return null;
               return (
                 <path
-                  d={`M${xL.toFixed(1)},${(oy0 + m * (xL - ox0)).toFixed(1)} L${xR.toFixed(1)},${(oy0 + m * (xR - ox0)).toFixed(1)}`}
+                  d={ray
+                    .map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.x).toFixed(2)},${y(p.y).toFixed(2)}`)
+                    .join(' ')}
                   fill="none"
                   stroke="#f59e0b"
-                  strokeWidth={1.2}
-                  strokeDasharray="4 3"
+                  strokeWidth={1.15}
+                  strokeDasharray="5 4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  opacity={0.85}
                 />
               );
             })()}
@@ -4771,159 +4797,158 @@ function PortfolioCarryVarFrontierPlot({
             {farPath.length >= 2 && (
               <path d={toPath(farPath)} fill="none" stroke="#fb7185" strokeWidth={1.6} />
             )}
-          </g>
-          {farInView.map((p, i) => (
-            farDotAt.has(i) ? (
+            {askY != null && askY > 1e-9 && (
+              <line
+                x1={padL}
+                y1={y(askY)}
+                x2={W - padR}
+                y2={y(askY)}
+                stroke="#60a5fa"
+                strokeWidth={1.1}
+                strokeDasharray="5 4"
+                opacity={0.9}
+              />
+            )}
+            {farInView.map((p, i) => {
+              if (!farDotAt.has(i)) return null;
+              const hovered = hover?.key === `f-${i}`;
+              return (
+                <circle
+                  key={`f-${i}`}
+                  cx={x(p.x)}
+                  cy={y(p.y)}
+                  r={hovered ? 5 : 3.5}
+                  fill="#fb7185"
+                  stroke={hovered ? '#cbd5e1' : '#0b1220'}
+                  strokeWidth={hovered ? 1.5 : 1}
+                  className="pointer-events-none"
+                />
+              );
+            })}
+            {originInX && zeroInY && (
               <circle
-                key={`f-${i}`}
-                cx={x(p.x)}
-                cy={y(p.y)}
-                r={3.5}
-                fill="#fb7185"
+                cx={x(x0)}
+                cy={y0}
+                r={6.5}
+                fill="#f8fafc"
                 stroke="#0b1220"
                 strokeWidth={1}
                 className="pointer-events-none"
               />
-            ) : null
-          ))}
-          {openInView.map((p, i) => {
-            const px = p.x;
-            const py = p.y;
-            if (!openDotAt.has(i) || !inFrame(px, py)) return null;
-            return (
-              <g key={`o-${i}`}>
-                {onPickCustom && (
+            )}
+            {scenarioDefs.map(s => {
+              const point = chartPresetPoint(s.id) ?? s.point;
+              const xy = scenarioXy(point, s.id);
+              if (!point || !xy || !inFrame(xy.x, xy.y)) return null;
+              const fill = s.breached ? '#f43f5e' : (PORTFOLIO_SCENARIO_COLORS[s.id] ?? '#94a3b8');
+              const on = selectedScenarioId === s.id;
+              const hovered = hover?.key === `sc-${s.id}`;
+              const p = s.id === 'unhedged'
+                ? { ...point, k: 0, portfolioVarUsd: x0, totalCarryUsdYr: 0 }
+                : point;
+              return (
+                <g
+                  key={s.id}
+                  onPointerDown={e => e.stopPropagation()}
+                >
                   <circle
-                    cx={x(px)}
-                    cy={y(py)}
-                    r={9}
+                    cx={x(xy.x)}
+                    cy={y(xy.y)}
+                    r={11}
                     fill="transparent"
-                    className="cursor-pointer"
+                    className={onApplyScenario && !s.breached ? 'cursor-pointer' : undefined}
                     onClick={e => {
                       e.stopPropagation();
                       if (suppressClickRef.current) return;
-                      const hit = walkPts.find(w => (
-                        Math.abs(w.portfolioVarUsd - px) < 1e-6
-                        && Math.abs(w.totalCarryUsdYr - py) < 1e-6
-                      )) ?? walkPts[0];
-                      if (hit) applyOpenPoint(hit);
+                      if (onApplyScenario && !s.breached) onApplyScenario(s.id, p, 'chip');
                     }}
                     onDoubleClick={e => e.stopPropagation()}
-                    onMouseEnter={() => {
-                      const hit = walkPts.find(w => (
-                        Math.abs(w.portfolioVarUsd - px) < 1e-6
-                        && Math.abs(w.totalCarryUsdYr - py) < 1e-6
-                      ));
-                      setHover({
-                        label: 'Custom sample',
-                        x: px,
-                        y: py,
-                        grossUsdM: hit?.grossOverlayUsdM,
-                        netUsdM: hit?.netOverlayUsdM,
-                      });
-                    }}
+                    onMouseEnter={() => setHover({
+                      key: `sc-${s.id}`,
+                      label: s.breached ? `${s.label} (breach)` : s.label,
+                      x: xy.x,
+                      y: xy.y,
+                      grossUsdM: point.grossOverlayUsdM,
+                      netUsdM: point.netOverlayUsdM,
+                    })}
                     onMouseLeave={() => setHover(null)}
                   />
-                )}
-                <circle
-                  cx={x(px)}
-                  cy={y(py)}
-                  r={3.5}
-                  fill="#34d399"
-                  stroke="#0b1220"
-                  strokeWidth={1}
-                  className="pointer-events-none"
-                />
-              </g>
-            );
-          })}
-          {tangency && inFrame(tangency.portfolioVarUsd, tangency.totalCarryUsdYr) && (
-            <g onPointerDown={e => e.stopPropagation()}>
-              <circle
-                cx={x(tangency.portfolioVarUsd)}
-                cy={y(tangency.totalCarryUsdYr)}
-                r={11}
-                fill="transparent"
-                onMouseEnter={() => setHover({
-                  label: 'Tangency (max Sharpe)',
-                  x: tangency.portfolioVarUsd,
-                  y: tangency.totalCarryUsdYr,
-                  grossUsdM: tangency.grossOverlayUsdM,
-                  netUsdM: tangency.netOverlayUsdM,
-                })}
-                onMouseLeave={() => setHover(null)}
+                  {!on && (
+                    <circle
+                      cx={x(xy.x)}
+                      cy={y(xy.y)}
+                      r={hovered ? 5.5 : 5}
+                      fill={fill}
+                      stroke={hovered ? '#cbd5e1' : '#0b1220'}
+                      strokeWidth={hovered ? 1.5 : 1}
+                      className="pointer-events-none"
+                    />
+                  )}
+                </g>
+              );
+            })}
+            {openInView.map((p, i) => {
+              const px = p.x;
+              const py = p.y;
+              if (!openDotAt.has(i) || !inFrame(px, py)) return null;
+              const key = `o-${i}`;
+              const hovered = hover?.key === key;
+              return (
+                <g key={key}>
+                  {onPickCustom && (
+                    <circle
+                      cx={x(px)}
+                      cy={y(py)}
+                      r={10}
+                      fill="transparent"
+                      className="cursor-pointer"
+                      onClick={e => {
+                        e.stopPropagation();
+                        if (suppressClickRef.current) return;
+                        const hit = walkPts.find(w => (
+                          Math.abs(w.portfolioVarUsd - px) < 1e-6
+                          && Math.abs(w.totalCarryUsdYr - py) < 1e-6
+                        )) ?? walkPts[0];
+                        if (hit) applyOpenPoint(hit);
+                      }}
+                      onDoubleClick={e => e.stopPropagation()}
+                      onMouseEnter={() => {
+                        const hit = walkPts.find(w => (
+                          Math.abs(w.portfolioVarUsd - px) < 1e-6
+                          && Math.abs(w.totalCarryUsdYr - py) < 1e-6
+                        ));
+                        setHover({
+                          key,
+                          label: 'open',
+                          x: px,
+                          y: py,
+                          grossUsdM: hit?.grossOverlayUsdM,
+                          netUsdM: hit?.netOverlayUsdM,
+                        });
+                      }}
+                      onMouseLeave={() => setHover(null)}
+                    />
+                  )}
+                  <circle
+                    cx={x(px)}
+                    cy={y(py)}
+                    r={hovered ? 5 : 3.5}
+                    fill="#34d399"
+                    stroke={hovered ? '#cbd5e1' : '#0b1220'}
+                    strokeWidth={hovered ? 1.5 : 1}
+                    className="pointer-events-none"
+                  />
+                </g>
+              );
+            })}
+            {selectedMarkXy && inFrame(selectedMarkXy.x, selectedMarkXy.y) && (
+              <SelectedFrontierMark
+                cx={x(selectedMarkXy.x)}
+                cy={y(selectedMarkXy.y)}
+                color={highlightColor}
               />
-              <circle
-                cx={x(tangency.portfolioVarUsd)}
-                cy={y(tangency.totalCarryUsdYr)}
-                r={4}
-                fill="#22d3ee"
-                stroke="#0b1220"
-                strokeWidth={1}
-                className="pointer-events-none"
-              />
-            </g>
-          )}
-          {scenarioDefs.map(s => {
-            const point = chartPresetPoint(s.id) ?? s.point;
-            const xy = scenarioXy(point, s.id);
-            if (!point || !xy || !inFrame(xy.x, xy.y)) return null;
-            const fill = s.breached ? '#f43f5e' : (PORTFOLIO_SCENARIO_COLORS[s.id] ?? '#94a3b8');
-            const p = s.id === 'unhedged'
-              ? { ...point, k: 0, portfolioVarUsd: x0, totalCarryUsdYr: 0 }
-              : point;
-            return (
-              <g
-                key={s.id}
-                onPointerDown={e => e.stopPropagation()}
-              >
-                <circle
-                  cx={x(xy.x)}
-                  cy={y(xy.y)}
-                  r={11}
-                  fill="transparent"
-                  className={onApplyScenario && !s.breached ? 'cursor-pointer' : undefined}
-                  onClick={e => {
-                    e.stopPropagation();
-                    if (suppressClickRef.current) return;
-                    if (onApplyScenario && !s.breached) onApplyScenario(s.id, p, 'chip');
-                  }}
-                  onDoubleClick={e => e.stopPropagation()}
-                  onMouseEnter={() => setHover({
-                    label: s.breached ? `${s.label} (breach)` : s.label,
-                    x: xy.x,
-                    y: xy.y,
-                    grossUsdM: point.grossOverlayUsdM,
-                    netUsdM: point.netOverlayUsdM,
-                  })}
-                  onMouseLeave={() => setHover(null)}
-                />
-                <circle
-                  cx={x(xy.x)}
-                  cy={y(xy.y)}
-                  r={5}
-                  fill={fill}
-                  stroke="#0b1220"
-                  strokeWidth={1}
-                  className="pointer-events-none"
-                />
-              </g>
-            );
-          })}
-          {selectedMarkXy && inFrame(selectedMarkXy.x, selectedMarkXy.y) && (
-            <SelectedFrontierMark
-              cx={x(selectedMarkXy.x)}
-              cy={y(selectedMarkXy.y)}
-              label={selectedLabel}
-              detail={selectedDetail}
-              plotLeft={padL}
-              plotRight={padL + plotW}
-              plotTop={padT}
-              plotBottom={padT + plotH}
-              xTick={fmtAbsK(selectedMarkXy.x)}
-              yTick={fmtSignedK(selectedMarkXy.y)}
-            />
-          )}
+            )}
+          </g>
         </svg>
         {hoverTip && (
           <div className="pointer-events-none absolute right-2 top-2 rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[9px] font-semibold text-slate-200">
@@ -4957,6 +4982,7 @@ function SelectedStrategyDetail({
   onApplyPortfolioDelta,
   canApplyPortfolioDelta,
   portfolioIncludedCcys,
+  stripOverrideByCcy,
 }: {
   result: LiquidityStrategyResult;
   isLive: boolean;
@@ -4984,6 +5010,8 @@ function SelectedStrategyDetail({
   canApplyPortfolioDelta?: boolean;
   /** Null = every CCY in. Deselected names drop out of this strip. */
   portfolioIncludedCcys?: ReadonlySet<string> | null;
+  /** Desk edits from the frontier legs chapter — same rows this nest expands. */
+  stripOverrideByCcy?: Readonly<Record<string, LiquidityStrategyCcy['schedule']>>;
 }) {
   // Open every CCY nest by default so leg pricing is on screen; chevron still
   // collapses. Switching programme re-opens so a new book is never hidden.
@@ -5048,12 +5076,10 @@ function SelectedStrategyDetail({
   const bookStandingUsdTotal = bookRows.reduce((s, c) => {
     const sl = serverLeg(c.ccy);
     const bsf = sl?.bookStandingFcyM ?? 0;
-    const serverEnd = sl?.strip && sl.strip.length > 0
-      ? sl.strip[sl.strip.length - 1]!.outstanding
-      : null;
-    if (serverEnd != null) return s + serverEnd * c.spot;
-    const sched = scenarioScheduleFor(
+    const sched = resolveScenarioSchedule(
       c.schedule, bsf, carryBreakdown?.askFillMode ?? askFillMode, bookingMode,
+      sl?.strip,
+      stripOverrideByCcy?.[c.ccy],
     );
     const end = sched.length > 0 ? sched[sched.length - 1]!.outstanding : bsf;
     return s + end * c.spot;
@@ -5237,7 +5263,10 @@ function SelectedStrategyDetail({
             </thead>
             <tbody>
               {bookRows.map(c => {
-                const canOpen = !overlayFill && c.schedule.length > 0;
+                const canOpen = !overlayFill && (
+                  c.schedule.length > 0
+                  || (stripOverrideByCcy?.[c.ccy]?.length ?? 0) > 0
+                );
                 const open = canOpen && !collapsed.has(c.ccy);
                 const liveSwapCarry = swapCarryUsdM(c);
                 const overlayCarryM = overlayCarryOf(c.ccy);
@@ -5249,12 +5278,14 @@ function SelectedStrategyDetail({
                 // header "Swap carry" by construction. Falls back to the local
                 // builder only when there is no server breakdown.
                 const serverStrip = serverLeg(c.ccy)?.strip;
-                const scenarioSchedule = serverStrip && serverStrip.length > 0
-                  ? serverStrip
-                  : scenarioScheduleFor(
-                    c.schedule, bookSF, carryBreakdown?.askFillMode ?? askFillMode,
-                    bookingMode,
-                  );
+                const scenarioSchedule = resolveScenarioSchedule(
+                  c.schedule,
+                  bookSF,
+                  carryBreakdown?.askFillMode ?? askFillMode,
+                  bookingMode,
+                  serverStrip,
+                  stripOverrideByCcy?.[c.ccy],
+                );
                 const totalCarryM = carryUsdM + overlayCarryM;
                 // CFaR of the position this strip actually builds (Book $ /
                 // Book S at the scenario k), not the unscaled live-desk book.

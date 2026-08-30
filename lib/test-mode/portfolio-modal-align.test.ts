@@ -2,13 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { INITIAL_ROWS, type LayerId, type RowState, type SharedGlobals } from '@/lib/fx-buffer';
 import { DEFAULT_FORECAST_PROFILE, type ForecastProfileState } from '@/lib/forecast-profile';
 import { DEFAULT_LIQUIDITY_TIMING, type LiquidityTiming } from '@/lib/liquidity-ladder';
-import { liquidityStrategyMeta } from '@/lib/test-mode/liquidity-strategies';
+import {
+  evaluateLiquidityStrategies,
+  liquidityStrategyMeta,
+} from '@/lib/test-mode/liquidity-strategies';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
 import {
   buildLiquidityLeftEndFrontier,
   carryFwd,
   priceLiquidityStanding,
   applyPortfolioFrontierTargets,
+  isoSSlicePoints,
+  priceIsoSSlice,
   type LiquidityFrontierInput,
 } from '@/lib/test-mode/liquidity-frontier';
 import {
@@ -43,12 +48,25 @@ import {
   overlayKToModalXy,
   pickConservativeFundingBook,
   portfolioFrontierFromLeftEnd,
+  leftEndFromPortfolioFrontier,
+  buildCcyInspectLeftEnd,
+  alignedInspectMaxScale,
+  frontierWalkTipK,
+  isWalkLevered,
+  splitLeveredChartPath,
+  overlayTFromCashCarryK,
+  modalLevMinK,
   unhedgedSectionCfarUsdM,
   alignLeftEndToCcyTicket,
   bookStandingChipLabel,
   ccyModalAlignTicket,
   modalCcyTicketTargets,
 } from '@/lib/test-mode/portfolio-modal-align';
+import {
+  buildPortfolioLiquidityFrontier,
+  overlayWalkMaxScale,
+  toPortfolioCarryFrontier,
+} from '@/lib/test-mode/portfolio-liquidity-frontier';
 
 const eur = INITIAL_ROWS.find(r => r.ccy === 'EUR')!;
 const shared: SharedGlobals = { r_USD: 4.5, σ_P: 0.1, days: 3, forecastMonths: 6 };
@@ -110,6 +128,265 @@ describe('portfolioFrontierFromLeftEnd', () => {
     const src = opens[0]!;
     expect(first.portfolioVarUsd).toBeCloseTo(src.finalCfarUsdM, 10);
     expect(first.totalCarryUsdYr).toBeCloseTo(src.totalCarryUsdYrM, 10);
+  });
+});
+
+describe('leftEndFromPortfolioFrontier', () => {
+  it('replays the one-name portfolio arm onto the modal left-end', () => {
+    const port = {
+      points: [
+        { k: 0, portfolioVarUsd: 0.42, totalCarryUsdYr: 0, floorBoundCcys: [] },
+        { k: 0.5, portfolioVarUsd: 4.2, totalCarryUsdYr: 0.8, floorBoundCcys: [] },
+        { k: 1, portfolioVarUsd: 9.4, totalCarryUsdYr: 1.6, floorBoundCcys: [] },
+      ],
+      farPoints: [
+        { k: 0, portfolioVarUsd: 0.42, totalCarryUsdYr: 0, floorBoundCcys: [] },
+        { k: 1, portfolioVarUsd: 9.4, totalCarryUsdYr: 0.2, floorBoundCcys: [] },
+      ],
+      sweetSpotIndex: -1,
+      nearestClampCcy: null,
+      nearestClampVarUsd: null,
+      walk: 'overlay' as const,
+    };
+    const left = leftEndFromPortfolioFrontier(port, {
+      dial: 'var_target',
+      liveStanding: 0,
+      overlayFcyM: -14.6,
+      walk: 'overlay',
+    });
+    expect(left.origin.finalCfarUsdM).toBeCloseTo(0.42, 8);
+    expect(left.origin.totalCarryUsdYrM).toBe(0);
+    expect(left.upper.length).toBe(2);
+    expect(left.upper[1]!.finalCfarUsdM).toBeCloseTo(9.4, 8);
+    expect(left.upper[1]!.totalCarryUsdYrM).toBeCloseTo(1.6, 8);
+    expect(Math.abs(left.upper[1]!.peakBook)).toBeGreaterThan(10);
+    expect(left.lower.length).toBe(1);
+  });
+});
+
+describe('buildCcyInspectLeftEnd', () => {
+  it('overlay fill draws a one-name arm past the unhedged origin', () => {
+    const r = row();
+    const eng = engine();
+    const results = evaluateLiquidityStrategies({
+      rows: [r],
+      months: 6,
+      shared,
+      activeLayers: eng.activeLayers,
+      forecastProfile: eng.forecastProfile,
+      setup: eng.setup,
+      cfarNetByCcyUsd: eng.cfarNetByCcyUsd,
+    });
+    const unfunded = results.find(x => x.strategy.id === 'unfunded')!;
+    const left = buildCcyInspectLeftEnd({
+      row: r,
+      engine: eng,
+      result: unfunded,
+      askFillMode: 'overlay',
+      overlayCapFcyM: -14.6,
+      maxScale: 2,
+      sectionCfarUsdM: 0.42,
+    });
+    expect(left.origin.finalCfarUsdM).toBeCloseTo(0.42, 5);
+    expect(left.upper.length).toBeGreaterThan(4);
+    const tip = left.upper[left.upper.length - 1]!;
+    expect(tip.finalCfarUsdM).toBeGreaterThan(left.origin.finalCfarUsdM + 0.05);
+    expect(Math.abs(tip.totalCarryUsdYrM)).toBeGreaterThan(0.01);
+  });
+
+  it('dashed tail stops at Ask-pad t, not selected overlayT = 0', () => {
+    expect(overlayWalkMaxScale(0)).toBeCloseTo(1.2, 8);
+    expect(overlayWalkMaxScale(8)).toBeCloseTo(10, 8);
+    expect(alignedInspectMaxScale({ askFillMode: 'overlay', tAsk: 8 })).toBeCloseTo(10, 8);
+    expect(alignedInspectMaxScale({ askFillMode: 'overlay', tAsk: 0 })).toBeCloseTo(1.2, 8);
+    expect(alignedInspectMaxScale({ askFillMode: 'swap', tAsk: 8 })).toBeNull();
+    expect(alignedInspectMaxScale({
+      askFillMode: 'overlay',
+      tAsk: 0,
+      overlayCapFcyM: 1,
+      row: row(),
+      r_USD: shared.r_USD,
+    })).toBeGreaterThanOrEqual(1.2);
+  });
+
+  it('one-name overlay inspect tip k matches the parent universe walk at the same maxScale', () => {
+    const r = row();
+    const eng = engine();
+    const results = evaluateLiquidityStrategies({
+      rows: [r],
+      months: 6,
+      shared,
+      activeLayers: eng.activeLayers,
+      forecastProfile: eng.forecastProfile,
+      setup: eng.setup,
+      cfarNetByCcyUsd: eng.cfarNetByCcyUsd,
+    });
+    const unfunded = results.find(x => x.strategy.id === 'unfunded')!;
+    const cap = -14.6;
+    const tAsk = 4;
+    const maxScale = alignedInspectMaxScale({
+      askFillMode: 'overlay',
+      tAsk,
+      overlayCapFcyM: cap,
+      row: r,
+      r_USD: shared.r_USD,
+    })!;
+    expect(maxScale).toBeCloseTo(overlayWalkMaxScale(tAsk), 8);
+    const parent = toPortfolioCarryFrontier(buildPortfolioLiquidityFrontier({
+      result: unfunded,
+      strategy: unfunded.strategy,
+      rows: [r],
+      engine: eng,
+      overlayFcyByCcy: { EUR: cap },
+      overlaySweetT: 0,
+      maxScale,
+    }));
+    const left = buildCcyInspectLeftEnd({
+      row: r,
+      engine: eng,
+      result: unfunded,
+      askFillMode: 'overlay',
+      overlayCapFcyM: cap,
+      maxScale,
+      sectionCfarUsdM: 0.42,
+    });
+    const parentTipK = frontierWalkTipK(parent.points)!;
+    const modalTipK = Math.max(...left.upper.map(p => p.multiple));
+    expect(parentTipK).toBeCloseTo(maxScale, 5);
+    expect(modalTipK).toBeCloseTo(parentTipK, 5);
+    expect(left.upper.some(p => p.levered)).toBe(true);
+    expect(left.upper.filter(p => p.levered).every(p => p.multiple > 1 + 1e-6)).toBe(true);
+    expect(left.upper.filter(p => !p.levered).every(p => p.multiple <= 1 + 1e-6)).toBe(true);
+    expect(left.upper.filter(p => p.multiple <= 1 + 1e-6).every(p => !p.levered)).toBe(true);
+    expect(parent.points.filter(p => isWalkLevered(p)).every(p => p.k > 1 + 1e-6)).toBe(true);
+    expect(parent.points.filter(p => p.k <= 1 + 1e-6).every(p => !isWalkLevered(p))).toBe(true);
+    const split = splitLeveredChartPath(parent.points, parent.points[0]!.portfolioVarUsd);
+    expect(split.solid.length).toBeGreaterThanOrEqual(2);
+    expect(split.levered.length).toBeGreaterThanOrEqual(2);
+    const book = parent.points.filter(p => p.k <= 1 + 1e-6).at(-1)!;
+    expect(split.solid.some(p => Math.abs(p.x - book.portfolioVarUsd) < 1e-6)).toBe(true);
+  });
+
+  it('swap inspect hard-caps at the parent walk tip k', () => {
+    const r = row();
+    const eng = engine();
+    const results = evaluateLiquidityStrategies({
+      rows: [r],
+      months: 6,
+      shared,
+      activeLayers: eng.activeLayers,
+      forecastProfile: eng.forecastProfile,
+      setup: eng.setup,
+      cfarNetByCcyUsd: eng.cfarNetByCcyUsd,
+    });
+    const rolling = results.find(x => x.strategy.id === 'rollingProgramme')!;
+    const parent = toPortfolioCarryFrontier(buildPortfolioLiquidityFrontier({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows: [r],
+      engine: eng,
+    }));
+    const tipK = frontierWalkTipK(parent.points);
+    expect(tipK).not.toBeNull();
+    const left = buildCcyInspectLeftEnd({
+      row: r,
+      engine: eng,
+      result: rolling,
+      askFillMode: 'swap',
+      maxScale: tipK,
+      sectionCfarUsdM: 0.42,
+    });
+    expect(Math.max(...left.upper.map(p => p.multiple))).toBeCloseTo(tipK!, 5);
+  });
+
+  it('inspect twins keep a yellow iso-S mix at matched k (d=0 open ↔ d=1 far)', () => {
+    const r = row();
+    const eng = engine();
+    const results = evaluateLiquidityStrategies({
+      rows: [r],
+      months: 6,
+      shared,
+      activeLayers: eng.activeLayers,
+      forecastProfile: eng.forecastProfile,
+      setup: eng.setup,
+      cfarNetByCcyUsd: eng.cfarNetByCcyUsd,
+    });
+    const rolling = results.find(x => x.strategy.id === 'rollingProgramme')!;
+    const left = buildCcyInspectLeftEnd({
+      row: r,
+      engine: eng,
+      result: rolling,
+      askFillMode: 'swap',
+      sectionCfarUsdM: 0.42,
+    });
+    const open = left.upper.find(p => p.delta < 1e-9 && !p.levered);
+    expect(open).toBeTruthy();
+    const far = left.lower.find(p => Math.abs(p.multiple - open!.multiple) < 1e-6)
+      ?? left.lower.find(p => Math.abs(p.peakBook - open!.peakBook) < 1e-4);
+    expect(far).toBeTruthy();
+    expect(Math.abs(far!.totalCarryUsdYrM - open!.totalCarryUsdYrM)).toBeGreaterThan(1e-5);
+    expect(Math.abs(open!.cipUsdYrM)).toBeGreaterThan(1e-5);
+    const mid = priceIsoSSlice(open!, far!, left.cfarOriginUsdM, 0.5);
+    const yLo = Math.min(open!.totalCarryUsdYrM, far!.totalCarryUsdYrM);
+    const yHi = Math.max(open!.totalCarryUsdYrM, far!.totalCarryUsdYrM);
+    expect(mid.totalCarryUsdYrM).toBeGreaterThanOrEqual(yLo - 1e-6);
+    expect(mid.totalCarryUsdYrM).toBeLessThanOrEqual(yHi + 1e-6);
+    expect(Math.abs(mid.totalCarryUsdYrM - open!.totalCarryUsdYrM)).toBeGreaterThan(1e-5);
+  });
+
+  it('tiny overlay cap: modal levMin $K extends the parent past the 1.2 floor', () => {
+    const r = row();
+    const tiny = 0.4;
+    const tFromK = overlayTFromCashCarryK(modalLevMinK(0), tiny, r, shared.r_USD);
+    const scale = alignedInspectMaxScale({
+      askFillMode: 'overlay',
+      tAsk: 0,
+      overlayCapFcyM: tiny,
+      row: r,
+      r_USD: shared.r_USD,
+    })!;
+    if (tFromK > 1.2) {
+      expect(scale).toBeCloseTo(tFromK, 8);
+      expect(scale).toBeGreaterThan(1.2);
+    } else {
+      expect(scale).toBeCloseTo(1.2, 8);
+    }
+  });
+});
+
+describe('splitLeveredChartPath', () => {
+  it('joins the dashed tail at the last live-book vertex', () => {
+    const pts = [
+      { k: 0, portfolioVarUsd: 1.0, totalCarryUsdYr: 0, floorBoundCcys: [] as string[] },
+      { k: 0.5, portfolioVarUsd: 1.2, totalCarryUsdYr: 0.10, floorBoundCcys: [] as string[] },
+      { k: 1, portfolioVarUsd: 1.5, totalCarryUsdYr: 0.20, floorBoundCcys: [] as string[] },
+      { k: 1.5, portfolioVarUsd: 2.5, totalCarryUsdYr: 0.40, floorBoundCcys: [] as string[], levered: true },
+    ];
+    const split = splitLeveredChartPath(pts, 1.0);
+    expect(split.solid[0]).toEqual({ x: 1.0, y: 0 });
+    expect(split.solid.some(p => Math.abs(p.x - 1.5) < 1e-9)).toBe(true);
+    expect(split.levered[0]!.x).toBeCloseTo(split.solid[split.solid.length - 1]!.x, 8);
+    expect(split.levered[split.levered.length - 1]!.x).toBeCloseTo(2.5, 8);
+    expect(frontierWalkTipK(pts)).toBeCloseTo(1.5, 8);
+  });
+
+  it('keeps the live book solid when k is FCY standing (not overlay t)', () => {
+    const pts = [
+      { k: 0, portfolioVarUsd: 0.42, totalCarryUsdYr: 0, floorBoundCcys: [] as string[], levered: false },
+      { k: 6, portfolioVarUsd: 0.50, totalCarryUsdYr: 0.10, floorBoundCcys: [] as string[], levered: false },
+      { k: 12, portfolioVarUsd: 0.70, totalCarryUsdYr: 0.20, floorBoundCcys: [] as string[], levered: false },
+      { k: 18, portfolioVarUsd: 1.20, totalCarryUsdYr: 0.30, floorBoundCcys: [] as string[], levered: true },
+    ];
+    expect(isWalkLevered({ k: 1.2 })).toBe(true);
+    expect(isWalkLevered({ k: 0.8 })).toBe(false);
+    expect(isWalkLevered({ k: 12, levered: false })).toBe(false);
+    expect(isWalkLevered({ k: 0.8, levered: true })).toBe(true);
+    const split = splitLeveredChartPath(pts, 0.42);
+    expect(split.solid.length).toBeGreaterThanOrEqual(2);
+    expect(split.solid.some(p => Math.abs(p.x - 0.70) < 1e-9)).toBe(true);
+    expect(split.levered[0]!.x).toBeCloseTo(split.solid[split.solid.length - 1]!.x, 8);
+    expect(split.levered.some(p => Math.abs(p.x - 1.20) < 1e-9)).toBe(true);
+    expect(split.levered.filter(p => Math.abs(p.x - 0.50) < 1e-9)).toHaveLength(0);
   });
 });
 
@@ -1036,6 +1313,27 @@ describe('alignLeftEndToCcyTicket', () => {
     const far = aligned.lower.find(p => Math.abs(p.peakBook - 79.36) < 1e-6)!;
     expect(far.totalCarryUsdYrM).toBeCloseTo(-0.203 + 0.716, 8);
     expect(far.finalCfarUsdM).toBeCloseTo(0.717, 8);
+  });
+
+  it('yellow mix at Book S connects remapped Total to far, not pre-morph cash', () => {
+    const aligned = alignLeftEndToCcyTicket(left(), eurTicket);
+    const open = aligned.upper.find(p => Math.abs(p.peakBook - 79.36) < 1e-6)!;
+    const far = aligned.lower.find(p => Math.abs(p.peakBook - 79.36) < 1e-6)!;
+    expect(open.totalCarryUsdYrM).toBeCloseTo(2.3, 8);
+    expect(far.totalCarryUsdYrM).toBeCloseTo(-0.203 + 0.716, 8);
+    const mid = priceIsoSSlice(open, far, aligned.cfarOriginUsdM, 0.5);
+    expect(mid.peakBook).toBeCloseTo(79.36, 5);
+    expect(mid.delta).toBeCloseTo(0.5, 6);
+    expect(mid.totalCarryUsdYrM).toBeCloseTo(
+      (open.totalCarryUsdYrM + far.totalCarryUsdYrM) / 2,
+      6,
+    );
+    expect(mid.totalCarryUsdYrM).not.toBeCloseTo((1.6 + far.totalCarryUsdYrM) / 2, 3);
+    const slice = isoSSlicePoints(open, far, aligned.cfarOriginUsdM);
+    expect(slice.length).toBeGreaterThan(3);
+    expect(slice[0]!.totalCarryUsdYrM).toBeCloseTo(2.3, 6);
+    expect(slice[slice.length - 1]!.totalCarryUsdYrM).toBeCloseTo(far.totalCarryUsdYrM, 6);
+    expect(slice.every(p => Math.abs(p.peakBook - 79.36) < 1e-6)).toBe(true);
   });
 
   it('leaves overlay-fill (S = 0) walks untouched', () => {

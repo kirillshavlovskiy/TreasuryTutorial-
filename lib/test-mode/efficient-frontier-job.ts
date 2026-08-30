@@ -50,6 +50,7 @@ import {
   frontierMonotoneStats,
   pickConservativeFundingBook,
   pricedBalancedVertex,
+  alignedInspectMaxScale,
 } from '@/lib/test-mode/portfolio-modal-align';
 import {
   buildPortfolioLiquidityFrontier,
@@ -637,7 +638,17 @@ function overlayTermWalkFrontier(input: {
     capLegs: input.capLegs,
     targetUsdYrM: ask,
   });
-  const maxScale = Math.max(1.2, Number.isFinite(tAsk) ? tAsk * 1.25 : 1.2);
+  const one = input.rows.length === 1 ? input.rows[0]! : null;
+  const oneCap = one && input.capLegs
+    ? input.capLegs.find(l => l.ccy === one.ccy)?.fcyM
+    : undefined;
+  const maxScale = alignedInspectMaxScale({
+    askFillMode: 'overlay',
+    tAsk: Number.isFinite(tAsk) ? tAsk : 0,
+    overlayCapFcyM: oneCap,
+    row: one,
+    r_USD: input.engine.shared.r_USD,
+  }) ?? 1.2;
   const unfunded = input.results.find(r => r.strategy.id === 'unfunded');
   const overlayFcy = overlayFcyByCcyFromLegs(input.capLegs);
   let walk: PortfolioCarryFrontier | null = null;

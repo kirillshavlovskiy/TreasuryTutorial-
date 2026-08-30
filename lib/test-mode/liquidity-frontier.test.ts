@@ -33,6 +33,15 @@ import {
   interpAlong,
   isoSSliceAlphas,
   isoSSlicePoints,
+  isoMixCipUsdYrM,
+  isoMixDrawable,
+  findIsoMixFar,
+  stampIsoMixTwin,
+  mixTwinForSelection,
+  namedCcyChipParksWalk,
+  originTangentDataRay,
+  resolveCcyFrontierScenarioId,
+  showCcyIsoMixStub,
   ISO_S_SLICE_STEPS,
   priceIsoSSlice,
   priceLiquidityStanding,
@@ -795,6 +804,49 @@ describe('priceIsoSSlice', () => {
     expect(priceIsoSSlice(open, far, built.cfarOriginUsdM, 1)).toBe(far);
   });
 
+  it('infers CIP from far Y when inspect twins left cipUsdYrM at 0', () => {
+    const built = buildLiquidityLeftEndFrontier(input({
+      row: row({ cash_floor: 0, carry_target: 0 }),
+      cfarNetByCcyUsd: { GBP: 0.361 },
+      carryUsdK: [20],
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, forecastUncertainty1m: 0.3 },
+    }));
+    const open0 = built.upper.find(p => p.delta < 1e-9)!;
+    const far0 = built.lower.find(p => Math.abs(p.peakBook - open0.peakBook) < 1e-6)!;
+    const open = { ...open0, cipUsdYrM: 0 };
+    const far = { ...far0, cipUsdYrM: 0, cashCarryUsdYrM: far0.totalCarryUsdYrM };
+    expect(isoMixCipUsdYrM(open, far)).toBeCloseTo(
+      far0.totalCarryUsdYrM - open0.cashCarryUsdYrM,
+      6,
+    );
+    const mid = priceIsoSSlice(open, far, built.cfarOriginUsdM, 0.5);
+    expect(mid.totalCarryUsdYrM).toBeCloseTo(
+      (open.totalCarryUsdYrM + far.totalCarryUsdYrM) / 2,
+      6,
+    );
+    const slice = isoSSlicePoints(open, far, built.cfarOriginUsdM);
+    expect(slice.length).toBeGreaterThan(3);
+    const ys = slice.map(p => p.totalCarryUsdYrM);
+    expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(1e-4);
+  });
+
+  it('mix Y follows remapped totals even when cipUsdYrM is stale', () => {
+    const built = buildLiquidityLeftEndFrontier(input({
+      row: row({ cash_floor: 0, carry_target: 0 }),
+      cfarNetByCcyUsd: { GBP: 0.361 },
+      carryUsdK: [20],
+      setup: { ...DEFAULT_VAR_SETUP, forecastMonths: 6, forecastUncertainty1m: 0.3 },
+    }));
+    const open0 = built.upper.find(p => p.delta < 1e-9)!;
+    const far0 = built.lower.find(p => Math.abs(p.peakBook - open0.peakBook) < 1e-6)!;
+    const open = { ...open0, cashCarryUsdYrM: 1.6, cipUsdYrM: -1.803, totalCarryUsdYrM: 2.3 };
+    const far = { ...far0, totalCarryUsdYrM: 0.513 };
+    expect(isoMixCipUsdYrM(open, far)).toBeCloseTo(0.513 - 2.3, 6);
+    const mid = priceIsoSSlice(open, far, built.cfarOriginUsdM, 0.5);
+    expect(mid.totalCarryUsdYrM).toBeCloseTo((2.3 + 0.513) / 2, 6);
+    expect(mid.peakBook).toBe(open0.peakBook);
+  });
+
   it('places extra Δ knots at Y = 0 and the RSS corner', () => {
     const built = buildLiquidityLeftEndFrontier(input({
       row: row({ cash_floor: 0, carry_target: 0 }),
@@ -844,6 +896,165 @@ describe('priceIsoSSlice', () => {
     expect(greenAtY).toBeTruthy();
     expect(mid.finalCfarUsdM).toBeGreaterThan(greenAtY!.cfarUsdM);
   });
+
+  it('draws mix when twins exist even if cipUsdYrM was 0', () => {
+    const open = pt(2.7, 0.25, { peakBook: 40, cashCarryUsdYrM: 0.25, cipUsdYrM: 0 });
+    const far = pt(1.8, -0.15, { peakBook: 40, cashCarryUsdYrM: 0.25, cipUsdYrM: 0, delta: 1 });
+    expect(isoMixDrawable(open, far)).toBe(true);
+    expect(isoMixCipUsdYrM(open, far)).toBeCloseTo(-0.40, 6);
+    const slice = isoSSlicePoints(open, far, 0.545);
+    expect(slice.length).toBeGreaterThan(8);
+    const xs = slice.map(p => p.finalCfarUsdM);
+    const ys = slice.map(p => p.totalCarryUsdYrM);
+    expect(Math.max(...xs) - Math.min(...xs)).toBeGreaterThan(1e-3);
+    expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(1e-3);
+  });
+
+  it('hides mix only when there is no far twin', () => {
+    const open = pt(2.7, 0.25, { peakBook: 40, cashCarryUsdYrM: 0.25, cipUsdYrM: 0 });
+    const clone = pt(2.7, 0.25, { peakBook: 40, cashCarryUsdYrM: 0.25, cipUsdYrM: 0, delta: 1 });
+    expect(isoMixDrawable(open, clone)).toBe(false);
+    expect(isoSSlicePoints(open, clone, 0.545)).toEqual([]);
+    const otherS = pt(1.8, -0.15, { peakBook: 12, cashCarryUsdYrM: 0.25, cipUsdYrM: 0, delta: 1 });
+    expect(isoMixDrawable(open, otherS)).toBe(false);
+    expect(findIsoMixFar(open, [clone, otherS])).toBeNull();
+    expect(isoSSlicePoints(open, otherS, 0.545)).toEqual([]);
+  });
+
+  it('pairs a far twin by standing slack even when cipUsdYrM is 0', () => {
+    const open = pt(2.7, 0.25, {
+      peakBook: 40, multiple: 0.5, cashCarryUsdYrM: 0.25, cipUsdYrM: 0,
+    });
+    const far = pt(1.8, -0.15, {
+      peakBook: 40.4, multiple: 0.5, cashCarryUsdYrM: 0.25, cipUsdYrM: 0, delta: 1,
+    });
+    expect(findIsoMixFar(open, [far])).toBe(far);
+    const stamped = stampIsoMixTwin(open, far);
+    expect(stamped.open.cipUsdYrM).toBeCloseTo(-0.40, 6);
+    expect(stamped.far.peakBook).toBe(40);
+    expect(isoMixDrawable(stamped.open, stamped.far)).toBe(true);
+    const slice = isoSSlicePoints(open, far, 0.545);
+    expect(slice.length).toBeGreaterThan(8);
+    expect(Math.abs(slice[0]!.totalCarryUsdYrM - slice[slice.length - 1]!.totalCarryUsdYrM))
+      .toBeGreaterThan(1e-3);
+  });
+
+  it('keeps a drawable mix when open and far Y and CFaR both move', () => {
+    const open = pt(2.7, 0.25, { peakBook: 40, cashCarryUsdYrM: 0.25, cipUsdYrM: -0.4 });
+    const far = pt(1.8, -0.15, { peakBook: 40, cashCarryUsdYrM: 0.25, cipUsdYrM: -0.4, delta: 1 });
+    expect(isoMixDrawable(open, far)).toBe(true);
+    const slice = isoSSlicePoints(open, far, 0.545);
+    expect(slice.length).toBeGreaterThan(8);
+    const xs = slice.map(p => p.finalCfarUsdM);
+    const ys = slice.map(p => p.totalCarryUsdYrM);
+    expect(Math.max(...xs) - Math.min(...xs)).toBeGreaterThan(1e-3);
+    expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(1e-3);
+  });
+});
+
+describe('resolveCcyFrontierScenarioId', () => {
+  const base = {
+    overlayFill: true,
+    pinnedScenario: null as 'carryTarget' | null,
+    livePick: false,
+    preferCustomChip: false,
+    atCustomSnap: false,
+    namedHit: null as 'carryTarget' | 'unhedged' | null,
+    portfolioChipId: 'carryTarget' as const,
+  };
+
+  it('does not keep Carry Target lit once the user walks off the named standing', () => {
+    expect(resolveCcyFrontierScenarioId({
+      ...base,
+      livePick: true,
+      namedHit: null,
+    })).toBe('custom');
+  });
+
+  it('keeps the overlay pin only when there is no live walk', () => {
+    expect(resolveCcyFrontierScenarioId({
+      ...base,
+      pinnedScenario: 'carryTarget',
+      livePick: false,
+    })).toBe('carryTarget');
+    expect(resolveCcyFrontierScenarioId({
+      ...base,
+      pinnedScenario: 'carryTarget',
+      livePick: true,
+      namedHit: null,
+    })).toBe('custom');
+  });
+
+  it('lights a named chip when the live pick is exactly that standing', () => {
+    expect(resolveCcyFrontierScenarioId({
+      ...base,
+      livePick: true,
+      namedHit: 'carryTarget',
+    })).toBe('carryTarget');
+  });
+
+  it('overlay keep-alive still lights Carry Target when there is no live walk', () => {
+    expect(resolveCcyFrontierScenarioId({
+      ...base,
+      livePick: false,
+      pinnedScenario: 'carryTarget',
+    })).toBe('carryTarget');
+  });
+});
+
+describe('namedCcyChipParksWalk', () => {
+  it('parks on Carry Target when the chip is lit without a live walk', () => {
+    expect(namedCcyChipParksWalk('carryTarget', false)).toBe(true);
+    expect(namedCcyChipParksWalk('balanced', false)).toBe(true);
+    expect(namedCcyChipParksWalk('unhedged', false)).toBe(true);
+    expect(namedCcyChipParksWalk('swapHedged', false)).toBe(true);
+  });
+
+  it('does not override a live walk or a custom pick', () => {
+    expect(namedCcyChipParksWalk('carryTarget', true)).toBe(false);
+    expect(namedCcyChipParksWalk('custom', false)).toBe(false);
+    expect(namedCcyChipParksWalk(null, false)).toBe(false);
+  });
+});
+
+describe('showCcyIsoMixStub', () => {
+  it('hides leftover Δ mix at the unhedged origin', () => {
+    expect(showCcyIsoMixStub('unhedged')).toBe(false);
+  });
+
+  it('keeps Δ mix at Book S and custom tail picks', () => {
+    expect(showCcyIsoMixStub('carryTarget')).toBe(true);
+    expect(showCcyIsoMixStub('balanced')).toBe(true);
+    expect(showCcyIsoMixStub('swapHedged')).toBe(true);
+    expect(showCcyIsoMixStub('custom')).toBe(true);
+    expect(showCcyIsoMixStub(null)).toBe(true);
+  });
+});
+
+describe('mixTwinForSelection', () => {
+  type Twin = { key: string; s: number; distinct: boolean };
+  const twins: Twin[] = [
+    { key: 'origin', s: 0, distinct: false },
+    { key: 'book', s: 12, distinct: true },
+    { key: 'walk', s: 40, distinct: true },
+  ];
+  const pick = (
+    selected: Twin,
+  ) => mixTwinForSelection(
+    selected,
+    twins,
+    t => t.distinct,
+    [12],
+    t => t.s,
+  );
+
+  it('uses the selected tail twin, not Book / Carry Target standing', () => {
+    expect(pick(twins[2]!).key).toBe('walk');
+  });
+
+  it('falls back to book standing only while parked at origin', () => {
+    expect(pick(twins[0]!).key).toBe('book');
+  });
 });
 
 describe('carryAxisFromArms', () => {
@@ -887,6 +1098,38 @@ describe('liquidityFrontierSkyline', () => {
     const skyline = liquidityFrontierSkyline(all);
     expect(skyline).toHaveLength(1);
     expect(isDegenerateLiquidityFrontier(all, skyline)).toBe(true);
+  });
+});
+
+describe('originTangentDataRay', () => {
+  it('is linear in data Y from (0, 0), not a 2-point screen chord', () => {
+    const touch = { cfar: 2.7, carry: 0.25 };
+    const ray = originTangentDataRay(touch.cfar, touch.carry, 12.5, 32);
+    expect(ray.length).toBeGreaterThan(16);
+    expect(ray[0]!.x).toBe(0);
+    expect(ray[0]!.y).toBe(0);
+    const slope = touch.carry / touch.cfar;
+    for (const p of ray) {
+      expect(p.y).toBeCloseTo(slope * p.x, 10);
+    }
+    const through = ray.find(p => Math.abs(p.x - touch.cfar) < 1e-9);
+    expect(through).toBeTruthy();
+    expect(through!.y).toBeCloseTo(touch.carry, 10);
+  });
+
+  it('maps to a bent asinh polyline, not colinear z vs CFaR', () => {
+    const ray = originTangentDataRay(2.7, 0.25, 12.5, 32);
+    const s = 0.012;
+    const z = ray.map(p => carryFwd(p.y, s));
+    const last = ray.length - 1;
+    const zChord = (i: number) => z[0]! + (z[last]! - z[0]!) * (i / last);
+    const mid = Math.floor(last / 2);
+    expect(Math.abs(z[mid]! - zChord(mid))).toBeGreaterThan(1e-4);
+  });
+
+  it('is empty when there is no touch off the origin', () => {
+    expect(originTangentDataRay(0, 0.25, 4)).toEqual([]);
+    expect(originTangentDataRay(2.7, 0, 4)).toEqual([]);
   });
 });
 

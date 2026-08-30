@@ -1304,6 +1304,111 @@ export function rssMixCfarUsdM(
   return Math.hypot(section, add);
 }
 
+/**
+ * Far − open carry for the yellow iso-S mix.
+ * Prefer the visible twin Y span (`totalCarry`) so ticket morph / inspect
+ * conversion still traces d=0↔d=1 between the drawn dots. Stale `cipUsdYrM`
+ * is only a fallback when totals have not been remapped.
+ */
+export function isoMixCipUsdYrM(
+  open: Pick<LiquidityFrontierPoint, 'cashCarryUsdYrM' | 'cipUsdYrM' | 'totalCarryUsdYrM'>,
+  far: Pick<LiquidityFrontierPoint, 'totalCarryUsdYrM'>,
+): number {
+  const fromTotals = far.totalCarryUsdYrM - open.totalCarryUsdYrM;
+  if (Number.isFinite(fromTotals) && Math.abs(fromTotals) > 1e-12) return fromTotals;
+  if (Math.abs(open.cipUsdYrM) > 1e-12) return open.cipUsdYrM;
+  const inferred = far.totalCarryUsdYrM - open.cashCarryUsdYrM;
+  return Number.isFinite(inferred) ? inferred : 0;
+}
+
+/** Pink far is a real twin, not an open clone — CIP field may still be 0. */
+export function isoMixDistinct(
+  open: Pick<LiquidityFrontierPoint, 'finalCfarUsdM' | 'totalCarryUsdYrM'>,
+  far: Pick<LiquidityFrontierPoint, 'finalCfarUsdM' | 'totalCarryUsdYrM'>,
+): boolean {
+  return Math.hypot(
+    open.finalCfarUsdM - far.finalCfarUsdM,
+    open.totalCarryUsdYrM - far.totalCarryUsdYrM,
+  ) > 1e-4;
+}
+
+/**
+ * Yellow Δ mix is a d=0→1 curve at one S: Y follows far−open carry, X RSS.
+ * Hide only when there is no pink twin at that S (clone / other standing).
+ * Stale `cipUsdYrM = 0` is not a reason to drop the path.
+ */
+export function isoMixDrawable(
+  open: Pick<LiquidityFrontierPoint, 'cashCarryUsdYrM' | 'cipUsdYrM' | 'finalCfarUsdM' | 'totalCarryUsdYrM' | 'peakBook'>,
+  far: Pick<LiquidityFrontierPoint, 'finalCfarUsdM' | 'totalCarryUsdYrM' | 'peakBook'>,
+): boolean {
+  if (Math.abs(open.peakBook - far.peakBook) > 0.05) return false;
+  return isoMixDistinct(open, far);
+}
+
+/**
+ * Pink far at the same S as `open`. Inspect walks often mismatch k vs
+ * peakBook by a grid step — do not require an exact standing hit.
+ */
+export function findIsoMixFar(
+  open: LiquidityFrontierPoint,
+  lowers: readonly LiquidityFrontierPoint[],
+): LiquidityFrontierPoint | null {
+  if (Math.abs(open.peakBook) < 1e-6) return null;
+  const tolS = Math.max(0.5, Math.abs(open.peakBook) * 0.02);
+  const ranked: { p: LiquidityFrontierPoint; rank: number; d: number }[] = [];
+  for (const p of lowers) {
+    if (!isoMixDistinct(open, p)) continue;
+    const dS = Math.abs(p.peakBook - open.peakBook);
+    const dK = Math.abs(p.multiple - open.multiple);
+    const kLive = Math.abs(open.multiple) > 1e-9 || Math.abs(p.multiple) > 1e-9;
+    if (dS <= 1e-4) ranked.push({ p, rank: 0, d: dS });
+    else if (kLive && dK <= 1e-6) ranked.push({ p, rank: 1, d: dK });
+    else if (dS <= tolS) ranked.push({ p, rank: 2, d: dS });
+    else if (kLive && dK <= 1e-3) ranked.push({ p, rank: 3, d: dK });
+  }
+  ranked.sort((a, b) => a.rank - b.rank || a.d - b.d);
+  return ranked[0]?.p ?? null;
+}
+
+/**
+ * Infer CIP from the drawn open→far Y span and pin far onto open's S
+ * so the mix polyline is iso-S even when inspect k/standing drifted.
+ */
+export function stampIsoMixTwin(
+  open: LiquidityFrontierPoint,
+  far: LiquidityFrontierPoint,
+): { open: LiquidityFrontierPoint; far: LiquidityFrontierPoint } {
+  const cip = isoMixCipUsdYrM(open, far);
+  return {
+    open: { ...open, cipUsdYrM: cip },
+    far: { ...far, peakBook: open.peakBook, cipUsdYrM: cip },
+  };
+}
+
+/**
+ * Linear-Y ray from true (0, 0) through a touch, in data coordinates.
+ * Map each sample through the plot x / asinh-y mappers — a 2-point SVG
+ * chord from the origin corner is a straight screen line on log Y.
+ */
+export function originTangentDataRay(
+  touchCfar: number,
+  touchCarry: number,
+  xHi: number,
+  steps = 64,
+): { x: number; y: number }[] {
+  if (!Number.isFinite(touchCfar) || !Number.isFinite(touchCarry)) return [];
+  if (!(Math.abs(touchCfar) > 1e-9) || !(Math.abs(touchCarry) > 1e-9)) return [];
+  const end = Math.max(Math.abs(xHi), Math.abs(touchCfar)) * 1.08;
+  if (!(end > 1e-9)) return [];
+  const n = Math.max(16, Math.floor(steps));
+  const slope = touchCarry / touchCfar;
+  const xs = new Set<number>([0, Math.abs(touchCfar), end]);
+  for (let i = 1; i < n; i += 1) xs.add((i / n) * end);
+  return [...xs]
+    .sort((a, b) => a - b)
+    .map(x => ({ x, y: slope * x }));
+}
+
 /** Price one cover on the iso-S slice between an open/far twin pair. */
 export function priceIsoSSlice(
   open: LiquidityFrontierPoint,
@@ -1312,17 +1417,18 @@ export function priceIsoSSlice(
   cover: number,
 ): LiquidityFrontierPoint {
   const alpha = clampHedgeDelta(cover);
-  const cash = open.cashCarryUsdYrM;
-  const points = open.cipUsdYrM;
+  const y0 = open.totalCarryUsdYrM;
+  const points = isoMixCipUsdYrM(open, far);
   if (alpha < 1e-9) return open;
   if (alpha >= 1 - 1e-9) return far;
   return {
     ...open,
+    cipUsdYrM: points,
     delta: alpha,
     phase: 'hedged',
     intensity: hedgeIntensity(alpha),
     hedgeCarryUsdYrM: roundMoney(alpha * points),
-    totalCarryUsdYrM: roundMoney(cash + alpha * points),
+    totalCarryUsdYrM: roundMoney(y0 + alpha * points),
     finalCfarUsdM: roundMoney(rssMixCfarUsdM(
       sectionUsdM, open.finalCfarUsdM, far.finalCfarUsdM, alpha,
     )),
@@ -1343,18 +1449,20 @@ function snapIsoAlpha(cover: number): number {
  * the mix, not a chord.
  */
 export function isoSSliceAlphas(
-  open: Pick<LiquidityFrontierPoint, 'cashCarryUsdYrM' | 'cipUsdYrM' | 'finalCfarUsdM'>,
-  far: Pick<LiquidityFrontierPoint, 'finalCfarUsdM'>,
+  open: Pick<LiquidityFrontierPoint, 'cashCarryUsdYrM' | 'cipUsdYrM' | 'finalCfarUsdM' | 'totalCarryUsdYrM'>,
+  far: Pick<LiquidityFrontierPoint, 'finalCfarUsdM' | 'totalCarryUsdYrM'>,
   sectionUsdM: number,
   steps = ISO_S_SLICE_STEPS,
 ): number[] {
   const n = Math.max(8, Math.floor(steps));
   const alphas = new Set<number>([0, 1]);
   for (let i = 1; i < n; i += 1) alphas.add(snapIsoAlpha(i / n));
-  const cash = open.cashCarryUsdYrM;
-  const cip = open.cipUsdYrM;
+  const y0 = Number.isFinite(open.totalCarryUsdYrM)
+    ? open.totalCarryUsdYrM
+    : open.cashCarryUsdYrM;
+  const cip = isoMixCipUsdYrM(open, far);
   if (Math.abs(cip) > 1e-12) {
-    const a0 = -cash / cip;
+    const a0 = -y0 / cip;
     if (a0 > 0 && a0 < 1) {
       for (const w of [-0.08, -0.04, -0.02, -0.01, 0, 0.01, 0.02, 0.04, 0.08]) {
         const a = a0 + w;
@@ -1387,9 +1495,97 @@ export function isoSSlicePoints(
   sectionUsdM: number,
   steps = ISO_S_SLICE_STEPS,
 ): LiquidityFrontierPoint[] {
-  return isoSSliceAlphas(open, far, sectionUsdM, steps).map(a =>
-    priceIsoSSlice(open, far, sectionUsdM, a),
+  const farAtS = isoMixDrawable(open, far) ? far : findIsoMixFar(open, [far]);
+  if (!farAtS) return [];
+  const stamped = stampIsoMixTwin(open, farAtS);
+  if (!isoMixDrawable(stamped.open, stamped.far)) return [];
+  return isoSSliceAlphas(stamped.open, stamped.far, sectionUsdM, steps).map(a =>
+    priceIsoSSlice(stamped.open, stamped.far, sectionUsdM, a),
   );
+}
+
+export type CcyFrontierScenarioId =
+  | 'unhedged'
+  | 'carryTarget'
+  | 'balanced'
+  | 'swapHedged'
+  | 'custom';
+
+/**
+ * Named chips stay lit only on an exact named hit or an overlay pin.
+ * A live walk / mix / click is always `custom` — overlay keep-alive must
+ * not glue Carry Target back onto that pick.
+ *
+ * Keep-alive can still light Carry Target while comboSnap/autoIdx sits on a
+ * leftover custom S. Pair with `namedCcyChipParksWalk` so the plot parks on
+ * the named vertex instead of pulsing that leftover walk.
+ */
+export function resolveCcyFrontierScenarioId(input: {
+  overlayFill: boolean;
+  pinnedScenario: CcyFrontierScenarioId | null;
+  livePick: boolean;
+  preferCustomChip: boolean;
+  atCustomSnap: boolean;
+  namedHit: CcyFrontierScenarioId | null;
+  portfolioChipId: CcyFrontierScenarioId | null;
+}): CcyFrontierScenarioId | null {
+  if (input.livePick) {
+    if (input.namedHit) return input.namedHit;
+    if (input.preferCustomChip && input.atCustomSnap) return 'custom';
+    return 'custom';
+  }
+  if (input.overlayFill && input.pinnedScenario) return input.pinnedScenario;
+  if (input.preferCustomChip && input.atCustomSnap) return 'custom';
+  if (input.namedHit) return input.namedHit;
+  if (input.overlayFill && input.portfolioChipId) return input.portfolioChipId;
+  return input.portfolioChipId;
+}
+
+/** Named chip + no live walk → park on that vertex, not leftover comboSnap. */
+export function namedCcyChipParksWalk(
+  selectedScenarioId: CcyFrontierScenarioId | null,
+  livePick: boolean,
+): boolean {
+  return !livePick
+    && selectedScenarioId != null
+    && selectedScenarioId !== 'custom';
+}
+
+/**
+ * Δ mix at the selected standing (custom tail, Book S, Carry Target,
+ * Balanced, Swap hedged). Unhedged origin has no pink twin — hide the
+ * leftover mix `mixTwinForSelection` would otherwise borrow from Book S.
+ */
+export function showCcyIsoMixStub(
+  selectedScenarioId: CcyFrontierScenarioId | null,
+): boolean {
+  return selectedScenarioId !== 'unhedged';
+}
+
+/**
+ * Yellow Δ mix (d=0→1) sits on the **selected** open/far twin.
+ * Book / Carry Target standing is only a fallback while parked at origin
+ * so the residual slider has a mixable S to jump to.
+ */
+export function mixTwinForSelection<T extends { key: string }>(
+  selected: T,
+  twins: readonly T[],
+  isDistinct: (t: T) => boolean,
+  fallbackStandings: readonly number[],
+  standingOf: (t: T) => number,
+): T | null {
+  if (selected.key !== 'origin') return selected;
+  for (const s of fallbackStandings) {
+    if (!(Math.abs(s) > 0.01)) continue;
+    const hit = twins.find(t => (
+      t.key !== 'origin'
+      && Math.abs(standingOf(t) - s) < 1e-3
+      && isDistinct(t)
+    ));
+    if (hit) return hit;
+  }
+  const liveBook = twins.filter(t => t.key !== 'origin' && isDistinct(t));
+  return liveBook[liveBook.length - 1] ?? twins.find(isDistinct) ?? null;
 }
 
 export type LiquidityStandingPriceInput = Pick<

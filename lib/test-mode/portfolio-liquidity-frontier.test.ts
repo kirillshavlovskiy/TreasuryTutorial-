@@ -708,6 +708,32 @@ describe('buildPortfolioLiquidityFrontier', () => {
     const chart = toPortfolioCarryFrontier(port);
     expect(chart.walk).toBe('overlay');
     expect(chart.points.filter(p => p.k > 0.5).length).toBeGreaterThan(3);
+    expect(port.open.filter(p => p.scale <= 1 + 1e-6).every(p => !p.levered)).toBe(true);
+    expect(port.open.filter(p => p.scale > 1 + 1e-6).every(p => p.levered)).toBe(true);
+    expect(port.far.filter(p => p.scale <= 1 + 1e-6).every(p => !p.levered)).toBe(true);
+    expect(chart.points.filter(p => p.k <= 1 + 1e-6).every(p => p.levered !== true)).toBe(true);
+  });
+
+  it('explicit book-scale maxScale is a hard cap — does not keep chasing $20M', () => {
+    const eurOnly = [rows[0]!];
+    const eurInput = { ...stratInput, rows: eurOnly };
+    const results = evaluateLiquidityStrategies(eurInput);
+    const rolling = results.find(r => r.strategy.id === 'rollingProgramme')!;
+    const capped = buildPortfolioLiquidityFrontier({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows: eurOnly,
+      engine,
+      maxScale: 1.5,
+    });
+    expect(Math.max(...capped.open.map(p => p.scale))).toBeCloseTo(1.5, 5);
+    const free = buildPortfolioLiquidityFrontier({
+      result: rolling,
+      strategy: rolling.strategy,
+      rows: eurOnly,
+      engine,
+    });
+    expect(Math.max(...free.open.map(p => p.scale))).toBeGreaterThan(1.55);
   });
 
   it('overlay CFaR vs carry is a curve, not the linear VAR/μ chord', () => {

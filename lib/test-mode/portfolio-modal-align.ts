@@ -20,16 +20,31 @@ import {
   bookCashCarryK,
   buildLiquidityLeftEndFrontier,
   carryFwd,
+  findIsoMixFar,
   frontierCarryDotsK,
+  isoMixCipUsdYrM,
+  leftEndOriginPoint,
   liquidityFrontierDial,
   priceLiquidityStanding,
   sectionCfarUsdM,
   signedPeakStanding,
+  type LiquidityFrontierDial,
   type LiquidityFrontierInput,
   type LiquidityFrontierPoint,
   type LiquidityLeftEndResult,
 } from '@/lib/test-mode/liquidity-frontier';
-import { cfarTailProbability, type LiquidityStrategy } from '@/lib/test-mode/liquidity-strategies';
+import {
+  cfarTailProbability,
+  type LiquidityStrategy,
+  type LiquidityStrategyResult,
+} from '@/lib/test-mode/liquidity-strategies';
+import {
+  buildPortfolioLiquidityFrontier,
+  overlayStandingAtPlotScale,
+  overlayWalkMaxScale,
+  standingAtScale,
+  toPortfolioCarryFrontier,
+} from '@/lib/test-mode/portfolio-liquidity-frontier';
 import { sumNetCfarUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
 
 /**
@@ -263,6 +278,85 @@ function fromLeftPoint(
   };
 }
 
+/** Modal Leverage slider floor ($K) — same rounding as the control. */
+export function modalLevMinK(bookCashK: number): number {
+  return Math.max(10, Math.ceil(Math.max(bookCashK, 0) / 5) * 5);
+}
+
+/** Overlay t that prints `cashK` on one cap standing. */
+export function overlayTFromCashCarryK(
+  cashK: number,
+  overlayFcyM: number,
+  row: RowState,
+  r_USD: number,
+): number {
+  if (!(cashK > 0.5) || !(Math.abs(overlayFcyM) > 0.01)) return 0;
+  const capK = bookCashCarryK(
+    overlayFcyM, ccySpotRate(row.ccy), row.r_FCY, r_USD, row.r_OD,
+  );
+  if (!(Math.abs(capK) > 0.5)) return 0;
+  return cashK / Math.abs(capK);
+}
+
+/**
+ * Dashed-tail cap both charts walk to.
+ *
+ * Overlay: max(Ask pad 1.25×tAsk, 1.2, modal levMin $K → t). Swap / Both:
+ * null — the book-scale builder auto-extends unless the caller passes the
+ * parent walk's tip k as a hard cap.
+ */
+export function alignedInspectMaxScale(input: {
+  askFillMode?: 'overlay' | 'swap' | 'both' | null;
+  tAsk: number;
+  overlayCapFcyM?: number | null;
+  row?: RowState | null;
+  r_USD?: number;
+  bookCashK?: number;
+  maxCarryK?: number | null;
+}): number | null {
+  if (input.askFillMode !== 'overlay') return null;
+  const fromAsk = overlayWalkMaxScale(input.tAsk);
+  const fcy = input.overlayCapFcyM;
+  const row = input.row;
+  if (
+    typeof fcy !== 'number' || !(Math.abs(fcy) > 0.01)
+    || !row || typeof input.r_USD !== 'number'
+  ) {
+    return fromAsk;
+  }
+  const bookK = typeof input.bookCashK === 'number' && Number.isFinite(input.bookCashK)
+    ? input.bookCashK
+    : 0;
+  const capK = Math.max(
+    modalLevMinK(bookK),
+    typeof input.maxCarryK === 'number' && input.maxCarryK > 0 ? input.maxCarryK : 0,
+  );
+  return Math.max(fromAsk, overlayTFromCashCarryK(capK, fcy, row, input.r_USD));
+}
+
+/** Tip k on a priced walk (parent chart → modal hard cap). */
+export function frontierWalkTipK(
+  points: readonly { k: number }[] | null | undefined,
+): number | null {
+  if (!points?.length) return null;
+  const hi = Math.max(...points.map(p => p.k).filter(Number.isFinite));
+  return Number.isFinite(hi) && hi > 1 + 1e-6 ? hi : null;
+}
+
+/**
+ * Dashed tail past the live book.
+ *
+ * Explicit `levered` wins: native left-end / solo walks store FCY standing
+ * in `k` (often ≫ 1) and stamp the flag from cash-carry vs the live book.
+ * ORing `k > 1` dashed that whole arm. Overlay / book-scale walks stamp
+ * `levered` from t/k > 1. Flag omitted → fall back to k > 1 (overlay t).
+ */
+export function isWalkLevered(p: { k: number; levered?: boolean }): boolean {
+  if (p.levered === true) return true;
+  if (p.levered === false) return false;
+  return Number.isFinite(p.k) && p.k > 1 + 1e-6;
+}
+
 /** Same default cash-carry grid the per-currency modal uses before the cap slider moves. */
 export function modalDefaultCarryUsdK(
   row: RowState,
@@ -277,7 +371,7 @@ export function modalDefaultCarryUsdK(
     row.r_OD,
   );
   const searching = liquidityFrontierDial(engine.activeLayers) !== 'cash_floor';
-  const levMin = Math.max(10, Math.ceil(Math.max(bookK, 0) / 5) * 5);
+  const levMin = modalLevMinK(bookK);
   return frontierCarryDotsK(bookK, {
     targetCashK: searching ? bookK : 0,
     tail: levMin > bookK + 0.5,
@@ -301,6 +395,150 @@ export function portfolioFrontierFromLeftEnd(
     nearestClampCcy: null,
     nearestClampVarUsd: null,
   };
+}
+
+function portfolioPtToLeft(
+  p: PortfolioCarryFrontierPoint,
+  delta: 0 | 1,
+  standing: number,
+): LiquidityFrontierPoint {
+  return {
+    ...leftEndOriginPoint(p.portfolioVarUsd),
+    delta,
+    multiple: p.k,
+    phase: delta >= 1 ? 'hedged' : 'unfunded',
+    peakBook: standing,
+    carryM: standing,
+    cashCarryUsdYrM: p.totalCarryUsdYr,
+    totalCarryUsdYrM: p.totalCarryUsdYr,
+    finalCfarUsdM: Math.max(0, p.portfolioVarUsd),
+    levered: isWalkLevered(p),
+  };
+}
+
+/**
+ * Stroke the same (CFaR, carry) arm the parent draws for a one-name
+ * filtered universe. Origin stays unhedged; later vertices keep walk k.
+ */
+export function leftEndFromPortfolioFrontier(
+  port: PortfolioCarryFrontier,
+  input: {
+    dial: LiquidityFrontierDial;
+    liveStanding: number;
+    overlayFcyM?: number;
+    walk: 'overlay' | 'book-scale';
+    bookCashK?: number;
+  },
+): LiquidityLeftEndResult {
+  const originX = port.points[0]?.portfolioVarUsd ?? 0;
+  const origin = leftEndOriginPoint(originX);
+  const sweetT = input.walk === 'overlay' ? 0 : 1;
+  const standingOf = (k: number) => (
+    input.walk === 'overlay'
+      ? overlayStandingAtPlotScale(input.liveStanding, k, input.overlayFcyM, sweetT)
+      : standingAtScale(input.liveStanding, k, input.overlayFcyM, sweetT)
+  );
+  const upper = port.points
+    .filter(p => p.k > 1e-9)
+    .map(p => portfolioPtToLeft(p, 0, standingOf(p.k)));
+  const farSrc = port.farPoints ?? [];
+  const lower = farSrc
+    .filter(p => p.k > 1e-9)
+    .map(p => portfolioPtToLeft(p, 1, standingOf(p.k)));
+  // Inspect conversion stores total Y only (`cipUsdYrM` stays 0). Stamp
+  // CIP from the paired far twin (k or standing) so d=0↔d=1 has a Y path.
+  for (const open of upper) {
+    const far = findIsoMixFar(open, lower);
+    if (!far) continue;
+    const cip = isoMixCipUsdYrM(open, far);
+    if (Number.isFinite(cip) && Math.abs(cip) > 1e-12) {
+      open.cipUsdYrM = cip;
+      far.cipUsdYrM = cip;
+    }
+  }
+  const tip = upper[upper.length - 1] ?? origin;
+  return {
+    dial: input.dial,
+    walk: 'carry_pair',
+    cfarOriginUsdM: originX,
+    origin,
+    upper,
+    lower,
+    curve: [origin, ...upper],
+    points: [...upper, ...lower],
+    applied: tip,
+    constraint: {
+      dial: input.dial,
+      hCarryUsdYrM: null,
+      vCfarUsdM: null,
+      openHit: null,
+      hedgeHit: null,
+    },
+    bookStanding: input.liveStanding,
+    bookCashK: input.bookCashK ?? 0,
+  };
+}
+
+/**
+ * One-name inspect walk — same builder as the EUR-only portfolio chart.
+ * Overlay fill: unhedged book + scaled term overlay. Swap / Both: book-scale.
+ */
+export function buildCcyInspectLeftEnd(input: {
+  row: RowState;
+  engine: SoloAlignEngine;
+  result: LiquidityStrategyResult;
+  askFillMode: 'overlay' | 'swap' | 'both';
+  overlayCapFcyM?: number | null;
+  maxScale?: number | null;
+  sectionCfarUsdM?: number;
+}): LiquidityLeftEndResult {
+  const engine = engineWithSectionCfar(input.engine, input.row.ccy, input.sectionCfarUsdM);
+  const overlayFcy = typeof input.overlayCapFcyM === 'number'
+    && Number.isFinite(input.overlayCapFcyM)
+    && Math.abs(input.overlayCapFcyM) > 0.01
+    ? input.overlayCapFcyM
+    : null;
+  const overlayFill = input.askFillMode === 'overlay' && overlayFcy != null;
+  const filtered: LiquidityStrategyResult = {
+    ...input.result,
+    byCcy: input.result.byCcy.filter(c => c.ccy === input.row.ccy),
+  };
+  const scaleCap = typeof input.maxScale === 'number' && Number.isFinite(input.maxScale) && input.maxScale > 0
+    ? { maxScale: input.maxScale }
+    : {};
+  const liq = buildPortfolioLiquidityFrontier({
+    result: filtered,
+    strategy: input.result.strategy,
+    rows: [input.row],
+    engine,
+    ...scaleCap,
+    ...(overlayFill
+      ? {
+          overlayFcyByCcy: { [input.row.ccy]: overlayFcy },
+          overlaySweetT: 0,
+        }
+      : {}),
+  });
+  const port = toPortfolioCarryFrontier(liq);
+  const live = overlayFill
+    ? 0
+    : signedPeakStanding(filtered.byCcy[0]?.plan);
+  const bookK = overlayFill || !input.row
+    ? 0
+    : bookCashCarryK(
+      live,
+      ccySpotRate(input.row.ccy),
+      input.row.r_FCY,
+      engine.shared.r_USD,
+      input.row.r_OD,
+    );
+  return leftEndFromPortfolioFrontier(port, {
+    dial: liquidityFrontierDial(engine.activeLayers),
+    liveStanding: live,
+    overlayFcyM: overlayFcy ?? undefined,
+    walk: liq.walk,
+    bookCashK: bookK,
+  });
 }
 
 /** Pin section / origin CFaR for one name (overdraft FX-only Net). */
@@ -538,6 +776,24 @@ export function chartOpenPath(
     ? rest.filter(p => Math.abs(p.x - originX) > 1e-3 || Math.abs(p.y) <= 0.20)
     : rest;
   return [{ x: originX, y: 0 }, ...kept];
+}
+
+/** Split a priced walk into live-book (solid) vs k>1 leverage (dashed). */
+export function splitLeveredChartPath(
+  walk: readonly PortfolioCarryFrontierPoint[],
+  originX: number,
+): { solid: { x: number; y: number }[]; levered: { x: number; y: number }[] } {
+  const toXy = (p: PortfolioCarryFrontierPoint) => ({
+    x: p.portfolioVarUsd,
+    y: p.totalCarryUsdYr,
+  });
+  const solidWalk = walk.filter(p => !isWalkLevered(p));
+  const levWalk = walk.filter(p => isWalkLevered(p));
+  const solid = chartOpenPath(solidWalk.map(toXy), originX, true);
+  if (levWalk.length === 0) return { solid, levered: [] };
+  const join = solid[solid.length - 1]
+    ?? (solidWalk.length > 0 ? toXy(solidWalk[solidWalk.length - 1]!) : { x: originX, y: 0 });
+  return { solid, levered: [join, ...levWalk.map(toXy)] };
 }
 
 /** Same as `chartOpenPath`. No fill arg, no hull, no stem filter. */
@@ -1249,9 +1505,56 @@ export function alignLeftEndToCcyTicket(
       totalCarryUsdYrM: p.totalCarryUsdYrM + u * dYFar,
     };
   };
-  const upper = left.upper.map(p => (p.delta < 1e-9 ? mapOpen(p) : p));
-  const lower = left.lower.map(mapFar);
-  const points = left.points.map(p => (p.delta < 1e-9 ? mapOpen(p) : mapFar(p)));
+  const upperRaw = left.upper.map(p => (p.delta < 1e-9 ? mapOpen(p) : p));
+  const lowerRaw = left.lower.map(mapFar);
+  const farTwinOf = (open: LiquidityFrontierPoint) =>
+    lowerRaw.find(p => Math.abs(p.peakBook - open.peakBook) < 1e-4)
+    ?? lowerRaw.find(p => Math.abs(p.multiple - open.multiple) < 1e-6);
+  // Morph updates total Y/X. Restamp cash/CIP so the yellow d=0↔d=1 mix
+  // interpolates the drawn Total and far dots — not pre-morph cash.
+  const upper = upperRaw.map(p => {
+    if (p.delta >= 1e-9) return p;
+    const far = farTwinOf(p);
+    if (!far) return p;
+    return {
+      ...p,
+      cashCarryUsdYrM: p.totalCarryUsdYrM,
+      cipUsdYrM: far.totalCarryUsdYrM - p.totalCarryUsdYrM,
+    };
+  });
+  const lower = lowerRaw.map(p => {
+    const open = upper.find(o => (
+      o.delta < 1e-9 && Math.abs(o.peakBook - p.peakBook) < 1e-4
+    ));
+    if (!open) return p;
+    return {
+      ...p,
+      cashCarryUsdYrM: open.totalCarryUsdYrM,
+      cipUsdYrM: p.totalCarryUsdYrM - open.totalCarryUsdYrM,
+    };
+  });
+  const points = left.points.map(p => {
+    if (p.delta < 1e-9) {
+      const mapped = mapOpen(p);
+      const far = farTwinOf(mapped);
+      if (!far) return mapped;
+      return {
+        ...mapped,
+        cashCarryUsdYrM: mapped.totalCarryUsdYrM,
+        cipUsdYrM: far.totalCarryUsdYrM - mapped.totalCarryUsdYrM,
+      };
+    }
+    const mapped = mapFar(p);
+    const open = upper.find(o => (
+      o.delta < 1e-9 && Math.abs(o.peakBook - mapped.peakBook) < 1e-4
+    ));
+    if (!open) return mapped;
+    return {
+      ...mapped,
+      cashCarryUsdYrM: open.totalCarryUsdYrM,
+      cipUsdYrM: mapped.totalCarryUsdYrM - open.totalCarryUsdYrM,
+    };
+  });
   const openLine = upper.filter(p => p.delta < 1e-9);
   const stamped = nearestStandingPoint(openLine, bookS);
   const openHit = stamped
