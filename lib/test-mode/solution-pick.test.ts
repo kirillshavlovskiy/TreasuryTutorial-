@@ -41,6 +41,7 @@ import {
   swapParkedOverlayScale,
   ticketCfarUsdM,
   pointForScenario,
+  relHedgeFarPoint,
   policyVarForSelection,
   remapSelectionToFrontier,
   resolveFrontierScenarioId,
@@ -444,6 +445,34 @@ describe('rebaseLiveBookArmToHoldY', () => {
     raw.farPoints = [pt(0, 0.50, 0), pt(1, 9.5, -0.040)];
     const out = rebaseLiveBookArmToHoldY(raw, 0.50);
     expect(out.farPoints[1]!.totalCarryUsdYr).toBeCloseTo(-0.040, 8);
+  });
+
+  it('Rel hedge is the far CIP twin at hold scale (k=1), overlay t=0', () => {
+    const raw = frontier([
+      pt(0, 0.50, 0),
+      pt(0.5, 5.0, 0.10),
+      pt(1, 8.0, 0.20),
+      pt(1.2, 12.0, 0.22),
+    ]);
+    raw.farPoints = [
+      pt(0, 0.50, 0),
+      pt(0.5, 5.0, -0.02),
+      pt(1, 8.0, -0.05),
+      pt(1.2, 12.0, -0.08),
+    ];
+    const rel = pointForScenario({
+      frontier: raw,
+      scenarioId: 'relHedge',
+      policyCapUsd: 20,
+      confidencePct: 95,
+    });
+    expect(rel).not.toBeNull();
+    expect(rel!.k).toBeCloseTo(1, 6);
+    expect(rel!.totalCarryUsdYr).toBeCloseTo(-0.05, 8);
+    expect(relHedgeFarPoint(raw)).toMatchObject({ k: 1, totalCarryUsdYr: -0.05 });
+    expect(overlayTForPoint({
+      point: rel!, frontier: raw, policyCapUsd: 20, scenarioId: 'relHedge',
+    })).toBe(0);
   });
 });
 

@@ -66,7 +66,7 @@ export {
   NORDTECH_ENTITY_IDS,
 } from '@/lib/test-mode/fixtures/nordtech-accounts';
 export { NORDTECH_REFERENCE, SCORE_TOLERANCE, withinTolerance } from '@/lib/test-mode/fixtures/nordtech-reference';
-export { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
+export { analyticsSpotUsd, marketSpotUsd, NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 export { computeStockLadder, largestMismatch } from '@/lib/test-mode/exposure-ladder';
 export { computeTaskVar, type VarResult } from '@/lib/test-mode/task-var';
 export {
@@ -302,6 +302,9 @@ export {
   residualByCcyFromBook,
   clearPreparedHedgeForCcy,
   setPreparedHedgeForCcy,
+  isReleasedToHedgingDecision,
+  releasedPreparedByCcy,
+  markPreparedApproval,
   applyHedgeTicketsPatch,
   applyPreparedHedgesPatch,
   setMarketRatesForCcy,
@@ -322,10 +325,38 @@ export {
   type HedgeVarRow,
   type HedgeVarSummary,
   type PreparedHedgeLeg,
+  type HedgeApprovalStatus,
   type PreparedHedgeProfile,
   type PreparedHedgesPatch,
   type RowRiskMetric,
 } from '@/lib/test-mode/hedge-var';
+export {
+  atlasPairCorr,
+  impliedFxVol,
+} from '@/lib/fx-market-risk';
+export {
+  atlasDatedHedgeCarryUsdM,
+  buildFxAtlasLegs,
+  datedAtlasExposuresLocalM,
+  fxAtlasHedgeFrontier,
+  fxAtlasMarginalEffects,
+  fxAtlasPointAtWeights,
+  fxAtlasPointAtCcyWeights,
+  fxAtlasMixWorseThanFrontier,
+  fxAtlasSweetPoint,
+  fxAtlasTenorFrontier,
+  atlasForceOpenPins,
+  fxCarryVarFrontier,
+  fxDiversifiedBooks,
+  signedFxVarUsdM,
+} from '@/lib/test-mode/fx-var-frontier';
+export {
+  computeFxAtlasJob,
+  emptyFxAtlasJobResult,
+  parseFxAtlasJobRequest,
+  type FxAtlasJobRequest,
+  type FxAtlasJobResult,
+} from '@/lib/test-mode/fx-atlas-job';
 export {
   hedgeBookContentScore,
   hedgeBookHasContent,
@@ -343,6 +374,17 @@ export {
   rebindHedgeBooksToWorkspace,
   serializeHedgeSidecar,
 } from '@/lib/hedge-book-normalize';
+export {
+  buildSoloCcyAlignedFrontier,
+  conservativeFundingPoint,
+  engineWithSectionCfar,
+  modalDefaultCarryUsdK,
+  overlayKToModalXy,
+  pickConservativeFundingBook,
+  portfolioFrontierFromLeftEnd,
+  unhedgedSectionCfarUsdM,
+  type SoloAlignEngine,
+} from '@/lib/test-mode/portfolio-modal-align';
 export {
   classifyNordtechEntity,
   mergedEntityForecastProfile,
@@ -387,6 +429,18 @@ export {
   saveSandboxPersistent,
   subscribeSandboxPersist,
 } from '@/lib/test-mode/sandbox-client';
+export {
+  acceptedDeskCfarByCcy,
+  optimizerOverlayFromLegs,
+  overlayTAlongPath,
+  overlayCarryUsdYrM,
+  liftFrontierToTotalCarry,
+  relHedgeFarPoint,
+  buildSolutionPick,
+  type OptimizerOverlayDesk,
+  type SolutionPick,
+} from '@/lib/test-mode/solution-pick';
+export { regimeTableCarryUsdM } from '@/lib/test-mode/liquidity-strategies';
 export {
   isTestModeEnabled,
   TEST_GUEST_EMAIL,

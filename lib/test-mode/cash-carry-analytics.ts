@@ -27,7 +27,6 @@ import {
 import {
   fcyCcyOf,
   fwdCarryFromSwapPointsUsdM,
-  fwdCarryMonthlyAccrualUsdM,
   interpolateSwapPoints,
   resolveCashRatesForHorizon,
   resolveForwardDepositRates,
@@ -426,7 +425,6 @@ function monthIndexForSettle(settleMonths: number, T: number): number | null {
  * Per-month FCY hedge cash flows for a CCY (prepared + booked).
  * Index 0 = M1 … T−1 = MT. Sign: + = FCY received, − = FCY delivered.
  */
-/** Desk overlay extra — hedge trade (sell FCY = −). Convert before CIP / CFaR. */
 export type AnalyticsForwardLeg = {
   ccy: string;
   amountLocalM: number;
@@ -586,9 +584,35 @@ export function buildCashForecastSchedule(input: {
         }).filter(l => l.ccy === input.ccy)
       : [];
 
-  // Locked far: CIP at the booked settle tenor, spread 1/S per month the
-  // contract is alive. Do not walk CIP(1M), CIP(2M), … CIP(S) — calendar M4
-  // is not a 4M tenor.
+  // Strip legs: each Δ at its own tenor (swap points).
+  // One Tf bullet: 12M points / CIP on the cover (the trade Book books).
+  const prep = input.preparedByCcy?.[input.ccy];
+  const bookedLive = (input.bookedHedges ?? []).filter(
+    t =>
+      t.ccy === input.ccy &&
+      isLiveHedgeTicket(t) &&
+      t.instrument !== 'spot',
+  );
+  const hasFxRiskCover =
+    (prep != null && Math.abs(prep.coverLocalM) >= 1e-12) ||
+    bookedLive.length > 0;
+  const onlyBullet =
+    legs.length === 1 &&
+    legs[0]!.structure === 'bullet' &&
+    hasFxRiskCover;
+  let datedBulletFwdUsdM: number | null = null;
+  if (onlyBullet) {
+    const cover = hedgeLegCoverLocalM(legs[0]!);
+    const settle = Math.max(0, legs[0]!.settleMonths || T);
+    datedBulletFwdUsdM = fwdCarryForExposureCoverUsdM({
+      coverLocalM: cover,
+      ccy: input.ccy,
+      settleMonths: settle,
+      bundle: input.marketRates,
+      r_FCY: overnight.fcy.creditPct,
+      r_USD: overnight.usd.creditPct,
+    }).fwdCarryUsdM;
+  }
   const legFwd = legs.map(leg => {
     const S = Math.max(0, leg.settleMonths);
     return { settleMonths: S, notionalLocalM: hedgeLegCoverLocalM(leg) };
@@ -624,15 +648,27 @@ export function buildCashForecastSchedule(input: {
     // 1) Operating CF only — settle is month-end (after interest).
     fcy += net;
 
-    // 2) Accrue FWD pts this month — booked-far CIP / settle months.
+    // 2) Accrue FWD / CIP this month — 1/S of the locked total.
     let monthFwd = 0;
-    for (const lf of legFwd) {
-      monthFwd += fwdCarryMonthlyAccrualUsdM({
-        notionalLocalM: lf.notionalLocalM,
-        settleMonths: lf.settleMonths,
-        month,
-        bundle: input.marketRates,
-      });
+    if (datedBulletFwdUsdM != null) {
+      const S = legFwd[0]?.settleMonths ?? 0;
+      if (S >= 1 - 1e-12 && month <= S + 1e-12) {
+        monthFwd = datedBulletFwdUsdM / S;
+      }
+    } else {
+      for (const lf of legFwd) {
+        const S = lf.settleMonths;
+        if (S < 1 - 1e-12 || month > S + 1e-12) continue;
+        monthFwd +=
+          fwdCarryForExposureCoverUsdM({
+            coverLocalM: lf.notionalLocalM,
+            ccy: input.ccy,
+            settleMonths: S,
+            bundle: input.marketRates,
+            r_FCY: overnight.fcy.creditPct,
+            r_USD: overnight.usd.creditPct,
+          }).fwdCarryUsdM / S;
+      }
     }
 
     // 3) Interest on mid-month balances before month-end settle.
@@ -818,58 +854,74 @@ export function buildCashForecastCarryComparison(input: {
   };
 }
 
-/** Live swap-curve FWD for one prepared strip leg (trade Δ × pts). */
+function preparedCoverFwdUsdM(
+  coverLocalM: number,
+  settleMonths: number,
+  marketRates: FxMarketRatesBundle,
+  ccy: string,
+  fallbackUsdM: number,
+): number {
+  if (settleMonths < 1 - 1e-9 || Math.abs(coverLocalM) < 1e-12) {
+    return fallbackUsdM;
+  }
+  const overnight = resolveOvernightCashRates(marketRates, ccy);
+  return fwdCarryForExposureCoverUsdM({
+    coverLocalM,
+    ccy,
+    settleMonths,
+    bundle: marketRates,
+    r_FCY: overnight.fcy.creditPct,
+    r_USD: overnight.usd.creditPct,
+  }).fwdCarryUsdM;
+}
+
+/** Live FWD / CIP for one prepared strip leg (trade Δ × pts, else deposit CIP). */
 export function preparedLegFwdCarryUsdM(
   leg: PreparedHedgeProfile['legs'][number],
   prevHedgeLocalM: number,
   marketRates: FxMarketRatesBundle,
+  ccy?: string,
 ): number {
   const settle = Math.max(0, leg.settleMonths ?? leg.endMonth);
-  if (settle < 1 - 1e-9) return 0;
+  const desk = (ccy || fcyCcyOf(marketRates)).toUpperCase();
   const delta =
     typeof leg.tradeNotionalLocalM === 'number'
       ? leg.tradeNotionalLocalM
       : leg.hedgeLocalM - prevHedgeLocalM;
-  if (Math.abs(delta) < 1e-12) return 0;
-  return (
-    fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: delta,
-      settleMonths: settle,
-      bundle: marketRates,
-    })?.fwdCarryUsdM ?? 0
-  );
+  return preparedCoverFwdUsdM(delta, settle, marketRates, desk, 0);
 }
 
-/** Live swap-curve FWD for a prepared strip (Σ trade Δ × pts). */
+/** Live FWD / CIP for a prepared strip (Σ trade Δ). */
 export function preparedStripFwdCarryUsdM(
   prep: PreparedHedgeProfile,
   marketRates: FxMarketRatesBundle,
+  ccy?: string,
 ): number {
   let prev = 0;
   let sum = 0;
   for (const leg of prep.legs) {
-    sum += preparedLegFwdCarryUsdM(leg, prev, marketRates);
+    sum += preparedLegFwdCarryUsdM(leg, prev, marketRates, ccy);
     prev = leg.hedgeLocalM;
   }
   return sum;
 }
 
-/** Live swap-curve FWD for a prepared bullet. */
+/** Live FWD / CIP for a prepared bullet. */
 export function preparedBulletFwdCarryUsdM(
   prep: PreparedHedgeProfile,
   marketRates: FxMarketRatesBundle,
   fallbackUsdM: number,
+  ccy?: string,
 ): number {
+  if (Number.isFinite(fallbackUsdM)) return fallbackUsdM;
   const settle = Math.max(0, prep.settleMonths ?? 0);
-  if (settle < 1 - 1e-9 || Math.abs(prep.coverLocalM) < 1e-12) {
-    return fallbackUsdM;
-  }
-  return (
-    fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: prep.coverLocalM,
-      settleMonths: settle,
-      bundle: marketRates,
-    })?.fwdCarryUsdM ?? fallbackUsdM
+  const desk = (ccy || fcyCcyOf(marketRates)).toUpperCase();
+  return preparedCoverFwdUsdM(
+    prep.coverLocalM,
+    settle,
+    marketRates,
+    desk,
+    fallbackUsdM,
   );
 }
 
@@ -888,18 +940,11 @@ export function resolvedHedgedTotalCarryUsdM(input: {
 } {
   const { comparison: cmp, prepared: prep, marketRates } = input;
   let fwdCarryUsdM = cmp.categories.fwdCarryUsdM;
+  const desk = cmp.ccy;
   if (prep?.structure === 'strip' && (prep.legs?.length ?? 0) >= 2) {
-    fwdCarryUsdM = preparedStripFwdCarryUsdM(prep, marketRates);
-  } else if (
-    prep?.structure === 'bullet' &&
-    Math.abs(prep.coverLocalM) >= 1e-12
-  ) {
-    fwdCarryUsdM = preparedBulletFwdCarryUsdM(
-      prep,
-      marketRates,
-      cmp.categories.fwdCarryUsdM,
-    );
+    fwdCarryUsdM = preparedStripFwdCarryUsdM(prep, marketRates, desk);
   }
+  // Bullets keep the forecast FWD (Tf swap points / CIP on cover).
   const fwdAdjust = fwdCarryUsdM - cmp.categories.fwdCarryUsdM;
   return {
     fwdCarryUsdM,
@@ -1091,6 +1136,9 @@ export function assignImpliedCarryFromSwapPoints(
     bulletSettleMonths: number;
     /** Book FCY — USDPLN files have baseCcy `USD`; do not use that as the pair. */
     ccy?: string;
+    bookRows?: readonly RowState[];
+    forecastProfile?: ForecastProfileState | null;
+    forecastMonths?: number;
   },
 ): PreparedHedgeProfile {
   const { marketRates, bulletSettleMonths } = input;
@@ -1601,6 +1649,7 @@ function legsForTargetWam(
 function fwdCarryForLegsUsdM(
   legs: readonly { settleMonths: number; amountLocalM: number }[],
   bundle: FxMarketRatesBundle,
+  ccy?: string,
 ): number {
   let sum = 0;
   for (const leg of legs) {
@@ -1611,6 +1660,7 @@ function fwdCarryForLegsUsdM(
       notionalLocalM: leg.amountLocalM,
       settleMonths: leg.settleMonths,
       bundle,
+      ccy,
     });
     sum += pts?.fwdCarryUsdM ?? 0;
   }
@@ -1801,7 +1851,7 @@ export function buildSettleWamScenarios(input: {
     ...pathBase,
     settleCashFlowsByMonth: settleCashFlowsFromLegs(bookLegs),
   });
-  const bookFwd = fwdCarryForLegsUsdM(bookLegs, input.marketRates);
+  const bookFwd = fwdCarryForLegsUsdM(bookLegs, input.marketRates, input.ccy);
   const bookInterestDelta = bookPath.newCarryUsdM - unhedgedCarryUsdM;
   const bookEnhancement = bookInterestDelta + bookFwd;
 
@@ -1835,7 +1885,7 @@ export function buildSettleWamScenarios(input: {
       ...pathBase,
       settleCashFlowsByMonth: settleCashFlowsFromLegs(legs),
     });
-    const fwdCarryUsdM = fwdCarryForLegsUsdM(legs, input.marketRates);
+    const fwdCarryUsdM = fwdCarryForLegsUsdM(legs, input.marketRates, input.ccy);
     const newCarryUsdM = path.newCarryUsdM;
     const interestDeltaUsdM = newCarryUsdM - unhedgedCarryUsdM;
     // Enhancement includes FWD pts — full benefit vs do-nothing.
@@ -2098,7 +2148,7 @@ export function scoreStripShapeAroundWam(input: {
     ...pathBase,
     settleCashFlowsByMonth: settleCashFlowsFromLegs(legs),
   });
-  const fwdCarryUsdM = fwdCarryForLegsUsdM(legs, input.marketRates);
+  const fwdCarryUsdM = fwdCarryForLegsUsdM(legs, input.marketRates, input.ccy);
   const newCarryUsdM = path.newCarryUsdM;
   const interestDeltaUsdM = newCarryUsdM - unhedgedCarryUsdM;
   const enhancementUsdM = interestDeltaUsdM + fwdCarryUsdM;

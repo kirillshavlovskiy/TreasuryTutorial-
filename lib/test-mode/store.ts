@@ -12,6 +12,7 @@ import {
 import { NORDTECH_ENTITY_IDS } from '@/lib/test-mode/fixtures/nordtech-accounts';
 import {
   createEntity,
+  hydrateWorkspace,
   type Workspace,
 } from '@/lib/workspace-store';
 import { ensureTask01FxLayers } from '@/lib/test-mode/score';
@@ -218,7 +219,7 @@ export function normalizeSandboxState(parsed: unknown): TestSandboxState {
     : seeded.group;
 
   const defaults = defaultTaskProgress();
-  const workspace = ensureTask01FxLayers(blob.workspace);
+  const workspace = hydrateWorkspace(ensureTask01FxLayers(blob.workspace));
   const ui = normalizeUi(blob.ui);
 
   return {

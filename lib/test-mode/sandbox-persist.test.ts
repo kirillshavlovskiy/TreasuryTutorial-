@@ -12,6 +12,7 @@ import {
   seedSandbox,
 } from '@/lib/test-mode/store';
 import type { EntityHedgeBook, HedgeTicket } from '@/lib/test-mode/hedge-var';
+import type { TestSandboxState } from '@/lib/test-mode/types';
 
 const ticket = (id: string): HedgeTicket => ({
   id,
@@ -121,8 +122,11 @@ describe('sandboxStateWithProtectedHedges', () => {
       updatedAt: '2026-06-01T00:00:00.000Z',
       hedgesByEntityId: {},
     };
-    const protectedState = sandboxStateWithProtectedHedges(incoming, existing);
-    expect(protectedState.hedgesByEntityId.ent_1?.bookedHedges.map(t => t.id)).toEqual([
+    const protectedState = sandboxStateWithProtectedHedges(
+      incoming as TestSandboxState,
+      existing as TestSandboxState,
+    );
+    expect(protectedState.hedgesByEntityId?.ent_1?.bookedHedges.map(t => t.id)).toEqual([
       'keep-me',
     ]);
   });
@@ -140,8 +144,11 @@ describe('sandboxStateWithProtectedHedges', () => {
       hedgesUpdatedAt: '2026-06-01T00:00:00.000Z',
       hedgesByEntityId: {},
     };
-    const protectedState = sandboxStateWithProtectedHedges(incoming, existing);
-    expect(protectedState.hedgesByEntityId.ent_1?.bookedHedges.map(t => t.id)).toEqual([
+    const protectedState = sandboxStateWithProtectedHedges(
+      incoming as TestSandboxState,
+      existing as TestSandboxState,
+    );
+    expect(protectedState.hedgesByEntityId?.ent_1?.bookedHedges.map(t => t.id)).toEqual([
       'keep-me',
     ]);
   });
@@ -182,11 +189,14 @@ describe('sandboxStateWithProtectedHedges', () => {
         },
       },
     };
-    const protectedState = sandboxStateWithProtectedHedges(incoming, existing);
+    const protectedState = sandboxStateWithProtectedHedges(
+      incoming as TestSandboxState,
+      existing as TestSandboxState,
+    );
     expect(
-      protectedState.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor,
+      protectedState.hedgesByEntityId?.ent_1?.preparedByCcy?.EUR?.preparedFor,
     ).toBe('liquidity');
-    expect(protectedState.hedgesByEntityId.ent_1?.bookedHedges.map(t => t.id)).toEqual([
+    expect(protectedState.hedgesByEntityId?.ent_1?.bookedHedges.map(t => t.id)).toEqual([
       'keep-me',
     ]);
   });
@@ -220,9 +230,12 @@ describe('sandboxStateWithProtectedHedges', () => {
       hedgesUpdatedAt: '2026-01-01T00:00:00.000Z',
       hedgesByEntityId: { ent_1: bookWithTickets('keep-me') },
     };
-    const protectedState = sandboxStateWithProtectedHedges(incoming, existing);
+    const protectedState = sandboxStateWithProtectedHedges(
+      incoming as TestSandboxState,
+      existing as TestSandboxState,
+    );
     expect(
-      protectedState.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor,
+      protectedState.hedgesByEntityId?.ent_1?.preparedByCcy?.EUR?.preparedFor,
     ).toBe('liquidity');
   });
 
@@ -255,9 +268,12 @@ describe('sandboxStateWithProtectedHedges', () => {
       hedgesUpdatedAt: '2026-06-01T00:00:00.000Z',
       hedgesByEntityId: { ent_1: bookWithTickets('keep-me') },
     };
-    const protectedState = sandboxStateWithProtectedHedges(incoming, existing);
+    const protectedState = sandboxStateWithProtectedHedges(
+      incoming as TestSandboxState,
+      existing as TestSandboxState,
+    );
     expect(
-      protectedState.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor,
+      protectedState.hedgesByEntityId?.ent_1?.preparedByCcy?.EUR?.preparedFor,
     ).toBe('liquidity');
   });
 
@@ -272,8 +288,11 @@ describe('sandboxStateWithProtectedHedges', () => {
       updatedAt: '2026-01-01T00:00:00.000Z',
       hedgesByEntityId: { ent_1: bookWithTickets('stale') },
     };
-    const protectedState = sandboxStateWithProtectedHedges(incoming, existing);
-    const ids = protectedState.hedgesByEntityId.ent_1?.bookedHedges.map(t => t.id) ?? [];
+    const protectedState = sandboxStateWithProtectedHedges(
+      incoming as TestSandboxState,
+      existing as TestSandboxState,
+    );
+    const ids = protectedState.hedgesByEntityId?.ent_1?.bookedHedges.map(t => t.id) ?? [];
     expect(ids).toContain('server');
     expect(ids).toContain('stale');
   });
@@ -343,10 +362,10 @@ describe('sandbox hedge sidecar', () => {
       }
       const loaded = loadSandbox('test:analyst@sigma.local');
       expect(
-        loaded.hedgesByEntityId[NORDTECH_ENTITY_IDS.de]?.bookedHedges[0]?.id,
+        loaded.hedgesByEntityId?.[NORDTECH_ENTITY_IDS.de]?.bookedHedges[0]?.id,
       ).toBe('keep-me');
       expect(
-        loaded.hedgesByEntityId[NORDTECH_ENTITY_IDS.de]?.preparedByCcy?.EUR
+        loaded.hedgesByEntityId?.[NORDTECH_ENTITY_IDS.de]?.preparedByCcy?.EUR
           ?.preparedFor,
       ).toBe('liquidity');
     } finally {
@@ -399,14 +418,14 @@ describe('sandbox hedge sidecar', () => {
       });
       const loaded = loadSandbox(user);
       expect(
-        loaded.hedgesByEntityId[NORDTECH_ENTITY_IDS.de]?.preparedByCcy?.EUR
+        loaded.hedgesByEntityId?.[NORDTECH_ENTITY_IDS.de]?.preparedByCcy?.EUR
           ?.preparedFor,
       ).toBe('liquidity');
       expect(
-        loaded.hedgesByEntityId[NORDTECH_ENTITY_IDS.de]?.desk?.portfolioScenarioId,
+        loaded.hedgesByEntityId?.[NORDTECH_ENTITY_IDS.de]?.desk?.portfolioScenarioId,
       ).toBe('balanced');
       expect(
-        loaded.hedgesByEntityId[NORDTECH_ENTITY_IDS.de]?.desk?.policyVAR,
+        loaded.hedgesByEntityId?.[NORDTECH_ENTITY_IDS.de]?.desk?.policyVAR,
       ).toBe(12);
     } finally {
       restore();

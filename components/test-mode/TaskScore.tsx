@@ -10,7 +10,7 @@ export function TaskScore({ result }: TaskScoreProps) {
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5">
       <div className="flex items-center justify-between gap-3">
-        <h3 className="text-sm font-semibold text-white">±5% vs hidden reference</h3>
+        <h3 className="text-sm font-semibold text-white">±5% vs reference ladder</h3>
         <span
           className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${
             result.pass

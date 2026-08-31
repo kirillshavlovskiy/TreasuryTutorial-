@@ -40,8 +40,8 @@ describe('buildSettleWamScenarios', () => {
           openExposureLocalM: 16.9,
         },
       },
-    ] as CurrencyRiskRow[];
-    const preparedByCcy: Record<string, PreparedHedgeProfile> = {
+    ] as unknown as CurrencyRiskRow[];
+    const preparedByCcy = {
       EUR: {
         structure: 'bullet',
         basis: 'totalExpected',
@@ -58,7 +58,7 @@ describe('buildSettleWamScenarios', () => {
       risk,
       setup,
       bookedHedges: [],
-      preparedByCcy,
+      preparedByCcy: preparedByCcy as unknown as Record<string, PreparedHedgeProfile>,
       marketRates,
       bookRows,
     });
@@ -116,8 +116,8 @@ describe('buildSettleWamScenarios', () => {
           openExposureLocalM: 28.16,
         },
       },
-    ] as CurrencyRiskRow[];
-    const preparedByCcy: Record<string, PreparedHedgeProfile> = {
+    ] as unknown as CurrencyRiskRow[];
+    const preparedByCcy = {
       EUR: {
         structure: 'strip',
         basis: 'totalExpected',
@@ -146,6 +146,8 @@ describe('buildSettleWamScenarios', () => {
             settleMonths: 9,
             hedgeLocalM: 15.02,
             tradeNotionalLocalM: 6.13,
+            index: 2,
+            label: 'M9',
           },
           {
             startMonth: 0,
@@ -153,6 +155,8 @@ describe('buildSettleWamScenarios', () => {
             settleMonths: 12,
             hedgeLocalM: 23.23,
             tradeNotionalLocalM: 8.21,
+            index: 3,
+            label: 'M12',
           },
         ],
       },
@@ -163,7 +167,7 @@ describe('buildSettleWamScenarios', () => {
       risk,
       setup,
       bookedHedges: [],
-      preparedByCcy,
+      preparedByCcy: preparedByCcy as unknown as Record<string, PreparedHedgeProfile>,
       marketRates,
       bookRows,
     });
@@ -212,8 +216,8 @@ describe('buildSettleWamScenarios', () => {
           openExposureLocalM: 28.16,
         },
       },
-    ] as CurrencyRiskRow[];
-    const preparedByCcy: Record<string, PreparedHedgeProfile> = {
+    ] as unknown as CurrencyRiskRow[];
+    const preparedByCcy = {
       EUR: {
         structure: 'strip',
         basis: 'totalExpected',
@@ -252,7 +256,7 @@ describe('buildSettleWamScenarios', () => {
       risk,
       setup,
       bookedHedges: [],
-      preparedByCcy,
+      preparedByCcy: preparedByCcy as unknown as Record<string, PreparedHedgeProfile>,
       marketRates,
       bookRows,
       ladderMode: 'bullet',
@@ -291,8 +295,8 @@ describe('optimizeStripShapeAroundWam', () => {
           openExposureLocalM: 16.9,
         },
       },
-    ] as CurrencyRiskRow[];
-    const preparedByCcy: Record<string, PreparedHedgeProfile> = {
+    ] as unknown as CurrencyRiskRow[];
+    const preparedByCcy = {
       EUR: {
         structure: 'bullet',
         basis: 'totalExpected',
@@ -309,7 +313,7 @@ describe('optimizeStripShapeAroundWam', () => {
       risk,
       setup,
       bookedHedges: [],
-      preparedByCcy,
+      preparedByCcy: preparedByCcy as unknown as Record<string, PreparedHedgeProfile>,
       marketRates,
       bookRows,
       targetWamMonths: 6,
@@ -331,7 +335,7 @@ describe('optimizeStripShapeAroundWam', () => {
       risk,
       setup,
       bookedHedges: [],
-      preparedByCcy,
+      preparedByCcy: preparedByCcy as unknown as Record<string, PreparedHedgeProfile>,
       marketRates,
       bookRows,
       targetWamMonths: 6,

@@ -38,25 +38,35 @@ npm test -- <pattern>       # single file or pattern
 
 ## Environment Variables
 
-| Variable | Description | Required | Example |
-|----------|-------------|----------|---------|
-| TODO     | TODO        | Yes      | TODO    |
+There is **one** list of environment variables, and it lives in two places that are kept in
+sync: `.env.example` (with the long per-variable notes) and the Environment Variables table in
+`README.md`. Do not start a third list here — a second copy drifts, and `CLAUDE.md` forbids it.
 
 Copy `.env.example` to `.env.local` and fill in values. Never commit `.env.local`.
+
+Check the two sources still agree:
+
+```bash
+node .claude/skills/fx-review/scripts/env-drift.mjs
+```
 
 ## Repository Structure
 
 ```
-src/lib/        Pure business logic (calculators, transformers)
-src/services/   External integrations (MCP calls, HTTP clients)
-src/api/        Route handlers / controllers
-src/types/      Shared TypeScript interfaces and enums
-tests/          Integration and e2e tests
-docs/           Architecture diagrams, runbooks
-scripts/        Operational scripts — never imported by src/
+app/            Next.js App Router — pages and API routes (app/api/**)
+lib/            Business logic: FX/buffer/VaR calculators, db access, Treasury client, agent
+components/     React components, including the simulator and workbench screens
+data/           Static data files
+docs/           Architecture notes and runbooks
+scripts/        Operational scripts — never imported by application code
+public/         Static assets
+.claude/skills/ Agent skills for this repo — see .claude/skills/README.md
+.claude/hooks/  Deterministic guards (protected paths)
 ```
 
-See `engineering.md` for full structure and naming conventions.
+Unit tests are co-located with their source: `lib/fx-buffer.ts` → `lib/fx-buffer.test.ts`.
+
+See `engineering.md` for naming conventions.
 
 ## CI/CD
 

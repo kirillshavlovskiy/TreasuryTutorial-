@@ -8,6 +8,13 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { Activity, Coins, Shield } from 'lucide-react';
+import {
+  AnalyticsWizardShell,
+  useAnalyticsWizard,
+  type AnalyticsWizardStep,
+} from '@/components/test-mode/AnalyticsWizardShell';
+import { ChartViewFrame } from '@/components/ChartViewToggle';
 import { CfarDrawdownChart } from '@/components/test-mode/CfarDrawdownChart';
 import {
   buildCashForecastCarryComparison,
@@ -67,11 +74,7 @@ import {
   fwdCarryFromSwapPointsUsdM,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
-import {
-  coverFromTradeLocalM,
-  stripHedgeLegCarryUsdM,
-  tradeFromCoverLocalM,
-} from '@/lib/fx-hedge';
+import { stripHedgeLegCarryUsdM, coverFromTradeLocalM, tradeFromCoverLocalM } from '@/lib/fx-hedge';
 import { CURRENCY_PARAMS, type RowState } from '@/lib/fx-buffer';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -523,6 +526,75 @@ function WhatIfDeltaRow({
   );
 }
 
+type CfarHedgeScenarioId =
+  | 'unhedged'
+  | 'conservative'
+  | 'balanced'
+  | 'full'
+  | 'maxCarry'
+  | 'applied'
+  | 'custom';
+
+function CfarHedgeScenarioCard({
+  name,
+  short,
+  coverPct,
+  netCfarUsdM,
+  carryUsdM,
+  isSelected,
+  disabled,
+  onSelect,
+}: {
+  name: string;
+  short: string;
+  coverPct: number | null;
+  netCfarUsdM: number | null;
+  carryUsdM: number | null;
+  isSelected: boolean;
+  disabled?: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      disabled={disabled}
+      aria-pressed={isSelected}
+      className={`rounded-xl border p-4 text-left transition ${
+        disabled
+          ? 'cursor-not-allowed border-slate-800 bg-slate-950/30 opacity-60'
+          : isSelected
+            ? 'border-sky-400/60 bg-sky-500/10 ring-1 ring-inset ring-sky-400/30'
+            : 'border-slate-700 bg-slate-950/50 hover:border-slate-600 hover:bg-slate-900/50'
+      }`}
+    >
+      <div className="flex items-start gap-2.5">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium text-slate-100">{name}</div>
+          <div className="mt-1 text-[11px] leading-snug text-slate-500">{short}</div>
+        </div>
+        <span className="flex-none rounded-full bg-slate-800 px-2.5 py-0.5 font-mono text-[10px] font-semibold text-slate-300">
+          {coverPct == null ? '—' : `${Math.round(coverPct)}% Δ`}
+        </span>
+      </div>
+      <div className="mt-3.5 grid grid-cols-2 gap-2">
+        <div>
+          <div className="font-mono text-[10px] text-slate-500">Net CFaR</div>
+          <div className="font-mono text-xs font-medium tabular-nums text-yellow-200">
+            {netCfarUsdM == null ? '…' : fmtK(netCfarUsdM)}
+          </div>
+        </div>
+        <div>
+          <div className="font-mono text-[10px] text-slate-500">Carry</div>
+          <div className="font-mono text-xs font-medium tabular-nums text-emerald-200">
+            {carryUsdM == null ? '…' : fmtCarryK(carryUsdM)}
+          </div>
+        </div>
+      </div>
+    </button>
+  );
+}
+
 /**
  * Cumulative carry accrued to the end of each month (USD M), taken from the
  * realized platform book (`buildCashForecastSchedule` months) and scaled so its
@@ -643,6 +715,12 @@ const FRONTIER_PATHS = 600;
  * Styling follows the hedge carry profile modal locked kit (slate sections ·
  * violet CCY select · yellow CFaR).
  */
+const CFAR_WIZARD_STEPS: readonly AnalyticsWizardStep[] = [
+  { id: 'settings', n: 1, label: 'Settings', Icon: Shield },
+  { id: 'book', n: 2, label: 'Book', Icon: Coins },
+  { id: 'path', n: 3, label: 'Path', Icon: Activity },
+];
+
 export function CfarAnalysisView({
   risk,
   setup,
@@ -658,6 +736,7 @@ export function CfarAnalysisView({
   livePlanByCcy,
   extraForwards = [],
 }: CfarAnalysisViewProps) {
+  const wizard = useAnalyticsWizard(CFAR_WIZARD_STEPS.length);
   // Stable across renders but re-created the moment any rate input changes,
   // so the Monte Carlo memos below can depend on it directly: they re-run when
   // the curve moves and not on every unrelated render.
@@ -970,8 +1049,11 @@ export function CfarAnalysisView({
   const [whatIfLegs, setWhatIfLegs] = useState<WhatIfLegRow[]>(() =>
     seedWhatIfLegs(appliedDetail, T),
   );
-  /** Gear open = edit Settle / Notional; closed = read-only legs + metric chips. */
+  /** Gear open = edit Settle / Notional; closed = same table, read-only cells. */
   const [whatIfScheduleOpen, setWhatIfScheduleOpen] = useState(false);
+  const [cfarScenarioId, setCfarScenarioId] = useState<CfarHedgeScenarioId>('applied');
+  /** Chart pane: cover sweep (Liquidity Carry vs CFaR axes) or path drawdown. */
+  const [chartMode, setChartMode] = useState<'frontier' | 'drawdown'>('frontier');
   const syncedCcyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!selected) return;
@@ -979,12 +1061,17 @@ export function CfarAnalysisView({
     syncedCcyRef.current = selected.ccy;
     setWhatIfLegs(seedWhatIfLegs(appliedDetail, T));
     setWhatIfScheduleOpen(false);
+    setCfarScenarioId('applied');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?.ccy]);
-  const resetWhatIfToApplied = () =>
+  const resetWhatIfToApplied = () => {
     setWhatIfLegs(seedWhatIfLegs(appliedDetail, T));
-  const updateWhatIfLeg = (id: number, patch: Partial<WhatIfLegRow>) =>
+    setCfarScenarioId('applied');
+  };
+  const updateWhatIfLeg = (id: number, patch: Partial<WhatIfLegRow>) => {
+    setCfarScenarioId('custom');
     setWhatIfLegs(prev => prev.map(l => (l.id === id ? { ...l, ...patch } : l)));
+  };
   /**
    * Regenerate the whole schedule to `n` equally-spaced legs, redistributing
    * the current total notional evenly — same "− Legs +" behavior as the real
@@ -1000,6 +1087,30 @@ export function CfarAnalysisView({
         ? whatIfLegs.filter(l => l.on).reduce((s, l) => s + l.amountLocalM, 0)
         : (appliedDetail?.totalNotionalLocalM ?? 0);
     const per = roundNotionalM(total / count);
+    setCfarScenarioId('custom');
+    setWhatIfLegs(
+      Array.from({ length: count }, (_, i) => {
+        const k = i + 1;
+        const settle = k === count ? T : (k * T) / count;
+        return { id: i, on: true, settleMonths: roundMonths(settle), amountLocalM: per };
+      }),
+    );
+  };
+
+  const applyCoverRatio = (ratio: number, id: CfarHedgeScenarioId) => {
+    setCfarScenarioId(id);
+    if (id === 'applied') {
+      setWhatIfLegs(seedWhatIfLegs(appliedDetail, T));
+      return;
+    }
+    const baseTotal = appliedDetail?.totalNotionalLocalM
+      ?? Math.abs(selected?.endM ?? 0);
+    const count = Math.max(1, Math.min(24, whatIfLegs.length || appliedLegCount || 1));
+    if (ratio < 1e-9) {
+      setWhatIfLegs([{ id: 0, on: false, settleMonths: roundMonths(T), amountLocalM: 0 }]);
+      return;
+    }
+    const per = roundNotionalM((baseTotal * ratio) / count);
     setWhatIfLegs(
       Array.from({ length: count }, (_, i) => {
         const k = i + 1;
@@ -1423,6 +1534,64 @@ export function CfarAnalysisView({
   const frontier = showLast ? lastFrontierRef.current.sweep : freshSweep;
   const frontierApplied = showLast ? lastFrontierRef.current.applied : freshApplied;
 
+  const balancedCover = lowestReservePoint(efficientFrontier(frontier));
+  const maxCarryCover = frontier.reduce<FrontierPoint | null>(
+    (best, p) => (!best || p.carryUsdM > best.carryUsdM ? p : best),
+    null,
+  );
+  const pickCoverPoint = (ratio: number) =>
+    frontier.find(p => Math.abs(p.coverRatio - ratio) < 1e-9) ?? null;
+  const cfarHedgeScenarios: {
+    id: CfarHedgeScenarioId;
+    name: string;
+    short: string;
+    ratio: number;
+    point: FrontierPoint | null;
+  }[] = [
+    {
+      id: 'unhedged',
+      name: 'Unhedged',
+      short: 'Open book · hedge Δ = 0',
+      ratio: 0,
+      point: pickCoverPoint(0),
+    },
+    {
+      id: 'conservative',
+      name: 'Conservative',
+      short: 'Half cover · modest residual CFaR',
+      ratio: 0.5,
+      point: pickCoverPoint(0.5),
+    },
+    {
+      id: 'balanced',
+      name: 'Balanced',
+      short: 'Lowest net CFaR on the cover sweep',
+      ratio: balancedCover?.coverRatio ?? 1,
+      point: balancedCover,
+    },
+    {
+      id: 'full',
+      name: 'Full cover',
+      short: '100% of applied notional · equal legs',
+      ratio: 1,
+      point: pickCoverPoint(1),
+    },
+    {
+      id: 'maxCarry',
+      name: 'Max carry',
+      short: 'Over-hedge Δ · more carry, CFaR may rise',
+      ratio: maxCarryCover?.coverRatio ?? 1.5,
+      point: maxCarryCover,
+    },
+    {
+      id: 'applied',
+      name: 'Applied',
+      short: 'Legs as booked on the desk',
+      ratio: 1,
+      point: frontierApplied,
+    },
+  ];
+
   const simError = rowSim.error ?? detailSim.error;
   const simPending = rowSim.pending || detailSim.pending;
 
@@ -1445,7 +1614,17 @@ export function CfarAnalysisView({
   }
 
   return (
-    <div className="space-y-3">
+    <AnalyticsWizardShell
+      title="Cash-flow-at-risk"
+      steps={CFAR_WIZARD_STEPS}
+      step={wizard.step}
+      maxReached={wizard.maxReached}
+      onGoToStep={wizard.goToStep}
+      onNext={wizard.nextStep}
+      onPrev={wizard.prevStep}
+    >
+      {wizard.step === 1 && (
+      <>
       <div className="flex flex-wrap items-baseline justify-between gap-4">
         <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
           CFaR · critical cash absorption
@@ -1576,85 +1755,10 @@ export function CfarAnalysisView({
           </div>
         </div>
       </section>
+      </>
+      )}
 
-      {/* Chapter 1 — summary metric cards (locked kit) */}
-      <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-5">
-        <div className="rounded border border-yellow-700/40 bg-yellow-950/30 px-2 py-1.5">
-          <div className="text-[9px] uppercase text-yellow-400/80">
-            Net CFaR · {setup.confidencePct}%
-          </div>
-          <div className="font-mono text-sm font-semibold text-yellow-200">
-            {fmtK(totals.netCashUsdM)}
-          </div>
-          <div className="mt-0.5 text-[9px] text-yellow-200/70">
-            USD to reserve to survive every moment · $0 = carry covers it
-          </div>
-        </div>
-        <div className="rounded border border-sky-700/40 bg-sky-950/30 px-2 py-1.5">
-          <div className="text-[9px] uppercase text-sky-400/80">
-            Peak bridge funding · {setup.confidencePct}%
-          </div>
-          <div className="font-mono text-sm font-semibold text-sky-200">
-            {fmtK(totals.bridgeFundingUsdM)}
-          </div>
-          <div className="mt-0.5 text-[9px] text-sky-200/70">
-            facility to size, principal included ·{' '}
-            {fmtK(totals.planBridgeFundingUsdM)} of it planned
-          </div>
-        </div>
-        <div className="rounded border border-fuchsia-700/40 bg-fuchsia-950/30 px-2 py-1.5">
-          <div className="text-[9px] uppercase text-fuchsia-400/80">
-            Unplanned USD funding · {setup.confidencePct}%
-          </div>
-          <div className="font-mono text-sm font-semibold text-fuchsia-200">
-            {fmtK(totals.unplannedFundingUsdM)}
-          </div>
-          <div className="mt-0.5 text-[9px] text-fuchsia-200/70">
-            USD to move to hold fact on plan · survives σ=0
-          </div>
-        </div>
-        <div className="rounded border border-amber-700/40 bg-amber-950/30 px-2 py-1.5">
-          <div className="text-[9px] uppercase text-amber-400/80">Gross CFaR</div>
-          <div className="font-mono text-sm font-semibold text-amber-200">
-            {fmtK(totals.grossCashUsdM)}
-          </div>
-          <div className="mt-0.5 text-[9px] text-amber-200/70">
-            drawdown alone · before carry · the ceiling on Net
-          </div>
-        </div>
-        <div className="rounded border border-emerald-700/40 bg-emerald-950/30 px-2 py-1.5">
-          <div className="text-[9px] uppercase text-emerald-400/80">
-            Carry {carryOffsetUsdM >= 0 ? 'earned' : 'paid'}
-          </div>
-          <div
-            className={`font-mono text-sm font-semibold ${
-              carryOffsetUsdM >= 0 ? 'text-emerald-200' : 'text-rose-300'
-            }`}
-          >
-            {fmtSignedK(carryOffsetUsdM)}
-          </div>
-          <div className="mt-0.5 text-[9px] text-emerald-200/60">
-            {carryOffsetUsdM >= 0
-              ? 'Cash Carry · All CCY Σ · reduces the reserve'
-              : 'Cash Carry · All CCY Σ · a cost, but not a risk reserve'}
-          </div>
-        </div>
-        <div className="rounded border border-blue-700/40 bg-blue-950/30 px-2 py-1.5">
-          <div className="text-[9px] uppercase text-blue-400/80">
-            Sim carry · mean ± std
-          </div>
-          <div className="font-mono text-sm font-semibold text-blue-200">
-            {fmtSignedK(totals.mismatchCarryMeanUsdM)}
-            <span className="mx-1 text-slate-600">±</span>
-            {fmtK(totals.mismatchCarryStdUsdM)}
-          </div>
-          <div className="mt-0.5 text-[9px] text-blue-200/60">
-            hedge points + ledger interest · ± is the buffer at risk (Σ)
-          </div>
-        </div>
-      </div>
-
-      {/* Chapter 2 — per-currency critical cash table (violet select kit) */}
+      {wizard.step === 2 && (
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
@@ -1915,14 +2019,60 @@ export function CfarAnalysisView({
           </table>
         </div>
       </div>
+      )}
 
-      {/* Chapter 3 — drawdown fan for the selected currency */}
-      {selected && (
-        <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
-              {selected.ccy} · {selected.hedged ? 'residual' : 'open'} cash
-              drawdown
+      {wizard.step === 3 && selected && (
+        <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)]">
+          <section className="flex flex-col gap-3.5 rounded-2xl border border-slate-700 bg-slate-950/40 p-5">
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-medium text-slate-100">Solutions</h2>
+              <span className="font-mono text-[11px] text-slate-500">
+                CFaR × hedge Δ
+              </span>
+            </div>
+            <div className="flex flex-col gap-3">
+              {cfarHedgeScenarios.map(s => (
+                <CfarHedgeScenarioCard
+                  key={s.id}
+                  name={s.name}
+                  short={s.short}
+                  coverPct={s.point ? s.point.coverRatio * 100 : s.ratio * 100}
+                  netCfarUsdM={s.point?.netCfarUsdM ?? null}
+                  carryUsdM={s.point?.carryUsdM ?? null}
+                  isSelected={cfarScenarioId === s.id}
+                  disabled={s.id !== 'applied' && s.id !== 'unhedged' && !s.point && frontier.length === 0}
+                  onSelect={() => applyCoverRatio(s.ratio, s.id)}
+                />
+              ))}
+              {cfarScenarioId === 'custom' && (
+                <CfarHedgeScenarioCard
+                  name="Custom"
+                  short="Edited strip · gear or Legs −/+"
+                  coverPct={
+                    Math.abs(selected.endM) > 1e-9
+                      ? ((whatIf?.totalNotionalLocalM ?? 0) / selected.endM) * 100
+                      : null
+                  }
+                  netCfarUsdM={whatIf?.bands.netCriticalCashUsdM ?? null}
+                  carryUsdM={whatIf?.totalCarryUsdM ?? null}
+                  isSelected
+                  onSelect={() => undefined}
+                />
+              )}
+            </div>
+          </section>
+
+        <section className="flex flex-col gap-6 rounded-2xl border border-slate-700 bg-slate-950/40 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-base font-medium text-slate-100">
+                {cfarHedgeScenarios.find(s => s.id === cfarScenarioId)?.name
+                  ?? (cfarScenarioId === 'custom' ? 'Custom' : selected.ccy)}
+              </h2>
+              <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                {cfarHedgeScenarios.find(s => s.id === cfarScenarioId)?.short
+                  ?? 'Edited hedge Δ vs the booked strip. Gear edits settle and notional; presets on the left re-seed cover.'}
+              </p>
             </div>
             <div
               className="inline-flex shrink-0 flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
@@ -1949,19 +2099,163 @@ export function CfarAnalysisView({
             </div>
           </div>
 
-          {/* What-if: review (chips + read-only legs) by default; gear = edit tick trades.
-              Legs −/+ always available in both modes. */}
+          {/* Impact metrics first — same Net / Gross / Carry defs as the charts below. */}
+          <div className="rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
+            {whatIf ? (
+              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                <WhatIfDeltaRow
+                  label="Net CFaR"
+                  current={selected.bands.netCriticalCashUsdM}
+                  proposed={whatIf.bands.netCriticalCashUsdM}
+                  fmt={fmtK}
+                  lowerIsBetter
+                  note="USD to reserve to survive every moment at this confidence, each path netting its own stochastic carry. More/better-spaced legs shrink the mismatch — this should fall, and reads $0 once carry covers every excursion."
+                />
+                <WhatIfDeltaRow
+                  label="Gross CFaR"
+                  current={selected.bands.criticalCashUsdM}
+                  proposed={whatIf.bands.criticalCashUsdM}
+                  fmt={fmtK}
+                  lowerIsBetter
+                  note="The drawdown on its own, before carry. Net sits below this when the book earns carry and above it when the book pays."
+                />
+                <WhatIfDeltaRow
+                  label="Sim carry"
+                  current={selected.bands.carryMeanUsdM}
+                  proposed={whatIf.bands.carryMeanUsdM}
+                  fmt={fmtSignedK}
+                  lowerIsBetter={false}
+                  note="Mean total carry the simulation banks — the hedge's forward points plus the ledger's own interest on both accounts. This is the buffer Net CFaR is measured against."
+                />
+                <WhatIfDeltaRow
+                  label="Funding gap"
+                  current={selected.fundingGap?.maxGapUsdM ?? 0}
+                  proposed={whatIf.fundingGap?.maxGapUsdM ?? 0}
+                  fmt={fmtK}
+                  lowerIsBetter
+                  note="Deterministic settlement residual floor."
+                />
+                <WhatIfDeltaRow
+                  label="Carry"
+                  current={selected.totalCarryUsdM}
+                  proposed={whatIf.totalCarryUsdM}
+                  fmt={fmtCarryK}
+                  lowerIsBetter={false}
+                  note="Total carry @ Tf — same as Cash Carry Total."
+                />
+                <WhatIfDeltaRow
+                  label="Do nothing"
+                  current={selected.doNothingUsdM}
+                  proposed={whatIf.doNothingUsdM}
+                  fmt={fmtCarryK}
+                  lowerIsBetter={false}
+                  note="Unhedged income @ Tf."
+                />
+                <WhatIfDeltaRow
+                  label="Δ Benefit"
+                  current={selected.benefitUsdM}
+                  proposed={whatIf.benefitUsdM}
+                  fmt={fmtCarryK}
+                  lowerIsBetter={false}
+                  note="Total − Do nothing."
+                />
+                <WhatIfDeltaRow
+                  label="Cover"
+                  current={appliedDetail?.totalNotionalLocalM ?? 0}
+                  proposed={whatIf.totalNotionalLocalM}
+                  fmt={fmtM}
+                  lowerIsBetter={false}
+                  note="Total dealt notional (local M)."
+                />
+              </div>
+            ) : (
+              <p className="text-[9px] text-slate-500">
+                No legs ticked On — open the gear and turn a leg on to see
+                impact.
+              </p>
+            )}
+          </div>
+
+          {/* Chart pane: Liquidity-style Carry vs CFaR frontier, or path drawdown. */}
+          <div className="overflow-hidden rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
+            <ChartViewFrame
+              ariaLabel="Chart view"
+              value={chartMode}
+              onChange={setChartMode}
+              options={[
+                { id: 'frontier', label: 'Frontier' },
+                { id: 'drawdown', label: 'CFaR drawdown' },
+              ]}
+              extra={
+                chartMode === 'drawdown' ? (
+                  <span className="rounded-md border border-slate-700/70 bg-slate-950/80 px-1.5 py-0.5 font-mono text-[9px] text-slate-400">
+                    what-if {fmtM(whatIf?.totalNotionalLocalM ?? 0)}
+                    {' '}· {whatIfLegs.filter(l => l.on).length} leg
+                    {whatIfLegs.filter(l => l.on).length === 1 ? '' : 's'}
+                    {' '}· Net {fmtK(selected.bands.netCriticalCashUsdM)}
+                  </span>
+                ) : frontier.length > 1 ? (
+                  <span className="rounded-md border border-slate-700/70 bg-slate-950/80 px-1.5 py-0.5 font-mono text-[9px] text-slate-400">
+                    cover {Math.round((frontier[0]?.coverRatio ?? 0) * 100)}–
+                    {Math.round((frontier[frontier.length - 1]?.coverRatio ?? 0) * 100)}%
+                    {' '}· {appliedLegCount} legs
+                  </span>
+                ) : null
+              }
+            >
+            {chartMode === 'frontier' ? (
+              frontier.length > 1 ? (
+                <FrontierChart
+                  overlay
+                  points={frontier}
+                  applied={frontierApplied}
+                  legCount={appliedLegCount}
+                  selectedCoverRatio={
+                    cfarScenarioId === 'custom'
+                      ? null
+                      : (cfarHedgeScenarios.find(s => s.id === cfarScenarioId)?.ratio ?? null)
+                  }
+                  onPickCover={(ratio) => {
+                    const named = cfarHedgeScenarios.find(
+                      s => s.point && Math.abs(s.point.coverRatio - ratio) < 1e-9,
+                    );
+                    applyCoverRatio(ratio, named?.id ?? 'custom');
+                  }}
+                />
+              ) : (
+                <div className="rounded border border-dashed border-slate-700 bg-slate-950/40 px-4 py-10 text-center text-[11px] text-slate-500">
+                  Cover sweep is still pricing — frontier appears once the batch lands.
+                </div>
+              )
+            ) : (
+              <>
+                <CfarDrawdownChart
+                  bands={whatIf?.bands ?? selected.bands}
+                  confidencePct={setup.confidencePct}
+                  height={240}
+                  showHeader={false}
+                />
+                <CfarDecompositionCharts
+                  components={(whatIf?.bands ?? selected.bands).components}
+                />
+              </>
+            )}
+            </ChartViewFrame>
+          </div>
+
+          {/* Trades: editable hedge Δ schedule */}
           <div className="mb-2 rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
             <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-1.5">
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
-                  What-if hedge · tick trades
+                  Hedge Δ · schedule
                 </div>
-                <InfoTip label="What-if hedge">
+                <InfoTip label="Hedge Δ schedule">
                   <p>
-                    Review mode shows Cover / Legs / Carry chips and a read-only
-                    strip table. Legs −/+ always redistribute. Amber gear opens
-                    Settle · Notional editing. Reset restores Applied legs.
+                    Same strip table as Carry overlay. Review and edit stay the
+                    same height — gear unlocks settle and notional. Legs −/+
+                    redistribute. Presets on the left set cover Δ vs the applied
+                    book.
                   </p>
                 </InfoTip>
               </div>
@@ -2019,7 +2313,7 @@ export function CfarAnalysisView({
               </div>
             </div>
 
-            {!whatIfScheduleOpen && whatIf && (
+            {whatIf && (
               <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                 {(() => {
                   const chip =
@@ -2100,11 +2394,14 @@ export function CfarAnalysisView({
               </div>
             )}
 
-            {whatIfScheduleOpen ? (
-              <div className="mb-1.5 rounded border border-amber-500/25 bg-slate-950/70 p-1.5">
+            <div className="mb-1.5 min-h-[12.5rem] rounded border border-amber-500/30 bg-slate-950/50 p-1.5">
                 <div className="mb-1.5 text-[9px] font-semibold uppercase tracking-wide text-amber-200/90">
-                  Edit · Settle · Notional · Carry
+                  Schedule setup
+                  <span className="ml-1 font-normal normal-case tracking-normal text-slate-500">
+                    {whatIfScheduleOpen ? '· edit settle & Δ' : '· review'}
+                  </span>
                 </div>
+                {whatIfScheduleOpen ? (
                 <div className="overflow-x-auto">
                   <table className="w-full min-w-[520px] text-left text-[10px]">
                     <thead>
@@ -2141,8 +2438,8 @@ export function CfarAnalysisView({
                           ? whatIfLegMetricsById.get(row.id)
                           : undefined;
                         return (
-                        <tr key={row.id} className="border-b border-slate-900/80">
-                          <td className="py-1 pr-2">
+                        <tr key={row.id} className="h-7 border-b border-slate-900/80">
+                          <td className="py-0 pr-2">
                             <input
                               type="checkbox"
                               checked={row.on}
@@ -2154,13 +2451,14 @@ export function CfarAnalysisView({
                               className="h-3.5 w-3.5 accent-sky-500"
                             />
                           </td>
-                          <td className="py-1 pr-3">
+                          <td className="py-0 pr-3">
                             <input
                               type="number"
                               step={0.5}
                               min={0}
                               max={T}
                               value={row.settleMonths}
+                              readOnly={!whatIfScheduleOpen}
                               onChange={e =>
                                 updateWhatIfLeg(row.id, {
                                   settleMonths: Math.max(
@@ -2169,21 +2467,22 @@ export function CfarAnalysisView({
                                   ),
                                 })
                               }
-                              className="w-16 rounded border border-amber-500/40 bg-slate-900 px-1 py-0.5 font-mono text-amber-100"
+                              className="h-6 w-16 rounded border border-amber-500/40 bg-slate-900 px-1 py-0 font-mono text-amber-100"
                             />
                             <span className="ml-1 text-slate-500">m</span>
                           </td>
-                          <td className="py-1 pr-3">
+                          <td className="py-0 pr-3">
                             <input
                               type="number"
                               step={0.1}
                               value={row.amountLocalM}
+                              readOnly={!whatIfScheduleOpen}
                               onChange={e =>
                                 updateWhatIfLeg(row.id, {
                                   amountLocalM: Number(e.target.value) || 0,
                                 })
                               }
-                              className="w-20 rounded border border-amber-500/40 bg-slate-900 px-1 py-0.5 font-mono text-amber-100"
+                              className="h-6 w-20 rounded border border-amber-500/40 bg-slate-900 px-1 py-0 font-mono text-amber-100"
                             />
                             <span className="ml-1 text-slate-500">M</span>
                           </td>
@@ -2233,7 +2532,6 @@ export function CfarAnalysisView({
                     </tbody>
                   </table>
                 </div>
-              </div>
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full min-w-[520px] text-left text-[10px]">
@@ -2333,118 +2631,23 @@ export function CfarAnalysisView({
                 </table>
               </div>
             )}
+            </div>
 
             <p className="mb-2 mt-1.5 text-[9px] leading-relaxed text-slate-500">
               Seeded from the {selected.ccy} hedge applied above (
               {appliedDetail?.source ?? 'none'}). Use Legs −/+ any time; open
               the gear to edit Settle / Notional per leg.
             </p>
-            {whatIf ? (
-              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
-                <WhatIfDeltaRow
-                  label="Net CFaR"
-                  current={selected.bands.netCriticalCashUsdM}
-                  proposed={whatIf.bands.netCriticalCashUsdM}
-                  fmt={fmtK}
-                  lowerIsBetter
-                  note="USD to reserve to survive every moment at this confidence, each path netting its own stochastic carry. More/better-spaced legs shrink the mismatch — this should fall, and reads $0 once carry covers every excursion."
-                />
-                <WhatIfDeltaRow
-                  label="Gross CFaR"
-                  current={selected.bands.criticalCashUsdM}
-                  proposed={whatIf.bands.criticalCashUsdM}
-                  fmt={fmtK}
-                  lowerIsBetter
-                  note="The drawdown on its own, before carry. Net sits below this when the book earns carry and above it when the book pays."
-                />
-                <WhatIfDeltaRow
-                  label="Sim carry"
-                  current={selected.bands.carryMeanUsdM}
-                  proposed={whatIf.bands.carryMeanUsdM}
-                  fmt={fmtSignedK}
-                  lowerIsBetter={false}
-                  note="Mean total carry the simulation banks — the hedge's forward points plus the ledger's own interest on both accounts. This is the buffer Net CFaR is measured against."
-                />
-                <WhatIfDeltaRow
-                  label="Funding gap"
-                  current={selected.fundingGap?.maxGapUsdM ?? 0}
-                  proposed={whatIf.fundingGap?.maxGapUsdM ?? 0}
-                  fmt={fmtK}
-                  lowerIsBetter
-                  note="Deterministic settlement residual floor."
-                />
-                <WhatIfDeltaRow
-                  label="Carry"
-                  current={selected.totalCarryUsdM}
-                  proposed={whatIf.totalCarryUsdM}
-                  fmt={fmtCarryK}
-                  lowerIsBetter={false}
-                  note="Total carry @ Tf — same as Cash Carry Total."
-                />
-                <WhatIfDeltaRow
-                  label="Do nothing"
-                  current={selected.doNothingUsdM}
-                  proposed={whatIf.doNothingUsdM}
-                  fmt={fmtCarryK}
-                  lowerIsBetter={false}
-                  note="Unhedged income @ Tf."
-                />
-                <WhatIfDeltaRow
-                  label="Δ Benefit"
-                  current={selected.benefitUsdM}
-                  proposed={whatIf.benefitUsdM}
-                  fmt={fmtCarryK}
-                  lowerIsBetter={false}
-                  note="Total − Do nothing."
-                />
-                <WhatIfDeltaRow
-                  label="Cover"
-                  current={appliedDetail?.totalNotionalLocalM ?? 0}
-                  proposed={whatIf.totalNotionalLocalM}
-                  fmt={fmtM}
-                  lowerIsBetter={false}
-                  note="Total dealt notional (local M)."
-                />
-              </div>
-            ) : (
-              <p className="text-[9px] text-slate-500">
-                No legs ticked On — open the gear and turn a leg on to see
-                impact.
-              </p>
-            )}
           </div>
-
-          <div className="mb-1 flex items-baseline justify-between">
-            <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-400">
-              Chart shows: what-if scenario ({fmtM(whatIf?.totalNotionalLocalM ?? 0)}
-              {' '}across {whatIfLegs.filter(l => l.on).length} leg
-              {whatIfLegs.filter(l => l.on).length === 1 ? '' : 's'})
-            </span>
-            <span className="text-[9px] text-slate-600">
-              current Net CFaR {fmtK(selected.bands.netCriticalCashUsdM)} shown
-              above for reference
-            </span>
-          </div>
-          <CfarDrawdownChart
-            bands={whatIf?.bands ?? selected.bands}
-            confidencePct={setup.confidencePct}
-            height={240}
-          />
-
-          <CfarDecompositionCharts
-            components={(whatIf?.bands ?? selected.bands).components}
-          />
-
-          {frontier.length > 1 && (
-            <FrontierChart
-              points={frontier}
-              applied={frontierApplied}
-              legCount={appliedLegCount}
-            />
-          )}
         </section>
+        </div>
       )}
-    </div>
+      {wizard.step === 3 && !selected && (
+        <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
+          Select a currency on Book to open the drawdown path.
+        </div>
+      )}
+    </AnalyticsWizardShell>
   );
 }
 
@@ -2759,121 +2962,160 @@ function axisTicks(min: number, max: number, target: number): number[] {
 }
 
 /**
- * Efficient frontier: gross CFaR against carry as COVER varies, leg spacing
- * held at the applied hedge's.
+ * Efficient frontier — same axes as Liquidity Carry vs CFaR:
+ *   X = Gross CFaR (risk, safer ← left)
+ *   Y = Carry (more ↑)
  *
- * Both axes are independent by construction — see {@link FrontierPoint} for
- * why the risk axis cannot be Net CFaR, and why cover is the dial rather than
- * leg count. Net is still the criterion the desk optimises, and on these axes
- * it is a diagonal: net = gross − carry, so lines of equal reserve run at 45°
- * in data space and the best structure is the one the lowest such line
- * touches. That point is marked rather than left to be eyeballed.
+ * The drawn curve is the cover dial in order (0% → 150%), which is U-shaped
+ * in CFaR — not the dominance skyline sorted by risk (that collapses the
+ * under-hedged arm and leaves the applied strip floating off the path).
+ * Spline each arm separately: x must stay monotone for Fritsch–Carlson.
+ * Applied replaces the 100% equal-leg sample on the trace so the dealt strip
+ * sits on the curve.
  */
 function FrontierChart({
   points,
   applied,
   legCount,
+  selectedCoverRatio,
+  onPickCover,
+  overlay,
 }: {
   points: FrontierPoint[];
   applied: FrontierPoint | null;
   legCount: number;
+  selectedCoverRatio?: number | null;
+  onPickCover?: (coverRatio: number) => void;
+  overlay?: boolean;
 }) {
   const W = 560;
-  const H = 210;
-  const padL = 60;
-  const padR = 22;
-  const padT = 16;
-  const padB = 42;
+  const H = overlay ? 256 : 240;
+  const padL = 56;
+  const padR = 18;
+  const padT = overlay ? 36 : 16;
+  const padB = 40;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
-  const drawn = applied ? [...points, applied] : points;
+
+  /** Cover-order walk; applied stands in for the 100% equal-leg rung. */
+  const trace: FrontierPoint[] = (() => {
+    const pts = points.map(p => ({ ...p }));
+    if (applied) {
+      const i = pts.findIndex(p => Math.abs(p.coverRatio - 1) < 1e-9);
+      if (i >= 0) pts[i] = { ...applied, coverRatio: 1 };
+      else pts.push({ ...applied, coverRatio: applied.coverRatio });
+    }
+    return pts.sort((a, b) => a.coverRatio - b.coverRatio);
+  })();
+
+  const drawn = trace;
   const allCarry = drawn.map(p => p.carryUsdM);
   const allCfar = drawn.map(p => p.grossCfarUsdM);
-  let xMin = Math.min(...allCarry);
-  let xMax = Math.max(...allCarry);
-  if (xMax - xMin < 1e-9) {
-    xMin -= 0.01;
-    xMax += 0.01;
+  let xMin = Math.min(...allCfar);
+  let xMax = Math.max(...allCfar);
+  if (!(xMax > xMin)) {
+    xMin = Math.max(0, xMin - 0.01);
+    xMax = xMin + 0.02;
   }
-  const xPad = (xMax - xMin) * 0.12;
-  xMin -= xPad;
+  const xPad = (xMax - xMin) * 0.08;
+  xMin = Math.max(0, xMin - xPad);
   xMax += xPad;
-  const yMax = Math.max(1e-9, Math.max(...allCfar) * 1.12);
-  const x = (v: number) => padL + ((v - xMin) / (xMax - xMin)) * plotW;
-  const y = (v: number) => padT + (1 - v / yMax) * plotH;
+
+  let yMin = Math.min(0, ...allCarry);
+  let yMax = Math.max(...allCarry);
+  if (!(yMax > yMin)) {
+    yMin -= 0.01;
+    yMax += 0.01;
+  }
+  const yPad = (yMax - yMin) * 0.12;
+  yMin -= yPad;
+  yMax += yPad;
+
+  const x = (cfar: number) => padL + ((cfar - xMin) / (xMax - xMin)) * plotW;
+  const y = (carry: number) => padT + (1 - (carry - yMin) / (yMax - yMin)) * plotH;
   const xTicks = axisTicks(xMin, xMax, 5);
-  const yTicks = axisTicks(0, yMax, 6);
+  const yTicks = axisTicks(yMin, yMax, 5);
+
   const efficient = efficientFrontier(points);
   const onFrontier = new Set(efficient);
-  // Splined, and safe to spline: the efficient set comes back sorted by carry
-  // and rises in both coordinates, so x is monotone and the Fritsch–Carlson
-  // clamp cannot bulge the curve past a structure the sweep actually priced.
-  const frontierPath = splinePath(
-    efficient.map(p => [x(p.carryUsdM), y(p.grossCfarUsdM)] as SplinePt),
-  );
-  const x0 = x(0);
-  const best = lowestReservePoint(efficient);
+  const efficientCover = new Set(efficient.map(p => p.coverRatio));
+
+  /** Split at the safest cover so each arm is x-monotone for the spline. */
+  let minRiskIdx = 0;
+  for (let i = 1; i < trace.length; i += 1) {
+    if (trace[i]!.grossCfarUsdM < trace[minRiskIdx]!.grossCfarUsdM - 1e-12) {
+      minRiskIdx = i;
+    }
+  }
+  const toXY = (p: FrontierPoint): SplinePt => [x(p.grossCfarUsdM), y(p.carryUsdM)];
+  const leftArm = trace.slice(0, minRiskIdx + 1).map(toXY);
+  const rightArm = trace.slice(minRiskIdx).map(toXY);
+  const sweepPath = [
+    leftArm.length ? splinePath(leftArm) : '',
+    rightArm.length > 1 ? splinePath(rightArm) : '',
+  ].filter(Boolean).join(' ');
+
+  // Efficient highlight: cover-order subset, same arm split.
+  const effTrace = trace.filter(p => efficientCover.has(p.coverRatio)
+    || (applied && Math.abs(p.coverRatio - 1) < 1e-9 && efficientCover.has(1)));
+  let effMinIdx = 0;
+  for (let i = 1; i < effTrace.length; i += 1) {
+    if (effTrace[i]!.grossCfarUsdM < effTrace[effMinIdx]!.grossCfarUsdM - 1e-12) {
+      effMinIdx = i;
+    }
+  }
+  const effLeft = effTrace.slice(0, effMinIdx + 1).map(toXY);
+  const effRight = effTrace.slice(effMinIdx).map(toXY);
+  const efficientPath = [
+    effLeft.length ? splinePath(effLeft) : '',
+    effRight.length > 1 ? splinePath(effRight) : '',
+  ].filter(Boolean).join(' ');
+
+  const best = overlay ? null : lowestReservePoint(efficient);
   const pct = (p: FrontierPoint) => `${Math.round(p.coverRatio * 100)}%`;
   const degenerate = isDegenerateFrontier(points, efficient);
+  const selected =
+    selectedCoverRatio != null && Number.isFinite(selectedCoverRatio)
+      ? points.find(p => Math.abs(p.coverRatio - selectedCoverRatio) < 1e-9) ?? null
+      : null;
+  const appliedOnTrace = applied
+    ? trace.find(p => Math.abs(p.coverRatio - 1) < 1e-9) ?? applied
+    : null;
+
   return (
-    <div className="mt-3 rounded-md border border-slate-700/80 bg-slate-950/50 p-2">
-      <div className="mb-1.5 flex items-center justify-between gap-2">
+    <div>
+      {!overlay && (
+      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
-          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-300">
-            Efficient frontier · Gross CFaR vs Carry
+          <span className="font-mono text-[9px] font-semibold uppercase tracking-[0.09em] text-slate-400">
+            Carry vs CFaR
           </span>
           <InfoTip label="Efficient frontier">
             <p>
-              Each point scales the applied notional to a cover level, spreads
-              it across the same {legCount} evenly-spaced leg
-              {legCount === 1 ? '' : 's'}, and re-runs the full carry + CFaR
-              pipeline — all against the same random draws, so the difference
-              between two points is the structure and not the sample.
+              Same plane as Liquidity Optimize: Gross CFaR on X, Carry on Y. The
+              curve walks cover 0%→150% in order — risk is U-shaped (falls to a
+              minimum near full cover, then rises on the over-hedge), while carry
+              keeps climbing. Green = efficient subset (not dominated).
             </p>
             <p className="mt-1">
-              Cover is the dial, not leg count. Leg count trades nothing off:
-              settling earlier closes the mismatch AND converts into the
-              higher-yielding currency sooner, so more legs win on both counts
-              and everything else is dominated. Cover is two-sided — risk falls
-              to a minimum near full cover and climbs again beyond it, where
-              the over-hedge is an exposure of its own, while carry keeps
-              rising with notional.
-            </p>
-            <p className="mt-1">
-              The risk axis is GROSS CFaR, before carry. Net CFaR would put
-              carry on both axes — it is the drawdown already less the carry —
-              and a structure would appear to buy down risk with carry it had
-              just been paid for on the x-axis. Net is still what you minimise,
-              and here it is a diagonal: net = gross − carry, so equal-reserve
-              lines run at 45° and the best cover is the one the lowest such
-              line touches. That is the filled amber dot
+              Amber ring is the dealt strip (stands on the 100% rung). Filled
+              amber is lowest Net
               {best ? ` (${pct(best)} cover, net ${fmtK(best.netCfarUsdM)})` : ''}.
-            </p>
-            <p className="mt-1">
-              Hollow dots are efficient but not optimal. Grey dots are
-              DOMINATED — some other cover level gives at least as much carry
-              for no more risk — so the curve skips them. On a currency that
-              earns carry that is the whole under-hedged branch, since covering
-              more buys less risk and more carry at once. The amber ring is the
-              hedge actually applied, priced on this same basis; its legs are
-              wherever they were dealt rather than evenly spaced, so it can sit
-              inside the curve.
+              Click a cover label to load that structure.
             </p>
           </InfoTip>
         </div>
         <span className="text-[9px] text-slate-500">
-          cover {pct(points[0]!)}–{pct(points[points.length - 1]!)} of applied ·{' '}
-          {legCount} leg{legCount === 1 ? '' : 's'} · {FRONTIER_PATHS} paths, common seed
+          cover {pct(points[0]!)}–{pct(points[points.length - 1]!)} ·{' '}
+          {legCount} leg{legCount === 1 ? '' : 's'} · {FRONTIER_PATHS} paths
         </span>
       </div>
+      )}
       {degenerate && (
         <p className="mb-1 text-[8.5px] leading-snug text-amber-300/70">
-          No trade-off to walk at this leg spacing: cover barely moves risk
-          across the whole sweep, so whatever slope survives dominance is
-          inside the simulation&apos;s own error. Read the filled dot as the
-          answer rather than as a compromise — and if these are bullets, that
-          is why, since one settlement at maturity cannot touch a drawdown that
-          peaks before it.
+          No real trade-off at this leg spacing — cover barely moves risk.
+          Read the filled dot as the answer, not a compromise (bullets often
+          look like this).
         </p>
       )}
       <svg
@@ -2892,7 +3134,7 @@ function FrontierChart({
               strokeWidth={1}
             />
             <text x={padL - 6} y={y(v) + 3} textAnchor="end" fontSize={8} fill="#64748b">
-              {fmtK(v)}
+              {fmtCarryK(v)}
             </text>
           </g>
         ))}
@@ -2913,13 +3155,10 @@ function FrontierChart({
               fontSize={8}
               fill="#64748b"
             >
-              {fmtSignedK(v)}
+              {fmtK(v)}
             </text>
           </g>
         ))}
-        {xMin < 0 && xMax > 0 && (
-          <line x1={x0} y1={padT} x2={x0} y2={H - padB} stroke="#475569" strokeWidth={1} strokeDasharray="2 3" />
-        )}
         <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#475569" strokeWidth={1} />
         <line x1={padL} y1={padT} x2={padL} y2={H - padB} stroke="#475569" strokeWidth={1} />
         <text
@@ -2929,7 +3168,7 @@ function FrontierChart({
           fontSize={8}
           fill="#94a3b8"
         >
-          Carry — more to the right →
+          Gross CFaR — riskier →
         </text>
         <text
           x={12}
@@ -2939,72 +3178,78 @@ function FrontierChart({
           fill="#94a3b8"
           transform={`rotate(-90 12 ${padT + plotH / 2})`}
         >
-          ← safer · Gross CFaR
+          Carry ↑
         </text>
+        {/* Full cover walk (U in CFaR). */}
         <path
-          d={frontierPath}
+          d={sweepPath}
           fill="none"
-          stroke="#facc15"
-          strokeWidth={1.5}
+          stroke="#475569"
+          strokeWidth={1.25}
           strokeLinecap="round"
-          opacity={0.75}
+          opacity={0.9}
         />
-        {points.map(p => {
-          const isBest = p === best;
-          const isEfficient = onFrontier.has(p);
+        {/* Efficient subset on that walk. */}
+        <path
+          d={efficientPath}
+          fill="none"
+          stroke="#34d399"
+          strokeWidth={2}
+          strokeLinecap="round"
+          opacity={0.95}
+        />
+        {trace.map(p => {
+          const isAppliedRung = appliedOnTrace != null && p === appliedOnTrace;
+          const sweepTwin = points.find(q => Math.abs(q.coverRatio - p.coverRatio) < 1e-9);
+          const isBest = sweepTwin != null && sweepTwin === best;
+          const isEfficient = sweepTwin != null && onFrontier.has(sweepTwin);
+          const isSelected = selected != null && sweepTwin === selected;
+          const cx = x(p.grossCfarUsdM);
+          const cy = y(p.carryUsdM);
           return (
-            <g key={p.coverRatio}>
+            <g
+              key={p.coverRatio}
+              className={onPickCover ? 'cursor-pointer' : undefined}
+              onClick={() => onPickCover?.(p.coverRatio)}
+            >
               <circle
-                cx={x(p.carryUsdM)}
-                cy={y(p.grossCfarUsdM)}
-                r={isBest ? 4 : 2.5}
+                cx={cx}
+                cy={cy}
+                r={isBest ? 4.5 : isSelected || isAppliedRung ? 3.5 : 2.5}
                 fill={isBest ? '#facc15' : '#0b1220'}
-                stroke={isEfficient ? '#facc15' : '#64748b'}
-                strokeWidth={isBest ? 0 : 1.5}
+                stroke={
+                  isAppliedRung ? '#f97316'
+                    : isSelected ? '#38bdf8'
+                      : isEfficient ? '#34d399'
+                        : '#64748b'
+                }
+                strokeWidth={isBest ? 0 : isAppliedRung || isSelected ? 2 : 1.5}
               />
+              <title>
+                {`${pct(p)} cover · CFaR ${fmtK(p.grossCfarUsdM)} · Carry ${fmtCarryK(p.carryUsdM)} · Net ${fmtK(p.netCfarUsdM)}`}
+              </title>
               <text
-                x={x(p.carryUsdM)}
-                y={y(p.grossCfarUsdM) - 7}
+                x={cx}
+                y={cy - 7}
                 textAnchor="middle"
                 fontSize={8}
-                fontWeight={isBest ? 700 : 500}
-                fill={isBest ? '#fde047' : isEfficient ? '#94a3b8' : '#64748b'}
-                opacity={isEfficient ? 1 : 0.55}
+                fontWeight={isBest || isSelected || isAppliedRung ? 700 : 500}
+                fill={
+                  isBest ? '#fde047'
+                    : isAppliedRung ? '#fdba74'
+                      : isSelected ? '#7dd3fc'
+                        : isEfficient ? '#94a3b8'
+                          : '#64748b'
+                }
+                opacity={isEfficient || isSelected || isAppliedRung ? 1 : 0.55}
               >
-                {pct(p)}
+                {isAppliedRung ? 'applied' : pct(p)}
               </text>
             </g>
           );
         })}
-        {applied && (
-          <g>
-            <circle
-              cx={x(applied.carryUsdM)}
-              cy={y(applied.grossCfarUsdM)}
-              r={5.5}
-              fill="none"
-              stroke="#f97316"
-              strokeWidth={1.5}
-            />
-            <circle
-              cx={x(applied.carryUsdM)}
-              cy={y(applied.grossCfarUsdM)}
-              r={1.5}
-              fill="#f97316"
-            />
-            <text
-              x={x(applied.carryUsdM)}
-              y={y(applied.grossCfarUsdM) + 15}
-              textAnchor="middle"
-              fontSize={8}
-              fontWeight={700}
-              fill="#fdba74"
-            >
-              applied
-            </text>
-          </g>
-        )}
       </svg>
     </div>
   );
 }
+

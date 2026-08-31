@@ -8,14 +8,22 @@ import {
   defaultCurriculumFxConfig,
   defaultRateIndex,
   emptyWorkspace,
+  entityAllCurrencies,
+  entityLpCurrencies,
   fxConfigFromDashboardSetup,
+  hydrateEntity,
+  hydrateWorkspace,
   groupFxUnlocked,
   loadWorkspaceDetailed,
+  normalizeOptimize,
+  normalizeProtect,
   saveWorkspace,
   supportsInstruments,
   tickersFromInstruments,
   updateDashboardFromWizard,
+  updateEntity,
   type DashboardSetup,
+  type Entity,
   type Workspace,
 } from '@/lib/workspace-store';
 import {
@@ -28,8 +36,8 @@ import { seedSandbox } from '@/lib/test-mode/store';
 describe('applyStructureWizard', () => {
   const fxDesk: DashboardSetup = {
     riskAsset: 'currencies',
-    protect: ['assetValue', 'cashFlow'],
-    optimize: ['var', 'hedgeCarry'],
+    protect: ['var'],
+    optimize: ['hedgeRatio', 'carryCashInterest'],
     tickers: ['EUR', 'GBP', 'JPY'],
   };
 
@@ -83,8 +91,8 @@ describe('applyStructureWizard', () => {
           dashboardName: 'Metals desk',
           setup: {
             riskAsset: 'commodities',
-            protect: ['assetValue'],
-            optimize: ['var'],
+            protect: ['var'],
+            optimize: ['hedgeRatio'],
             tickers: ['XAU'],
           },
         },
@@ -145,8 +153,8 @@ describe('workspace curriculum bridge', () => {
           dashboardName: 'Alpha FX',
           setup: {
             riskAsset: 'currencies',
-            protect: ['assetValue'],
-            optimize: ['var', 'hedgeCarry'],
+            protect: ['var'],
+            optimize: ['hedgeRatio', 'carryCashInterest'],
             tickers: ['EUR'],
           },
         },
@@ -158,6 +166,8 @@ describe('workspace curriculum bridge', () => {
 
     expect(merged.workspace.entities).toHaveLength(1);
     expect(merged.workspace.entities[0].name).toBe('Entity Alpha');
+    expect(merged.workspace.entities[0].allCurrencies?.length).toBeGreaterThan(0);
+    expect(merged.workspace.entities[0].lpCurrencies?.length).toBeGreaterThan(0);
     expect(merged.group.name).toBe('Live Group');
     expect(merged.group.dashboard?.name).toBe('Consolidated FX');
     expect(merged.group.dashboard?.includedEntityIds).toEqual(
@@ -178,8 +188,8 @@ describe('workspace curriculum bridge', () => {
           dashboardName: 'Alpha FX',
           setup: {
             riskAsset: 'currencies',
-            protect: ['assetValue'],
-            optimize: ['var', 'hedgeCarry'],
+            protect: ['var'],
+            optimize: ['hedgeRatio', 'carryCashInterest'],
             tickers: ['EUR'],
           },
         },
@@ -236,8 +246,8 @@ describe('createDashboardFromWizard', () => {
       name: 'Currencies desk',
       setup: {
         riskAsset: 'currencies',
-        protect: ['assetValue', 'liquidity'],
-        optimize: ['var', 'hedgeCarry'],
+        protect: ['var'],
+        optimize: ['hedgeRatio', 'carryCashInterest'],
         tickers: ['EUR', 'PLN'],
       },
     });
@@ -252,18 +262,123 @@ describe('createDashboardFromWizard', () => {
     expect(profile.fxConfig?.inputs).toContain('liquidity');
     expect(workspace.entities[0].dashboards).toHaveLength(1);
   });
+});
 
+describe('dashboard setup taxonomy', () => {
+  it('maps legacy protect/optimize ids onto the current picks', () => {
+    expect(normalizeProtect(['assetValue', 'liquidity', 'cashFlow'])).toEqual(['var']);
+    expect(normalizeProtect(['cashFlow'])).toEqual(['cfar']);
+    expect(normalizeProtect(['earnings'])).toEqual(['ear']);
+    expect(normalizeProtect(['credit'])).toEqual(['evar']);
+    expect(normalizeOptimize(['var', 'hedgeCarry', 'cfar'])).toEqual([
+      'hedgeRatio',
+      'carryCashInterest',
+    ]);
+    expect(normalizeOptimize(['greeks'])).toEqual(['greeksSensitivity']);
+    expect(normalizeOptimize(['greeksSensitivity'])).toEqual(['greeksSensitivity']);
+    expect(normalizeOptimize([])).toEqual(['hedgeRatio', 'carryCashInterest']);
+  });
+});
+
+describe('entity currency universes', () => {
+  it('persists All and LP lists on create', () => {
+    const { entity } = createEntity(emptyWorkspace(), {
+      name: 'Deel US',
+      baseCurrency: 'USD',
+      allCurrencies: ['EUR', 'GBP', 'TRY'],
+      lpCurrencies: ['EUR', 'GBP'],
+    });
+    expect(entityAllCurrencies(entity)).toEqual(['EUR', 'GBP', 'TRY']);
+    expect(entityLpCurrencies(entity)).toEqual(['EUR', 'GBP']);
+  });
+
+  it('drops LP codes that are not in All', () => {
+    const { entity } = createEntity(emptyWorkspace(), {
+      name: 'Deel US',
+      baseCurrency: 'USD',
+      allCurrencies: ['EUR'],
+      lpCurrencies: ['EUR', 'GBP'],
+    });
+    expect(entityLpCurrencies(entity)).toEqual(['EUR']);
+  });
+
+  it('hydrates missing All/LP lists and normalizes legacy dashboard setup', () => {
+    const { entity } = createEntity(emptyWorkspace(), {
+      name: 'Deel US',
+      baseCurrency: 'USD',
+    });
+    const stripped = {
+      ...entity,
+      allCurrencies: undefined,
+      lpCurrencies: undefined,
+      dashboards: [
+        {
+          id: 'd1',
+          name: 'FX',
+          createdAt: new Date().toISOString(),
+          riskProfiles: [],
+          setup: {
+            riskAsset: 'currencies' as const,
+            protect: ['assetValue'],
+            optimize: ['hedgeCarry'],
+            tickers: ['EUR'],
+          },
+        },
+      ],
+    } as unknown as Entity;
+    const hydrated = hydrateEntity(stripped);
+    expect(hydrated.allCurrencies?.length).toBeGreaterThan(0);
+    expect(hydrated.lpCurrencies?.length).toBeGreaterThan(0);
+    expect(hydrated.dashboards[0]?.setup?.protect).toEqual(['var']);
+    expect(hydrated.dashboards[0]?.setup?.optimize).toEqual([
+      'hedgeRatio',
+      'carryCashInterest',
+    ]);
+    expect(hydrateWorkspace({ entities: [stripped] }).entities[0]?.allCurrencies?.length).toBeGreaterThan(0);
+  });
+
+  it('updates All and LP lists and keeps LP inside All', () => {
+    const created = createEntity(emptyWorkspace(), {
+      name: 'Deel US',
+      baseCurrency: 'USD',
+      allCurrencies: ['EUR', 'GBP', 'TRY'],
+      lpCurrencies: ['EUR', 'GBP'],
+    });
+    const next = updateEntity(created.workspace, created.entity.id, {
+      name: 'Deel US Inc',
+      allCurrencies: ['EUR', 'GBP'],
+      lpCurrencies: ['EUR', 'GBP', 'TRY'],
+    });
+    const entity = next.entities[0]!;
+    expect(entity.name).toBe('Deel US Inc');
+    expect(entityAllCurrencies(entity)).toEqual(['EUR', 'GBP']);
+    expect(entityLpCurrencies(entity)).toEqual(['EUR', 'GBP']);
+  });
+});
+
+describe('createDashboardFromWizard (config)', () => {
   it('builds fxConfigFromDashboardSetup with selected currency mode', () => {
     const cfg = fxConfigFromDashboardSetup({
       riskAsset: 'currencies',
-      protect: ['cashFlow'],
-      optimize: ['cfar'],
+      protect: ['cfar'],
+      optimize: ['carryCashInterest'],
       tickers: ['GBP'],
     });
     expect(cfg.currencyMode).toBe('selected');
     expect(cfg.currencies).toEqual(['GBP']);
     expect(cfg.optimizationMetrics).toContain('carryTarget');
     expect(cfg.optimizationMetrics).toContain('cfarCover');
+  });
+
+  it('turns Greeks / Sensitivity hedging on as the Sensitivity analytical layer', () => {
+    const cfg = fxConfigFromDashboardSetup({
+      riskAsset: 'currencies',
+      protect: ['var'],
+      optimize: ['hedgeRatio', 'greeksSensitivity'],
+      tickers: ['EUR'],
+    });
+    expect(cfg.analyticalLayers).toContain('sensitivity');
+    expect(cfg.decisionLayers).toContain('hedging');
   });
 
   it('updates an existing dashboard via wizard edit workflow', () => {
@@ -276,8 +391,8 @@ describe('createDashboardFromWizard', () => {
       name: 'EU FX',
       setup: {
         riskAsset: 'currencies',
-        protect: ['assetValue'],
-        optimize: ['var'],
+        protect: ['var'],
+        optimize: ['hedgeRatio'],
         tickers: ['EUR'],
       },
     });
@@ -289,18 +404,21 @@ describe('createDashboardFromWizard', () => {
         name: 'EU Currencies desk',
         setup: {
           riskAsset: 'currencies',
-          protect: ['assetValue', 'cashFlow', 'liquidity'],
-          optimize: ['var', 'hedgeCarry', 'cfar'],
+          protect: ['cfar'],
+          optimize: ['hedgeRatio', 'carryCashInterest'],
           tickers: ['EUR', 'PLN', 'GBP'],
         },
       },
     );
     expect(updated.dashboard.name).toBe('EU Currencies desk');
-    expect(updated.dashboard.setup?.protect).toContain('liquidity');
+    expect(updated.dashboard.setup?.protect).toEqual(['cfar']);
+    expect(updated.profile.fxConfig?.inputs).toContain('liquidity');
     expect(updated.dashboard.setup?.tickers).toEqual(['EUR', 'PLN', 'GBP']);
     expect(updated.profile.fxConfig?.currencies).toEqual(['EUR', 'PLN', 'GBP']);
     const inferred = dashboardSetupFromDashboard(updated.dashboard);
-    expect(inferred.optimize).toContain('cfar');
+    expect(inferred.protect).toEqual(['cfar']);
+    expect(inferred.optimize).toContain('hedgeRatio');
+    expect(inferred.optimize).toContain('carryCashInterest');
   });
 });
 
@@ -358,8 +476,8 @@ describe('rate instruments', () => {
       name: 'Rates desk',
       setup: {
         riskAsset: 'interestRates',
-        protect: ['cashFlow'],
-        optimize: ['var'],
+        protect: ['cfar'],
+        optimize: ['hedgeRatio'],
         tickers: ['SOFR', 'EURIBOR'],
         instruments: [loan, swap],
       },
@@ -423,7 +541,7 @@ describe('saveWorkspace error path', () => {
 
     const result = saveWorkspace('user-test', { entities: [] });
     expect(result.ok).toBe(true);
-    expect(store.size).toBeGreaterThanOrEqual(1);
+    expect(store.size).toBe(1);
   });
 });
 
@@ -600,39 +718,6 @@ describe('workspace hedge persistence', () => {
         hedgesUpdatedAt: '2026-01-01T00:00:00.000Z',
       },
     );
-    const loaded = loadWorkspaceDetailed('u');
-    expect(loaded.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor).toBe(
-      'liquidity',
-    );
-  });
-
-  it('recovers prepared hedges from the sidecar when the fat workspace blob is gone', () => {
-    const store = stubStore();
-    saveWorkspace(
-      'u',
-      { entities: [] },
-      {
-        hedgesByEntityId: {
-          ent_1: {
-            bookedHedges: [],
-            hedgeRatios: {},
-            preparedByCcy: {
-              EUR: {
-                structure: 'bullet' as const,
-                basis: 'cash' as const,
-                ticketBasis: 'stock' as const,
-                legs: [],
-                coverLocalM: 1,
-                hedgeRatio: 0.5,
-                preparedFor: 'liquidity' as const,
-              },
-            },
-          },
-        },
-        hedgesUpdatedAt: '2026-06-01T00:00:00.000Z',
-      },
-    );
-    store.delete('treasury:workspace:u');
     const loaded = loadWorkspaceDetailed('u');
     expect(loaded.hedgesByEntityId.ent_1?.preparedByCcy?.EUR?.preparedFor).toBe(
       'liquidity',

@@ -13,6 +13,9 @@ export type SplinePt = readonly [number, number];
  * x must be monotone but may run either way, so the same code smooths a
  * band's return leg.
  */
+/** Pixel hops smaller than this are a vertical walk, not a slope. */
+const VERTICAL_PX = 1;
+
 export function splineTail(pts: readonly SplinePt[]): string {
   const n = pts.length;
   if (n < 2) return '';
@@ -21,7 +24,10 @@ export function splineTail(pts: readonly SplinePt[]): string {
   for (let i = 0; i < n - 1; i += 1) {
     const dx = pts[i + 1]![0] - pts[i]![0];
     h.push(dx);
-    d.push(dx === 0 ? 0 : (pts[i + 1]![1] - pts[i]![1]) / dx);
+    // Swap fill pins Unhedged then lifts overlay at nearly the same CFaR.
+    // dy/dx on a sub-pixel hop is huge; treating it as a slope poisons the
+    // next cubic so the green arm appears to start at Carry Target, not $0.
+    d.push(Math.abs(dx) < VERTICAL_PX ? 0 : (pts[i + 1]![1] - pts[i]![1]) / dx);
   }
   const m: number[] = new Array<number>(n);
   m[0] = d[0]!;
@@ -48,6 +54,10 @@ export function splineTail(pts: readonly SplinePt[]): string {
   for (let i = 0; i < n - 1; i += 1) {
     const [x0, y0] = pts[i]!;
     const [x1, y1] = pts[i + 1]!;
+    if (Math.abs(h[i]!) < VERTICAL_PX) {
+      out += ` L ${x1.toFixed(1)},${y1.toFixed(1)}`;
+      continue;
+    }
     const t = h[i]! / 3;
     out +=
       ` C ${(x0 + t).toFixed(1)},${(y0 + m[i]! * t).toFixed(1)}` +

@@ -40,6 +40,7 @@ export function hiddenTabsForLayers(
   analytical: readonly AnalyticalLayer[],
 ): SimulatorTab[] {
   const hide = new Set<SimulatorTab>(CURRICULUM_BASE_HIDDEN);
+  if (analytical.includes('sensitivity')) hide.delete('sensitivity');
   if (!decision.includes('hedging')) {
     hide.add('hedging');
     hide.add('liveLadder');

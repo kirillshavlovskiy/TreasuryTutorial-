@@ -12,6 +12,7 @@ import {
   serializeHedgeSidecar,
 } from '@/lib/hedge-book-normalize';
 import { GROUP_HEDGE_SCOPE } from '@/lib/test-mode/hedge-var';
+import type { LayerId } from '@/lib/fx-buffer';
 import { NORDTECH_ENTITY_IDS } from '@/lib/test-mode/fixtures/nordtech-accounts';
 
 describe('normalizeHedgeBooksMap', () => {
@@ -188,7 +189,7 @@ describe('pickHedgeBooksForWrite', () => {
         desk: {
           policyVAR: 12,
           residualByCcy: { EUR: 0.4 },
-          activeLayers: ['carryOptim', 'portfolioDiv'],
+          activeLayers: ['carryOptim', 'portfolioDiv'] as LayerId[],
           portfolioScenarioId: 'balanced',
         },
       },
@@ -201,7 +202,7 @@ describe('pickHedgeBooksForWrite', () => {
         desk: {
           policyVAR: 5,
           residualByCcy: { EUR: 0.4 },
-          activeLayers: [],
+          activeLayers: [] as LayerId[],
           portfolioScenarioId: '',
         },
       },
@@ -216,6 +217,51 @@ describe('pickHedgeBooksForWrite', () => {
     expect(picked.hedgesByEntityId.ent?.desk?.activeLayers).toEqual([
       'carryOptim',
       'portfolioDiv',
+    ]);
+  });
+
+  it('does not let a Portfolio+$5M remount default wipe a custom Policy VAR desk', () => {
+    const existing = {
+      ent: {
+        bookedHedges: [] as never[],
+        hedgeRatios: {},
+        preparedByCcy: prepared,
+        desk: {
+          policyVAR: 12,
+          residualByCcy: { EUR: 0.4 },
+          activeLayers: ['carryOptim'] as LayerId[],
+          portfolioScenarioId: 'balanced',
+        },
+      },
+    };
+    const incoming = {
+      ent: {
+        bookedHedges: [] as never[],
+        hedgeRatios: {},
+        preparedByCcy: prepared,
+        desk: {
+          policyVAR: 5,
+          residualByCcy: { EUR: 0.4 },
+          activeLayers: [
+            'floorH',
+            'sigmaP',
+            'carryOptim',
+            'cfarCover',
+            'portfolioDiv',
+          ] as LayerId[],
+          portfolioScenarioId: '',
+        },
+      },
+    };
+    const picked = pickHedgeBooksForWrite(
+      incoming,
+      existing,
+      '2026-07-01T00:00:00.000Z',
+      '2026-06-01T00:00:00.000Z',
+    );
+    expect(picked.hedgesByEntityId.ent?.desk?.policyVAR).toBe(12);
+    expect(picked.hedgesByEntityId.ent?.desk?.activeLayers).toEqual([
+      'carryOptim',
     ]);
     expect(picked.hedgesByEntityId.ent?.desk?.portfolioScenarioId).toBe(
       'balanced',

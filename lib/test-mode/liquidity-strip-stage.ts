@@ -415,6 +415,7 @@ export function fundingStripPreparedProfile(input: {
     settleMonths: bulletSettle,
     cashDeliveryAt: 'periodEnd',
     preparedFor: 'liquidity',
+    approvalStatus: 'draft',
   };
 
   if (Math.abs(raw.coverLocalM) < NOTIONAL_DUST) return null;
@@ -426,5 +427,50 @@ export function fundingStripPreparedProfile(input: {
       ccy: input.ccy,
     }),
     preparedFor: 'liquidity',
+    approvalStatus: 'draft',
   };
+}
+
+export function overlayMixPreparedProfile(input: {
+  ccy: string;
+  overlayFcyM: number;
+  schedule: readonly FundingStripStageLeg[];
+  forecastMonths: number;
+  marketRates?: FxMarketRatesBundle | null;
+  ratesScopeId?: string | null;
+}): PreparedHedgeProfile | null {
+  const overlay = input.overlayFcyM;
+  if (!Number.isFinite(overlay) || Math.abs(overlay) < NOTIONAL_DUST) return null;
+
+  const trades = input.schedule.filter(
+    l => Math.abs(l.newLeg) > NOTIONAL_DUST && l.settleMonths > 0,
+  );
+  const months = Math.max(1, Math.floor(input.forecastMonths) || 1);
+  if (trades.length === 0) {
+    return fundingStripPreparedProfile({
+      ...input,
+      residual: 1,
+      schedule: [{
+        cycleIndex: 0,
+        valueDateMonths: 0,
+        newLeg: overlay,
+        outstanding: overlay,
+        settleMonths: months,
+        preBookable: false,
+      }],
+    });
+  }
+
+  const rawSum = trades.reduce((s, l) => s + l.newLeg, 0);
+  const scale = Math.abs(rawSum) > NOTIONAL_DUST ? overlay / rawSum : 0;
+  const scaled = trades.map((l, i) => ({
+    ...l,
+    newLeg: scale !== 0 ? l.newLeg * scale : (i === 0 ? overlay : 0),
+    outstanding: scale !== 0 ? l.outstanding * scale : (i === 0 ? overlay : 0),
+  }));
+  return fundingStripPreparedProfile({
+    ...input,
+    residual: 1,
+    schedule: scaled,
+  });
 }

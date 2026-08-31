@@ -92,11 +92,12 @@ describe('FX simulator unified invariants', () => {
 
   it('7. PAY CAD zero payout: swap sell; EARN rebalance when VAR limit allows', () => {
     const cad0 = model.fcyComputed.find(r => r.ccy === 'CAD')!;
-    const loose = computeDashboardModel({ ...baseInput(), policyVAR: 20 });
-    const gbpLoose = loose.fcyComputed.find(r => r.ccy === 'GBP')!;
-    expect(gbpLoose.swapNear).toBeGreaterThan(0);
+    const loose = computeDashboardModel({ ...baseInput(), policyVAR: 20, usdCash: 900 });
+    const mxnLoose = loose.fcyComputed.find(r => r.ccy === 'MXN')!;
+    expect(mxnLoose.swapNear).toBeGreaterThan(0);
     expect(cad0.swapNear).toBeLessThan(0);
     expect(cad0.cash_threshold).toBeLessThan(cad0.cash);
+    expect(cad0.cash_threshold).toBeGreaterThanOrEqual(-1e-6);
   });
 
   it('7b. PAY CAD −150M: Target = LP+Swap rises with payout; swap buys the gap', () => {

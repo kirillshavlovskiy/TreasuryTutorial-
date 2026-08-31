@@ -752,6 +752,34 @@ describe('stripHedgeLegCarryUsdM — conversion cash', () => {
     expect(h.fwdCarryUsdYr).toBe(0);
   });
 
+  it('MXN CIP is a cost when the points column is flat or EUR-scale', () => {
+    const S = 1 / CURRENCY_PARAMS.MXN!.spot;
+    const cover = 146.61;
+    const hedge = -cover;
+    const cip = fwdHedgeCarryUsdYr(hedge, 'MXN', 6.19, 4);
+    expect(cip).toBeLessThan(-0.15);
+
+    const bundle = (bid: number, ask: number): FxMarketRatesBundle => ({
+      pair: 'USDMXN',
+      baseCcy: 'USD',
+      quoteCcy: 'MXN',
+      sourceFile: 'test',
+      spot: { bid: S, ask: S, mid: S },
+      deposits: [{
+        tenor: '1Y',
+        months: 12,
+        eur: { creditPct: 6.19, debitPct: 7.59 },
+        usd: { creditPct: 4, debitPct: 4.5 },
+        swapPoints: { bid, ask },
+      }],
+    });
+
+    expect(fwdHedgeCarryFromMarketUsd(hedge, 'MXN', 6.19, 4, 12, bundle(0, 0)))
+      .toBeCloseTo(cip, 8);
+    expect(fwdHedgeCarryFromMarketUsd(hedge, 'MXN', 6.19, 4, 12, bundle(18, 22)))
+      .toBeCloseTo(cip, 8);
+  });
+
   it('coverFromTrade flips overlay extras before CIP / CFaR settle', () => {
     expect(coverFromTradeLocalM(-21.6)).toBeCloseTo(21.6, 9);
     expect(coverFromTradeLocalM(21.6)).toBeCloseTo(-21.6, 9);

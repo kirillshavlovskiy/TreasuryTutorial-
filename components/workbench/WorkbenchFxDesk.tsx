@@ -8,7 +8,10 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
+import { persistWorkbench } from '@/lib/desk/desk-client';
 import { Simulator } from '@/app/dashboard/Simulator';
+import { AgentDock } from '@/components/workbench/AgentPanel';
+import { buildDeskContextSnapshot } from '@/lib/agent/desk-context';
 import { HedgingDecisionLayer } from '@/components/test-mode/HedgingDecisionLayer';
 import { ConsolidatedLiveLadder } from '@/components/test-mode/ConsolidatedLiveLadder';
 import { VarAnalyticsPanel } from '@/components/test-mode/VarAnalyticsPanel';
@@ -26,19 +29,22 @@ import {
   rowsForSelectedCurrencies,
   simSeedForEntity,
 } from '@/lib/test-mode/nordtech-sim-seed';
+import type {
+  EntityHedgeBook,
+  HedgeTicket,
+  HedgeTicketsPatch,
+  PreparedHedgeProfile,
+  PreparedHedgesPatch,
+} from '@/lib/test-mode/hedge-var';
 import {
   applyHedgeTicketsPatch,
   applyPreparedHedgesPatch,
-  type EntityHedgeBook,
-  type HedgeTicket,
-  type HedgeTicketsPatch,
-  type PreparedHedgesPatch,
 } from '@/lib/test-mode/hedge-var';
-import { applyDeskPatch } from '@/lib/hedge-book-normalize';
 import type { ForecastHedgeStructure } from '@/lib/test-mode/rolling-hedge';
 import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import type { VarSetup } from '@/lib/test-mode/var-setup';
-import type { RowState } from '@/lib/fx-buffer';
+import type { RowState, UsdParams } from '@/lib/fx-buffer';
+import type { TreasurySnapshot } from '@/lib/treasury/snapshot';
 import {
   DEFAULT_FORECAST_PROFILE,
   type ForecastProfileState,
@@ -51,6 +57,35 @@ import {
   type TimingProfile,
 } from '@/lib/workspace-store';
 
+/**
+ * Live Treasury props for the embedded <Simulator>, or {} when not connected
+ * / not live. Mirrors Simulator's own currency-filter fallback so a risk
+ * profile scoped to specific currencies keeps showing only those currencies
+ * once Treasury data is live — passing `initialRows` unfiltered would
+ * otherwise silently ignore that setting (Simulator prefers `initialRows`
+ * over `currencyFilter` whenever both are given).
+ */
+function liveBookProps(
+  treasury: TreasurySnapshot | null | undefined,
+  currencyFilter: string[] | undefined,
+): {
+  initialRows?: RowState[];
+  initialUsdCash?: number;
+  initialUsdNonLpCash?: number;
+  initialUsdParams?: UsdParams;
+} {
+  if (!treasury || treasury.status !== 'live') return {};
+  const rows = currencyFilter && currencyFilter.length > 0
+    ? treasury.rows.filter(r => currencyFilter.includes(r.ccy))
+    : treasury.rows;
+  return {
+    initialRows: rows,
+    initialUsdCash: treasury.usdCash,
+    initialUsdNonLpCash: treasury.usdNonNpCash,
+    initialUsdParams: treasury.usdParams,
+  };
+}
+
 export function WorkbenchFxDesk({
   entity,
   dashboard,
@@ -59,6 +94,7 @@ export function WorkbenchFxDesk({
   onVarSetupChange,
   hedgeBook,
   onHedgeBookChange,
+  treasury,
   onFormulaChange,
   onFormulaChanges,
   onForecastProfileChange,
@@ -70,6 +106,8 @@ export function WorkbenchFxDesk({
   onVarSetupChange: (setup: VarSetup) => void;
   hedgeBook: EntityHedgeBook;
   onHedgeBookChange: (updater: (prev: EntityHedgeBook) => EntityHedgeBook) => void;
+  /** Live Treasury snapshot for the signed-in user, or null/undefined if not connected. */
+  treasury?: TreasurySnapshot | null;
   onFormulaChange: (cellKey: string, formula: string) => void;
   onFormulaChanges: (updates: Record<string, string>) => void;
   onForecastProfileChange?: (profile: ForecastProfileState) => void;
@@ -92,6 +130,35 @@ export function WorkbenchFxDesk({
   });
   const [hedgeStructure, setHedgeStructure] =
     useState<ForecastHedgeStructure>('bullet');
+
+  useEffect(() => {
+    if (analyticsBook.rows.length === 0) return;
+    const liq = analyticsBook.forecastProfile.liquidity;
+    persistWorkbench({
+      key: `fx:${dashboard.id}`,
+      fxBook: {
+        dashboardId: dashboard.id,
+        entityId: entity.id,
+        rows: analyticsBook.rows,
+        formulas: dashboard.formulas ?? null,
+      },
+      liquidity: {
+        dashboardId: dashboard.id,
+        entityId: entity.id,
+        forecastProfile: analyticsBook.forecastProfile,
+        timing: dashboard.timing ?? null,
+        sizingBasis: liq?.sizingBasis ?? null,
+        bookingMode: liq?.bookingMode ?? null,
+      },
+      action: {
+        module: 'fx',
+        action: 'fx.book',
+        dashboardId: dashboard.id,
+        scopeId: entity.id,
+        payload: { rows: analyticsBook.rows.length },
+      },
+    });
+  }, [analyticsBook, dashboard.id, dashboard.formulas, dashboard.timing, entity.id]);
 
   const hedgeRatios = hedgeBook.hedgeRatios;
   const bookedHedges = hedgeBook.bookedHedges;
@@ -134,12 +201,6 @@ export function WorkbenchFxDesk({
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgeBookChange(prev => ({
       ...prev,
-      bookedHedges: prev.bookedHedges.some(t => t.id === ticket.id)
-        ? prev.bookedHedges
-        : [
-            { ...ticket, entityId: entity.id, entityName: entity.name },
-            ...prev.bookedHedges,
-          ],
       hedgeRatios: { ...prev.hedgeRatios, [ticket.ccy]: 0 },
       preparedByCcy: prev.preparedByCcy ?? {},
       carrySessionsByCcy: prev.carrySessionsByCcy ?? {},
@@ -175,6 +236,14 @@ export function WorkbenchFxDesk({
     return seed.rows;
   }, [fxConfig, seed.rows]);
 
+  const currencyFilter =
+    fxConfig?.currencyMode === 'selected' && fxConfig.currencies.length > 0
+      ? fxConfig.currencies
+      : seed.currencyFilter.length > 0
+        ? seed.currencyFilter
+        : undefined;
+  const liveBook = liveBookProps(treasury, currencyFilter);
+
   useEffect(() => {
     // Keep desk scoped when switching profiles / entities.
     setAnalyticsBook({
@@ -183,21 +252,47 @@ export function WorkbenchFxDesk({
     });
   }, [entity.id, profile.id, dashboard.forecastProfile, seed.forecastProfile]);
 
+  const agentDeskContext = useMemo(
+    () =>
+      buildDeskContextSnapshot({
+        entityName: entity.name,
+        dashboardName: dashboard.name,
+        risk: entityRisk,
+        varSetup,
+        hedgeBook,
+        bookRows: analyticsBook.rows.length > 0 ? analyticsBook.rows : initialRows,
+        forecastProfile:
+          analyticsBook.forecastProfile
+          ?? dashboard.forecastProfile
+          ?? seed.forecastProfile
+          ?? null,
+        ratesScopeId: entity.id,
+      }),
+    [
+      entity.id,
+      entity.name,
+      dashboard.name,
+      dashboard.forecastProfile,
+      entityRisk,
+      varSetup,
+      hedgeBook,
+      analyticsBook,
+      initialRows,
+      seed.forecastProfile,
+    ],
+  );
+
   return (
+    <>
     <Simulator
-      key={`${entity.id}-${profile.id}-${initialRows.map(row => row.ccy).join(',')}`}
+      key={`${entity.id}-${profile.id}`}
       embedded
       initialRows={initialRows}
       initialUsdCash={seed.usdCash}
       initialUsdNonLpCash={seed.usdNonLpCash}
       initialUsdParams={seed.usdParams}
-      currencyFilter={
-        fxConfig?.currencyMode === 'selected' && fxConfig.currencies.length > 0
-          ? fxConfig.currencies
-          : seed.currencyFilter.length > 0
-            ? seed.currencyFilter
-            : undefined
-      }
+      {...liveBook}
+      currencyFilter={currencyFilter}
       initialActiveLayers={[]}
       simplifiedBook
       liquidityMode="fullSimulator"
@@ -205,10 +300,6 @@ export function WorkbenchFxDesk({
       onVarSetupChange={onVarSetupChange}
       bookedHedges={bookedHedges}
       preparedByCcy={preparedByCcy}
-      desk={hedgeBook.desk}
-      onDeskChange={next =>
-        onHedgeBookChange(prev => applyDeskPatch(prev, next))
-      }
       hedgeRatios={hedgeRatios}
       marketRatesByCcy={marketRatesByCcy}
       ratesScopeId={entity.id}
@@ -295,5 +386,7 @@ export function WorkbenchFxDesk({
         />
       }
     />
+    <AgentDock deskContext={agentDeskContext} />
+    </>
   );
 }

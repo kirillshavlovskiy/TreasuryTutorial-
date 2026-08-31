@@ -99,8 +99,8 @@ export const TASK01_REQUIRED_DECISION_LAYERS = ['hedging'] as const;
 
 export const TASK01_REQUIRED_ANALYTICAL_LAYERS = ['riskMetrics'] as const;
 
-/** Task 02 Cash Carry book — five FX exposures, same three legal entities. */
-export const TASK02_CARRY_CCYS = ['EUR', 'GBP', 'PLN', 'MXN', 'JPY'] as const;
+/** Task 02 Cash Carry book — six FX exposures, same three legal entities. */
+export const TASK02_CARRY_CCYS = ['EUR', 'GBP', 'PLN', 'MXN', 'JPY', 'TRY'] as const;
 
 export const TASK02_FORECAST_MONTHS = 12;
 
@@ -122,6 +122,7 @@ function extras(partial: Partial<ForecastCashExtras>): ForecastCashExtras {
  * Analytics and the overlay frontier see a growing long-high / short-low book.
  *
  *   MXN  EARN vs USD (6.19%) — LatAm cash + NWC build (overlay long)
+ *   TRY  strong EARN (near-uncorrelated with the rest) — Turkey cash + NWC build (overlay long)
  *   GBP  slight EARN (3.57%) — UK ops
  *   PLN  near-USD (3.41%) — payroll short + PL billing
  *   EUR  PAY (1.78%) — ops pile + AR collect + debt amortize
@@ -136,6 +137,7 @@ export function task02ForecastProfile(): ForecastProfileState {
       PLN: extras({ nwcIn: 0.18, nwcOut: -0.10 }),
       MXN: extras({ nwcIn: 2.8, nwcOut: -1.1, debtOut: -0.9 }),
       JPY: extras({ nwcIn: 12, nwcOut: -22, debtOut: -28 }),
+      TRY: extras({ nwcIn: 2.2, nwcOut: -0.85, debtOut: -0.6 }),
     },
     flatGrowthByCcy: {
       EUR: { collections: 0.025, nwcIn: 0.02, payout: 0.015 },
@@ -143,6 +145,7 @@ export function task02ForecastProfile(): ForecastProfileState {
       PLN: { collections: 0.02, nwcIn: 0.03 },
       MXN: { collections: 0.04, nwcIn: 0.035, payout: 0.02 },
       JPY: { payout: 0.02, nwcOut: 0.025, debtOut: 0.015 },
+      TRY: { collections: 0.045, nwcIn: 0.04, payout: 0.025 },
     },
   };
 }
@@ -247,14 +250,18 @@ export function simSeedForEntity(entity: Entity, taskId?: string): EntitySimSeed
   // Default / NordTech US — USD hub
   // Task 02: MXN LatAm cash — high-yield EARN book the overlay longs.
   const mxn = makeSimRow('us-mxn', 'MXN', 90, 0, 0, 90, -3.2, 5.5, 0);
+  // Task 02: TRY Turkey cash — very-high-yield EARN book, near-uncorrelated
+  // with the rest of the book (added to test generalization beyond the
+  // original 5-currency set).
+  const tryRow = makeSimRow('us-try', 'TRY', 60, 0, 0, 60, -2, 3, 0);
   return {
-    rows: isTask02(taskId) ? [mxn] : [],
+    rows: isTask02(taskId) ? [mxn, tryRow] : [],
     usdCash: 6.0,
     usdNonLpCash: 0,
     usdParams: { ...INITIAL_USD_PARAMS, payout: -0.8, collections: 0 },
-    currencyFilter: isTask02(taskId) ? ['MXN'] : [],
-    profileCurrencies: isTask02(taskId) ? ['MXN'] : ['USD'],
-    forecastProfile: isTask02(taskId) ? task02ForecastFor(['MXN']) : undefined,
+    currencyFilter: isTask02(taskId) ? ['MXN', 'TRY'] : [],
+    profileCurrencies: isTask02(taskId) ? ['MXN', 'TRY'] : ['USD'],
+    forecastProfile: isTask02(taskId) ? task02ForecastFor(['MXN', 'TRY']) : undefined,
   };
 }
 

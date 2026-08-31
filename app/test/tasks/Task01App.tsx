@@ -10,11 +10,14 @@ import {
 } from 'react';
 import Link from 'next/link';
 import { Simulator, type SimulatorTab } from '@/app/dashboard/Simulator';
+import { AgentDock } from '@/components/workbench/AgentPanel';
 import { TaskScore } from '@/components/test-mode/TaskScore';
 import { HedgingDecisionLayer } from '@/components/test-mode/HedgingDecisionLayer';
 import { ConsolidatedLiveLadder } from '@/components/test-mode/ConsolidatedLiveLadder';
 import { DataUploadPanel } from '@/components/test-mode/DataUploadPanel';
 import { VarAnalyticsPanel } from '@/components/test-mode/VarAnalyticsPanel';
+import { buildDeskContextSnapshot } from '@/lib/agent/desk-context';
+import { sandboxAgentChatScope } from '@/lib/agent/chat-store';
 import {
   DEFAULT_FORECAST_PROFILE,
   type ForecastProfileState,
@@ -711,6 +714,46 @@ export function Task01App({
 
   const firstPendingStep = taskSteps.find(s => progress.steps[s.id] !== 'done')?.id;
 
+  /** Chat on the entity tree / dashboard list — desk views own the live snapshot. */
+  const shellAgentContext = (() => {
+    if (view === 'group' || dashboard) return null;
+    if (entity) {
+      const seed = simSeedForEntity(entity, taskId);
+      return buildDeskContextSnapshot({
+        entityName: entity.name,
+        dashboardName: entity.dashboards[0]?.name ?? 'FX Risk',
+        risk: computeConsolidatedRisk([entity], varSetup, taskId),
+        varSetup,
+        hedgeBook: hedgesByEntityId[entity.id] ?? EMPTY_HEDGE_BOOK,
+        bookRows: seed.rows,
+        forecastProfile: seed.forecastProfile ?? DEFAULT_FORECAST_PROFILE,
+        ratesScopeId: entity.id,
+        surface: 'sandbox',
+      });
+    }
+    const ents =
+      consolidatedEntities.length > 0 ? consolidatedEntities : workspace.entities;
+    const book = consolidateEntityBooks(ents, taskId);
+    return buildDeskContextSnapshot({
+      entityName: group.name,
+      dashboardName: group.dashboard?.name ?? 'Group FX (consolidated)',
+      risk: computeConsolidatedRisk(ents, varSetup, taskId),
+      varSetup,
+      hedgeBook: {
+        ...(hedgesByEntityId[GROUP_HEDGE_SCOPE] ?? EMPTY_HEDGE_BOOK),
+        bookedHedges: aggregateBookedHedges(
+          hedgesByEntityId,
+          ents.map(e => e.id),
+          true,
+        ),
+      },
+      bookRows: book.rows,
+      forecastProfile: mergedEntityForecastProfile(ents, taskId),
+      ratesScopeId: GROUP_HEDGE_SCOPE,
+      surface: 'sandbox',
+    });
+  })();
+
   return (
     <main className={`mx-auto px-6 py-8 ${wide ? 'max-w-screen-2xl' : 'max-w-6xl'}`}>
       <div className="mb-4">
@@ -1111,6 +1154,16 @@ export function Task01App({
             setModal('none');
             if (firstId) setActiveProfileId(firstId);
           }}
+        />
+      )}
+
+      {shellAgentContext && (
+        <AgentDock
+          deskContext={shellAgentContext}
+          chatScopeId={sandboxAgentChatScope(
+            taskId,
+            shellAgentContext.ratesScopeId,
+          )}
         />
       )}
     </main>
@@ -1544,6 +1597,35 @@ function GroupConsolidatedView({
     });
   };
 
+  const agentDeskContext = useMemo(
+    () =>
+      buildDeskContextSnapshot({
+        entityName: groupDashboardName,
+        dashboardName: groupDashboardName,
+        risk,
+        varSetup,
+        hedgeBook: {
+          ...groupBook,
+          bookedHedges,
+        },
+        bookRows: analyticsBook.rows.length > 0 ? analyticsBook.rows : book.rows,
+        forecastProfile: analyticsBook.forecastProfile ?? groupForecast ?? null,
+        ratesScopeId: GROUP_HEDGE_SCOPE,
+        surface: 'sandbox',
+      }),
+    [
+      groupDashboardName,
+      risk,
+      varSetup,
+      groupBook,
+      bookedHedges,
+      analyticsBook,
+      book.rows,
+      groupForecast,
+    ],
+  );
+  const chatScopeId = sandboxAgentChatScope(taskId ?? '01', GROUP_HEDGE_SCOPE);
+
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1673,6 +1755,7 @@ function GroupConsolidatedView({
           }
         />
       </div>
+      <AgentDock deskContext={agentDeskContext} chatScopeId={chatScopeId} />
     </div>
   );
 }
@@ -2352,6 +2435,38 @@ function DashboardView({
     return seed.rows;
   }, [active, seed.rows]);
 
+  const agentDeskContext = useMemo(
+    () =>
+      buildDeskContextSnapshot({
+        entityName: entity.name,
+        dashboardName: dashboard.name,
+        risk: entityRisk,
+        varSetup,
+        hedgeBook,
+        bookRows: analyticsBook.rows.length > 0 ? analyticsBook.rows : ladderRows,
+        forecastProfile:
+          analyticsBook.forecastProfile
+          ?? dashboard.forecastProfile
+          ?? seed.forecastProfile
+          ?? null,
+        ratesScopeId: entity.id,
+        surface: 'sandbox',
+      }),
+    [
+      entity.id,
+      entity.name,
+      dashboard.name,
+      dashboard.forecastProfile,
+      entityRisk,
+      varSetup,
+      hedgeBook,
+      analyticsBook,
+      ladderRows,
+      seed.forecastProfile,
+    ],
+  );
+  const chatScopeId = sandboxAgentChatScope(taskId ?? '01', entity.id);
+
   return (
     <>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -2615,6 +2730,7 @@ function DashboardView({
           )}
         </>
       )}
+      <AgentDock deskContext={agentDeskContext} chatScopeId={chatScopeId} />
     </>
   );
 }

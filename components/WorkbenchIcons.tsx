@@ -1,8 +1,13 @@
+'use client';
+
 /**
  * Inline SVG icons for Treasury Workbench chrome — no external icon package.
  * Desk taxonomy marks (risk asset · protect · optimize · ticker) live in
  * RiskTaxonomyIcons instead, so the wizards and the summary chips agree.
+ * ProfileTypeIcon / RiskProfileTypeCards are shared by Workbench and Sandbox.
  */
+
+import { RISK_PROFILE_TYPES } from '@/lib/workspace-store';
 
 type IconProps = { className?: string; title?: string };
 
@@ -163,20 +168,51 @@ export function IconFx({ className = base, title }: IconProps) {
   );
 }
 
+/** Bonds / IR — coupon / yield percent. */
 export function IconBonds({ className = base, title }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden={title ? undefined : true} role={title ? 'img' : undefined}>
       {title ? <title>{title}</title> : null}
-      <path d="M4 19V5M4 19h16M8 15v-4M12 15V8M16 15v-6M20 15v-2" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="6.75" cy="6.75" r="2.45" stroke="currentColor" strokeWidth="1.75" />
+      <circle cx="17.25" cy="17.25" r="2.45" stroke="currentColor" strokeWidth="1.75" />
+      <path d="M17.6 5.2 6.4 18.8" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
     </svg>
   );
 }
 
+/** Investments — circular portfolio mix across instruments. */
 export function IconInvestments({ className = base, title }: IconProps) {
+  const r = 7.15;
+  const C = 2 * Math.PI * r;
+  const gap = 1.55;
+  const weights = [0.38, 0.27, 0.20, 0.15];
+  const opacities = [1, 0.72, 0.46, 0.26];
+  const usable = C - gap * weights.length;
+  let cursor = 0;
+  const slices = weights.map((w, i) => {
+    const len = usable * w;
+    const slice = { len, offset: cursor, opacity: opacities[i]! };
+    cursor += len + gap;
+    return slice;
+  });
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden={title ? undefined : true} role={title ? 'img' : undefined}>
       {title ? <title>{title}</title> : null}
-      <path d="M3 21h18M7 21V10l5-4 5 4v11M10 14h4v7h-4v-7Z" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+      {slices.map((s, i) => (
+        <circle
+          key={i}
+          cx="12"
+          cy="12"
+          r={r}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="4.5"
+          strokeDasharray={`${s.len} ${C - s.len}`}
+          strokeDashoffset={-s.offset}
+          transform="rotate(-90 12 12)"
+          opacity={s.opacity}
+        />
+      ))}
     </svg>
   );
 }
@@ -221,4 +257,68 @@ export function ProfileTypeIcon({
     case 'commodities':
       return <IconCommodities className={className} />;
   }
+}
+
+/**
+ * Asset-class picker used by Add risk profile on Workbench and Sandbox.
+ * Bonds / IR = %, Investments = portfolio donut.
+ */
+export function RiskProfileTypeCards({
+  selected,
+  onToggle,
+  badgeFor,
+}: {
+  selected: Iterable<string>;
+  onToggle: (id: WorkbenchProfileType) => void;
+  /** Badge text also locks the card unless it is already selected. */
+  badgeFor?: (id: WorkbenchProfileType) => string | undefined;
+}) {
+  const selectedSet = selected instanceof Set ? selected : new Set(selected);
+  return (
+    <div className="space-y-3">
+      {RISK_PROFILE_TYPES.map(t => {
+        const isSelected = selectedSet.has(t.id);
+        const badge = badgeFor?.(t.id) ?? (!t.available ? 'Soon' : undefined);
+        const locked = Boolean(badge) && !isSelected;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            disabled={locked}
+            onClick={() => {
+              if (!locked) onToggle(t.id);
+            }}
+            className={`flex w-full items-start gap-3 rounded-xl border p-4 text-left transition-colors ${
+              locked
+                ? 'cursor-not-allowed border-slate-800 opacity-55'
+                : isSelected
+                  ? 'border-blue-500 bg-blue-500/10'
+                  : 'border-slate-700 hover:border-slate-600'
+            }`}
+          >
+            <div
+              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border ${
+                isSelected
+                  ? 'border-blue-500/40 bg-blue-600/20 text-blue-300'
+                  : 'border-slate-700 bg-slate-950 text-slate-400'
+              }`}
+            >
+              <ProfileTypeIcon type={t.id} className="h-5 w-5" />
+            </div>
+            <div className="flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium text-white">{t.label}</span>
+                {badge && (
+                  <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] uppercase text-slate-400">
+                    {badge}
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 text-xs text-slate-400">{t.description}</p>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
 }

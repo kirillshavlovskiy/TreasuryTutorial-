@@ -1,4 +1,4 @@
-import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
+import { analyticsSpotUsd } from '@/lib/test-mode/fixtures/nordtech-var';
 import { CURRENCY_PARAMS } from '@/lib/fx-buffer';
 import type { ForecastProfileState } from '@/lib/forecast-profile';
 import {
@@ -464,7 +464,7 @@ export function computeHedgeCfarBands(input: {
       ? { ...setup, exposureBasis: 'avgBuildup' }
       : setup;
   const T = input.tenureMonths > 0 ? input.tenureMonths : horizonMonths(setup.horizon);
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const sigmaFx = monthlyVolForSetup(setup);
   const monthlyFlowM =
     input.monthlyFlows.length > 0
@@ -732,7 +732,7 @@ export function settlementFundingGapForHedge(
     monthlyFlows.length > 0
       ? monthlyFlows.reduce((a, b) => a + b, 0) / monthlyFlows.length
       : 0;
-  const spot = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spot = analyticsSpotUsd(ccy);
 
   const fromProfile = (
     profile: { t: number; exposureLocalM: number; cumulCoverLocalM: number }[],

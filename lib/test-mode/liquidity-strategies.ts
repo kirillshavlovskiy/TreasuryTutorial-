@@ -1325,6 +1325,14 @@ export interface LiquidityAnalyticsSource {
   /** Overlay sweet-spot chip — persisted on the hedge-book desk. */
   portfolioScenarioId?: string | null;
   onPortfolioScenarioIdChange?: (id: string | null) => void;
+  /**
+   * Total treasury capital ($M USD) — primary liquidity-model input.
+   * Same stock as the simulator USD LP cash row; overlay/NWC is allocated from it.
+   */
+  usdCash?: number;
+  onUsdCashChange?: (usdM: number) => void;
+  /** USD payout forecast ($M, negative = outflow) — sizes the USD NWC reserve. */
+  usdPayout?: number;
 }
 
 /**

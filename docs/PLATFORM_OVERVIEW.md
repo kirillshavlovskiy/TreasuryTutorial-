@@ -191,12 +191,12 @@ Parallel to the FX Buffer Simulator workbench (`/workspace`), the app ships a ga
 
 | Piece | Detail |
 |---|---|
-| Entry | Landing CTA **Open Test Dashboard** (when `TEST_MODE_ENABLED=true`) |
+| Entry | Landing CTA **Open Test Dashboard**, plus the Sandbox link in `ModeNav` and the avatar menu |
 | Auth | Guest Credentials provider (`test@sigma.local`) — separate localStorage namespace `treasury:test:*` so it never overwrites a Google user's FX workspace |
 | Banner | Persistent **Test Dashboard — sample data** |
 | Task 01 | Parent **Group FX** + entity dashboards; FX Risk book only; profile presetup = **Decision** (Hedging, Δ=1 unhedged) + **Analytical** (Risk Metrics VaR / Sensitivity / Monte Carlo); **Validate** (±5%) |
 | Engine | `lib/test-mode/` — NordTech seeds, consolidate, `buildHedgeVarSummary`, `scoreTask01` |
-| Production gate | Off unless `TEST_MODE_ENABLED=true`; in `NODE_ENV=production` also requires `TEST_MODE_ALLOW_PROD=true` |
+| Production gate | None — `isTestModeEnabled()` always returns `true`, so the sandbox is present in every environment. The former `TEST_MODE_ENABLED` / `TEST_MODE_ALLOW_PROD` flags are no longer read |
 
 Task 01 acceptance targets: open Group FX; EUR Net FX stock **+€1.9M** (4.9 − 3 debt), PLN stock **−zł1.8M**, EUR 1M 99% VaR **≈ $110K** (all ±5%).
 

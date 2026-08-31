@@ -1,3 +1,5 @@
+import { ccySpotRate } from '@/lib/fx-buffer';
+
 /**
  * Curriculum VaR inputs for Sigma Task 01 (episode var.json semantics).
  *
@@ -27,3 +29,21 @@ export const NORDTECH_VAR = {
     GBP: 1.26,
   } as Record<string, number>,
 } as const;
+
+/**
+ * USD per 1 local unit for Analytics / Group FX VaR.
+ * Curriculum pins (EUR = 1) win for Task 01 scoring; JPY / MXN / other
+ * desk CCYs fall back to TMS spots so −¥900M is not priced as −$900M.
+ */
+export function analyticsSpotUsd(ccy: string): number {
+  const pinned = NORDTECH_VAR.spotUsd[ccy];
+  if (typeof pinned === 'number' && Number.isFinite(pinned) && pinned > 0) {
+    return pinned;
+  }
+  return ccySpotRate(ccy);
+}
+
+/** TMS / market mid — Group FX Optimize and Atlas paste. Task 01 scoring stays on pins. */
+export function marketSpotUsd(ccy: string): number {
+  return ccySpotRate(ccy);
+}

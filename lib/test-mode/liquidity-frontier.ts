@@ -1386,27 +1386,30 @@ export function stampIsoMixTwin(
 }
 
 /**
- * Linear-Y ray from true (0, 0) through a touch, in data coordinates.
- * Map each sample through the plot x / asinh-y mappers — a 2-point SVG
- * chord from the origin corner is a straight screen line on log Y.
+ * (0, 0) supporting-ray as a 2-point SVG chord in **screen** space.
+ *
+ * Passes through the mapped origin `(ox, oy)` and the mapped Balanced touch
+ * `(tx, ty)`, then extends to the plot left/right edges. Dense linear-Y
+ * samples mapped through asinh Y look curved — that is not this guide.
  */
-export function originTangentDataRay(
-  touchCfar: number,
-  touchCarry: number,
-  xHi: number,
-  steps = 64,
-): { x: number; y: number }[] {
-  if (!Number.isFinite(touchCfar) || !Number.isFinite(touchCarry)) return [];
-  if (!(Math.abs(touchCfar) > 1e-9) || !(Math.abs(touchCarry) > 1e-9)) return [];
-  const end = Math.max(Math.abs(xHi), Math.abs(touchCfar)) * 1.08;
-  if (!(end > 1e-9)) return [];
-  const n = Math.max(16, Math.floor(steps));
-  const slope = touchCarry / touchCfar;
-  const xs = new Set<number>([0, Math.abs(touchCfar), end]);
-  for (let i = 1; i < n; i += 1) xs.add((i / n) * end);
-  return [...xs]
-    .sort((a, b) => a - b)
-    .map(x => ({ x, y: slope * x }));
+export function originTangentScreenChord(
+  ox: number,
+  oy: number,
+  tx: number,
+  ty: number,
+  xL: number,
+  xR: number,
+): { x1: number; y1: number; x2: number; y2: number } | null {
+  if (![ox, oy, tx, ty, xL, xR].every(Number.isFinite)) return null;
+  const den = tx - ox;
+  if (!(Math.abs(den) > 1e-6)) return null;
+  const m = (ty - oy) / den;
+  return {
+    x1: xL,
+    y1: oy + m * (xL - ox),
+    x2: xR,
+    y2: oy + m * (xR - ox),
+  };
 }
 
 /** Price one cover on the iso-S slice between an open/far twin pair. */
@@ -1495,9 +1498,14 @@ export function isoSSlicePoints(
   sectionUsdM: number,
   steps = ISO_S_SLICE_STEPS,
 ): LiquidityFrontierPoint[] {
-  const farAtS = isoMixDrawable(open, far) ? far : findIsoMixFar(open, [far]);
-  if (!farAtS) return [];
-  const stamped = stampIsoMixTwin(open, farAtS);
+  if (isoMixDrawable(open, far)) {
+    return isoSSliceAlphas(open, far, sectionUsdM, steps).map(a =>
+      priceIsoSSlice(open, far, sectionUsdM, a),
+    );
+  }
+  const hit = findIsoMixFar(open, [far]);
+  if (!hit) return [];
+  const stamped = stampIsoMixTwin(open, hit);
   if (!isoMixDrawable(stamped.open, stamped.far)) return [];
   return isoSSliceAlphas(stamped.open, stamped.far, sectionUsdM, steps).map(a =>
     priceIsoSSlice(stamped.open, stamped.far, sectionUsdM, a),

@@ -332,6 +332,12 @@ describe('buildCcyInspectLeftEnd', () => {
     expect(mid.totalCarryUsdYrM).toBeGreaterThanOrEqual(yLo - 1e-6);
     expect(mid.totalCarryUsdYrM).toBeLessThanOrEqual(yHi + 1e-6);
     expect(Math.abs(mid.totalCarryUsdYrM - open!.totalCarryUsdYrM)).toBeGreaterThan(1e-5);
+    const dropped = { ...open!, cipUsdYrM: 0 };
+    const droppedFar = { ...far!, cipUsdYrM: 0 };
+    const slice = isoSSlicePoints(dropped, droppedFar, left.cfarOriginUsdM);
+    expect(slice.length).toBeGreaterThan(8);
+    expect(Math.abs(slice[0]!.totalCarryUsdYrM - slice[slice.length - 1]!.totalCarryUsdYrM))
+      .toBeGreaterThan(1e-5);
   });
 
   it('tiny overlay cap: modal levMin $K extends the parent past the 1.2 floor', () => {

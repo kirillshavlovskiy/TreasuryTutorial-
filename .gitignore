@@ -42,3 +42,11 @@ next-env.d.ts
 .cursor/
 .test-trigger
 .DS_Store
+.tmp-handover*/
+.tmp-compare/
+scripts/scratch/
+handover-*/
+
+# production secrets (use .env.prod.example as the template)
+.env.prod
+

@@ -5,9 +5,7 @@
 
 import { hedgeBookContentScore } from '@/lib/hedge-book-normalize';
 import {
-  fetchSandboxApi,
   finishSandboxHydration,
-  isSandboxHydrationCurrent,
   persistSandboxRemote,
   startSandboxHydration,
 } from '@/lib/test-mode/sandbox-client';
@@ -29,6 +27,33 @@ import {
 } from '@/lib/workspace-store';
 
 export const WORKSPACE_SANDBOX_TASK_ID = 'workspace';
+
+interface ApiSandboxResponse {
+  state: TestSandboxState;
+  updatedAt: string;
+  source: 'database' | 'seed' | 'local';
+  persistent: boolean;
+}
+
+async function fetchJson<T>(
+  input: RequestInfo,
+  init?: RequestInit,
+): Promise<T | null> {
+  try {
+    const res = await fetch(input, {
+      credentials: 'same-origin',
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
 
 function toSandboxState(book: WorkspaceLoadResult): TestSandboxState {
   return normalizeSandboxState({
@@ -81,42 +106,29 @@ export async function persistWorkspaceRemote(
  */
 export async function loadWorkspacePersistent(
   userKey: string,
-): Promise<{ book: WorkspaceLoadResult; persistent: boolean; error?: string }> {
+): Promise<{ book: WorkspaceLoadResult; persistent: boolean }> {
   const gen = startSandboxHydration(WORKSPACE_SANDBOX_TASK_ID);
   let loaded: WorkspaceLoadResult | undefined;
   try {
-  const remote = await fetchSandboxApi(WORKSPACE_SANDBOX_TASK_ID);
-  if (!isSandboxHydrationCurrent(WORKSPACE_SANDBOX_TASK_ID, gen)) {
-    const live = loadWorkspaceDetailed(userKey);
-    loaded = live;
-    return { book: live, persistent: false };
-  }
+  const remote = await fetchJson<ApiSandboxResponse>(
+    `/api/test/sandbox?taskId=${encodeURIComponent(WORKSPACE_SANDBOX_TASK_ID)}`,
+  );
   const local = loadWorkspaceDetailed(userKey);
 
-  if (!remote.body) {
+  if (!remote?.state || remote.source === 'seed') {
     const live = loadWorkspaceDetailed(userKey);
     loaded = live;
-    return { book: live, persistent: false, error: remote.error };
-  }
-
-  if (!remote.body.state || remote.body.source === 'seed') {
-    const live = loadWorkspaceDetailed(userKey);
-    loaded = live;
-    if (
-      isSandboxHydrationCurrent(WORKSPACE_SANDBOX_TASK_ID, gen)
-      && remote.body.persistent
-      && live.workspace.entities.length > 0
-    ) {
+    if (remote?.persistent && live.workspace.entities.length > 0) {
       void persistWorkspaceRemote(live);
     }
-    return { book: live, persistent: Boolean(remote.body.persistent) };
+    return { book: live, persistent: Boolean(remote?.persistent) };
   }
 
   const remoteState = normalizeSandboxState({
-    ...remote.body.state,
-    updatedAt: remote.body.updatedAt ?? remote.body.state.updatedAt,
+    ...remote.state,
+    updatedAt: remote.updatedAt ?? remote.state.updatedAt,
   });
-  const remoteBook = bookFromSandboxState(remoteState, remote.body.updatedAt);
+  const remoteBook = bookFromSandboxState(remoteState, remote.updatedAt);
   const localAt = Date.parse(local.updatedAt ?? '') || 0;
   const remoteAt = Date.parse(remoteBook.updatedAt ?? '') || 0;
   const localNewer = localAt > remoteAt;
@@ -165,11 +177,6 @@ export async function loadWorkspacePersistent(
         ? live.hedgesUpdatedAt
         : merged.hedgesUpdatedAt,
   };
-  if (!isSandboxHydrationCurrent(WORKSPACE_SANDBOX_TASK_ID, gen)) {
-    const liveNow = loadWorkspaceDetailed(userKey);
-    loaded = liveNow;
-    return { book: liveNow, persistent: false };
-  }
   saveWorkspace(userKey, finalBook.workspace, {
     hedgesByEntityId: finalBook.hedgesByEntityId,
     varSetup: finalBook.varSetup,
@@ -179,17 +186,14 @@ export async function loadWorkspacePersistent(
   const mergedScore = hedgeBookContentScore(liveHedges);
   const newerScore = hedgeBookContentScore(newer.hedgesByEntityId);
   if (
-    isSandboxHydrationCurrent(WORKSPACE_SANDBOX_TASK_ID, gen)
-    && (
-      localAt > remoteAt
-      || mergedScore.prepared > newerScore.prepared
-      || mergedScore.booked > newerScore.booked
-      || mergedScore.desk > newerScore.desk
-      || mergedScore.carry > newerScore.carry
-      || mergedScore.market > newerScore.market
-      || workspaceFxProfileCount(asSandboxShell(finalBook))
-        > workspaceFxProfileCount(asSandboxShell(newer))
-    )
+    localAt > remoteAt
+    || mergedScore.prepared > newerScore.prepared
+    || mergedScore.booked > newerScore.booked
+    || mergedScore.desk > newerScore.desk
+    || mergedScore.carry > newerScore.carry
+    || mergedScore.market > newerScore.market
+    || workspaceFxProfileCount(asSandboxShell(finalBook))
+      > workspaceFxProfileCount(asSandboxShell(newer))
   ) {
     void persistWorkspaceRemote(loadWorkspaceDetailed(userKey));
   }

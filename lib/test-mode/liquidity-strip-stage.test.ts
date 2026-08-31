@@ -6,6 +6,7 @@ import {
   buildStandingStripToTerm,
   canLiquidityStageReplace,
   fundingStripPreparedProfile,
+  overlayMixPreparedProfile,
   fundingSwapTenorLabel,
   hedgeLegNotionalFcyM,
   hedgeLegNotionalUsdM,
@@ -201,7 +202,7 @@ describe('canLiquidityStageReplace', () => {
     expect(canLiquidityStageReplace({
       structure: 'strip',
       basis: 'varNeutral',
-      ticketBasis: 'varNeutral',
+      ticketBasis: 'stock',
       legs: [],
       coverLocalM: 2,
       hedgeRatio: 1,
@@ -497,3 +498,31 @@ describe('fundingSwapTenorLabel', () => {
     ]);
   });
 });
+
+describe('overlayMixPreparedProfile', () => {
+  it('scales the strip calendar so cover equals overlay FCY', () => {
+    const profile = overlayMixPreparedProfile({
+      ccy: 'GBP',
+      overlayFcyM: 26.281,
+      schedule: strip,
+      forecastMonths: 12,
+    });
+    expect(profile).not.toBeNull();
+    expect(profile!.preparedFor).toBe('liquidity');
+    expect(profile!.approvalStatus).toBe('draft');
+    expect(profile!.coverLocalM).toBeCloseTo(26.281, 6);
+  });
+
+  it('stages a Tf bullet when there is no swap calendar', () => {
+    const profile = overlayMixPreparedProfile({
+      ccy: 'GBP',
+      overlayFcyM: 10,
+      schedule: [],
+      forecastMonths: 12,
+    });
+    expect(profile!.structure).toBe('bullet');
+    expect(profile!.coverLocalM).toBeCloseTo(10, 9);
+    expect(profile!.settleMonths).toBe(12);
+  });
+});
+

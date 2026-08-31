@@ -29,6 +29,7 @@ import {
   type EntityHedgeBook,
   type HedgeTicket,
   type HedgeTicketsPatch,
+  type PreparedHedgeProfile,
   type PreparedHedgesPatch,
   type ForecastHedgeStructure,
   type VarSetup,
@@ -155,25 +156,15 @@ export function WorkbenchGroupDesk({
 
   const handleBookHedge = (ticket: HedgeTicket) => {
     onHedgesByEntityIdChange(prev => {
-      const current = aggregateBookedHedges(prev, entityIds, true);
-      const exists = current.some(t => t.id === ticket.id);
-      const nextTickets = exists
-        ? current
-        : [
-            {
-              ...ticket,
-              entityId: ticket.entityId ?? GROUP_HEDGE_SCOPE,
-              entityName: ticket.entityName ?? group.dashboardName,
-            },
-            ...current,
-          ];
-      const mapped = applyConsolidatedBookedChange(nextTickets, entityIds, prev);
-      const g = mapped[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
+      const g = prev[GROUP_HEDGE_SCOPE] ?? emptyHedgeBook();
       return {
-        ...mapped,
+        ...prev,
         [GROUP_HEDGE_SCOPE]: {
           ...g,
           hedgeRatios: { ...g.hedgeRatios, [ticket.ccy]: 0 },
+          preparedByCcy: g.preparedByCcy ?? {},
+          carrySessionsByCcy: g.carrySessionsByCcy ?? {},
+          marketRatesByCcy: g.marketRatesByCcy ?? {},
         },
       };
     });

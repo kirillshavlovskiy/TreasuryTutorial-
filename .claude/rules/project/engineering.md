@@ -17,22 +17,32 @@
 │   ├── framework-setup.md       # Fetched from GDrive — do not edit manually
 │   ├── registry.json            # GDrive folder IDs (auto-generated, commit it)
 │   ├── commands/                # Slash commands for Claude Code — commit them
+│   ├── skills/                  # Agent skills for this repo — see .claude/skills/README.md
+│   ├── hooks/                   # Deterministic guards (protected paths) — commit them
 │   └── rules/
 │       ├── dept/                # Department knowledge — read-only, sync-managed
 │       ├── div/                 # Division knowledge — read-only, sync-managed
 │       └── project/             # This project's knowledge — team editable
-├── src/                         # All source code
-│   ├── lib/                     # Pure business logic — no framework dependencies
-│   ├── api/                     # Route handlers / controllers
-│   ├── services/                # External integrations (MCP calls, HTTP clients)
-│   └── types/                   # Shared TypeScript interfaces and enums
-├── tests/                       # Integration and e2e tests (co-locate unit tests)
+├── app/                         # Next.js App Router — pages and API routes
+│   └── api/                     # Route handlers; validate the session first
+├── lib/                         # Business logic
+│   ├── db/                      # Sequelize models and data access
+│   ├── treasury/                # Treasury MCP client and token crypto
+│   ├── agent/                   # Workbench AI agent
+│   └── test-mode/               # Sandbox and analytics engines
+├── components/                  # React components, including simulator and workbench screens
+├── data/                        # Static data files
 ├── docs/                        # Long-form documentation (architecture diagrams, runbooks)
 │   └── decisions/               # One file per ADR if growing beyond decisions.md
-└── scripts/                     # One-off operational scripts — never imported by src/
+├── public/                      # Static assets
+└── scripts/                     # One-off operational scripts — never imported by app code
 ```
 
-Co-locate unit test files with source: `src/lib/fx-calculator.ts` → `src/lib/fx-calculator.test.ts`
+There is no `src/` directory. An earlier version of this document described a
+`src/lib`, `src/api`, `src/services`, `src/types` layout that this repository never used; the
+leftover `src/app/` Next.js scaffold was removed once it was confirmed unused. Unit tests are
+**co-located** with their source (`lib/fx-buffer.ts` → `lib/fx-buffer.test.ts`), not gathered
+into a `tests/` directory.
 
 ---
 

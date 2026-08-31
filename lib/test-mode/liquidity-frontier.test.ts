@@ -39,7 +39,7 @@ import {
   stampIsoMixTwin,
   mixTwinForSelection,
   namedCcyChipParksWalk,
-  originTangentDataRay,
+  originTangentScreenChord,
   resolveCcyFrontierScenarioId,
   showCcyIsoMixStub,
   ISO_S_SLICE_STEPS,
@@ -1101,35 +1101,26 @@ describe('liquidityFrontierSkyline', () => {
   });
 });
 
-describe('originTangentDataRay', () => {
-  it('is linear in data Y from (0, 0), not a 2-point screen chord', () => {
-    const touch = { cfar: 2.7, carry: 0.25 };
-    const ray = originTangentDataRay(touch.cfar, touch.carry, 12.5, 32);
-    expect(ray.length).toBeGreaterThan(16);
-    expect(ray[0]!.x).toBe(0);
-    expect(ray[0]!.y).toBe(0);
-    const slope = touch.carry / touch.cfar;
-    for (const p of ray) {
-      expect(p.y).toBeCloseTo(slope * p.x, 10);
-    }
-    const through = ray.find(p => Math.abs(p.x - touch.cfar) < 1e-9);
-    expect(through).toBeTruthy();
-    expect(through!.y).toBeCloseTo(touch.carry, 10);
+describe('originTangentScreenChord', () => {
+  it('is a 2-point screen chord through origin and the mapped touch', () => {
+    const ox = 80;
+    const oy = 220;
+    const tx = 240;
+    const ty = 100;
+    const chord = originTangentScreenChord(ox, oy, tx, ty, 72, 640);
+    expect(chord).not.toBeNull();
+    const m = (ty - oy) / (tx - ox);
+    expect(chord!.x1).toBe(72);
+    expect(chord!.x2).toBe(640);
+    expect(chord!.y1).toBeCloseTo(oy + m * (72 - ox), 10);
+    expect(chord!.y2).toBeCloseTo(oy + m * (640 - ox), 10);
+    const yAtTouch = chord!.y1 + (chord!.y2 - chord!.y1) * ((tx - chord!.x1) / (chord!.x2 - chord!.x1));
+    expect(yAtTouch).toBeCloseTo(ty, 10);
   });
 
-  it('maps to a bent asinh polyline, not colinear z vs CFaR', () => {
-    const ray = originTangentDataRay(2.7, 0.25, 12.5, 32);
-    const s = 0.012;
-    const z = ray.map(p => carryFwd(p.y, s));
-    const last = ray.length - 1;
-    const zChord = (i: number) => z[0]! + (z[last]! - z[0]!) * (i / last);
-    const mid = Math.floor(last / 2);
-    expect(Math.abs(z[mid]! - zChord(mid))).toBeGreaterThan(1e-4);
-  });
-
-  it('is empty when there is no touch off the origin', () => {
-    expect(originTangentDataRay(0, 0.25, 4)).toEqual([]);
-    expect(originTangentDataRay(2.7, 0, 4)).toEqual([]);
+  it('is empty when the touch sits on the origin vertical', () => {
+    expect(originTangentScreenChord(72, 200, 72, 100, 72, 640)).toBeNull();
+    expect(originTangentScreenChord(NaN, 200, 200, 100, 72, 640)).toBeNull();
   });
 });
 

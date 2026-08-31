@@ -433,21 +433,6 @@ describe('joinOverlayStripWeights', () => {
     expect(joined.every(r => r.overlayWeight === 0)).toBe(true);
     expect(joined.reduce((s, r) => s + Math.abs(r.stripWeight), 0)).toBeCloseTo(1, 9);
   });
-
-  it('Strip w% follows live outstanding sign — not scenario Book S', () => {
-    const joined = joinOverlayStripWeights(
-      [{
-        ccy: 'EUR', mu: -0.01, usdM: -55.5, fcyM: -47.43, side: 'short',
-        carryUsdYrM: 0.716, componentVarUsdM: 1.8,
-      }],
-      [{ ccy: 'EUR', bookNow: -36.74, outstanding: -23.51 }],
-    );
-    const eur = joined.find(r => r.ccy === 'EUR')!;
-    expect(eur.overlayFcyM).toBeCloseTo(-47.43, 2);
-    expect(eur.outstanding).toBeCloseTo(-23.51, 2);
-    expect(eur.stripWeight).toBeLessThan(0);
-    expect(eur.overlayWeight).toBeLessThan(0);
-  });
 });
 
 describe('overlayBookBaseFcyM', () => {

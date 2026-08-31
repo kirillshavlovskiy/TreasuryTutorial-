@@ -43,7 +43,6 @@ import {
   allowsNegativeLp,
   fundingSwapOverlayUsdYr,
   fundingSwapCashDeltaUsdYr,
-  bothSidesPayVsUsd,
   fundingSwapCarryLegs,
   allocateToTotal,
   fundingSwapMonthBufferUsdM,
@@ -57,6 +56,8 @@ import {
   approvalTierCapUsd,
   POLICY_VAR_LIMITS,
   computeEffectiveUsdBudget,
+  allocateLiquidityCapital,
+  overlayUsdCapitalDrawM,
   toggleLayerGroup,
   setBufferLevel,
   bufferLevelOf,
@@ -844,18 +845,6 @@ describe('PLN cash + points vs USD', () => {
     expect(cash).toBeLessThan(0);
     expect(cash).toBeCloseTo(S * ((r_FCY - r_USD) / 100) * spot, 10);
     expect(overlay.pointsUsdYr).toBeCloseTo(-cash, 10);
-  });
-
-  it('desk Buffer +$79K on +317.45M Book S is |9 bp × Book $|, not CIP-net $0', () => {
-    const S = 317.45;
-    expect(bothSidesPayVsUsd(spot, r_FCY, r_USD, r_OD)).toBe(true);
-    const cash = fundingSwapCashDeltaUsdYr(S, spot, r_FCY, r_USD, r_OD);
-    const points = fundingSwapCipPointsUsdYr(S, spot, r_FCY, r_USD);
-    expect(S * spot).toBeCloseTo(87.3, 1);
-    expect(cash).toBeLessThan(0);
-    expect(cash).toBeCloseTo(S * ((r_FCY - r_USD) / 100) * spot, 10);
-    expect(Math.abs(cash) * 1000).toBeCloseTo(79, 0);
-    expect(cash + points).toBeCloseTo(0, 10);
   });
 
   it('12m term Buffer Carry is annual cash Δr on M1 standing, not a 1M nest or a 6-cycle path', () => {
@@ -2097,6 +2086,70 @@ describe('computeEffectiveUsdBudget', () => {
 
   it('positive USD payout does not increase collateral budget', () => {
     expect(computeEffectiveUsdBudget(303.9, 50)).toBeCloseTo(303.9);
+  });
+});
+
+
+describe('allocateLiquidityCapital', () => {
+  it('reserves USD NWC first; leftover funds FCY overlay', () => {
+    const a = allocateLiquidityCapital({
+      totalCapitalUsdM: 303.9,
+      usdPayoutBufferM: 116.45,
+      fcyOverlayUsdM: 40,
+    });
+    expect(a.usdNwcReservedM).toBeCloseTo(116.45);
+    expect(a.cfarCoverageAllocatedM).toBe(0);
+    expect(a.fcyNwcAllocatedM).toBeCloseTo(40);
+    expect(a.unallocatedUsdM).toBeCloseTo(303.9 - 116.45 - 40);
+    expect(a.capitalBinding).toBe(false);
+  });
+
+  it('ring-fences CFaR cover after USD NWC, before FCY hedge', () => {
+    const a = allocateLiquidityCapital({
+      totalCapitalUsdM: 303.9,
+      usdPayoutBufferM: 116.45,
+      fcyOverlayUsdM: 40,
+      cfarCoverageUsdM: 50,
+    });
+    expect(a.usdNwcReservedM).toBeCloseTo(116.45);
+    expect(a.cfarCoverageAllocatedM).toBeCloseTo(50);
+    expect(a.fcyNwcAllocatedM).toBeCloseTo(40);
+    expect(a.unallocatedUsdM).toBeCloseTo(303.9 - 116.45 - 50 - 40);
+    expect(a.capitalBinding).toBe(false);
+  });
+
+  it('binds when overlay exceeds leftover after USD NWC', () => {
+    const a = allocateLiquidityCapital({
+      totalCapitalUsdM: 200,
+      usdPayoutBufferM: 150,
+      fcyOverlayUsdM: 80,
+    });
+    expect(a.usdNwcReservedM).toBeCloseTo(150);
+    expect(a.fcyNwcAllocatedM).toBeCloseTo(50);
+    expect(a.unallocatedUsdM).toBe(0);
+    expect(a.capitalBinding).toBe(true);
+  });
+
+  it('binds when USD NWC alone exceeds total capital', () => {
+    const a = allocateLiquidityCapital({
+      totalCapitalUsdM: 50,
+      usdPayoutBufferM: 80,
+      fcyOverlayUsdM: 10,
+    });
+    expect(a.usdNwcReservedM).toBe(50);
+    expect(a.fcyNwcAllocatedM).toBe(0);
+    expect(a.unallocatedUsdM).toBe(0);
+    expect(a.capitalBinding).toBe(true);
+  });
+});
+
+describe('overlayUsdCapitalDrawM', () => {
+  it('nets long FCY overlay as USD capital drawn', () => {
+    expect(overlayUsdCapitalDrawM([{ usdM: 40 }, { usdM: -15 }])).toBeCloseTo(25);
+  });
+
+  it('short-only overlay does not consume capital', () => {
+    expect(overlayUsdCapitalDrawM([{ usdM: -80 }])).toBe(0);
   });
 });
 

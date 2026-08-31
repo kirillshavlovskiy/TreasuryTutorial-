@@ -16,7 +16,7 @@ import {
   sizingForHedgePathBasis,
   type ForecastHedgeStructure,
 } from '@/lib/test-mode/rolling-hedge';
-import type { FxMarketRatesBundle } from '@/lib/fx-market-rates';
+import { fcyCcyOf, type FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import {
   horizonMonths,
   type VarSetup,
@@ -168,6 +168,7 @@ export function remodelPreparedHedgeInstruments(input: {
       {
         marketRates: input.marketRates,
         bulletSettleMonths: Tf,
+        ccy: input.ccy,
       },
     );
   }
@@ -211,6 +212,7 @@ export function remodelPreparedHedgeInstruments(input: {
     {
       marketRates: input.marketRates,
       bulletSettleMonths: settle,
+      ccy: input.ccy,
     },
   );
 }
@@ -277,6 +279,7 @@ export function applySettleWamToPrepared(input: {
       {
         marketRates: input.marketRates,
         bulletSettleMonths: Tf > 0 ? Tf : target,
+        ccy: fcyCcyOf(input.marketRates),
       },
     );
   }
@@ -293,6 +296,7 @@ export function applySettleWamToPrepared(input: {
     {
       marketRates: input.marketRates,
       bulletSettleMonths: settle,
+      ccy: fcyCcyOf(input.marketRates),
     },
   );
 }

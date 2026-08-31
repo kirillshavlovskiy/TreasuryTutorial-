@@ -1,13 +1,27 @@
 {
-  "permissions": {
-    "deny": [
-      "Bash(git push*)",
-      "Bash(git push --force*)",
-      "Bash(git reset --hard*)",
-      "Bash(git clean*)",
-      "Bash(rm -rf*)",
-      "Bash(DROP TABLE*)",
-      "Bash(DROP DATABASE*)"
-    ]
-  }
+    "permissions": {
+        "deny": [
+            "Bash(git push*)",
+            "Bash(git push --force*)",
+            "Bash(git reset --hard*)",
+            "Bash(git clean*)",
+            "Bash(rm -rf*)",
+            "Bash(DROP TABLE*)",
+            "Bash(DROP DATABASE*)"
+        ]
+    },
+    "hooks": {
+        "PreToolUse": [
+            {
+                "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash -c 'if [ -n \"$CLAUDE_PROJECT_DIR\" ] && [ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/protected-paths.mjs\" ]; then exec node \"$CLAUDE_PROJECT_DIR/.claude/hooks/protected-paths.mjs\"; fi; d=\"$PWD\"; while [ \"$d\" != \"/\" ]; do if [ -f \"$d/.claude/hooks/protected-paths.mjs\" ]; then exec node \"$d/.claude/hooks/protected-paths.mjs\"; fi; d=$(dirname \"$d\"); done; exit 0'",
+                        "timeout": 10
+                    }
+                ]
+            }
+        ]
+    }
 }

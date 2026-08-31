@@ -4,18 +4,22 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
 type ModeNavProps = {
-  /** When false, hide the Sandbox link (TEST_MODE off). */
-  sandboxEnabled?: boolean;
+  /**
+   * Hides the Sandbox link when the `/test` gate is closed. Required so callers
+   * must pass `isTestModeEnabled()` instead of silently defaulting to visible.
+   */
+  sandboxEnabled: boolean;
 };
 
 const linkBase =
   'rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors';
 
-export function ModeNav({ sandboxEnabled = true }: ModeNavProps) {
+export function ModeNav({ sandboxEnabled }: ModeNavProps) {
   const pathname = usePathname() ?? '';
   const onHome = pathname === '/';
   const onSandbox = pathname.startsWith('/test');
   const onWorkbench = pathname.startsWith('/workspace');
+  const onRates = pathname.startsWith('/treasury/rates');
 
   const active = (on: boolean) =>
     on
@@ -45,6 +49,13 @@ export function ModeNav({ sandboxEnabled = true }: ModeNavProps) {
         title="Live Treasury Workbench"
       >
         Workbench
+      </Link>
+      <Link
+        href="/treasury/rates"
+        className={active(onRates)}
+        title="Live FX rates via Treasury MCP (PoC)"
+      >
+        FX Rates
       </Link>
     </nav>
   );

@@ -1,16 +1,20 @@
 /**
  * One hedge structure on the risk/return plane.
  *
- * The risk coordinate is GROSS CFaR, not net. Net already has carry subtracted
- * from it, so pairing net with carry puts the same quantity on both axes and a
+ * Axes match the Liquidity Carry vs CFaR plot:
+ *   X = CFaR (GROSS — drawdown before carry)
+ *   Y = Carry
+ *
+ * Gross, not net, is the risk coordinate. Net already has carry subtracted,
+ * so pairing net with carry puts the same quantity on both axes and a
  * structure appears to buy risk reduction with carry it has just been credited
  * for on the other axis. Gross is measured with interest accrual off and is
  * untouched by the carry schedule, so the two coordinates are independent and
  * the trade-off between them is real.
  *
- * Net is carried alongside because it remains the decision criterion, and on
- * these axes it is a diagonal: net = gross − carry, so equal-reserve lines run
- * at 45° and the best structure is the one the lowest such line touches.
+ * Net is carried alongside because it remains the decision criterion: the
+ * lowest-reserve cover is the point that minimises net, even though the chart
+ * plots gross on X.
  */
 export interface FrontierPoint {
   /**
@@ -25,8 +29,11 @@ export interface FrontierPoint {
    * of its own, while carry keeps climbing with notional.
    */
   coverRatio: number;
+  /** Risk axis (X) — gross CFaR before carry. */
   grossCfarUsdM: number;
+  /** Decision criterion — net CFaR after carry. */
   netCfarUsdM: number;
+  /** Return axis (Y) — same Carry total as the desk metrics. */
   carryUsdM: number;
 }
 

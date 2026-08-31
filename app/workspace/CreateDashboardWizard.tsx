@@ -1,13 +1,14 @@
 'use client';
 
 import { useMemo, useState, type ReactNode } from 'react';
-import { Check, LayoutDashboard, X } from 'lucide-react';
+import { Check, Droplets, LayoutDashboard, X } from 'lucide-react';
 import { INITIAL_ROWS } from '@/lib/fx-buffer';
 import {
   OptimizeFrameworkIcon,
   ProtectGoalIcon,
   RateInstrumentIcon,
   RiskAssetIcon,
+  TickerGlyph,
 } from '@/components/RiskTaxonomyIcons';
 import {
   OPTIMIZE_FRAMEWORKS,
@@ -16,7 +17,12 @@ import {
   RISK_ASSETS,
   createRateInstrument,
   defaultRateIndex,
+  entityAllCurrencies,
   entityEnabledRiskAssets,
+  entityLpCurrencies,
+  FX_CURRENCY_UNIVERSE,
+  normalizeOptimize,
+  normalizeProtect,
   supportsInstruments,
   tickersFromInstruments,
   type DashboardSetup,
@@ -45,10 +51,13 @@ const RATE_TICKERS = ['SOFR', 'EURIBOR', 'SONIA', 'TONA', 'SARON', 'WIBOR'];
 const COMMODITY_TICKERS = ['XAU', 'XAG', 'WTI', 'BRT', 'CU'];
 const GENERIC_TICKERS = ['TICK1', 'TICK2', 'TICK3'];
 
-export function tickersForAsset(asset: RiskAssetId): string[] {
+export function tickersForAsset(
+  asset: RiskAssetId,
+  entity?: Pick<Entity, 'allCurrencies' | 'lpCurrencies'>,
+): string[] {
   switch (asset) {
     case 'currencies':
-      return FX_TICKERS;
+      return entity ? entityAllCurrencies(entity) : FX_TICKERS;
     case 'interestRates':
       return RATE_TICKERS;
     case 'commodities':
@@ -59,23 +68,35 @@ export function tickersForAsset(asset: RiskAssetId): string[] {
 }
 
 /**
- * Opening ticker pick for an asset. Currencies get the majors rather than the
- * first three rows of the buffer, which are alphabetical and arbitrary.
+ * Opening ticker pick for an asset. Currencies default to the entity LP book
+ * (or majors when the entity has no pool configured yet).
  */
-export function defaultTickersForAsset(asset: RiskAssetId): string[] {
+export function defaultTickersForAsset(
+  asset: RiskAssetId,
+  entity?: Pick<Entity, 'allCurrencies' | 'lpCurrencies'>,
+): string[] {
   if (asset === 'currencies') {
+    if (entity) {
+      const lp = entityLpCurrencies(entity);
+      if (lp.length) return [...lp];
+    }
     const majors = ['EUR', 'GBP', 'JPY'].filter(c => FX_TICKERS.includes(c));
     if (majors.length) return majors;
   }
-  return tickersForAsset(asset).slice(0, 3);
+  return tickersForAsset(asset, entity).slice(0, 3);
 }
 
 /** Live frameworks offered for an asset — the wizard's default Optimize pick. */
 export function defaultOptimizeForAsset(asset: RiskAssetId): OptimizeFrameworkId[] {
-  const live = OPTIMIZE_FRAMEWORKS.filter(
-    f => f.live && (!f.assets || f.assets.includes(asset)),
-  ).map(f => f.id);
-  return live.length ? live : ['var'];
+  const ids: OptimizeFrameworkId[] = ['hedgeRatio', 'carryCashInterest'];
+  return ids.filter(id => {
+    const f = OPTIMIZE_FRAMEWORKS.find(x => x.id === id);
+    return f && (!f.assets || f.assets.includes(asset));
+  });
+}
+
+export function defaultProtectGoal(): ProtectGoalId[] {
+  return ['var'];
 }
 
 export function toggleIn<T>(list: T[], value: T): T[] {
@@ -113,15 +134,22 @@ export function CreateDashboardWizard({
     ?? null,
   );
   const [protect, setProtect] = useState<ProtectGoalId[]>(
-    initial?.setup.protect?.length ? [...initial.setup.protect] : ['assetValue', 'cashFlow'],
+    normalizeProtect(initial?.setup.protect),
   );
   const [optimize, setOptimize] = useState<OptimizeFrameworkId[]>(
-    initial?.setup.optimize?.length ? [...initial.setup.optimize] : ['var', 'hedgeCarry'],
+    initial?.setup.optimize?.length
+      ? normalizeOptimize(initial.setup.optimize)
+      : defaultOptimizeForAsset(
+          initial?.setup.riskAsset
+          ?? assets.find(a => a.id === 'currencies')?.id
+          ?? assets[0]?.id
+          ?? 'currencies',
+        ),
   );
   const [tickers, setTickers] = useState<string[]>(
     initial?.setup.tickers?.length
       ? [...initial.setup.tickers]
-      : defaultTickersForAsset('currencies'),
+      : defaultTickersForAsset('currencies', entity),
   );
   const [instruments, setInstruments] = useState<RateInstrument[]>(
     initial?.setup.instruments?.map(i => ({ ...i })) ?? [],
@@ -171,14 +199,14 @@ export function CreateDashboardWizard({
 
   const tickerOptions = useMemo(() => {
     if (!riskAsset) return [];
-    const all = tickersForAsset(riskAsset);
+    const all = tickersForAsset(riskAsset, entity);
     const q = tickerQuery.trim().toUpperCase();
     return q ? all.filter(t => t.includes(q)) : all;
   }, [riskAsset, tickerQuery]);
 
   const canNext = () => {
     if (stepId === 'asset') return Boolean(riskAsset);
-    if (stepId === 'protect') return protect.length >= 1;
+    if (stepId === 'protect') return protect.length === 1;
     if (stepId === 'optimize') {
       const livePicked = optimize.some(
         id => optimizeOptions.find(o => o.id === id)?.live,
@@ -197,7 +225,7 @@ export function CreateDashboardWizard({
     if (changing) {
       setOptimize(defaultOptimizeForAsset(id));
       // Instrument-scoped desks derive their tickers from the legs instead.
-      setTickers(supportsInstruments(id) ? [] : defaultTickersForAsset(id));
+      setTickers(supportsInstruments(id) ? [] : defaultTickersForAsset(id, entity));
       if (!supportsInstruments(id)) setInstruments([]);
     }
     const assetLabel = RISK_ASSETS.find(a => a.id === id)?.label ?? 'Dashboard';
@@ -283,28 +311,57 @@ export function CreateDashboardWizard({
           {stepId === 'protect' && (
             <StepBlock
               title="Protect"
-              helper="What this desk defends. Pick one or more."
+              helper="One risk metric for this desk. Liquidity stays on."
             >
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 {PROTECT_GOALS.map(g => (
                   <SelectCard
                     key={g.id}
-                    selected={protect.includes(g.id)}
-                    onClick={() => setProtect(toggleIn(protect, g.id))}
+                    selected={protect[0] === g.id}
+                    onClick={() => setProtect([g.id])}
                     icon={<ProtectGoalIcon id={g.id} />}
                     label={g.label}
+                    badge={g.live ? 'Live' : 'Soon'}
+                    soon={!g.live}
                   />
                 ))}
               </div>
+              <p className="text-[10px] text-slate-500">
+                {PROTECT_GOALS.find(g => g.id === protect[0])?.longLabel ?? 'Value at Risk'}{' '}
+                configures the risk layer. Liquidity is always included.
+              </p>
             </StepBlock>
           )}
 
           {stepId === 'optimize' && (
             <StepBlock
               title="Optimize"
-              helper="Frameworks / metrics for this asset desk."
+              helper="Hedge ratio, carry, and Greeks / Sensitivity hedging. The Protect metric and Liquidity stay on."
             >
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <div className="grid grid-cols-2 gap-2">
+                {(() => {
+                  const metric = PROTECT_GOALS.find(g => g.id === protect[0]) ?? PROTECT_GOALS[0];
+                  return (
+                    <SelectCard
+                      selected
+                      locked
+                      onClick={() => undefined}
+                      icon={<ProtectGoalIcon id={metric.id} />}
+                      label={metric.label}
+                      badge="Risk · always"
+                    />
+                  );
+                })()}
+                <SelectCard
+                  selected
+                  locked
+                  onClick={() => undefined}
+                  icon={<Droplets className="h-7 w-7" strokeWidth={1.75} />}
+                  label="Liquidity"
+                  badge="Always"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {optimizeOptions.map(f => (
                   <SelectCard
                     key={f.id}
@@ -330,31 +387,32 @@ export function CreateDashboardWizard({
                 onChange={setName}
                 placeholder={`${RISK_ASSETS.find(a => a.id === riskAsset)?.label ?? 'Asset'} desk`}
               />
+              {riskAsset === 'currencies' && (
+                <TickerBulkBar
+                  selectedCount={tickers.length}
+                  universeCount={entityAllCurrencies(entity).length}
+                  lpCount={entityLpCurrencies(entity).length}
+                  onSelectAll={() =>
+                    setTickers([...new Set([...tickers, ...tickerOptions])])
+                  }
+                  onDeselectAll={() =>
+                    setTickers(tickers.filter(t => !tickerOptions.includes(t)))
+                  }
+                  onSelectLp={() => setTickers(entityLpCurrencies(entity))}
+                  onSelectUniverse={() => setTickers(entityAllCurrencies(entity))}
+                />
+              )}
               <input
                 className="mb-3 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
                 placeholder="Search tickers…"
                 value={tickerQuery}
                 onChange={e => setTickerQuery(e.target.value)}
               />
-              <div className="flex flex-wrap gap-2">
-                {tickerOptions.map(t => {
-                  const on = tickers.includes(t);
-                  return (
-                    <button
-                      key={t}
-                      type="button"
-                      onClick={() => setTickers(toggleIn(tickers, t))}
-                      className={`min-w-[3.25rem] rounded-md border px-2.5 py-1.5 font-mono text-[11px] font-semibold transition-colors ${
-                        on
-                          ? 'border-violet-500 bg-violet-600/25 text-violet-100'
-                          : 'border-slate-700 bg-slate-950/40 text-slate-400 hover:border-slate-500'
-                      }`}
-                    >
-                      {t}
-                    </button>
-                  );
-                })}
-              </div>
+              <CurrencyChipGrid
+                options={tickerOptions}
+                selected={tickers}
+                onToggle={t => setTickers(toggleIn(tickers, t))}
+              />
             </StepBlock>
           )}
 
@@ -702,6 +760,190 @@ export function StepBlock({
   );
 }
 
+const chipOn =
+  'border-violet-500 bg-violet-600/25 text-violet-100';
+const chipOff =
+  'border-slate-700 bg-slate-950/40 text-slate-400 hover:border-slate-500';
+
+export function CurrencyChipGrid({
+  options,
+  selected,
+  onToggle,
+}: {
+  options: string[];
+  selected: string[];
+  onToggle: (code: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {options.map(t => {
+        const on = selected.includes(t);
+        return (
+          <button
+            key={t}
+            type="button"
+            onClick={() => onToggle(t)}
+            className={`inline-flex min-w-[3.25rem] items-center justify-center gap-1 rounded-md border px-2.5 py-1.5 font-mono text-[11px] font-semibold transition-colors ${
+              on ? chipOn : chipOff
+            }`}
+          >
+            <TickerGlyph code={t} />
+            {t}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export function TickerBulkBar({
+  selectedCount,
+  universeCount,
+  lpCount,
+  onSelectAll,
+  onDeselectAll,
+  onSelectLp,
+  onSelectUniverse,
+}: {
+  selectedCount: number;
+  universeCount: number;
+  lpCount: number;
+  onSelectAll: () => void;
+  onDeselectAll: () => void;
+  onSelectLp: () => void;
+  onSelectUniverse: () => void;
+}) {
+  const allOn = selectedCount > 0 && selectedCount === universeCount;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <button
+        type="button"
+        className={ghostBtn + ' px-2.5 py-1 text-[10px]'}
+        onClick={allOn ? onDeselectAll : onSelectAll}
+      >
+        {allOn ? 'Deselect all' : 'Select all'}
+      </button>
+      <button
+        type="button"
+        className={ghostBtn + ' px-2.5 py-1 text-[10px]'}
+        disabled={lpCount === 0}
+        title={lpCount === 0 ? 'Configure LP currencies on the entity' : `${lpCount} LP currencies`}
+        onClick={onSelectLp}
+      >
+        Select LP
+      </button>
+      <button
+        type="button"
+        className={ghostBtn + ' px-2.5 py-1 text-[10px]'}
+        disabled={universeCount === 0}
+        title={`${universeCount} currencies on this entity`}
+        onClick={onSelectUniverse}
+      >
+        Select all currencies
+      </button>
+      <span className="ml-auto font-mono text-[10px] tabular-nums text-slate-500">
+        {selectedCount}/{universeCount}
+      </span>
+    </div>
+  );
+}
+
+/** All-currencies + LP lists, configured on the entity. */
+export function CurrencyUniverseFields({
+  universe,
+  allCurrencies,
+  lpCurrencies,
+  onChangeAll,
+  onChangeLp,
+}: {
+  universe: string[];
+  allCurrencies: string[];
+  lpCurrencies: string[];
+  onChangeAll: (next: string[]) => void;
+  onChangeLp: (next: string[]) => void;
+}) {
+  const allSet = new Set(allCurrencies);
+  const toggleAll = (code: string) => {
+    const next = toggleIn(allCurrencies, code);
+    onChangeAll(next);
+    const keep = new Set(next);
+    onChangeLp(lpCurrencies.filter(c => keep.has(c)));
+  };
+  const toggleLp = (code: string) => {
+    if (!allSet.has(code)) return;
+    onChangeLp(toggleIn(lpCurrencies, code));
+  };
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+            All currencies
+          </span>
+          <span className="font-mono text-[10px] tabular-nums text-slate-600">
+            {allCurrencies.length}/{universe.length}
+          </span>
+          <button
+            type="button"
+            className={ghostBtn + ' ml-auto px-2.5 py-1 text-[10px]'}
+            onClick={() => onChangeAll([...universe])}
+          >
+            Select all
+          </button>
+          <button
+            type="button"
+            className={ghostBtn + ' px-2.5 py-1 text-[10px]'}
+            onClick={() => {
+              onChangeAll([]);
+              onChangeLp([]);
+            }}
+          >
+            Deselect all
+          </button>
+        </div>
+        <CurrencyChipGrid
+          options={universe}
+          selected={allCurrencies}
+          onToggle={toggleAll}
+        />
+      </div>
+      <div>
+        <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+            LP currencies
+          </span>
+          <span className="font-mono text-[10px] tabular-nums text-slate-600">
+            {lpCurrencies.length}/{allCurrencies.length || universe.length}
+          </span>
+          <button
+            type="button"
+            className={ghostBtn + ' ml-auto px-2.5 py-1 text-[10px]'}
+            disabled={allCurrencies.length === 0}
+            onClick={() => onChangeLp([...allCurrencies])}
+          >
+            Select all in All
+          </button>
+          <button
+            type="button"
+            className={ghostBtn + ' px-2.5 py-1 text-[10px]'}
+            onClick={() => onChangeLp([])}
+          >
+            Deselect all
+          </button>
+        </div>
+        <p className="mb-2 text-[10px] text-slate-500">
+          Liquidity-pool book. Must be a subset of All currencies.
+        </p>
+        <CurrencyChipGrid
+          options={allCurrencies.length ? allCurrencies : universe}
+          selected={lpCurrencies}
+          onToggle={toggleLp}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function SelectCard({
   selected,
   onClick,
@@ -710,6 +952,7 @@ export function SelectCard({
   badge,
   soon,
   disabled,
+  locked,
 }: {
   selected: boolean;
   onClick: () => void;
@@ -718,26 +961,31 @@ export function SelectCard({
   badge?: string;
   soon?: boolean;
   disabled?: boolean;
+  locked?: boolean;
 }) {
   return (
     <button
       type="button"
-      disabled={disabled}
+      disabled={disabled || locked}
       onClick={onClick}
-      className={`relative flex flex-col items-center gap-1.5 rounded-lg border px-2 py-3 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-        selected
+      className={`relative flex flex-col items-center gap-1.5 rounded-lg border px-2 py-3 text-center transition-colors disabled:cursor-not-allowed ${
+        disabled && !locked
+          ? 'opacity-40'
+          : ''
+      } ${
+        selected || locked
           ? 'border-sky-500 bg-sky-600/15 text-sky-100'
           : soon
             ? 'border-slate-700 bg-slate-950/40 text-slate-400'
             : 'border-slate-700 bg-slate-950/40 text-slate-300 hover:border-slate-500'
       }`}
     >
-      {selected && (
+      {(selected || locked) && (
         <span className="absolute right-1.5 top-1.5 text-sky-300">
           <Check className="h-3 w-3" strokeWidth={2} />
         </span>
       )}
-      <span className={selected ? 'text-sky-300' : 'text-slate-300'}>{icon}</span>
+      <span className={selected || locked ? 'text-sky-300' : 'text-slate-300'}>{icon}</span>
       <span className="text-[11px] font-semibold leading-tight">{label}</span>
       {badge && (
         <span
@@ -749,5 +997,86 @@ export function SelectCard({
         </span>
       )}
     </button>
+  );
+}
+
+export function EntityEditModal({
+  entity,
+  onClose,
+  onSave,
+}: {
+  entity: Entity;
+  onClose: () => void;
+  onSave: (patch: {
+    name: string;
+    allCurrencies: string[];
+    lpCurrencies: string[];
+  }) => void;
+}) {
+  const [name, setName] = useState(entity.name);
+  const [allCurrencies, setAllCurrencies] = useState<string[]>(
+    entityAllCurrencies(entity),
+  );
+  const [lpCurrencies, setLpCurrencies] = useState<string[]>(
+    entityLpCurrencies(entity),
+  );
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="border-b border-slate-800 px-5 py-4">
+          <h2 className="text-sm font-semibold text-white">Edit entity</h2>
+          <p className="mt-0.5 text-[11px] text-slate-400">
+            Name, All currencies, and LP currencies used by dashboard ticker picks.
+          </p>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          <div>
+            <label className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+              Entity name
+            </label>
+            <input
+              autoFocus
+              className="w-full rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-blue-500 focus:outline-none"
+              value={name}
+              onChange={e => setName(e.target.value)}
+            />
+          </div>
+          <CurrencyUniverseFields
+            universe={FX_CURRENCY_UNIVERSE}
+            allCurrencies={allCurrencies}
+            lpCurrencies={lpCurrencies}
+            onChangeAll={setAllCurrencies}
+            onChangeLp={setLpCurrencies}
+          />
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-slate-800 px-5 py-3">
+          <button type="button" className={ghostBtn} onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={primaryBtn}
+            disabled={!name.trim() || allCurrencies.length === 0}
+            onClick={() =>
+              onSave({
+                name: name.trim(),
+                allCurrencies,
+                lpCurrencies,
+              })
+            }
+          >
+            <Check className="h-4 w-4" strokeWidth={2} />
+            Save entity
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

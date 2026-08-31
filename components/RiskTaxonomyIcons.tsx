@@ -6,15 +6,14 @@
  */
 
 import {
+  Activity,
   ArrowLeftRight,
   Banknote,
   BarChart3,
   Building2,
   CalendarClock,
+  ChartPie,
   Coins,
-  CreditCard,
-  Droplets,
-  Factory,
   Gem,
   Globe2,
   Handshake,
@@ -23,13 +22,10 @@ import {
   Percent,
   PiggyBank,
   Repeat,
-  Scale,
   Shield,
   Sigma,
   Split,
-  TrendingUp,
   Vault,
-  Waves,
 } from 'lucide-react';
 import type {
   OptimizeFrameworkId,
@@ -56,7 +52,7 @@ export function RiskAssetIcon({
     case 'bonds':
       return <Landmark {...p} />;
     case 'investments':
-      return <TrendingUp {...p} />;
+      return <ChartPie {...p} />;
     case 'commodities':
       return <Gem {...p} />;
     case 'realAssets':
@@ -73,16 +69,16 @@ export function ProtectGoalIcon({
 }: TaxonomyIconProps & { id: ProtectGoalId }) {
   const p = { className, strokeWidth };
   switch (id) {
-    case 'assetValue':
+    case 'var':
+      return <Sigma {...p} />;
+    case 'cfar':
+      return <Banknote {...p} />;
+    case 'ear':
+      return <LineChart {...p} />;
+    case 'evar':
       return <Shield {...p} />;
-    case 'cashFlow':
-      return <Waves {...p} />;
-    case 'liquidity':
-      return <Droplets {...p} />;
-    case 'credit':
-      return <CreditCard {...p} />;
-    case 'earnings':
-      return <PiggyBank {...p} />;
+    default:
+      return <Shield {...p} />;
   }
 }
 
@@ -93,21 +89,13 @@ export function OptimizeFrameworkIcon({
 }: TaxonomyIconProps & { id: OptimizeFrameworkId }) {
   const p = { className, strokeWidth };
   switch (id) {
-    case 'var':
-      return <Sigma {...p} />;
-    case 'cfar':
-      return <Banknote {...p} />;
-    case 'ear':
-      return <LineChart {...p} />;
-    case 'dv01':
+    case 'hedgeRatio':
       return <Percent {...p} />;
-    case 'greeks':
-      return <Scale {...p} />;
-    case 'factorModel':
-      return <Factory {...p} />;
-    case 'credit':
-      return <CreditCard {...p} />;
-    case 'hedgeCarry':
+    case 'carryCashInterest':
+      return <BarChart3 {...p} />;
+    case 'greeksSensitivity':
+      return <Activity {...p} />;
+    default:
       return <BarChart3 {...p} />;
   }
 }

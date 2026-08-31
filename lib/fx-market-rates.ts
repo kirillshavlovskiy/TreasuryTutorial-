@@ -11,6 +11,7 @@ import {
   fundingSwapFarSettleMonths,
   roundMoney,
 } from '@/lib/fx-buffer';
+import { impliedVolRecord } from '@/lib/fx-market-risk';
 
 export interface DepositSideRates {
   /** Earn on long cash — % p.a. (deposit bid). */
@@ -70,6 +71,8 @@ export interface FxMarketRatesBundle {
   cashInterestMode?: CashInterestMode;
   /** Term deposit / yield curve — used for forward CIP / points pricing. */
   deposits: DepositTenorRow[];
+  /** Atlas implied vol as decimal (0.063 = 6.3%) keyed by tenor months 1–12. */
+  impliedVolByTenor?: Record<string, number>;
   volatility?: unknown[];
   parameters?: Record<string, unknown>;
   legsSnapshot?: unknown;
@@ -142,7 +145,7 @@ export function normalizeMarketRatesBundle(
   const baseCcy = (deskCcy || bundle.baseCcy || 'EUR').toUpperCase();
   const pair = usdMarketPair(baseCcy);
   const quoteCcy = isUsdPerFcyQuoted(baseCcy) ? 'USD' : baseCcy;
-  const overnightCash =
+  let overnightCash =
     bundle.overnightCash ??
     defaultOvernightCashFromLp(baseCcy);
   const canon = {
@@ -168,9 +171,12 @@ export function normalizeMarketRatesBundle(
           mid: 1 / mid,
         };
       } else if (!isFcyPerUsd && tms > 0) {
-        // EURUSD ~1.16 on a PLN book is not USDPLN. TMS quote; drop foreign points.
+        // EURUSD ~1.16 on a JPY/PLN book is not USDJPY/USDPLN. TMS quote;
+        // drop the foreign points *and* EUR deposits so cash/CIP fall back
+        // to this desk's LP (0.45% JPY), not EUR term (~2–3%) or EUR pips.
         spot = { bid: tms, ask: tms, mid: tms };
-        deposits = stripQuotedForwards(deposits);
+        deposits = [];
+        overnightCash = defaultOvernightCashFromLp(baseCcy);
       }
     }
   }
@@ -178,6 +184,8 @@ export function normalizeMarketRatesBundle(
     ...canon,
     spot,
     deposits,
+    overnightCash,
+    impliedVolByTenor: bundle.impliedVolByTenor ?? impliedVolRecord(baseCcy),
     rateConvention: {
       depositBid: 'term credit — forward CIP / points',
       depositAsk: 'term debit — forward CIP / points',
@@ -413,6 +421,9 @@ export function swapPointsTenorCurve(
     const bid = d.swapPoints?.bid ?? null;
     const ask = d.swapPoints?.ask ?? null;
     if (bid == null || ask == null) continue;
+    // Stub 0/0 quotes are not a CIP curve — keep the deposit-rate fallback.
+    // Treating them as real mid=0 made pink far = open |cash| (fake +carry).
+    if (Math.abs(bid) < 1e-12 && Math.abs(ask) < 1e-12) continue;
     seen.add(key);
     raw.push({
       tenor: tenor || tenorLabelFromMonths(months as number),
@@ -582,6 +593,11 @@ export function fwdCarryFromSwapPointsUsdM(input: {
    */
   startMonths?: number;
   bundle: FxMarketRatesBundle;
+  /**
+   * Book FCY. EURUSD pips × JPY yen-millions is not CIP — reject when the
+   * bundle is a different pair than this desk.
+   */
+  ccy?: string;
 }): {
   fwdCarryUsdM: number;
   points: number;
@@ -591,6 +607,10 @@ export function fwdCarryFromSwapPointsUsdM(input: {
   const N = input.notionalLocalM;
   if (Math.abs(N) < 1e-12) {
     return { fwdCarryUsdM: 0, points: 0, priceDelta: 0, side: 'mid' };
+  }
+  const desk = (input.ccy || '').toUpperCase();
+  if (desk && desk !== 'USD' && fcyCcyOf(input.bundle) !== desk) {
+    return null;
   }
   const mid = input.bundle.spot?.mid;
   if (
@@ -677,13 +697,17 @@ export function fundingSwapFarLegCipUsdM(input: {
   if (Math.abs(N) < 1e-12) return 0;
   if (input.settleMonths < 1 - 1e-12) return 0;
   if (input.bundle) {
-    const pts = fwdCarryFromSwapPointsUsdM({
-      notionalLocalM: N,
-      settleMonths: input.settleMonths,
-      startMonths: input.startMonths,
-      bundle: input.bundle,
-    });
-    if (pts) return pts.fwdCarryUsdM;
+    // Empty / stub swap-points curve → deposit CIP fallback (otherwise pink
+    // far collapses onto open |cash| and prints fake positive “swap hedged”).
+    if (bundleHasCipSwapPoints(input.bundle)) {
+      const pts = fwdCarryFromSwapPointsUsdM({
+        notionalLocalM: N,
+        settleMonths: input.settleMonths,
+        startMonths: input.startMonths,
+        bundle: input.bundle,
+      });
+      if (pts) return pts.fwdCarryUsdM;
+    }
   }
   return input.fallbackUsdM ?? 0;
 }
@@ -882,6 +906,32 @@ export function suggestOvernightFromSw(
   );
 }
 
+/** True when the book slot is an LP shell, not an FXO CIP upload. */
+export function isLpDefaultMarketRates(
+  bundle: FxMarketRatesBundle | null | undefined,
+): boolean {
+  if (!bundle) return true;
+  if (bundleHasCipSwapPoints(bundle)) return false;
+  return (bundle.deposits?.length ?? 0) === 0
+    || bundle.sourceFile === 'LP defaults (no upload)';
+}
+
+/** Resolve each desk's live curve (book CIP, else scoped upload, else seed/shell). */
+export function resolveMarketRatesBook(
+  marketRatesByCcy: Record<string, FxMarketRatesBundle> | undefined,
+  ccys: readonly string[],
+  scopeId?: string | null,
+): Record<string, FxMarketRatesBundle> {
+  const next: Record<string, FxMarketRatesBundle> = {
+    ...(marketRatesByCcy ?? {}),
+  };
+  for (const ccy of ccys) {
+    if (!ccy || ccy === 'USD') continue;
+    next[ccy] = resolveMarketRatesForCcy(marketRatesByCcy, ccy, scopeId);
+  }
+  return next;
+}
+
 /** Empty per-CCY shell — LP overnight, no term curve (until upload). */
 export function emptyMarketRatesForCcy(ccy: string): FxMarketRatesBundle {
   const base = (ccy || 'EUR').toUpperCase();
@@ -1022,6 +1072,28 @@ export function resolveOvernightCashRates(
 }
 
 /**
+ * Our `eur` field is FCY. FXO USDJPY/USDPLN files put USD in the left
+ * columns (stored as `eur`) and FCY on the right (`usd`). Pick the side
+ * closer to this desk's LP vs USD so JPY cash is 0.45%, not 3.5% USD.
+ */
+function depositColumnForFcy(
+  bundle: Pick<FxMarketRatesBundle, 'deposits' | 'pair' | 'baseCcy' | 'quoteCcy' | 'spot'>,
+  ccy: string,
+): 'eur' | 'usd' {
+  const sample = bundle.deposits.find(
+    d => d.months != null && Number.isFinite(d.months) && (d.months as number) >= 1,
+  ) ?? bundle.deposits[0];
+  if (!sample || !isUsdBaseFcyPair(bundle)) return 'eur';
+  const fcyLp = CURRENCY_PARAMS[ccy]?.carry ?? 0;
+  const usdLp = CURRENCY_PARAMS.USD?.carry ?? 3.5;
+  const left = sample.eur.creditPct;
+  const right = sample.usd.creditPct;
+  const leftIsUsd = Math.abs(left - usdLp) < Math.abs(left - fcyLp);
+  const rightIsFcy = Math.abs(right - fcyLp) < Math.abs(right - usdLp);
+  return leftIsUsd && rightIsFcy ? 'usd' : 'eur';
+}
+
+/**
  * Term deposit credit/debit at tenor — for forward CIP / points pricing only.
  * Uses the uploaded curve when the bundle belongs to `ccy`; else LP.
  * USD uses the USD deposit column of a peer FCY×USD file.
@@ -1065,9 +1137,14 @@ export function resolveForwardDepositRates(
       (ccy === 'EUR' &&
         (bundle.baseCcy === 'EUR' || bundle.pair === 'EURUSD')));
   if (bundleForCcy) {
+    const fcyCol = depositColumnForFcy(bundle, ccy);
     return {
-      fcy: interpolateDepositSide(bundle.deposits, 'eur', months),
-      usd: interpolateDepositSide(bundle.deposits, 'usd', months),
+      fcy: interpolateDepositSide(bundle.deposits, fcyCol, months),
+      usd: interpolateDepositSide(
+        bundle.deposits,
+        fcyCol === 'eur' ? 'usd' : 'eur',
+        months,
+      ),
       source: `${bundle.sourceFile || 'uploaded curve'} · term fwd`,
     };
   }
@@ -1223,6 +1300,17 @@ export function parseFxoCalculatorWorkbook(
   const pairNormalized = pairCell.replace('/', '').toUpperCase();
   const baseCcy = pairNormalized.slice(0, 3) || 'EUR';
   const quoteCcy = pairNormalized.slice(3, 6) || 'USD';
+
+  // FXO USDJPY / USDPLN: left columns are USD, right are FCY. Our `eur`
+  // field is FCY — swap so JPY cash is not accrued at the USD ladder.
+  if (baseCcy === 'USD' && quoteCcy && quoteCcy !== 'USD') {
+    for (const d of deposits) {
+      const fcy = d.usd;
+      const usd = d.eur;
+      d.eur = fcy;
+      d.usd = usd;
+    }
+  }
 
   // Overnight cash: prefer ON / TN / SN row only. SW stays on the term
   // curve — O/N is applied separately in the market-data UI.

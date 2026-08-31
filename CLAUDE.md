@@ -14,6 +14,19 @@ Do not introduce alternative frameworks, databases, ORMs, or Redis clients. If a
 
 ---
 
+## Environment Variables — keep in sync
+
+`.env.example` and the Environment Variables table in `README.md` must always describe the exact same set of variables. Whenever a change adds, renames, removes, or changes the requiredness of an environment variable (including one only read implicitly by a library, e.g. NextAuth's `AUTH_SECRET` or the AWS SDK's credential chain):
+
+- Add/update the entry in `.env.example` (with its generation command or default, if any) in the same change.
+- Add/update the matching row in `README.md`'s Environment Variables table in the same change — do not defer this to a follow-up.
+- Note explicitly whether the app runs without it (degrades a specific feature) or fails outright, matching the Required column convention already used in the README table.
+- Before adding a *new* table or list of env vars elsewhere (e.g. in `.claude/rules/project/setup.md`), check whether one already exists — point to the existing one instead of creating a second copy that can drift.
+
+A `git grep -oE "process\.env\.[A-Za-z_][A-Za-z0-9_]*"` (restricted to `app/`, `lib/`, `components/`, `auth.ts`, config files — exclude `node_modules`, `.next`, `.claude/worktrees`, and `*.test.ts`) is the fastest way to audit for drift, but it will miss vars a library reads on its own from `process.env` without an explicit reference in this codebase — check `.env.example`'s existing entries for those before assuming grep's result is the complete list.
+
+---
+
 ## Code Style
 
 - Prefer explicit types — avoid `any`; use `unknown` and narrow it
@@ -21,26 +34,51 @@ Do not introduce alternative frameworks, databases, ORMs, or Redis clients. If a
 - No dead code, commented-out blocks, or unused imports
 - Use `async/await` over raw Promise chains
 - Avoid over-engineering: no abstractions for one-time use, no premature generalization
+- Don't let one function silently reinterpret/coerce its input to mean something
+  different from what the caller expects (e.g. a parser normalizing an enum value
+  "just to be safe"). If two call sites genuinely need different normalization
+  rules for the same shape, that's two functions with two names, not one function
+  with a hidden special case — a case exactly like this reached production and
+  silently broke a scoring path (see `decisions.md`)
+- Test fixtures must satisfy the real type, not `as SomeType` past it. A cast that
+  papers over missing required fields hides exactly the bugs types exist to catch;
+  when a fixture is annoying to build by hand, reuse the real production
+  constructor/factory instead of hand-rolling and casting a partial object
+- Type errors (`tsc --noEmit`) are part of "done," not noise — a type mismatch in
+  test code is usually either a real bug in the fixture or a real bug in the
+  function under test, and it's worth finding out which before suppressing it
 
 ---
 
 ## Security
 
-- Never hardcode secrets, tokens, or credentials — use environment variables
-- Validate all external input at API boundaries (user input, webhooks, query params)
-- Sanitize before interpolating into queries — never build raw SQL strings
-- Do not log sensitive data (tokens, passwords, PII)
-- Keep dependencies up to date; flag known-vulnerable packages
+Never hardcode secrets, tokens, or credentials — use environment variables. Validate all external input at API boundaries (user input, webhooks, query params). Sanitize before interpolating into queries — never build raw SQL strings. Do not log sensitive data (tokens, passwords, PII, account numbers). Keep dependencies up to date; flag known-vulnerable packages — if a scanner reports a finding with no fix available (registry stuck on the last vulnerable version), that's a decision to make and document, not a warning to ignore.
+
+**Encryption at rest**
+- Any secret or credential persisted outside the request that issued it (OAuth tokens, API keys, session material) must be encrypted at rest with an AEAD cipher — **AES-256-GCM**, not a plain block cipher, and not something hand-rolled. Never store plaintext secrets in a database row, even if the database itself is access-controlled — the threat model is "the DB (or a backup, or a replica, or Redis if one is added) leaks on its own," where the app's access control is already bypassed
+- A fresh random IV/nonce per encryption call, never reused across encryptions under the same key
+- Use Associated Data (AAD) to bind a ciphertext to its purpose when one key encrypts more than one kind of secret, so a ciphertext stolen from context A can't be replayed as valid in context B — see `lib/treasury/crypto.ts` for the pattern
+- Tag ciphertext with an envelope/algorithm version and support decrypting under a previous key during rotation. Don't assume today's key (or algorithm) never needs to change — design so a key rotation is an operational action, not a data migration
+- **Do not reach for post-quantum algorithms for symmetric-key, single-party encryption** (a server encrypting its own data with a key it already holds — no key exchange, no signature). AES-256 already keeps ~128-bit security against a quantum adversary (Grover's algorithm only gives a quadratic speedup against symmetric ciphers) — this is the same margin NIST's PQC guidance targets. Shor's algorithm threatens *asymmetric* crypto (RSA/ECC key exchange and signatures); that risk lives in TLS negotiation, which the platform/runtime handles, not in application code. Bolting a KEM like ML-KEM onto a use case that has no asymmetric step adds real complexity for a threat that isn't there — if you're unsure whether a specific design needs PQC, ask before implementing one
+
+**Auth & sessions**
+- Server-to-server OAuth (Authorization Code + PKCE) for anything beyond a simple login: random `state` (CSRF) and `nonce` (id_token replay) per attempt, single-use, short TTL
+- Cookies carrying session or OAuth-flow state: `httpOnly`, `Secure`, explicit `SameSite`, and an explicit `path` that matches between `set` and `delete` — a mismatched path means the delete silently no-ops (RFC 6265 identity is name+domain+path)
+- Fail closed: on any auth/decrypt/verification failure, deny and log — never fall back to trusting unverified data because verification was inconvenient
+- Rate-limit and audit-log security-sensitive endpoints (auth, token refresh/disconnect, anything that moves money)
 
 ---
 
-## Sequelize Patterns
+## Database (PostgreSQL / Sequelize) Best Practices
 
 - Use **migrations** for all schema changes — never `sync({ force: true })` in production
 - Define models with explicit column types and constraints
-- Use transactions for multi-step writes
-- Use `findOne` / `findAll` with explicit `where`, never rely on implicit filtering
+- Use transactions for multi-step writes — and know exactly what "multi-step" means for Sequelize: a managed transaction (`sequelize.transaction(async (t) => {...})`) **rolls back everything, including a `destroy()`/`update()` that already ran**, if the callback throws afterward for any reason. If a write must survive even when the caller wants to signal an error to its own caller, return a sentinel from the callback and throw only after the transaction has resolved — don't throw inside it
+- Use `findOne` / `findAll` with explicit `where`, never rely on implicit filtering — always scope by tenant/org/user, not just by primary key
 - Associations must be declared in both directions
+- Index columns used in `WHERE` / `JOIN` / `ORDER BY`; watch for N+1 (use `include`, not a query-per-row loop)
+- DB credentials are least-privilege per environment — the app's own DB user should not have more grants than the app needs
+- Never string-concatenate values into a query — parameterize via the ORM/query builder even for raw `sequelize.query` calls
 
 ```ts
 // correct
@@ -49,6 +87,19 @@ await User.findOne({ where: { id, organizationId } });
 // wrong — missing scope
 await User.findByPk(id);
 ```
+
+---
+
+## Financial Data Handling
+
+This app processes financial data (balances, rates, hedges, exposures). Treat it accordingly:
+
+- **Never use native floating-point arithmetic for money or FX rates** — use `Decimal.js` (or equivalent) for any calculation that aggregates, converts, or compares monetary amounts. A float rounding error in a hedging calculation is a production incident, not a cosmetic bug
+- Every rate value carries an explicit currency code (ISO 4217, uppercase) and an explicit timestamp/source — no implicit "current rate," no numeric currency codes
+- Log the *decision*, not just the *result*, for anything that sizes or executes a financial position — audit trail entries should let someone reconstruct why a number was what it was
+- Respect configured approval thresholds in code, not just in policy docs — if a limit exists, the code path that could exceed it should hard-stop, not warn
+- Account identifiers, balances, and counterparty data are sensitive — encrypt at rest where persisted, never log in plaintext, never put in a URL query string
+- Financial writes (trade execution, hedge booking, token issuance) must be idempotent — a retried request must not double-book
 
 ---
 
@@ -104,6 +155,19 @@ import { createClient } from "redis";
 
 ---
 
+## Working with AI-Generated Code
+
+Rules to keep vibe-coded changes from quietly degrading quality or security in a codebase handling financial data:
+
+- After any AI-generated change: typecheck, run the full test suite, and — for financial logic specifically — hand-verify at least one real number. A green test suite proves the code matches the tests, not that the tests were right; tests built on `as Type`-cast fixtures can pass while hiding a real gap (this happened in this repo — see `decisions.md`)
+- Before "fixing" a failing test, determine whether the bug is in the implementation or the test. A failing test is a symptom; changing the assertion to match current behavior is only correct if that behavior is actually intended — check git history/blame and trace what else depends on the current behavior before deciding
+- Before changing a shared function's behavior (renaming, retyping, changing a return value's meaning), grep for every caller — an AI assistant fixing one call site can silently break another it didn't look at
+- Don't accept new dependencies, patterns, or abstractions an assistant introduces beyond what the task needed — every new library is new attack surface and new audit burden; see "Tech Stack" above
+- Don't trust a third-party library's TypeScript types as ground truth for its runtime behavior — community type definitions can be wrong or narrower than what the library actually does (and vice versa); verify empirically against the library's own docs/tests when a type error looks suspicious
+- Security- and deployment-sensitive files (`Dockerfile`, `.github/`, `helm/`, `argocd/`, anything under `.claude/rules/dept/` or `.claude/rules/div/`, encryption/crypto code, auth flows) get a human review pass — don't let "the assistant already checked it" substitute for that
+
+---
+
 ## What NOT to do
 
 - Do not add features beyond what was asked
@@ -115,7 +179,7 @@ import { createClient } from "redis";
 
 # Knowledge framework — read this before anything else
 
-This project uses the Treasury three-layer shared knowledge framework.
+This project uses the Deel Treasury three-layer shared knowledge framework.
 You must understand the layers before acting on any instruction.
 
 ## Framework documentation (above all layers — always auto-fetched)

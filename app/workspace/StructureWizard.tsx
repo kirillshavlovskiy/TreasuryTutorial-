@@ -18,18 +18,23 @@ import {
 import {
   SelectCard,
   StepBlock,
+  TickerBulkBar,
+  CurrencyChipGrid,
+  CurrencyUniverseFields,
   defaultOptimizeForAsset,
+  defaultProtectGoal,
   defaultTickersForAsset,
   tickersForAsset,
   toggleIn,
 } from '@/app/workspace/CreateDashboardWizard';
 import {
+  DEFAULT_LP_CURRENCIES,
+  FX_CURRENCY_UNIVERSE,
   OPTIMIZE_FRAMEWORKS,
   PROTECT_GOALS,
   RISK_ASSETS,
   type DashboardSetup,
   type OptimizeFrameworkId,
-  type ProtectGoalId,
   type RiskAssetId,
   type StructureWizardInput,
   type StructureWizardSubsidiary,
@@ -54,13 +59,15 @@ type DraftSub = {
   baseCurrency: string;
   dashboardName: string;
   setup: DashboardSetup;
+  allCurrencies: string[];
+  lpCurrencies: string[];
 };
 
 /** Same starting point the create-dashboard wizard offers. */
 function defaultDeskSetup(): DashboardSetup {
   return {
     riskAsset: 'currencies',
-    protect: ['assetValue', 'cashFlow'],
+    protect: defaultProtectGoal(),
     optimize: defaultOptimizeForAsset('currencies'),
     tickers: defaultTickersForAsset('currencies'),
   };
@@ -72,7 +79,12 @@ function newDraft(baseCurrency: string, index: number): DraftSub {
     name: '',
     baseCurrency,
     dashboardName: '',
-    setup: defaultDeskSetup(),
+    setup: {
+      ...defaultDeskSetup(),
+      tickers: [...DEFAULT_LP_CURRENCIES],
+    },
+    allCurrencies: [...FX_CURRENCY_UNIVERSE],
+    lpCurrencies: [...DEFAULT_LP_CURRENCIES],
   };
 }
 
@@ -134,6 +146,8 @@ export function StructureWizard({
       baseCurrency: s.baseCurrency,
       dashboardName: s.dashboardName.trim() || `${s.name.trim()} FX`,
       setup: s.setup,
+      allCurrencies: s.allCurrencies,
+      lpCurrencies: s.lpCurrencies,
     }));
     return {
       groupName: groupName.trim(),
@@ -166,7 +180,10 @@ export function StructureWizard({
                 ...s.setup,
                 riskAsset: id,
                 optimize: defaultOptimizeForAsset(id),
-                tickers: defaultTickersForAsset(id),
+                tickers: defaultTickersForAsset(id, {
+                  allCurrencies: s.allCurrencies,
+                  lpCurrencies: s.lpCurrencies,
+                }),
               },
             }
           : s,
@@ -188,6 +205,8 @@ export function StructureWizard({
           optimize: [...setup.optimize],
           tickers: [...setup.tickers],
         },
+        allCurrencies: [...activeProfile.allCurrencies],
+        lpCurrencies: [...activeProfile.lpCurrencies],
       })),
     );
   };
@@ -448,29 +467,31 @@ export function StructureWizard({
                   </div>
                 </StepBlock>
 
-                <StepBlock title="Protect" helper="What this desk defends.">
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+                <StepBlock title="Protect" helper="One risk metric. Liquidity stays on.">
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                     {PROTECT_GOALS.map(g => (
                       <SelectCard
                         key={g.id}
-                        selected={activeProfile.setup.protect.includes(g.id)}
+                        selected={activeProfile.setup.protect[0] === g.id}
                         onClick={() =>
                           updateSetup(activeProfile.key, {
-                            protect: toggleIn<ProtectGoalId>(
-                              activeProfile.setup.protect,
-                              g.id,
-                            ),
+                            protect: [g.id],
                           })
                         }
                         icon={<ProtectGoalIcon id={g.id} className="h-6 w-6" />}
                         label={g.label}
+                        badge={g.live ? 'Live' : 'Soon'}
+                        soon={!g.live}
                       />
                     ))}
                   </div>
                 </StepBlock>
 
-                <StepBlock title="Optimize" helper="Frameworks this desk runs.">
-                  <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+                <StepBlock
+                  title="Optimize"
+                  helper="Hedge ratio, carry, and Greeks / Sensitivity hedging. Protect metric and Liquidity stay on."
+                >
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                     {OPTIMIZE_FRAMEWORKS.filter(
                       f => !f.assets || f.assets.includes(activeProfile.setup.riskAsset),
                     ).map(f => (
@@ -494,31 +515,68 @@ export function StructureWizard({
                   </div>
                 </StepBlock>
 
+                <StepBlock
+                  title="Currencies"
+                  helper="All currencies and LP pool for this entity — used by Select LP on the ticker step."
+                >
+                  <CurrencyUniverseFields
+                    universe={FX_CURRENCY_UNIVERSE}
+                    allCurrencies={activeProfile.allCurrencies}
+                    lpCurrencies={activeProfile.lpCurrencies}
+                    onChangeAll={next => {
+                      const keep = new Set(next);
+                      updateSub(activeProfile.key, {
+                        allCurrencies: next,
+                        lpCurrencies: activeProfile.lpCurrencies.filter(c => keep.has(c)),
+                        setup: {
+                          ...activeProfile.setup,
+                          tickers: activeProfile.setup.tickers.filter(c => keep.has(c)),
+                        },
+                      });
+                    }}
+                    onChangeLp={next => updateSub(activeProfile.key, { lpCurrencies: next })}
+                  />
+                </StepBlock>
+
                 <StepBlock title="Tickers" helper="Codes scoped to this desk.">
-                  <div className="flex flex-wrap gap-2">
-                    {tickersForAsset(activeProfile.setup.riskAsset).map(t => {
-                      const on = activeProfile.setup.tickers.includes(t);
-                      return (
-                        <button
-                          key={t}
-                          type="button"
-                          onClick={() =>
-                            updateSetup(activeProfile.key, {
-                              tickers: toggleIn(activeProfile.setup.tickers, t),
-                            })
-                          }
-                          className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1.5 font-mono text-[11px] font-semibold transition-colors ${
-                            on
-                              ? 'border-violet-500 bg-violet-600/25 text-violet-100'
-                              : 'border-slate-700 bg-slate-950/40 text-slate-400 hover:border-slate-500'
-                          }`}
-                        >
-                          <TickerGlyph code={t} />
-                          {t}
-                        </button>
-                      );
+                  {activeProfile.setup.riskAsset === 'currencies' && (
+                    <TickerBulkBar
+                      selectedCount={activeProfile.setup.tickers.length}
+                      universeCount={activeProfile.allCurrencies.length}
+                      lpCount={activeProfile.lpCurrencies.length}
+                      onSelectAll={() =>
+                        updateSetup(activeProfile.key, {
+                          tickers: tickersForAsset('currencies', {
+                            allCurrencies: activeProfile.allCurrencies,
+                            lpCurrencies: activeProfile.lpCurrencies,
+                          }),
+                        })
+                      }
+                      onDeselectAll={() => updateSetup(activeProfile.key, { tickers: [] })}
+                      onSelectLp={() =>
+                        updateSetup(activeProfile.key, {
+                          tickers: [...activeProfile.lpCurrencies],
+                        })
+                      }
+                      onSelectUniverse={() =>
+                        updateSetup(activeProfile.key, {
+                          tickers: [...activeProfile.allCurrencies],
+                        })
+                      }
+                    />
+                  )}
+                  <CurrencyChipGrid
+                    options={tickersForAsset(activeProfile.setup.riskAsset, {
+                      allCurrencies: activeProfile.allCurrencies,
+                      lpCurrencies: activeProfile.lpCurrencies,
                     })}
-                  </div>
+                    selected={activeProfile.setup.tickers}
+                    onToggle={t =>
+                      updateSetup(activeProfile.key, {
+                        tickers: toggleIn(activeProfile.setup.tickers, t),
+                      })
+                    }
+                  />
                 </StepBlock>
               </div>
             </div>

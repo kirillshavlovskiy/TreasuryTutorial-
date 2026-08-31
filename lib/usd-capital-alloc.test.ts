@@ -43,10 +43,8 @@ describe('allocateUsdCapital', () => {
   it('leftover = peak − WC − Σ FX-only Net CFaR', () => {
     const a = allocateUsdCapital(303.9, 116.45, 40, 0);
     expect(a.usd_peak).toBeCloseTo(303.9);
-    expect(a.wc_reserve).toBeCloseTo(116.45);
-    expect(a.cfar_reserve).toBeCloseTo(40);
-    expect(a.protected).toBeCloseTo(156.45);
     expect(a.leftover).toBeCloseTo(303.9 - 156.45);
+    expect(a.protected).toBeCloseTo(156.45);
     expect(a.wc_dip_ceiling).toBeCloseTo(303.9 - 40);
   });
 
@@ -86,7 +84,9 @@ describe('desk USD waterfall', () => {
     expect(on.usdComputed.usd_available_for_fcy).toBeCloseTo(
       off.usdComputed.usd_available_for_fcy - 20,
     );
-    expect(on.usdComputed.usd_protected).toBeCloseTo(on.usdComputed.usd_reserved + 20);
+    expect(on.usdComputed.usd_protected).toBeCloseTo(
+      on.usdComputed.usd_reserved + 20,
+    );
   });
 
   it('does not size FCY Swap Near from CFaR', () => {

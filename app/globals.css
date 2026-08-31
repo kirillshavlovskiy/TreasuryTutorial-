@@ -115,6 +115,44 @@
 .sim-dark .bg-rose-50     { background-color: rgba(244,63,94,0.12); }
 .sim-dark .bg-rose-100    { background-color: rgba(244,63,94,0.20); }
 
+/* Sticky table headers: the tints above are translucent, so scrolling rows
+   show through. Composite the same hues onto slate-950 so thead is solid. */
+.sim-dark thead,
+.sim-dark thead tr {
+  background-color: #0f172a;
+}
+.sim-dark thead .bg-white     { background-color: #0f172a; }
+.sim-dark thead .bg-gray-50,
+.sim-dark thead .bg-slate-50  { background-color: #0b1220; }
+.sim-dark thead .bg-gray-100,
+.sim-dark thead .bg-slate-100 { background-color: #1e293b; }
+.sim-dark thead .bg-sky-50    { background-color: #0f2841; }
+.sim-dark thead .bg-sky-100   { background-color: #0f3350; }
+.sim-dark thead .bg-blue-50   { background-color: #142442; }
+.sim-dark thead .bg-blue-100  { background-color: #182c53; }
+.sim-dark thead .bg-indigo-50 { background-color: #192042; }
+.sim-dark thead .bg-indigo-100{ background-color: #202752; }
+.sim-dark thead .bg-violet-50 { background-color: #1e1f42; }
+.sim-dark thead .bg-violet-100{ background-color: #282553; }
+.sim-dark thead .bg-purple-50 { background-color: #211e43; }
+.sim-dark thead .bg-purple-100{ background-color: #2e2353; }
+.sim-dark thead .bg-emerald-50{ background-color: #0f2a34; }
+.sim-dark thead .bg-emerald-100{ background-color: #0f373b; }
+.sim-dark thead .bg-green-50  { background-color: #112c30; }
+.sim-dark thead .bg-green-100 { background-color: #133a34; }
+.sim-dark thead .bg-lime-50   { background-color: #1d2d28; }
+.sim-dark thead .bg-lime-100  { background-color: #263b26; }
+.sim-dark thead .bg-amber-50  { background-color: #2b2726; }
+.sim-dark thead .bg-amber-100 { background-color: #3d3224; }
+.sim-dark thead .bg-yellow-50 { background-color: #292a26; }
+.sim-dark thead .bg-yellow-100{ background-color: #3b3623; }
+.sim-dark thead .bg-orange-50 { background-color: #2b2228; }
+.sim-dark thead .bg-orange-100{ background-color: #3e2926; }
+.sim-dark thead .bg-red-50    { background-color: #2a1c2d; }
+.sim-dark thead .bg-red-100   { background-color: #3c202f; }
+.sim-dark thead .bg-rose-50   { background-color: #2a1c30; }
+.sim-dark thead .bg-rose-100  { background-color: #3d1f34; }
+
 /* ── Semantic text → lightened for contrast on dark (all shades) ─────────── */
 .sim-dark [class*="text-sky-"]     { color: #7dd3fc; }
 .sim-dark [class*="text-blue-"]    { color: #93c5fd; }

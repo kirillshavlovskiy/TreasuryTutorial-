@@ -97,11 +97,8 @@ export const SIZING_BASIS_OPTIONS: {
  *   `term`    — one swap today, near leg sized to the deepest requirement on the
  *               whole horizon and the far leg at its end. No rollover risk and
  *               one set of points, at the cost of carrying cover before it bites.
- *   `stripTerm` — a leg per cycle, same as rolling (each starts on its own date
- *               as the requirement arises), but none of them roll monthly — every
- *               leg's far date is the SAME point, the forecast horizon's end. One
- *               shared maturity, staggered trade dates, priced per leg at that
- *               leg's own remaining tenor to the horizon (not a flat 1M knot).
+ *   `stripTerm` — a leg per cycle, same as rolling, but none of them roll monthly —
+ *               every leg's far date is the forecast horizon's end.
  */
 export type LiquidityBookingMode = 'rolling' | 'term' | 'stripTerm';
 
@@ -111,6 +108,11 @@ export const BOOKING_MODE_OPTIONS: {
   hint: string;
 }[] = [
   {
+    id: 'rolling',
+    label: 'Rolling legs',
+    hint: 'A near leg per cycle, each rolled at maturity — nothing sits idle, but a repeating drain leaves an outstanding book growing by a leg every cycle',
+  },
+  {
     id: 'term',
     label: 'One term swap',
     hint: 'One swap booked today covering the deepest requirement on the whole horizon — no rollover risk and one set of points, at the cost of carrying cover before it bites',
@@ -118,7 +120,7 @@ export const BOOKING_MODE_OPTIONS: {
   {
     id: 'stripTerm',
     label: 'Strip to term',
-    hint: 'A leg per cycle, each starting at its own future date as the requirement arises — but none of them roll monthly. Every leg settles together at the forecast horizon’s end, priced at its own remaining tenor to that date',
+    hint: 'A leg per cycle, each starting at its own future date — none roll monthly. Every leg settles together at the forecast horizon’s end',
   },
 ];
 
@@ -159,7 +161,7 @@ export const DEFAULT_LIQUIDITY_TIMING: LiquidityTiming = {
   enabled: true,
   granularity: 'week',
   sizingBasis: 'horizon',
-  bookingMode: 'stripTerm',
+  bookingMode: 'rolling',
   defaults: { ...WORST_CASE_TIMING },
   byField: {},
   byCcy: {},
@@ -658,6 +660,60 @@ export function carrySplitFromBalances(balances: number[], shift = 0): CarrySpli
 export function cycleCarrySplit(ladder: LiquidityLadderResult, shift = 0): CarrySplit {
   const days = Math.min(ladder.cycleDays, ladder.closingByDay.length);
   return carrySplitFromBalances(ladder.closingByDay.slice(0, Math.max(0, days)), shift);
+}
+
+/**
+ * How much each cycle's near leg lifts the unfunded ladder (M FCY).
+ * A leg that lands before the first payout raises every day of that cycle
+ * by the same amount — the drain shape does not change.
+ */
+export function fundingShiftsByCycle(
+  ladder: LiquidityLadderResult,
+  plan: readonly { post_swap_cash: number }[] | null | undefined,
+): number[] {
+  return ladder.cycles.map((cycle, k) => {
+    const p = plan?.[k];
+    return p ? p.post_swap_cash - cycle.opening : 0;
+  });
+}
+
+/**
+ * Credit / debit split across the whole forecast, each cycle on its own
+ * funded level. This is Cash Carry: each day's net position picks r_FCY
+ * or r_OD. Regimes differ because their shifts differ.
+ */
+export function horizonCarrySplit(
+  ladder: LiquidityLadderResult,
+  shiftByCycle: readonly number[] = [],
+): CarrySplit {
+  let credit = 0;
+  let debit = 0;
+  let creditDays = 0;
+  let debitDays = 0;
+  let days = 0;
+  for (const cycle of ladder.cycles) {
+    const shift = shiftByCycle[cycle.index] ?? 0;
+    const slice = ladder.closingByDay.slice(cycle.startDay, cycle.endDay + 1);
+    const s = carrySplitFromBalances(slice, shift);
+    credit += s.avgCredit * slice.length;
+    debit += s.avgDebit * slice.length;
+    creditDays += s.creditDays;
+    debitDays += s.debitDays;
+    days += slice.length;
+  }
+  if (days <= 0) return { avgCredit: 0, avgDebit: 0, creditDays: 0, debitDays: 0 };
+  return { avgCredit: credit / days, avgDebit: debit / days, creditDays, debitDays };
+}
+
+/** Annual USD cash carry on a credit/debit split (run-rate, $M/yr). */
+export function cashCarryUsdYr(
+  split: Pick<CarrySplit, 'avgCredit' | 'avgDebit'>,
+  spot: number,
+  r_FCY: number,
+  r_OD: number,
+  r_USD: number,
+): number {
+  return (split.avgCredit * (r_FCY - r_USD) + split.avgDebit * (r_OD - r_USD)) / 100 * spot;
 }
 
 /**

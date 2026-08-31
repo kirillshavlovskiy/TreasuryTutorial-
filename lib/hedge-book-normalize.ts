@@ -4,7 +4,11 @@ import {
   type EntityHedgeBook,
   type EntityHedgeDeskState,
 } from '@/lib/test-mode/hedge-var';
-import type { LayerId } from '@/lib/fx-buffer';
+import {
+  DEFAULT_BUFFER_LAYERS,
+  DEFAULT_POLICY_VAR_USD_M,
+  type LayerId,
+} from '@/lib/fx-buffer';
 
 const DESK_LAYER_IDS = new Set<string>([
   'sigmaP',
@@ -312,14 +316,22 @@ function scoreOneBook(book?: EntityHedgeBook) {
  * keeps at least one prepared key and is not treated as a wipe.
  *
  * Fast Refresh remount of Simulator also publishes
- * `{ policyVAR: 5, activeLayers: [] }` while packages are still on the book.
+ * `{ policyVAR: 5, activeLayers: [] }` (legacy) or the Portfolio + $5M
+ * default stack, while packages are still on the book.
  */
+function layersLookLikeRemountDefault(layers?: LayerId[]): boolean {
+  if (!layers || layers.length === 0) return true;
+  if (layers.length !== DEFAULT_BUFFER_LAYERS.length) return false;
+  const want = new Set<LayerId>(DEFAULT_BUFFER_LAYERS);
+  return layers.every(id => want.has(id));
+}
+
 function deskLooksLikeRemountDefault(desk?: EntityHedgeDeskState): boolean {
   if (!desk) return true;
-  const noLayers = !desk.activeLayers || desk.activeLayers.length === 0;
   const noScenario = !desk.portfolioScenarioId;
-  const defaultVar = desk.policyVAR === undefined || desk.policyVAR === 5;
-  return noLayers && noScenario && defaultVar;
+  const defaultVar =
+    desk.policyVAR === undefined || desk.policyVAR === DEFAULT_POLICY_VAR_USD_M;
+  return layersLookLikeRemountDefault(desk.activeLayers) && noScenario && defaultVar;
 }
 
 function entityLooksLikeAccidentalWipe(

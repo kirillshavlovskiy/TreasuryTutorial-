@@ -185,6 +185,27 @@ export function suggestCarryHedge(inp: HedgeSuggestionInput): HedgeSuggestion {
  * far) — pass −notional into {@link fwdCarryFromSwapPointsUsdM}. Feeding the
  * hedge trade straight in prices a *buy* and flips USDPLN CIP to a cost.
  */
+/**
+ * Atlas / hedge locked carry on one tenor:
+ *   E_usd × (r_USD − r_FCY)/100 × T_years   (sign via the hedge trade)
+ *
+ * Market swap points win only when they actually price a differential.
+ * A flat column (0 / blank-as-0) or EUR-scale pips on a USD-base pair
+ * invert to ~$0 and must not silence CIP — that is what showed MXN
+ * 100% cover as locked carry $0.
+ */
+function marketHedgeCarryIsUsable(
+  pts: { fwdCarryUsdM: number; points: number },
+  cipUsdM: number,
+): boolean {
+  const market = pts.fwdCarryUsdM;
+  if (Math.abs(pts.points) < 0.5 && Math.abs(market) < 1e-6) return false;
+  if (Math.abs(cipUsdM) > 0.005 && Math.abs(market) < 0.15 * Math.abs(cipUsdM)) {
+    return false;
+  }
+  return true;
+}
+
 export function fwdHedgeCarryFromMarketUsd(
   notional: number,
   ccy: string,
@@ -195,15 +216,17 @@ export function fwdHedgeCarryFromMarketUsd(
 ): number {
   if (Math.abs(notional) < 0.001) return 0;
   const months = Math.max(1e-9, settleMonths);
+  const cip = fwdHedgeCarryUsdYr(notional, ccy, r_FCY, r_USD) * (months / 12);
   if (bundle) {
     const pts = fwdCarryFromSwapPointsUsdM({
       notionalLocalM: -notional,
       settleMonths: months,
       bundle,
+      ccy,
     });
-    if (pts) return pts.fwdCarryUsdM;
+    if (pts && marketHedgeCarryIsUsable(pts, cip)) return pts.fwdCarryUsdM;
   }
-  return fwdHedgeCarryUsdYr(notional, ccy, r_FCY, r_USD) * (months / 12);
+  return cip;
 }
 
 /**
@@ -253,6 +276,7 @@ export function fwdCarryForExposureCoverUsdM(input: {
       notionalLocalM: cover,
       settleMonths: settle,
       bundle: input.bundle,
+      ccy: input.ccy,
     });
     if (pts) {
       return {

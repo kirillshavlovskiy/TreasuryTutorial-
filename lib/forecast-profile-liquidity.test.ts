@@ -230,26 +230,17 @@ describe('projectLiquidityCycles — term booking', () => {
     expect(term[0]!.swap_needed).toBeCloseTo(rolling[T - 1]!.standing_swap, 2);
   });
 
-  it('books a PAY short as one term leg — peak standing is not floored at 0', () => {
-    const pay = row({
-      cash: 40, payout: -2, collections: 2, cash_floor: 0, carry_target: -15,
-    });
-    const layers = new Set<LayerId>(['carryOptim']);
-    const rolling = projectLiquidityCycles(
-      pay, SHARED, layers, 6, flatGrowthProfile(0),
-    );
-    const term = projectLiquidityCycles(
-      pay, SHARED, layers, 6, flatGrowthProfile(0),
+  it('books a short term when the carry target is a cheap-OD PAY ask', () => {
+    const short = row({ cash: 20, payout: 0, collections: 0, cash_floor: 0, carry_target: -40 });
+    const layers = new Set<LayerId>(['sigmaP', 'carryOptim', 'floorH']);
+    const plan = projectLiquidityCycles(
+      short, SHARED, layers, 12, flatGrowthProfile(0),
       undefined, undefined, 'term',
     );
-    const peak = rolling.reduce(
-      (best, p) => (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
-      0,
-    );
-    expect(peak).toBeLessThan(-0.5);
-    expect(term[0]!.swap_needed).toBeCloseTo(peak, 1);
-    expect(swapLegSchedule(term)).toHaveLength(1);
-    expect(term.slice(1).every(p => p.swap_needed === 0)).toBe(true);
+    expect(plan[0]!.swap_needed).toBeLessThan(-1);
+    for (let k = 1; k < 12; k++) expect(plan[k]!.swap_needed).toBe(0);
+    expect(plan[0]!.standing_swap).toBeCloseTo(plan[0]!.swap_needed, 6);
+    expect(Math.abs(plan[0]!.swap_needed)).toBeGreaterThan(1);
   });
 });
 

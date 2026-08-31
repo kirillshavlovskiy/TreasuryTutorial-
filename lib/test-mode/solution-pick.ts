@@ -35,6 +35,7 @@ import {
 export type SolutionScenarioId =
   | 'unhedged'
   | 'carryTarget'
+  | 'relHedge'
   | 'balanced'
   | 'maxCarry'
   | 'maxReturn'
@@ -140,7 +141,7 @@ export function remapSelectionToFrontier(input: {
     ? Math.max(0, input.chartOriginX)
     : input.unhedgedOriginUsdM;
   const kind = input.selection.kind;
-  if (kind !== 'custom' && kind !== 'maxReturn') {
+  if (kind !== 'custom' && kind !== 'maxReturn' && kind !== 'relHedge') {
     const chartHit = chartPresetPointForScenario({
       scenarioId: kind,
       points: input.frontier.points,
@@ -757,6 +758,22 @@ export function maxExpectedReturnFrontierPoint(
   return points[bestIdx] ?? null;
 }
 
+/** Live-book Rel hedge = CIP-on far twin at hold scale (k=1). Not green |cash|. */
+export function relHedgeFarPoint(
+  frontier: PortfolioCarryFrontier | null | undefined,
+): PortfolioCarryFrontierPoint | null {
+  const far = frontier?.farPoints ?? [];
+  if (far.length === 0) return null;
+  const hold = far.find(p => Math.abs(p.k - 1) < 1e-6);
+  if (hold) return hold;
+  let best: PortfolioCarryFrontierPoint | null = null;
+  for (const p of far) {
+    if (!(p.k > 1e-9)) continue;
+    if (!best || Math.abs(p.k - 1) < Math.abs(best.k - 1)) best = p;
+  }
+  return best;
+}
+
 /** Named (or custom-k) point on an already-lifted Total-Carry curve. */
 /**
  * Overlay fill: live book on the lifted k-walk (k = 1).
@@ -803,6 +820,9 @@ export function pointForScenario(input: {
       if (!best || Math.abs(p.k - k) < Math.abs(best.k - k)) best = p;
     }
     return best ?? input.customPoint ?? null;
+  }
+  if (input.scenarioId === 'relHedge') {
+    return relHedgeFarPoint(input.frontier);
   }
   const hold = input.frontier.points.find(p => Math.abs(p.k - 1) < 1e-6) ?? null;
   const originX = typeof input.chartOriginX === 'number' && Number.isFinite(input.chartOriginX)
@@ -886,7 +906,7 @@ export function overlayTForPoint(input: {
   /** Constant overlay scale from Fill Ask. */
   fixedOverlayT?: number;
 }): number {
-  if (input.scenarioId === 'unhedged') return 0;
+  if (input.scenarioId === 'unhedged' || input.scenarioId === 'relHedge') return 0;
   if (input.frontier.walk === 'overlay') {
     return Math.max(0, input.point.k);
   }

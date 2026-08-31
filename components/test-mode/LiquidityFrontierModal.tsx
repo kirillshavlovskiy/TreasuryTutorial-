@@ -26,7 +26,7 @@ import {
   liquidityFrontierDialLabel,
   mixTwinForSelection,
   namedCcyChipParksWalk,
-  originTangentDataRay,
+  originTangentScreenChord,
   priceIsoSSlice,
   resolveCcyFrontierScenarioId,
   showCcyIsoMixStub,
@@ -2490,19 +2490,24 @@ function FrontierPlot({
         const balanced = scenarios.find(s => s.id === 'balanced');
         const bxy = balanced ? scenarioPlotXy(balanced) : null;
         if (!bxy) return null;
-        const ray = originTangentDataRay(bxy.x, bxy.y, xMax);
-        if (ray.length < 2) return null;
+        const chord = originTangentScreenChord(
+          x(0),
+          y(0),
+          x(bxy.x),
+          y(bxy.y),
+          padL,
+          padL + plotW,
+        );
+        if (!chord) return null;
         return (
-          <path
-            d={ray
-              .map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.x).toFixed(2)},${y(p.y).toFixed(2)}`)
-              .join(' ')}
-            fill="none"
+          <line
+            x1={chord.x1}
+            y1={chord.y1}
+            x2={chord.x2}
+            y2={chord.y2}
             stroke="#f59e0b"
             strokeWidth={1.15}
             strokeDasharray="5 4"
-            strokeLinecap="round"
-            strokeLinejoin="round"
             opacity={0.85}
           />
         );

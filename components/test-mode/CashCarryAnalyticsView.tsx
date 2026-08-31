@@ -7,8 +7,22 @@ import {
   useRef,
   useState,
 } from 'react';
+import {
+  Activity,
+  BadgeCheck,
+  Coins,
+  LineChart,
+  Shield,
+  SlidersHorizontal,
+} from 'lucide-react';
+import { ChartViewToggle } from '@/components/ChartViewToggle';
+import {
+  AnalyticsWizardShell,
+  useAnalyticsWizard,
+  type AnalyticsWizardStep,
+} from '@/components/test-mode/AnalyticsWizardShell';
+import { HedgeApprovalStep } from '@/components/test-mode/HedgeApprovalStep';
 import { DeskStepper } from '@/components/DeskStepper';
-import { createPortal } from 'react-dom';
 import {
   ExposureHedgePathChart,
   type HedgePathSummaryMetrics,
@@ -82,9 +96,11 @@ import {
 import {
   cashInterestModeOf,
   resolveMarketRatesForCcy,
+  resolveOvernightCashRates,
   type CashInterestMode,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
+import { bothPaySellCoverLocalM } from '@/lib/fx-hedge';
 import { setMarketRatesForCcy } from '@/lib/test-mode/hedge-var';
 import type { RowState } from '@/lib/fx-buffer';
 import {
@@ -256,6 +272,56 @@ function tradeSelectionLabel(
     return `${ccy} ${label}${settle != null ? ` · M${Math.round(settle)}` : ''}`;
   }
   return tradeKey;
+}
+
+const CASH_CARRY_WIZARD_STEPS: readonly AnalyticsWizardStep[] = [
+  { id: 'settings', n: 1, label: 'Settings', Icon: Shield },
+  { id: 'book', n: 2, label: 'Book', Icon: Coins },
+  { id: 'path', n: 3, label: 'Path', Icon: Activity },
+  { id: 'hedge', n: 4, label: 'Hedge', Icon: SlidersHorizontal },
+  { id: 'profile', n: 5, label: 'Profile', Icon: LineChart },
+  { id: 'approve', n: 6, label: 'Approve', Icon: BadgeCheck },
+];
+
+/** Both-pay vs USD (PLN): cover is always a long / sell-far. */
+function bothPayCoverLocalM(
+  ccy: string,
+  signed: number,
+  rates: FxMarketRatesBundle,
+): number {
+  const usd = resolveOvernightCashRates(rates, ccy).usd.creditPct;
+  return bothPaySellCoverLocalM(signed, ccy, usd);
+}
+
+/** Flip cover + strip leg notionals together when both-pay changes sign. */
+function withBothPayCover(
+  ccy: string,
+  coverLocalM: number,
+  rates: FxMarketRatesBundle,
+  legs?: PreparedHedgeProfile['legs'],
+): { coverLocalM: number; legs?: PreparedHedgeProfile['legs'] } {
+  const next = bothPayCoverLocalM(ccy, coverLocalM, rates);
+  if (!legs?.length || Math.abs(coverLocalM) < 1e-12) {
+    return { coverLocalM: next, legs };
+  }
+  if (
+    Math.sign(next) === Math.sign(coverLocalM) ||
+    Math.abs(next - coverLocalM) < 1e-12
+  ) {
+    return { coverLocalM: next, legs };
+  }
+  const s = next / coverLocalM;
+  return {
+    coverLocalM: next,
+    legs: legs.map(l => ({
+      ...l,
+      hedgeLocalM: l.hedgeLocalM * s,
+      tradeNotionalLocalM:
+        typeof l.tradeNotionalLocalM === 'number'
+          ? l.tradeNotionalLocalM * s
+          : l.tradeNotionalLocalM,
+    })),
+  };
 }
 
 interface CashCarryAnalyticsViewProps {
@@ -2724,12 +2790,30 @@ export function CashCarryAnalyticsView({
   onAllCcyTotalCarryUsdMChange,
   extraForwards = [],
 }: CashCarryAnalyticsViewProps) {
+  const wizard = useAnalyticsWizard(CASH_CARRY_WIZARD_STEPS.length);
   /** Resolve the uploaded curve for any CCY — multi-ccy table rows use this directly. */
   const marketRatesFor = useCallback(
     (ccy: string): FxMarketRatesBundle =>
       marketRatesProp ??
       resolveMarketRatesForCcy(marketRatesByCcy, ccy, ratesScopeId),
     [marketRatesProp, marketRatesByCcy, ratesScopeId],
+  );
+  const implyCarry = useCallback(
+    (
+      profile: PreparedHedgeProfile,
+      opts: {
+        marketRates: FxMarketRatesBundle;
+        bulletSettleMonths: number;
+        ccy?: string;
+      },
+    ) =>
+      assignImpliedCarryFromSwapPoints(profile, {
+        ...opts,
+        bookRows,
+        forecastProfile,
+        forecastMonths: setup.forecastMonths,
+      }),
+    [bookRows, forecastProfile, setup.forecastMonths],
   );
 
   const patch = (partial: Partial<VarSetup>) =>
@@ -3031,6 +3115,7 @@ export function CashCarryAnalyticsView({
           benefitUsdM: resolved.benefitUsdM,
           hasHedge: cmp.hasHedge,
           hedgeCashOutM: cmp.hedged.totals.hedgeCashOutM,
+          hedgeCashFlowM: cmp.hedged.totals.hedgeCashFlowM,
           cmp,
         };
       })
@@ -3111,6 +3196,7 @@ export function CashCarryAnalyticsView({
             ? flows.reduce((a, b) => a + b, 0) / flows.length
             : 0))
         : 0;
+    const rates = marketRatesFor(ccy);
     const amountLocalM = equalVarLinearHedgeNotionalLocalM(
       stockNetM,
       flowM,
@@ -3123,17 +3209,18 @@ export function CashCarryAnalyticsView({
     const settle = Math.max(0.25, tfLocal || 1);
     const ticketBasis =
       setup.exposureBasis === 'stock' ? 'simpleAvg' : setup.exposureBasis;
-    return assignImpliedCarryFromSwapPoints(
+    const coverLocalM = bothPayCoverLocalM(ccy, amountLocalM, rates);
+    return implyCarry(
       {
         structure: 'bullet',
         basis: 'totalExpected',
         ticketBasis,
         legs: [],
-        coverLocalM: amountLocalM,
+        coverLocalM,
         hedgeRatio: 1,
         settleMonths: settle,
       },
-      { marketRates, bulletSettleMonths: settle },
+      { marketRates: rates, bulletSettleMonths: settle, ccy },
     );
   };
 
@@ -3251,8 +3338,38 @@ export function CashCarryAnalyticsView({
         : null);
     if (session) {
       profileSessionByCcyRef.current[ccy] = session;
-      setProfileDraft(session.draft);
-      setProfileDraftDirty(session.dirty);
+      const rates = marketRatesFor(ccy);
+      const draft = session.draft
+        ? (() => {
+            const bp = withBothPayCover(
+              ccy,
+              session.draft.coverLocalM,
+              rates,
+              session.draft.legs,
+            );
+            if (Math.abs(bp.coverLocalM - session.draft.coverLocalM) < 1e-12) {
+              return session.draft;
+            }
+            return implyCarry(
+              {
+                ...session.draft,
+                coverLocalM: bp.coverLocalM,
+                legs: bp.legs ?? session.draft.legs,
+              },
+              {
+                marketRates: rates,
+                bulletSettleMonths: Math.max(
+                  0.25,
+                  session.draft.settleMonths
+                    ?? (setup.forecastMonths || horizonMonths(setup.horizon)),
+                ),
+                ccy,
+              },
+            );
+          })()
+        : session.draft;
+      setProfileDraft(draft);
+      setProfileDraftDirty(session.dirty || draft !== session.draft);
       setAppliedShape(session.appliedShape);
       setAppliedShapeScore(session.appliedShapeScore);
       setShapePreview(session.shapePreview);
@@ -3264,6 +3381,7 @@ export function CashCarryAnalyticsView({
       setPathHedgeWeights(session.pathHedgeWeights);
       setSelectedSettleMonths(session.selectedSettleMonths);
       setWamChartView('enhancement');
+      wizard.unlockAndGo(5);
       return;
     }
 
@@ -3274,10 +3392,35 @@ export function CashCarryAnalyticsView({
     setAppliedShapeScore(null);
     setWamChartView('enhancement');
     const prep = preparedByCcy[ccy];
-    const draft = prep ?? buildEqualVarBulletDraft(ccy);
+    const rates = marketRatesFor(ccy);
+    let draft = prep ?? buildEqualVarBulletDraft(ccy);
+    if (draft && prep) {
+      const bp = withBothPayCover(ccy, draft.coverLocalM, rates, draft.legs);
+      if (Math.abs(bp.coverLocalM - draft.coverLocalM) > 1e-12) {
+        draft = implyCarry(
+          {
+            ...draft,
+            coverLocalM: bp.coverLocalM,
+            legs: bp.legs ?? draft.legs,
+          },
+          {
+            marketRates: rates,
+            bulletSettleMonths: Math.max(
+              0.25,
+              draft.settleMonths
+                ?? (setup.forecastMonths || horizonMonths(setup.horizon)),
+            ),
+            ccy,
+          },
+        );
+      }
+    }
     setProfileDraft(draft);
-    // Seeded equal-var is unstaged; platform prepared starts clean.
-    setProfileDraftDirty(!prep && draft != null);
+    // Seeded equal-var is unstaged; both-pay rewrite of a staged pack is dirty until Restage.
+    setProfileDraftDirty(
+      (!prep && draft != null)
+      || (Boolean(prep) && draft != null && Math.abs(draft.coverLocalM - prep.coverLocalM) > 1e-12),
+    );
     hydratePathFromProfile(draft);
     // Staged strip → treat as applied lock so optimizer does not overwrite.
     if (draft?.structure === 'strip' && draft.legs.length >= 2) {
@@ -3321,6 +3464,7 @@ export function CashCarryAnalyticsView({
     ) {
       setSelectedSettleMonths(Math.round(draft.settleMonths));
     }
+    wizard.unlockAndGo(5);
   };
 
   const closeCcyProfile = () => {
@@ -3344,6 +3488,7 @@ export function CashCarryAnalyticsView({
     setPathSummaryMetrics(null);
     setPathPerfPanelHost(null);
     setPathSchedulePanelHost(null);
+    wizard.goToStep(4);
   };
 
   const lastStagedPkgSigRef = useRef('');
@@ -3374,6 +3519,7 @@ export function CashCarryAnalyticsView({
       setPreparedHedgeForCcy(preparedByCcy, chartCcy, {
         ...pkg,
         preparedFor: 'carry',
+        approvalStatus: 'draft',
       }),
     );
     setProfileDraftDirty(false);
@@ -3849,26 +3995,29 @@ export function CashCarryAnalyticsView({
     // score.hedgeDeltaLocalM / leg amounts already include coverScale when
     // scored from the live draft — do not multiply twice.
     const coverLocalM = score.hedgeDeltaLocalM;
+    const rates = marketRatesFor(chartCcy);
+    const ccy = chartCcy;
 
     if (score.structure === 'bullet' || score.legCount <= 1) {
       const settle = Math.max(
         0,
         score.settleMonths[0] ?? score.wamMonths ?? defaultTf,
       );
-      return assignImpliedCarryFromSwapPoints(
+      const bp = withBothPayCover(ccy, coverLocalM, rates);
+      return implyCarry(
         {
           structure: 'bullet',
           basis,
           ticketBasis,
           legs: [],
-          coverLocalM,
+          coverLocalM: bp.coverLocalM,
           hedgeRatio: coverPct,
           settleMonths: settle,
         },
         {
-          marketRates,
+          marketRates: rates,
           bulletSettleMonths: Math.max(0.25, settle || defaultTf),
-          ccy: chartCcy,
+          ccy,
         },
       );
     }
@@ -3890,22 +4039,23 @@ export function CashCarryAnalyticsView({
         label: leg.label,
       };
     });
-    return assignImpliedCarryFromSwapPoints(
+    const bp = withBothPayCover(ccy, coverLocalM, rates, legs);
+    return implyCarry(
       {
         structure: 'strip',
         basis,
         ticketBasis,
-        legs,
-        coverLocalM,
+        legs: bp.legs ?? legs,
+        coverLocalM: bp.coverLocalM,
         hedgeRatio: coverPct,
         cashDeliveryAt: 'periodEnd',
         settleSkew: settleSkewFromCenterOfMass(score.centerOfMass),
       },
-      { marketRates, bulletSettleMonths: defaultTf, ccy: chartCcy },
+      { marketRates: rates, bulletSettleMonths: defaultTf, ccy },
     );
   };
 
-  /** Lock shape → local draft + path schedule. Stage in the header sends it. */
+  /** Lock shape → draft + path schedule, and stage to prepared book (Neon). */
   const applyStripShapeAroundWam = (score: StripShapeScore) => {
     if (Math.abs(score.hedgeDeltaLocalM) < 1e-12) return;
     const locked = {
@@ -3921,9 +4071,22 @@ export function CashCarryAnalyticsView({
     const pinned = draftFromShapeScore(score, pathBasis);
     commitProfileDraft(pinned, { markDirty: true });
 
-    const rememberPinned = (session: ProfileSession) => {
+    const stagePinned = (session: ProfileSession) => {
       if (!chartCcy) return;
       persistProfileSession(chartCcy, session);
+      // Apply shape must hit preparedByCcy / DB — otherwise reload loses the
+      // whole Prebook process (session used to live only in a React ref).
+      if (onPreparedByCcyChange) {
+        lastStagedPkgSigRef.current = '';
+        onPreparedByCcyChange(
+          setPreparedHedgeForCcy(preparedByCcy, chartCcy, {
+            ...pinned,
+            preparedFor: 'carry',
+            approvalStatus: 'draft',
+          }),
+        );
+        setProfileDraftDirty(false);
+      }
     };
 
     if (score.structure === 'bullet' || score.legCount <= 1) {
@@ -3937,9 +4100,9 @@ export function CashCarryAnalyticsView({
         Math.round(score.wamMonths > 1e-12 ? score.wamMonths : 1),
       );
       setSelectedSettleMonths(appliedWam);
-      rememberPinned({
+      stagePinned({
         draft: pinned,
-        dirty: true,
+        dirty: false,
         appliedShape: locked,
         appliedShapeScore: score,
         shapePreview: locked,
@@ -3973,9 +4136,9 @@ export function CashCarryAnalyticsView({
       Math.round(score.wamMonths > 1e-12 ? score.wamMonths : 1),
     );
     setSelectedSettleMonths(appliedWam);
-    rememberPinned({
+    stagePinned({
       draft: pinned,
-      dirty: true,
+      dirty: false,
       appliedShape: locked,
       appliedShapeScore: score,
       shapePreview: locked,
@@ -4101,13 +4264,14 @@ export function CashCarryAnalyticsView({
           endExposureM: e.endExposureM,
         };
       });
-      const profile = assignImpliedCarryFromSwapPoints(
+      const bp = withBothPayCover(chartCcy, coverLocalM, marketRates, legs);
+      const profile = implyCarry(
         {
           structure: 'strip',
           basis,
           ticketBasis,
-          legs,
-          coverLocalM,
+          legs: bp.legs ?? legs,
+          coverLocalM: bp.coverLocalM,
           hedgeRatio: coverPct,
           cashDeliveryAt,
           settleSkew: inferSettleSkewFromEnds(settleEnds, defaultTf),
@@ -4160,13 +4324,16 @@ export function CashCarryAnalyticsView({
       undefined,
       pathFlows ?? flows,
     ).amountLocalM;
-    const target =
-      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartCcy) * coverPct;
+    const target = bothPayCoverLocalM(
+      chartCcy,
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct,
+      marketRates,
+    );
     const settle = Math.max(
       0.25,
       Math.min(defaultTf, chartBulletSettle ?? defaultTf),
     );
-    const profile = assignImpliedCarryFromSwapPoints(
+    const profile = implyCarry(
       {
         structure: 'bullet',
         basis,
@@ -4177,7 +4344,7 @@ export function CashCarryAnalyticsView({
         cashDeliveryAt,
         settleMonths: settle,
       },
-        {
+      {
         marketRates,
         bulletSettleMonths: settle,
         ccy: chartCcy,
@@ -4187,8 +4354,20 @@ export function CashCarryAnalyticsView({
   };
 
   return (
-    <div className="min-w-0 max-w-full space-y-4">
-      {title && (
+    <AnalyticsWizardShell
+      title={
+        wizard.step === 5 && chartCcy
+          ? `${chartCcy} — hedge carry profile`
+          : 'Cash carry'
+      }
+      steps={CASH_CARRY_WIZARD_STEPS}
+      step={wizard.step}
+      maxReached={wizard.maxReached}
+      onGoToStep={wizard.goToStep}
+      onNext={wizard.nextStep}
+      onPrev={wizard.prevStep}
+    >
+      {title && wizard.step === 1 && (
         <div className="min-w-0">
           <h3 className="text-sm font-semibold text-white">{title}</h3>
           {subtitle && (
@@ -4196,6 +4375,8 @@ export function CashCarryAnalyticsView({
           )}
         </div>
       )}
+      {wizard.step === 1 && (
+      <>
       {/* Risk settings · σ source + confidence — shared VaR setup (drives FX Risk / CFaR). */}
       <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="mb-2 font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
@@ -4246,7 +4427,9 @@ export function CashCarryAnalyticsView({
           </p>
         </div>
       </section>
-      {/* ── All currencies — module chrome (meta / Tf / gear) lives on RiskPerspectiveSelector ── */}
+      </>
+      )}
+      {wizard.step === 2 && (
       <div className="space-y-3">
         {multiCcyRows.length === 0 ? (
           <p className="py-4 text-center text-xs text-slate-500">
@@ -4387,14 +4570,14 @@ export function CashCarryAnalyticsView({
                       </td>
                       <td
                         className={`py-2 pr-3 font-mono ${
-                          Math.abs(r.hedgeCashOutM) < 1e-12
+                          Math.abs(r.hedgeCashFlowM) < 1e-12
                             ? 'text-slate-600'
                             : 'text-white'
                         }`}
                       >
-                        {Math.abs(r.hedgeCashOutM) < 1e-12
+                        {Math.abs(r.hedgeCashFlowM) < 1e-12
                           ? '—'
-                          : fmtM(-r.hedgeCashOutM)}
+                          : fmtM(r.hedgeCashFlowM)}
                       </td>
                       <td
                         className={`py-2 pr-3 font-mono ${
@@ -4465,8 +4648,9 @@ export function CashCarryAnalyticsView({
           </div>
         )}
       </div>
+      )}
 
-      {cashForecast && multiCcyRows.length > 0 && (
+      {wizard.step === 3 && cashForecast && multiCcyRows.length > 0 && (
         <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
           <div className="mb-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -4614,79 +4798,26 @@ export function CashCarryAnalyticsView({
                     );
                   })}
                 </div>
-                <div
-                  className="inline-flex shrink-0 rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-                  role="group"
-                  aria-label="Carry and cash path view"
-                >
-                  <button
-                    type="button"
-                    aria-pressed={ccyPathView === 'carry'}
-                    onClick={() => setCcyPathView('carry')}
-                    className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
-                      ccyPathView === 'carry'
-                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                        : 'text-slate-500 hover:text-slate-300'
-                    }`}
-                  >
-                    Carry
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={ccyPathView === 'cashflow'}
-                    onClick={() => setCcyPathView('cashflow')}
-                    className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
-                      ccyPathView === 'cashflow'
-                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                        : 'text-slate-500 hover:text-slate-300'
-                    }`}
-                  >
-                    Cash flow
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={ccyPathView === 'table'}
-                    onClick={() => setCcyPathView('table')}
-                    className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
-                      ccyPathView === 'table'
-                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                        : 'text-slate-500 hover:text-slate-300'
-                    }`}
-                  >
-                    Table
-                  </button>
-                </div>
+                <ChartViewToggle
+                  ariaLabel="Carry and cash path view"
+                  value={ccyPathView}
+                  onChange={setCcyPathView}
+                  options={[
+                    { id: 'carry', label: 'Carry' },
+                    { id: 'cashflow', label: 'Cash flow' },
+                    { id: 'table', label: 'Table' },
+                  ]}
+                />
                 {(ccyPathView === 'carry' || ccyPathView === 'cashflow') && (
-                  <div
-                    className="inline-flex shrink-0 rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-                    role="group"
-                    aria-label="Path presentation"
-                  >
-                    <button
-                      type="button"
-                      aria-pressed={pathPresentationMode === 'mom'}
-                      onClick={() => setPathPresentationMode('mom')}
-                      className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
-                        pathPresentationMode === 'mom'
-                          ? 'bg-violet-500/20 text-violet-100 shadow-sm'
-                          : 'text-slate-500 hover:text-slate-300'
-                      }`}
-                    >
-                      MoM
-                    </button>
-                    <button
-                      type="button"
-                      aria-pressed={pathPresentationMode === 'cumulative'}
-                      onClick={() => setPathPresentationMode('cumulative')}
-                      className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
-                        pathPresentationMode === 'cumulative'
-                          ? 'bg-violet-500/20 text-violet-100 shadow-sm'
-                          : 'text-slate-500 hover:text-slate-300'
-                      }`}
-                    >
-                      Cumulative
-                    </button>
-                  </div>
+                  <ChartViewToggle
+                    ariaLabel="Path presentation"
+                    value={pathPresentationMode}
+                    onChange={setPathPresentationMode}
+                    options={[
+                      { id: 'mom', label: 'MoM' },
+                      { id: 'cumulative', label: 'Cumulative' },
+                    ]}
+                  />
                 )}
               </div>
             </div>
@@ -4742,7 +4873,7 @@ export function CashCarryAnalyticsView({
               <div>
                 <span className="text-slate-500">Hedge CF </span>
                 <span className="text-rose-300/80">
-                  {fmtM(-cashForecast.totals.hedgeCashOutM)}
+                  {fmtM(cashForecast.totals.hedgeCashFlowM)}
                 </span>
               </div>
               {Math.abs(cashForecast.totals.bookConversionM) > 1e-9 && (
@@ -5004,6 +5135,13 @@ export function CashCarryAnalyticsView({
         </section>
       )}
 
+      {wizard.step === 3 && (!cashForecast || multiCcyRows.length === 0) && (
+        <div className="rounded-lg border border-dashed border-slate-700 bg-slate-950/30 px-4 py-10 text-center text-xs text-slate-500">
+          Need a forecast path and at least one FCY name to show carry evolution.
+        </div>
+      )}
+
+      {wizard.step === 4 && (
       <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="mb-3">
           <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
@@ -5162,6 +5300,7 @@ export function CashCarryAnalyticsView({
                             leg,
                             prevHedge,
                             marketRatesFor(r.ccy),
+                            r.ccy,
                           );
                           return [
                             <tr
@@ -5213,6 +5352,7 @@ export function CashCarryAnalyticsView({
                               prep,
                               marketRatesFor(r.ccy),
                               r.fwdCarryUsdM,
+                              r.ccy,
                             );
                             return (
                               <tr
@@ -5265,22 +5405,18 @@ export function CashCarryAnalyticsView({
           </div>
         )}
       </section>
+      )}
 
-      {profileOpen &&
-        typeof document !== 'undefined' &&
-        createPortal(
-          <div
-            className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="cash-carry-profile-title"
-            onClick={e => {
-              if (e.target === e.currentTarget) closeCcyProfile();
-            }}
-          >
-            <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-t-xl rounded-b-none border border-slate-700 bg-slate-900 shadow-2xl">
+      {wizard.step === 5 && !profileOpen && (
+        <p className="py-8 text-center text-xs text-slate-500">
+          Pick a CCY on Hedge to open its carry profile.
+        </p>
+      )}
+
+      {wizard.step === 5 && profileOpen && (
+            <div className="flex w-full flex-col overflow-hidden rounded-lg border border-slate-700 bg-slate-900">
               {/* Same staging chrome as Hedging Decision / FX Risk path modals. */}
-              <div className="sticky top-0 z-30 shrink-0 rounded-t-xl border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
+              <div className="sticky top-0 z-30 shrink-0 rounded-t-lg border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
                 {(() => {
                   const optScore =
                     appliedShapeScore ??
@@ -5485,36 +5621,15 @@ export function CashCarryAnalyticsView({
                     </div>
                     {shapePreviewScore &&
                       shapePreviewScore.legs.length > 0 && (
-                        <div
-                          className="inline-flex shrink-0 rounded-md border border-slate-700 bg-slate-950/60 p-0.5"
-                          role="group"
-                          aria-label="WAM chart view"
-                        >
-                          <button
-                            type="button"
-                            aria-pressed={wamChartView === 'enhancement'}
-                            onClick={() => setWamChartView('enhancement')}
-                            className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
-                              wamChartView === 'enhancement'
-                                ? 'bg-emerald-500/20 text-emerald-100'
-                                : 'text-slate-500 hover:text-slate-300'
-                            }`}
-                          >
-                            Enhancement
-                          </button>
-                          <button
-                            type="button"
-                            aria-pressed={wamChartView === 'execution'}
-                            onClick={() => setWamChartView('execution')}
-                            className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
-                              wamChartView === 'execution'
-                                ? 'bg-violet-500/20 text-violet-100'
-                                : 'text-slate-500 hover:text-slate-300'
-                            }`}
-                          >
-                            Strip execution
-                          </button>
-                        </div>
+                        <ChartViewToggle
+                          ariaLabel="WAM chart view"
+                          value={wamChartView}
+                          onChange={setWamChartView}
+                          options={[
+                            { id: 'enhancement', label: 'Enhancement' },
+                            { id: 'execution', label: 'Strip execution' },
+                          ]}
+                        />
                       )}
                   </div>
                   {!hasStrategyHedge || settleScenarios.length === 0 ? (
@@ -6222,7 +6337,7 @@ export function CashCarryAnalyticsView({
                                         : ''
                                   }`}
                                   onClick={() => applyStripShapeAroundWam(c)}
-                                  title="Apply this shape as a local draft — Stage in the header to send it to Decision"
+                                  title="Apply this strip locally · Stage in the header to send to Decision and Liquidity"
                                 >
                                   <td className="py-1.5 pr-2 text-slate-500">
                                     {i + 1}
@@ -6397,10 +6512,19 @@ export function CashCarryAnalyticsView({
                 </div>
               </div>
             </div>
-          </div>,
-          document.body,
-        )}
+      )}
 
-    </div>
+      {wizard.step === 6 && (
+        <HedgeApprovalStep
+          preparedByCcy={preparedByCcy}
+          onPreparedByCcyChange={onPreparedByCcyChange}
+          varUsdM={risk.reduce(
+            (s, r) => s + (r.varStock?.varUsdM ?? 0),
+            0,
+          )}
+        />
+      )}
+
+    </AnalyticsWizardShell>
   );
 }

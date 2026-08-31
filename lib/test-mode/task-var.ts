@@ -1,4 +1,4 @@
-import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
+import { analyticsSpotUsd, NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   DEFAULT_VAR_SETUP,
   VAR_HORIZON_OPTIONS,
@@ -64,7 +64,7 @@ export function computeTaskVar(
     setup.exposureBasis,
     setup.forecastMonths,
   );
-  const spotUsd = NORDTECH_VAR.spotUsd[bar.ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(bar.ccy);
   const horizonVol = volForHorizon(setup.horizon, setup);
   const varUsdM = computeParametricVarUsdM(exposureLocalM, bar.ccy, setup);
   const z = varUsdM / (Math.abs(exposureLocalM) * spotUsd * horizonVol || 1);

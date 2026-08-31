@@ -100,6 +100,17 @@ describe('splinePath', () => {
     expect(splinePath([])).toBe('');
     expect(splinePath([[3, 4]])).toBe('M 3.0,4.0');
   });
+
+  it('draws a pinned-CFaR walk as lines so overlay lift cannot overshoot Unhedged', () => {
+    const d = splinePath([
+      [515.1, 335.4],
+      [515.4, 115.7],
+      [620.0, 90.0],
+    ]);
+    expect(d.startsWith('M 515.1,335.4 L 515.4,115.7')).toBe(true);
+    expect(d).toContain(' C ');
+    expect(d).not.toMatch(/C 515\.[0-9],2[0-9]{2}/);
+  });
 });
 
 describe('splineBand', () => {

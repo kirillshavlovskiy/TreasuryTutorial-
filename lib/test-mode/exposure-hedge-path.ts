@@ -5,7 +5,7 @@
  * notional H. Breakeven = first t>0 where |e| strictly crosses |H|.
  */
 
-import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
+import { analyticsSpotUsd, NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   zForConfidence,
   type VarConfidencePct,
@@ -362,7 +362,6 @@ export function resyncHedgeRatiosToNearestRegime(
       r.stockHedgeLocalM,
       r.targetHedgeLocalM,
       r.equalVarHedgeLocalM,
-      r.ccy,
     );
     const newRatio = Math.min(
       1,
@@ -410,7 +409,7 @@ export function budgetRiskUsdM(
   ccy: string,
   confidencePct: VarConfidencePct | number,
 ): number {
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const tau = Math.max(0, remainingMonths);
   return (
     Math.abs(absResidualM) *
@@ -490,7 +489,7 @@ export function residualPathVarUsdM(
   ccy: string,
   confidencePct: VarConfidencePct | number,
 ): number {
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   return (
     Math.max(0, cumPathFactorAtT) *
     spotUsd *

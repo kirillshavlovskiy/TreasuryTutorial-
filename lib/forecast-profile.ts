@@ -1462,11 +1462,7 @@ export function projectLiquidityCycles(
   // |standing| is the opening size (PAY shorts are negative; do not floor at 0).
   // H* moves a little once the cover is on (the layer formula reads opening
   // cash), so re-solve against any residual shortfall.
-  let leg = rolling.reduce(
-    (best, p) =>
-      (Math.abs(p.standing_swap) > Math.abs(best) ? p.standing_swap : best),
-    0,
-  );
+  let leg = signedPeakStanding(rolling);
   let projection = rolling;
   for (let pass = 0; pass < 4; pass++) {
     const booked = leg;
@@ -1485,6 +1481,17 @@ export function projectLiquidityCycles(
     leg = roundMoney(leg - shortfall);
   }
   return settleFarLegAtMaturity(projection);
+}
+
+/** Largest outstanding on the rolling path, sign kept — the one-term notional. */
+export function signedPeakStanding(
+  plan: readonly { standing_swap: number }[],
+): number {
+  let peak = 0;
+  for (const p of plan) {
+    if (Math.abs(p.standing_swap) > Math.abs(peak)) peak = p.standing_swap;
+  }
+  return peak;
 }
 
 /**

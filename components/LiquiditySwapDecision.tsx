@@ -12,11 +12,12 @@
  * strip (FX-neutral, remaining Δ = 0); 0% leaves the trough unfunded (Δ = 1).
  */
 
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import { DeskStepper } from '@/components/DeskStepper';
 import { ccySpotRate, fundingSwapCashDeltaUsdYr } from '@/lib/fx-buffer';
 import { swapLegSchedule, type SwapLegScheduleRow } from '@/lib/forecast-profile';
 import type { FcyComputedRow } from '@/lib/dashboard-model';
+import type { PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
 import {
   BOOKING_MODE_OPTIONS,
   SIZING_BASIS_OPTIONS,
@@ -29,6 +30,23 @@ const MAX_COVER_PCT = 100;
 
 const f2 = (v: number): string => v.toFixed(2);
 const signed = (v: number): string => `${v >= 0 ? '+' : '−'}${Math.abs(v).toFixed(2)}`;
+
+function fmtLocal(v: number, ccy: string): string {
+  const abs = Math.abs(v).toFixed(2);
+  const sign = v >= 0 ? '+' : '−';
+  if (ccy === 'EUR') return `${sign}€${abs}M`;
+  if (ccy === 'PLN') return `${sign}zł${abs}M`;
+  if (ccy === 'GBP') return `${sign}£${abs}M`;
+  return `${sign}${abs}M ${ccy}`;
+}
+
+function fmtVarK(usdM: number): string {
+  return `$${(usdM * 1000).toFixed(0)}K`;
+}
+
+function fmtShare(v: number): string {
+  return `${(Math.round(v * 10) / 10).toFixed(v % 1 ? 1 : 0)}%`;
+}
 
 export interface DecisionRow {
   ccy: string;
@@ -144,6 +162,89 @@ export function decisionRowFor(r: FcyComputedRow, r_USD: number): DecisionRow | 
   };
 }
 
+/**
+ * Exposure · hedge structuring owns the package on Hedging Decision.
+ * A staged strip / bullet replaces the independent 12-cycle H* plan so Target,
+ * residual, and leg count match the table above (e.g. EUR 3 staged strip at
+ * +€16.30M, not a 12-leg funding H*).
+ */
+export function decisionRowFromPrepared(
+  profile: PreparedHedgeProfile,
+  r: FcyComputedRow,
+  r_USD: number,
+): DecisionRow | null {
+  const cover = profile.coverLocalM;
+  const stripLegs = profile.structure === 'strip'
+    ? [...profile.legs].sort((a, b) => a.index - b.index)
+    : [];
+  const legs = stripLegs.length > 0
+    ? stripLegs
+    : [{
+        index: 0,
+        startMonth: 0,
+        endMonth: profile.settleMonths ?? 0,
+        settleMonths: profile.settleMonths,
+        hedgeLocalM: cover,
+        tradeNotionalLocalM: cover,
+        label: 'bullet',
+      }];
+  if (
+    Math.abs(cover) <= 0.001
+    && legs.every(l => Math.abs((l.tradeNotionalLocalM ?? l.hedgeLocalM) ?? 0) <= 0.001)
+  ) {
+    return null;
+  }
+
+  let prev = 0;
+  const schedule: SwapLegScheduleRow[] = legs.map((leg, i) => {
+    const outstanding = leg.hedgeLocalM;
+    const newLeg = Number.isFinite(leg.tradeNotionalLocalM)
+      ? (leg.tradeNotionalLocalM as number)
+      : outstanding - prev;
+    const rolledForward = outstanding - newLeg;
+    prev = outstanding;
+    return {
+      cycleIndex: leg.index,
+      valueDateMonths: i === 0 ? 0 : (leg.settleMonths ?? leg.endMonth ?? i),
+      newLeg,
+      rolledForward,
+      outstanding,
+      preBookable: i > 0,
+    };
+  });
+  const book = schedule.map(s => s.outstanding);
+  const peakBook = peakOutstanding(book);
+  const endingBook = book[book.length - 1] ?? cover;
+  const avgBook = book.reduce((s, v) => s + v, 0) / Math.max(1, book.length);
+  const spot = ccySpotRate(r.ccy);
+  const deltaR = r_USD - r.r_FCY;
+  return {
+    ccy: r.ccy,
+    drawdown: r.cycleDrawdown ?? 0,
+    nearLeg: cover,
+    endingBook,
+    peakBook,
+    rolling: profile.structure === 'strip' && legs.some(l => l.startMonth > 0),
+    schedule,
+    usdFunded: peakBook * spot,
+    deltaR,
+    costUsdYr: -fundingSwapCashDeltaUsdYr(avgBook, spot, r.r_FCY, r_USD, r.r_OD),
+    cycles: legs.length,
+  };
+}
+
+/** Staged Exposure package wins over the Liquidity H* plan when both exist. */
+export function pickDecisionRow(
+  r: FcyComputedRow,
+  r_USD: number,
+  prepared?: PreparedHedgeProfile,
+): DecisionRow | null {
+  if (prepared && Math.abs(prepared.coverLocalM) > 0.001) {
+    return decisionRowFromPrepared(prepared, r, r_USD);
+  }
+  return decisionRowFor(r, r_USD);
+}
+
 export function clampCoverRatio(ratio: number): number {
   if (!Number.isFinite(ratio)) return 1;
   return Math.min(1, Math.max(0, ratio));
@@ -175,90 +276,106 @@ export function scaleDecisionRow(d: DecisionRow, coverRatio: number): DecisionRo
  * near cycle are already sized by the path, so each is a forward-starting swap
  * that can be traded today instead of going back to market when it bites.
  */
+function settleLabel(months: number): string {
+  return Math.abs(months - Math.round(months)) < 1e-6
+    ? `M${Math.round(months)}`
+    : `t=${months.toFixed(1)}`;
+}
+
+/**
+ * Same Leg / Settle / Share / Notional / Cumulative H table as Exposure ·
+ * hedge structuring — funding legs, not a separate schedule layout.
+ */
 function LegSchedule({
   schedule,
   term,
   forecastMonths,
+  ccy,
+  costUsdYr,
   embedded,
 }: {
   schedule: readonly SwapLegScheduleRow[];
   term: boolean;
   forecastMonths: number;
+  ccy: string;
+  costUsdYr: number;
   embedded?: boolean;
 }) {
-  const sth = embedded
-    ? 'border-b border-slate-800 px-2 py-1 text-right text-[9px] font-semibold uppercase tracking-wide text-slate-500'
-    : 'border-b border-gray-200 px-2 py-1 text-right text-[9px] font-semibold uppercase tracking-wide text-gray-500';
-  const std = embedded
-    ? 'border-b border-slate-800/50 px-2 py-0.5 text-right text-slate-400'
-    : 'border-b border-gray-100 px-2 py-0.5 text-right text-gray-600';
-  const dateCls = embedded ? 'text-slate-200' : 'text-gray-700';
-  const outCls = embedded ? 'text-slate-200' : 'text-gray-700';
-  const note = embedded ? 'text-slate-500' : 'text-gray-500';
-  const fwdChip = embedded
-    ? 'rounded bg-sky-500/15 px-1 py-px text-sky-200'
-    : 'rounded bg-sky-100 px-1 py-px text-sky-700';
-  const spotChip = embedded
-    ? 'rounded bg-amber-500/15 px-1 py-px text-amber-200'
-    : 'rounded bg-orange-100 px-1 py-px text-orange-700';
+  const border = embedded ? 'border-slate-800' : 'border-gray-200';
+  const muted = embedded ? 'text-slate-500' : 'text-gray-500';
+  const sumAbs = schedule.reduce((s, l) => s + Math.abs(l.newLeg), 0);
+  const isStrip = !term && schedule.length > 1;
 
   return (
     <div className="overflow-x-auto">
-      <table className="w-full border-collapse font-mono text-[10px] tabular-nums">
+      <table className="w-full min-w-[720px] text-left text-[11px]">
         <thead>
-          <tr>
-            <th className={`${sth} text-left`}>Value date</th>
-            <th className={`${sth} text-left`}>Trade</th>
-            <th className={sth} title="Notional this leg adds: + buys FCY to fund the trough, − sells excess back">
-              New leg
+          <tr className={muted}>
+            <th className="py-0 pb-1.5 pr-3 font-medium">Leg</th>
+            <th className="py-0 pb-1.5 pr-3 font-medium">Settle</th>
+            <th className="py-0 pb-1.5 pr-3 font-medium">Share</th>
+            <th className="py-0 pb-1.5 pr-3 font-medium">Notional</th>
+            <th className="py-0 pb-1.5 pr-3 font-medium">Cumulative H</th>
+            <th className="py-0 pb-1.5 pr-3 font-medium text-emerald-300/70">
+              Implied carry
             </th>
-            <th className={sth} title="Notional carried in from earlier legs — extended at its far date, not settled">
-              Rolled in
-            </th>
-            <th className={sth} title="Notional outstanding once this leg is on">
-              Outstanding
-            </th>
+            <th className="py-0 pb-1.5 font-medium">Status</th>
           </tr>
         </thead>
         <tbody>
-          {schedule.map(l => (
-            <tr key={l.cycleIndex}>
-              <td className={`${std} text-left font-semibold ${dateCls}`}>
-                M{l.valueDateMonths + 1}
-              </td>
-              <td className={`${std} text-left`}>
-                {l.preBookable ? (
-                  <span className={fwdChip} title={`Sized already — bookable today as a swap value-dated M${l.valueDateMonths + 1}`}>
-                    forward-start · pre-bookable
+          {schedule.map((l, i) => {
+            const share = sumAbs < 1e-12 ? 0 : (Math.abs(l.newLeg) / sumAbs) * 100;
+            const carry = sumAbs < 1e-12 ? 0 : costUsdYr * (Math.abs(l.newLeg) / sumAbs);
+            const settle = term ? forecastMonths : l.valueDateMonths;
+            return (
+              <tr key={l.cycleIndex} className={`border-t ${border}/80`}>
+                <td className="py-1.5 pr-3">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span
+                      className={
+                        embedded
+                          ? 'rounded bg-violet-500/20 px-1 py-0.5 text-[9px] font-semibold text-violet-200'
+                          : 'rounded bg-violet-100 px-1 py-0.5 text-[9px] font-semibold text-violet-700'
+                      }
+                    >
+                      {l.preBookable ? 'FWD' : 'SWAP'}
+                    </span>
+                    <span
+                      className={`font-mono ${embedded ? 'text-slate-100' : 'text-gray-800'}`}
+                    >
+                      {isStrip
+                        ? `L${i + 1}`
+                        : term
+                          ? `M0–M${Math.round(forecastMonths)}`
+                          : `L${i + 1}`}
+                    </span>
                   </span>
-                ) : (
-                  <span className={spotChip} title="The near cycle's trade: spot start, book now">
-                    spot · book now
-                  </span>
-                )}
-              </td>
-              <td className={`${std} font-semibold ${l.newLeg > 0 ? (embedded ? 'text-sky-200' : 'text-orange-700') : (embedded ? 'text-emerald-300/80' : 'text-green-700')}`}>
-                {signed(l.newLeg)}
-              </td>
-              <td className={std}>
-                {Math.abs(l.rolledForward) > 0.001 ? f2(l.rolledForward) : '—'}
-              </td>
-              <td className={`${std} font-semibold ${outCls}`}>{f2(l.outstanding)}</td>
-            </tr>
-          ))}
+                </td>
+                <td className="py-1.5 pr-3 font-mono text-amber-200/90">
+                  {settleLabel(settle)}
+                </td>
+                <td className={`py-1.5 pr-3 font-mono ${embedded ? 'text-slate-100' : 'text-gray-800'}`}>
+                  {fmtShare(share)}
+                </td>
+                <td className="py-1.5 pr-3 font-mono font-semibold text-emerald-300">
+                  {fmtLocal(l.newLeg, ccy)}
+                </td>
+                <td className={`py-1.5 pr-3 font-mono ${muted}`}>
+                  {fmtLocal(l.outstanding, ccy)}
+                </td>
+                <td className="py-1.5 pr-3 font-mono text-emerald-300/90">
+                  {Math.abs(carry) < 1e-9
+                    ? '—'
+                    : fmtVarK(Math.abs(carry)).replace('$', carry >= 0 ? '+$' : '−$')}
+                </td>
+                <td className={`py-1.5 text-[10px] ${muted}`}>
+                  {l.preBookable ? 'forward · pre-bookable' : 'spot · book now'}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
-      <p className={`mt-1.5 text-[9px] ${note}`}>
-        {term
-          ? `One leg, value-dated spot and held to M${forecastMonths}: nothing rolls
-             and nothing is left to pre-book.`
-          : `Only the M1 leg has to be traded spot. Every later leg is already
-             sized by the path, so it can be booked today as a forward-starting
-             swap on its own value date — leaving it means going back to market
-             that cycle at whatever the points are then. Rolled in is the notional
-             carried from earlier legs: the far date is extended, not settled, so
-             the book only comes down on a cycle that turns cash-positive.`}
-      </p>
     </div>
   );
 }
@@ -275,12 +392,15 @@ function RegimeControls({
   onSizingBasisChange,
   onBookingModeChange,
   embedded,
+  parts = 'both',
 }: {
   sizingBasis: LiquiditySizingBasis;
   bookingMode: LiquidityBookingMode;
   onSizingBasisChange?: (v: LiquiditySizingBasis) => void;
   onBookingModeChange?: (v: LiquidityBookingMode) => void;
   embedded?: boolean;
+  /** Header keeps Size on; Book as lives in the expand Structure bar. */
+  parts?: 'sizing' | 'booking' | 'both';
 }) {
   const labelCls = embedded
     ? 'text-[9px] uppercase tracking-wide text-slate-500'
@@ -306,6 +426,7 @@ function RegimeControls({
   }
   return (
     <div className="inline-flex flex-wrap items-center gap-4">
+      {parts !== 'booking' && (
       <div className="flex items-center gap-2">
         <span className={labelCls}>Size on</span>
         <span className={groupCls} role="group" aria-label="Sizing basis">
@@ -323,8 +444,10 @@ function RegimeControls({
           ))}
         </span>
       </div>
+      )}
+      {parts !== 'sizing' && (
       <div className="flex items-center gap-2">
-        <span className={labelCls}>Book as</span>
+        <span className={labelCls}>{parts === 'booking' ? 'Structure' : 'Book as'}</span>
         <span className={groupCls} role="group" aria-label="Swap booking mode">
           {BOOKING_MODE_OPTIONS.map(o => (
             <button
@@ -340,6 +463,7 @@ function RegimeControls({
           ))}
         </span>
       </div>
+      )}
     </div>
   );
 }
@@ -352,6 +476,7 @@ export function LiquiditySwapDecision({
   forecastMonths,
   onSizingBasisChange,
   onBookingModeChange,
+  preparedByCcy,
   embedded = false,
 }: {
   rows: readonly FcyComputedRow[];
@@ -362,18 +487,27 @@ export function LiquiditySwapDecision({
   /** Wired up, the regime becomes editable from this card — not only the Liquidity desk toolbar. */
   onSizingBasisChange?: (v: LiquiditySizingBasis) => void;
   onBookingModeChange?: (v: LiquidityBookingMode) => void;
+  /**
+   * Staged Exposure · hedge structuring packages. When a CCY has cover, that
+   * strip / bullet is the funding decision (leg count + Target), not the
+   * independent Liquidity H* cycle plan.
+   */
+  preparedByCcy?: Record<string, PreparedHedgeProfile>;
   /** Dark slate — Hedging Decision / Analytics host. */
   embedded?: boolean;
 }) {
   const term = bookingMode === 'term';
   const decisions = rows
-    .map(r => decisionRowFor(r, r_USD))
+    .map(r => pickDecisionRow(r, r_USD, preparedByCcy?.[r.ccy]))
     .filter((d): d is DecisionRow =>
       d !== null
       && (Math.abs(d.nearLeg) > 0.001
         || Math.abs(d.peakBook) > 0.001
         || Math.abs(d.endingBook) > 0.001)
     );
+  const sizedByStructuring = rows.some(
+    r => Math.abs(preparedByCcy?.[r.ccy]?.coverLocalM ?? 0) > 0.001,
+  );
 
   const [openCcy, setOpenCcy] = useState<string | null>(null);
   const [coverByCcy, setCoverByCcy] = useState<Record<string, number>>({});
@@ -386,10 +520,14 @@ export function LiquiditySwapDecision({
 
   const border = embedded ? 'border-slate-800' : 'border-gray-200';
   const muted = embedded ? 'text-slate-500' : 'text-gray-500';
+  const head = embedded ? 'text-slate-500' : 'text-gray-500';
   const titleCls = embedded
     ? 'text-[11px] font-semibold uppercase tracking-wide text-slate-400'
     : 'text-[11px] font-semibold uppercase tracking-wide text-gray-500';
   const body = embedded ? 'text-xs text-slate-400' : 'text-xs text-gray-500';
+  /** Same 13-column rhythm as Exposure · hedge structuring. */
+  const structRowGrid =
+    'grid w-full min-w-[52rem] grid-cols-[2.4rem_2.85rem_5.5rem_5.5rem_5.75rem_3.6rem_3.6rem_minmax(4.5rem,1fr)_5.75rem_5.75rem_3.6rem_3.6rem_0.85rem] items-baseline gap-x-2 px-3';
 
   const regime = (
     <RegimeControls
@@ -398,6 +536,7 @@ export function LiquiditySwapDecision({
       onSizingBasisChange={onSizingBasisChange}
       onBookingModeChange={onBookingModeChange}
       embedded={embedded}
+      parts="sizing"
     />
   );
 
@@ -405,8 +544,14 @@ export function LiquiditySwapDecision({
     return (
       <div className="space-y-2">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <div className={titleCls}>Funding hedge · adjust before booking</div>
-          {regime}
+          <div className={titleCls}>Funding · hedge structuring</div>
+          <RegimeControls
+            sizingBasis={sizingBasis}
+            bookingMode={bookingMode}
+            onSizingBasisChange={onSizingBasisChange}
+            onBookingModeChange={onBookingModeChange}
+            embedded={embedded}
+          />
         </div>
         <p className={body}>
           No strip yet. Turn on a buffer layer on Liquidity (floor, payout σ,
@@ -424,9 +569,9 @@ export function LiquiditySwapDecision({
 
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className={titleCls}>Funding hedge · adjust before booking</div>
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div className={titleCls}>Funding · hedge structuring</div>
+          <div className="flex flex-wrap items-center gap-3">
           {regime}
           <button
             type="button"
@@ -446,89 +591,177 @@ export function LiquiditySwapDecision({
           <div className={`font-mono text-[9px] ${embedded ? 'text-slate-600' : 'text-gray-400'}`}>
             {forecastMonths}m horizon · {decisions.length}{' '}
             {decisions.length === 1 ? 'currency' : 'currencies'} · sized by
-            Liquidity layers
+            {sizedByStructuring
+              ? ' Exposure · hedge structuring'
+              : ' Liquidity layers'}
           </div>
         </div>
       </div>
 
-      {decisions.map((full, i) => {
-        const d = scaled[i]!;
-        const cover = coverRatioFor(full.ccy);
-        const coverPct = Math.round(cover * 100);
-        const residual = full.nearLeg * (1 - cover);
-        const delta = 1 - cover;
-        const open = openCcy === full.ccy;
-        const forward = d.schedule.filter(s => s.preBookable);
-        return (
-          <div
-            key={full.ccy}
-            className={`rounded-lg border ${
-              open
-                ? embedded
-                  ? 'border-violet-500/40 bg-slate-950/60'
-                  : 'border-violet-300 bg-violet-50/40'
-                : embedded
-                  ? `${border} bg-slate-950/30`
-                  : `${border} bg-white`
-            }`}
+      <div className={`overflow-x-auto rounded-lg border ${border}`}>
+        <div className={`${structRowGrid} border-b ${border} py-1.5 ${head}`}>
+          <span className="text-[9px] font-medium uppercase tracking-wide">
+            CCY
+          </span>
+          <span className="text-[9px] font-medium uppercase tracking-wide">
+            Dir
+          </span>
+          <span
+            className="text-right text-[9px] font-medium uppercase tracking-wide"
+            title="Cash the binding cycle drains at its deepest"
           >
-            <div
-              role="button"
-              tabIndex={0}
-              title={`Structure ${full.ccy} funding hedge`}
-              onClick={() => setOpenCcy(open ? null : full.ccy)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  setOpenCcy(open ? null : full.ccy);
-                }
-              }}
-              className="flex cursor-pointer flex-wrap items-center gap-4 px-3 py-2.5"
-            >
-              <div className="flex w-[120px] flex-none flex-col gap-0.5">
+            Drain
+          </span>
+          <span
+            className="text-right text-[9px] font-medium uppercase tracking-wide"
+            title="Near leg for cycle 1 — book now"
+          >
+            Near
+          </span>
+          <span
+            className="text-right text-[9px] font-medium uppercase tracking-wide"
+            title="Deepest the outstanding book gets on the path"
+          >
+            Peak
+          </span>
+          <span
+            className={`text-right text-[9px] font-medium uppercase tracking-wide ${
+              embedded ? 'text-amber-300/90' : 'text-amber-700'
+            }`}
+            title="USD the (scaled) peak outstanding book consumes at spot"
+          >
+            $USD
+          </span>
+          <span
+            className={`text-right text-[9px] font-medium uppercase tracking-wide ${
+              embedded ? 'text-emerald-300/80' : 'text-emerald-700'
+            }`}
+            title="Unfunded fraction of the proposed near leg (1 − cover)"
+          >
+            Δ
+          </span>
+          <span className="text-[9px] font-medium uppercase tracking-wide">
+            Structure
+          </span>
+          <span className="text-right text-[9px] font-medium uppercase tracking-wide">
+            Target
+          </span>
+          <span className="text-right text-[9px] font-medium uppercase tracking-wide">
+            Resid
+          </span>
+          <span
+            className="text-right text-[9px] font-medium uppercase tracking-wide"
+            title="Annual USD cost of Δr on the average outstanding book"
+          >
+            Cost
+          </span>
+          <span
+            className="text-right text-[9px] font-medium uppercase tracking-wide"
+            title="Δr = r_USD − r_FCY"
+          >
+            Δr
+          </span>
+          <span />
+        </div>
+        {decisions.map((full, i) => {
+          const d = scaled[i]!;
+          const cover = coverRatioFor(full.ccy);
+          const coverPct = Math.round(cover * 100);
+          const residual = full.nearLeg * (1 - cover);
+          const delta = 1 - cover;
+          const open = openCcy === full.ccy;
+          const direction: 'long' | 'short' | 'flat' =
+            Math.abs(full.nearLeg) < 1e-9
+              ? 'flat'
+              : full.nearLeg > 0
+                ? 'long'
+                : 'short';
+          const structureLabel = term
+            ? '1 term swap'
+            : `${full.schedule.length}-leg ${full.rolling ? 'rolling' : 'strip'}`;
+          return (
+            <Fragment key={full.ccy}>
+              <div
+                role="button"
+                tabIndex={0}
+                title={`Structure ${full.ccy} funding hedge`}
+                onClick={() => setOpenCcy(open ? null : full.ccy)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setOpenCcy(open ? null : full.ccy);
+                  }
+                }}
+                className={`${structRowGrid} cursor-pointer border-b ${border}/60 py-1.5 ${
+                  open
+                    ? embedded
+                      ? 'bg-violet-500/10'
+                      : 'bg-violet-50'
+                    : embedded
+                      ? 'bg-slate-950/30 hover:bg-violet-500/10'
+                      : 'bg-white hover:bg-violet-50/60'
+                }`}
+              >
                 <span
-                  className={`text-sm font-semibold ${embedded ? 'text-violet-200' : 'text-violet-700'}`}
+                  className={`text-[13px] font-semibold ${
+                    embedded ? 'text-violet-200' : 'text-violet-700'
+                  }`}
                 >
                   {full.ccy}
                 </span>
-                <span className={`text-[9px] ${muted}`}>
-                  {term
-                    ? '1 term swap'
-                    : `${full.schedule.length}-leg ${full.rolling ? 'rolling' : 'strip'}`}
-                </span>
-              </div>
-              <div className="flex w-[150px] flex-none flex-col gap-0.5">
-                <span className={`text-[9px] uppercase tracking-wide ${muted}`}>
-                  Target
+                <span>
+                  <span
+                    className={`rounded px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide ${
+                      direction === 'long'
+                        ? embedded
+                          ? 'bg-emerald-500/15 text-emerald-300'
+                          : 'bg-emerald-50 text-emerald-700'
+                        : direction === 'short'
+                          ? embedded
+                            ? 'bg-rose-500/15 text-rose-300'
+                            : 'bg-rose-50 text-rose-700'
+                          : embedded
+                            ? 'bg-slate-700/50 text-slate-500'
+                            : 'bg-gray-100 text-gray-500'
+                    }`}
+                  >
+                    {direction}
+                  </span>
                 </span>
                 <span
-                  className={`font-mono text-xs font-semibold ${embedded ? 'text-sky-300' : 'text-sky-700'}`}
-                >
-                  {signed(full.nearLeg)}
-                </span>
-              </div>
-              <div className="flex w-[130px] flex-none flex-col gap-0.5">
-                <span className={`text-[9px] uppercase tracking-wide ${muted}`}>
-                  Residual
-                </span>
-                <span
-                  className={`font-mono text-xs ${
-                    Math.abs(residual) < 1e-9
-                      ? muted
-                      : embedded
-                        ? 'text-amber-300'
-                        : 'text-amber-700'
+                  className={`text-right font-mono text-[11px] tabular-nums ${
+                    embedded ? 'text-slate-300' : 'text-gray-700'
                   }`}
                 >
-                  {Math.abs(residual) < 1e-9 ? '—' : signed(residual)}
-                </span>
-              </div>
-              <div className="flex w-[90px] flex-none flex-col gap-0.5">
-                <span className={`text-[9px] uppercase tracking-wide ${muted}`}>
-                  Δ
+                  {full.drawdown > 0.001 ? f2(full.drawdown) : '—'}
                 </span>
                 <span
-                  className={`font-mono text-xs font-semibold ${
+                  className={`text-right font-mono text-[11px] tabular-nums ${
+                    Math.abs(d.nearLeg) < 1e-9
+                      ? muted
+                      : embedded
+                        ? 'text-slate-300'
+                        : 'text-gray-700'
+                  }`}
+                >
+                  {Math.abs(d.nearLeg) < 1e-9 ? '—' : signed(d.nearLeg)}
+                </span>
+                <span
+                  className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
+                    embedded ? 'text-violet-200' : 'text-violet-700'
+                  }`}
+                >
+                  {signed(d.peakBook)}
+                </span>
+                <span
+                  className={`text-right font-mono text-[11px] tabular-nums ${
+                    embedded ? 'text-amber-300' : 'text-amber-700'
+                  }`}
+                >
+                  {f2(d.usdFunded)}
+                </span>
+                <span
+                  className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
                     delta < 1e-9
                       ? embedded
                         ? 'text-emerald-300'
@@ -540,148 +773,255 @@ export function LiquiditySwapDecision({
                 >
                   {delta.toFixed(2)}
                 </span>
-              </div>
-              <div className="flex w-[120px] flex-none flex-col gap-0.5">
-                <span className={`text-[9px] uppercase tracking-wide ${muted}`}>
-                  $USD funded
+                <span className={`truncate text-[9px] ${muted}`}>
+                  {structureLabel}
                 </span>
                 <span
-                  className={`font-mono text-xs ${embedded ? 'text-slate-200' : 'text-gray-700'}`}
+                  className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
+                    embedded ? 'text-sky-300' : 'text-sky-700'
+                  }`}
                 >
-                  {f2(d.usdFunded)}
+                  {signed(full.nearLeg)}
+                </span>
+                <span
+                  className={`text-right font-mono text-[11px] tabular-nums ${
+                    Math.abs(residual) < 1e-9
+                      ? muted
+                      : embedded
+                        ? 'text-amber-300'
+                        : 'text-amber-700'
+                  }`}
+                >
+                  {Math.abs(residual) < 1e-9 ? '—' : signed(residual)}
+                </span>
+                <span
+                  className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
+                    d.costUsdYr > 0.001
+                      ? embedded
+                        ? 'text-amber-300'
+                        : 'text-red-600'
+                      : d.costUsdYr < -0.001
+                        ? embedded
+                          ? 'text-emerald-300'
+                          : 'text-green-700'
+                        : muted
+                  }`}
+                >
+                  {f2(d.costUsdYr)}
+                </span>
+                <span
+                  className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
+                    embedded ? 'text-emerald-300' : 'text-emerald-700'
+                  }`}
+                >
+                  {full.deltaR >= 0 ? '+' : ''}
+                  {full.deltaR.toFixed(2)}
+                </span>
+                <span className={`text-center text-[9px] ${muted}`}>
+                  {open ? '▾' : '▸'}
                 </span>
               </div>
-              <span className="flex-1" />
-              <span className={`text-[10px] ${muted}`}>
-                {open ? 'Structuring' : 'Click to structure'}
-              </span>
-            </div>
+              {open && (
+                <div
+                  className={`border-b ${border} ${
+                    embedded ? 'bg-slate-950/40' : 'bg-gray-50'
+                  }`}
+                >
+                  <div className="flex flex-col gap-3 px-3 py-3.5">
+                    <div className="flex flex-wrap items-end gap-5">
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                          Cycle drain
+                        </span>
+                        <span className={`font-mono text-xs ${muted}`}>
+                          {full.drawdown > 0.001
+                            ? fmtLocal(full.drawdown, full.ccy)
+                            : '—'}
+                        </span>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                          Peak book
+                        </span>
+                        <span className={`font-mono text-xs ${muted}`}>
+                          {fmtLocal(full.peakBook, full.ccy)}
+                        </span>
+                      </div>
+                      <DeskStepper
+                        label="Cover"
+                        value={coverPct}
+                        min={0}
+                        max={MAX_COVER_PCT}
+                        step={1}
+                        nudgeStep={COVER_STEP_PCT}
+                        onChange={pct => setCoverPct(full.ccy, pct)}
+                        formatValue={v => `${v}%`}
+                        suffix={`→ ${fmtLocal(d.nearLeg, full.ccy)}`}
+                        editable
+                        tickValues={[0, 25, 50, 75, 100]}
+                        className="min-w-[280px] w-[280px]"
+                        title="Scale funding cover of the proposed strip (0% unfunded, 100% full H* · remaining Δ = 1 − cover)"
+                        ariaLabel="Funding cover percent"
+                      />
+                      <div className="flex flex-col gap-1">
+                        <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                          Target (near)
+                        </span>
+                        <span className="font-mono text-sm font-semibold text-sky-300">
+                          {fmtLocal(full.nearLeg, full.ccy)}
+                        </span>
+                      </div>
+                    </div>
 
-            {open && (
-              <div
-                className={`flex flex-col gap-3 border-t ${border} ${
-                  embedded ? 'bg-slate-950/40' : 'bg-gray-50'
-                } px-3 py-3.5`}
-              >
-                <div className="flex flex-wrap items-end gap-5">
-                  <div className="flex flex-col gap-1">
-                    <span className={`text-[9px] uppercase tracking-wide ${muted}`}>
-                      Cycle drain
-                    </span>
-                    <span className={`font-mono text-xs ${muted}`}>
-                      {full.drawdown > 0.001 ? f2(full.drawdown) : '—'}
-                    </span>
-                  </div>
-                  <DeskStepper
-                    label="Cover"
-                    value={coverPct}
-                    min={0}
-                    max={MAX_COVER_PCT}
-                    step={1}
-                    nudgeStep={COVER_STEP_PCT}
-                    onChange={pct => setCoverPct(full.ccy, pct)}
-                    formatValue={v => `${v}%`}
-                    suffix={`→ ${signed(d.nearLeg)}`}
-                    editable
-                    tickValues={[0, 25, 50, 75, 100]}
-                    className="min-w-[280px] w-[280px]"
-                    title="Scale funding cover of the proposed strip (0% unfunded, 100% full H* · remaining Δ = 1 − cover)"
-                    ariaLabel="Funding cover percent"
-                    accent="sky"
-                  />
-                  <div className="flex flex-col gap-1">
-                    <span className={`text-[9px] uppercase tracking-wide ${muted}`}>
-                      Remaining Δ
-                    </span>
-                    <span
-                      className={`font-mono text-sm font-semibold ${
-                        delta < 1e-9
-                          ? embedded
-                            ? 'text-emerald-300'
-                            : 'text-emerald-700'
-                          : embedded
-                            ? 'text-amber-300'
-                            : 'text-amber-700'
-                      }`}
+                    <div
+                      className={`flex flex-wrap items-center gap-4 border-y ${border} py-2.5`}
                     >
-                      {delta.toFixed(2)}
-                    </span>
+                      <RegimeControls
+                        sizingBasis={sizingBasis}
+                        bookingMode={bookingMode}
+                        onSizingBasisChange={onSizingBasisChange}
+                        onBookingModeChange={onBookingModeChange}
+                        embedded={embedded}
+                        parts="booking"
+                      />
+                      {!term && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-[9px] uppercase tracking-wide text-slate-500">
+                            Legs
+                          </span>
+                          <span
+                            className={`w-3 text-center font-mono text-xs ${
+                              embedded ? 'text-slate-100' : 'text-gray-800'
+                            }`}
+                          >
+                            {full.schedule.length}
+                          </span>
+                        </div>
+                      )}
+                      <span className="flex-1" />
+                      <span className={`text-[10px] ${muted}`}>
+                        {!term
+                          ? 'Σ share 100% · path-sized'
+                          : '1 term swap · held to Tf'}
+                      </span>
+                    </div>
+
+                    <LegSchedule
+                      schedule={d.schedule}
+                      term={term}
+                      forecastMonths={forecastMonths}
+                      ccy={full.ccy}
+                      costUsdYr={d.costUsdYr}
+                      embedded={embedded}
+                    />
+
+                    <div className="flex flex-nowrap items-center gap-2 overflow-x-auto">
+                      <span className="flex min-w-0 shrink gap-x-3 whitespace-nowrap text-[10px]">
+                        <span className={muted}>
+                          Outstanding M{forecastMonths}{' '}
+                          <span className={`font-mono ${embedded ? 'text-slate-300' : 'text-gray-700'}`}>
+                            {fmtLocal(d.endingBook, full.ccy)}
+                          </span>
+                        </span>
+                        <span className={muted}>
+                          Δ{' '}
+                          <span
+                            className={`font-mono ${
+                              delta < 1e-9
+                                ? embedded
+                                  ? 'text-emerald-300'
+                                  : 'text-emerald-700'
+                                : 'text-amber-300'
+                            }`}
+                          >
+                            {delta.toFixed(2)}
+                          </span>
+                        </span>
+                        <span className={muted}>
+                          Resid{' '}
+                          <span className={`font-mono ${embedded ? 'text-slate-300' : 'text-gray-700'}`}>
+                            {Math.abs(residual) < 1e-9
+                              ? '—'
+                              : fmtLocal(residual, full.ccy)}
+                          </span>
+                        </span>
+                        <span className={muted}>
+                          Cost{' '}
+                          <span
+                            className={`font-mono font-semibold ${
+                              d.costUsdYr > 0.001
+                                ? 'text-amber-300'
+                                : d.costUsdYr < -0.001
+                                  ? 'text-emerald-300'
+                                  : embedded
+                                    ? 'text-slate-300'
+                                    : 'text-gray-700'
+                            }`}
+                          >
+                          {Math.abs(d.costUsdYr) < 1e-9
+                            ? '—'
+                            : fmtVarK(Math.abs(d.costUsdYr)).replace(
+                                '$',
+                                d.costUsdYr >= 0 ? '+$' : '−$',
+                              )}
+                          </span>
+                        </span>
+                      </span>
+                    </div>
                   </div>
                 </div>
-
-                <div className={`flex flex-wrap items-center gap-x-4 gap-y-1 border-y ${border} py-2.5 text-[10px]`}>
-                  <span className={muted}>
-                    Outstanding M{forecastMonths}{' '}
-                    <span className={`font-mono ${embedded ? 'text-slate-300' : 'text-gray-700'}`}>
-                      {f2(d.endingBook)}
-                    </span>
-                  </span>
-                  <span className={muted}>
-                    Forward legs{' '}
-                    <span className={`font-mono ${embedded ? 'text-slate-300' : 'text-gray-700'}`}>
-                      {forward.length === 0
-                        ? '—'
-                        : `${forward.length} × ${signed(forward.reduce((s, l) => s + l.newLeg, 0))}`}
-                    </span>
-                  </span>
-                  <span className={muted}>
-                    Δr cost $/yr{' '}
-                    <span
-                      className={`font-mono ${
-                        d.costUsdYr > 0.001
-                          ? embedded
-                            ? 'text-amber-300'
-                            : 'text-red-600'
-                          : d.costUsdYr < -0.001
-                            ? embedded
-                              ? 'text-emerald-300'
-                              : 'text-green-700'
-                            : muted
-                      }`}
-                    >
-                      {f2(d.costUsdYr)}
-                    </span>
-                    <span className={`ml-1 ${muted}`}>
-                      Δr {full.deltaR >= 0 ? '+' : ''}
-                      {full.deltaR.toFixed(2)}
-                    </span>
-                  </span>
-                </div>
-
-                <p className={body}>
-                  The near leg buys FCY to bring the trough up to its cushion
-                  and the far leg sells it back, so the FX position is
-                  untouched. Cover scales how much of that strip is taken —
-                  remaining Δ is the unfunded fraction of the proposed near
-                  leg.
-                </p>
-
-                <LegSchedule
-                  schedule={d.schedule}
-                  term={term}
-                  forecastMonths={forecastMonths}
-                  embedded={embedded}
-                />
-              </div>
-            )}
+              )}
+            </Fragment>
+          );
+        })}
+        {decisions.length > 1 && (
+          <div
+            className={`${structRowGrid} ${
+              embedded ? 'bg-slate-900/40' : 'bg-gray-50'
+            } py-1.5`}
+            title="FCY amounts don't sum across currencies — $USD and Cost are USD totals"
+          >
+            <span
+              className={`text-[11px] font-semibold ${
+                embedded ? 'text-violet-200' : 'text-violet-700'
+              }`}
+            >
+              All
+            </span>
+            <span />
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span
+              className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
+                embedded ? 'text-amber-300' : 'text-amber-700'
+              }`}
+            >
+              {f2(totalUsd)}
+            </span>
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span />
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span
+              className={`text-right font-mono text-[11px] font-semibold tabular-nums ${
+                totalCost > 0.001
+                  ? embedded
+                    ? 'text-amber-300'
+                    : 'text-red-600'
+                  : totalCost < -0.001
+                    ? embedded
+                      ? 'text-emerald-300'
+                      : 'text-green-700'
+                    : muted
+              }`}
+            >
+              {f2(totalCost)}
+            </span>
+            <span className={`text-right font-mono text-[11px] ${muted}`}>—</span>
+            <span />
           </div>
-        );
-      })}
-
-      <div
-        className={`flex flex-wrap items-baseline justify-between gap-2 rounded-lg border ${border} ${
-          embedded ? 'bg-slate-900/40' : 'bg-gray-50'
-        } px-3 py-2`}
-      >
-        <span className={`text-sm font-semibold ${embedded ? 'text-violet-200' : 'text-violet-700'}`}>
-          All CCY
-        </span>
-        <span className={`font-mono text-xs ${embedded ? 'text-slate-300' : 'text-gray-700'}`}>
-          $USD funded {f2(totalUsd)}
-          <span className={`ml-3 ${totalCost > 0.001 ? (embedded ? 'text-amber-300' : 'text-red-600') : muted}`}>
-            Δr cost {f2(totalCost)} /yr
-          </span>
-        </span>
+        )}
       </div>
     </div>
   );

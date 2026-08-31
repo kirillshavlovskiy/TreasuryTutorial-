@@ -10,7 +10,6 @@ import {
 } from '@/lib/fx-hedge';
 import {
   ccySpotRate,
-  fcyToUsdM,
   fundingSwapCarryLegs,
   fundingSwapCipPointsUsdYr,
   makeSimRow,

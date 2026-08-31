@@ -4,7 +4,7 @@
 // PostgreSQL + Sequelize backend (Entity → Dashboard → RiskProfile tables)
 // when server persistence is introduced.
 
-import type { LayerId } from '@/lib/fx-buffer';
+import { INITIAL_ROWS, type LayerId } from '@/lib/fx-buffer';
 import type { ForecastProfileState } from '@/lib/forecast-profile';
 import {
   hedgeSidecarStorageKey,
@@ -59,7 +59,7 @@ export type OptMetric = 'minFloor' | 'payoutBuffer' | 'carryTarget' | 'portfolio
 export const OPT_METRICS: { id: OptMetric; label: string; layer: LayerId; description: string }[] = [
   { id: 'minFloor',     label: 'Min Floor',      layer: 'floorH',       description: 'Hard per-currency minimum cash floor.' },
   { id: 'payoutBuffer', label: 'Payout Buffer',  layer: 'sigmaP',       description: 'Forecast-uncertainty (σ_P) safety margin on payouts.' },
-  { id: 'cfarCover',    label: 'CFaR Cover',     layer: 'cfarCover',    description: 'FX-hedge Net CFaR reserves USD after cover. Does not size the funding swap — payout-σ does.' },
+  { id: 'cfarCover',    label: 'CFaR Cover',     layer: 'cfarCover',    description: 'FX-hedge Net CFaR readout (USD P&L). Does not size the funding swap — payout-σ does.' },
   { id: 'carryTarget',  label: 'Buffer Carry Target',   layer: 'carryOptim',   description: 'Steer Target LP Cash so Buffer Carry (funding-swap cash Δr vs USD) hits the ask.' },
   { id: 'portfolioVar', label: 'Portfolio VaR',  layer: 'portfolioDiv', description: 'Diversified portfolio VaR budget across currencies.' },
 ];
@@ -224,22 +224,11 @@ export type RiskAssetId =
   | 'commodities'
   | 'realAssets';
 
-export type ProtectGoalId =
-  | 'assetValue'
-  | 'cashFlow'
-  | 'liquidity'
-  | 'credit'
-  | 'earnings';
+/** Single risk metric the desk protects. Liquidity is always on, not a pick. */
+export type ProtectGoalId = 'var' | 'cfar' | 'ear' | 'evar';
 
-export type OptimizeFrameworkId =
-  | 'var'
-  | 'cfar'
-  | 'ear'
-  | 'dv01'
-  | 'greeks'
-  | 'factorModel'
-  | 'credit'
-  | 'hedgeCarry';
+/** What the desk optimises. Risk metric (Protect) and Liquidity stay on. */
+export type OptimizeFrameworkId = 'hedgeRatio' | 'carryCashInterest' | 'greeksSensitivity';
 
 export const RISK_ASSETS: {
   id: RiskAssetId;
@@ -255,51 +244,118 @@ export const RISK_ASSETS: {
   { id: 'realAssets', label: 'Real assets', live: false, profileType: 'investments' },
 ];
 
-export const PROTECT_GOALS: { id: ProtectGoalId; label: string }[] = [
-  { id: 'assetValue', label: 'Asset value' },
-  { id: 'cashFlow', label: 'Cash flow' },
-  { id: 'liquidity', label: 'Liquidity' },
-  { id: 'credit', label: 'Credit' },
-  { id: 'earnings', label: 'Earnings' },
+export const PROTECT_GOALS: {
+  id: ProtectGoalId;
+  label: string;
+  longLabel: string;
+  live: boolean;
+}[] = [
+  { id: 'var', label: 'VaR', longLabel: 'Value at Risk', live: true },
+  { id: 'cfar', label: 'CFaR', longLabel: 'Cash Flow at Risk', live: true },
+  { id: 'ear', label: 'EaR', longLabel: 'Earnings at Risk', live: false },
+  { id: 'evar', label: 'EVaR', longLabel: 'Economic Value at Risk', live: false },
 ];
 
 export const OPTIMIZE_FRAMEWORKS: {
   id: OptimizeFrameworkId;
   /** Short form for the wizard's narrow select cards. */
   label: string;
-  /** Spelled out — what desk summaries show, since the acronyms are opaque. */
+  /** Spelled out — what desk summaries show. */
   longLabel: string;
   live: boolean;
   /** When set, only offer for this risk asset (else all). */
   assets?: RiskAssetId[];
 }[] = [
-  { id: 'var', label: 'VaR', longLabel: 'Value at Risk', live: true },
-  { id: 'cfar', label: 'CFaR', longLabel: 'Cash Flow at Risk', live: true },
-  { id: 'ear', label: 'EaR', longLabel: 'Earnings at Risk', live: false },
   {
-    id: 'dv01',
-    label: 'DV01',
-    longLabel: 'Dollar value of 1bp',
-    live: false,
-    assets: ['interestRates', 'bonds'],
+    id: 'hedgeRatio',
+    label: 'Hedge ratio',
+    longLabel: 'Hedge ratio',
+    live: true,
   },
   {
-    id: 'greeks',
-    label: 'Greeks',
-    longLabel: 'Option Greeks',
-    live: false,
-    assets: ['currencies'],
+    id: 'carryCashInterest',
+    label: 'Carry & cash interest',
+    longLabel: 'Carry & cash interest',
+    live: true,
   },
-  { id: 'factorModel', label: 'Factor model', longLabel: 'Factor model', live: false },
-  { id: 'credit', label: 'Credit', longLabel: 'Credit exposure', live: false },
   {
-    id: 'hedgeCarry',
-    label: 'Hedge / carry',
-    longLabel: 'Hedge cost / carry',
+    id: 'greeksSensitivity',
+    label: 'Greeks / Sensitivity hedging',
+    longLabel: 'Greeks / Sensitivity hedging',
     live: true,
     assets: ['currencies'],
   },
 ];
+
+/** Full FX universe the desk can scope — same book as the simulator grid. */
+export const FX_CURRENCY_UNIVERSE: string[] = INITIAL_ROWS.map(r => r.ccy);
+
+/** Default LP subset when an entity has not configured its own pool. */
+export const DEFAULT_LP_CURRENCIES: string[] = [
+  'EUR', 'GBP', 'JPY', 'PLN', 'CHF', 'CAD', 'AUD',
+  'SEK', 'NOK', 'DKK', 'CZK', 'HUF', 'MXN', 'ZAR',
+].filter(c => FX_CURRENCY_UNIVERSE.includes(c));
+
+export function entityAllCurrencies(entity: Pick<Entity, 'allCurrencies'>): string[] {
+  if (entity.allCurrencies && entity.allCurrencies.length > 0) {
+    return [...entity.allCurrencies];
+  }
+  return [...FX_CURRENCY_UNIVERSE];
+}
+
+export function entityLpCurrencies(
+  entity: Pick<Entity, 'allCurrencies' | 'lpCurrencies'>,
+): string[] {
+  const all = new Set(entityAllCurrencies(entity));
+  const lp = entity.lpCurrencies?.length ? entity.lpCurrencies : DEFAULT_LP_CURRENCIES;
+  return lp.filter(c => all.has(c));
+}
+
+/** Map stored / legacy protect ids onto the single current risk metric. */
+export function normalizeProtect(ids: readonly string[] | undefined): ProtectGoalId[] {
+  const order = PROTECT_GOALS.map(g => g.id);
+  for (const id of ids ?? []) {
+    const mapped =
+      id === 'var' || id === 'assetValue' ? 'var'
+      : id === 'cfar' || id === 'cashFlow' ? 'cfar'
+      : id === 'ear' || id === 'earnings' ? 'ear'
+      : id === 'evar' || id === 'credit' ? 'evar'
+      : null;
+    if (mapped && order.includes(mapped)) return [mapped];
+  }
+  return ['var'];
+}
+
+/** Map stored / legacy optimize ids onto hedge ratio, carry, and Greeks. */
+export function normalizeOptimize(ids: readonly string[] | undefined): OptimizeFrameworkId[] {
+  const out = new Set<OptimizeFrameworkId>();
+  for (const id of ids ?? []) {
+    if (id === 'hedgeRatio') out.add('hedgeRatio');
+    if (id === 'greeks' || id === 'greeksSensitivity' || id === 'sensitivity') {
+      out.add('greeksSensitivity');
+    }
+    if (id === 'carryCashInterest') out.add('carryCashInterest');
+    if (id === 'hedgeCarry') {
+      out.add('hedgeRatio');
+      out.add('carryCashInterest');
+    }
+  }
+  if (out.size === 0) {
+    out.add('hedgeRatio');
+    out.add('carryCashInterest');
+  }
+  return OPTIMIZE_FRAMEWORKS.map(f => f.id).filter(id => out.has(id));
+}
+
+export function normalizeDashboardSetup(setup: DashboardSetup): DashboardSetup {
+  return {
+    ...setup,
+    protect: normalizeProtect(setup.protect),
+    optimize: normalizeOptimize(setup.optimize),
+    tickers: [...setup.tickers],
+    instruments: setup.instruments?.map(i => ({ ...i })),
+  };
+}
 
 /** Wizard choices persisted on the dashboard (desk create flow). */
 /**
@@ -480,6 +536,10 @@ export interface Entity {
   dashboards: Dashboard[];
   /** Risk assets enabled for this entity (drives Create dashboard step 1). */
   riskAssets?: RiskAssetId[];
+  /** Full currency universe this entity can put on a desk. */
+  allCurrencies?: string[];
+  /** Subset held in the liquidity pool — Select LP on the ticker step. */
+  lpCurrencies?: string[];
 }
 
 /**
@@ -514,6 +574,8 @@ export interface StructureWizardSubsidiary {
   setup?: DashboardSetup;
   /** Escape hatch for callers that already hold a raw profile config. */
   fxConfig?: FxProfileConfig;
+  allCurrencies?: string[];
+  lpCurrencies?: string[];
 }
 
 export interface StructureWizardInput {
@@ -554,7 +616,7 @@ export function applyStructureWizard(
   for (const sub of input.subsidiaries) {
     const name = sub.name.trim();
     if (!name) continue;
-    const setup = sub.setup;
+    const setup = sub.setup ? normalizeDashboardSetup(sub.setup) : sub.setup;
     const ent = createEntity(ws, {
       name,
       baseCurrency: sub.baseCurrency || reportingCurrency,
@@ -566,6 +628,8 @@ export function applyStructureWizard(
           'interestRates',
         ]),
       ],
+      allCurrencies: sub.allCurrencies,
+      lpCurrencies: sub.lpCurrencies,
     });
     ws = ent.workspace;
     createdIds.push(ent.entity.id);
@@ -680,7 +744,7 @@ function parseWorkspaceBlob(parsed: unknown): WorkspaceLoadResult | null {
   const blob = parsed as WorkspacePersistBlob;
   if (isBareWorkspace(blob)) {
     return {
-      workspace: migrateRenamedFormulaRefs(blob),
+      workspace: hydrateWorkspace(migrateRenamedFormulaRefs(blob)),
       hedgesByEntityId: {},
     };
   }
@@ -690,7 +754,7 @@ function parseWorkspaceBlob(parsed: unknown): WorkspaceLoadResult | null {
       ? (blob.varSetup as VarSetup)
       : undefined;
   return {
-    workspace: migrateRenamedFormulaRefs(blob.workspace),
+    workspace: hydrateWorkspace(migrateRenamedFormulaRefs(blob.workspace)),
     hedgesByEntityId: normalizeHedgeBooksMap(blob.hedgesByEntityId),
     ...(varSetup ? { varSetup } : {}),
     ...(blob.updatedAt ? { updatedAt: blob.updatedAt } : {}),
@@ -819,7 +883,7 @@ export function saveWorkspace(
     try {
       window.localStorage.setItem(
         hedgeSidecarStorageKey(storageKey(userKey)),
-        serializeHedgeSidecar(blob.hedgesByEntityId, blob.hedgesUpdatedAt),
+        serializeHedgeSidecar(picked.hedgesByEntityId, blob.hedgesUpdatedAt),
       );
     } catch {
       // Quota — still try the full envelope / Neon PUT.
@@ -844,18 +908,26 @@ export function createEntity(
     baseCurrency: string;
     description?: string;
     riskAssets?: RiskAssetId[];
-    /** Stable id — NordTech seed must not rotate or hedges orphan. */
-    id?: string;
+    allCurrencies?: string[];
+    lpCurrencies?: string[];
   },
 ): { workspace: Workspace; entity: Entity } {
+  const allCurrencies = input.allCurrencies?.length
+    ? [...input.allCurrencies]
+    : [...FX_CURRENCY_UNIVERSE];
+  const allSet = new Set(allCurrencies);
+  const lpCurrencies = (input.lpCurrencies?.length ? input.lpCurrencies : DEFAULT_LP_CURRENCIES)
+    .filter(c => allSet.has(c));
   const entity: Entity = {
-    id: input.id?.trim() || makeId('ent'),
+    id: makeId('ent'),
     name: input.name.trim(),
     baseCurrency: input.baseCurrency,
     description: input.description?.trim() ?? '',
     createdAt: new Date().toISOString(),
     dashboards: [],
     riskAssets: input.riskAssets,
+    allCurrencies,
+    lpCurrencies,
   };
   return { workspace: { ...workspace, entities: [...workspace.entities, entity] }, entity };
 }
@@ -882,33 +954,36 @@ export function createDashboard(
 
 /** Map Create-dashboard wizard optimize/protect picks → Cash/FX profile config. */
 export function fxConfigFromDashboardSetup(setup: DashboardSetup): FxProfileConfig {
-  const inputs: FxInput[] = ['fxExposure'];
-  if (setup.protect.includes('liquidity')) inputs.push('liquidity');
-  if (setup.protect.includes('cashFlow') || setup.optimize.includes('hedgeCarry')) {
+  const protect = normalizeProtect(setup.protect)[0] ?? 'var';
+  const optimize = normalizeOptimize(setup.optimize);
+
+  const inputs: FxInput[] = ['fxExposure', 'liquidity'];
+  if (optimize.includes('hedgeRatio') || optimize.includes('carryCashInterest')) {
     if (!inputs.includes('rates')) inputs.push('rates');
   }
 
-  const optimizationMetrics: OptMetric[] = [];
-  if (setup.optimize.includes('var') || setup.protect.includes('assetValue')) {
-    optimizationMetrics.push('portfolioVar', 'minFloor', 'payoutBuffer');
+  const optimizationMetrics: OptMetric[] = ['minFloor', 'payoutBuffer'];
+  if (protect === 'var' || protect === 'evar') {
+    optimizationMetrics.push('portfolioVar');
   }
-  if (setup.optimize.includes('hedgeCarry') || setup.optimize.includes('cfar')) {
-    optimizationMetrics.push('carryTarget');
-  }
-  if (setup.optimize.includes('cfar')) {
+  if (protect === 'cfar') {
     optimizationMetrics.push('cfarCover');
+  }
+  if (protect === 'ear') {
+    optimizationMetrics.push('portfolioVar');
+  }
+  if (optimize.includes('carryCashInterest')) {
+    optimizationMetrics.push('carryTarget');
   }
   if (optimizationMetrics.length === 0) {
     optimizationMetrics.push(...defaultCurriculumFxConfig().optimizationMetrics);
   }
 
-  const decisionLayers: DecisionLayer[] =
-    setup.optimize.includes('hedgeCarry') || setup.protect.includes('cashFlow')
-      ? ['hedging']
-      : [];
-  const analyticalLayers: AnalyticalLayer[] = setup.optimize.includes('var')
-    ? ['riskMetrics']
-    : [];
+  const decisionLayers: DecisionLayer[] = optimize.includes('hedgeRatio') ? ['hedging'] : [];
+  const analyticalLayers: AnalyticalLayer[] = ['riskMetrics'];
+  if (optimize.includes('greeksSensitivity')) {
+    analyticalLayers.push('sensitivity');
+  }
 
   const unique = <T,>(xs: T[]) => [...new Set(xs)];
   return {
@@ -933,14 +1008,15 @@ export function createDashboardFromWizard(
   const asset = RISK_ASSETS.find(a => a.id === input.setup.riskAsset);
   const label = asset?.label ?? 'Dashboard';
   const name = input.name?.trim() || `${label} desk`;
-  const created = createDashboard(workspace, entityId, name, input.setup);
+  const setup = normalizeDashboardSetup(input.setup);
+  const created = createDashboard(workspace, entityId, name, setup);
 
   const profileInput =
-    input.setup.riskAsset === 'currencies'
+    setup.riskAsset === 'currencies'
       ? {
           type: 'fx' as const,
           name: 'Cash/FX',
-          fxConfig: fxConfigFromDashboardSetup(input.setup),
+          fxConfig: fxConfigFromDashboardSetup(setup),
         }
       : {
           type: asset?.profileType ?? ('investments' as const),
@@ -969,27 +1045,21 @@ export function entityEnabledRiskAssets(entity: Entity): RiskAssetId[] {
 
 /** Infer wizard setup from a dashboard (including legacy books without setup). */
 export function dashboardSetupFromDashboard(dashboard: Dashboard): DashboardSetup {
-  if (dashboard.setup) return { ...dashboard.setup, tickers: [...dashboard.setup.tickers] };
+  if (dashboard.setup) return normalizeDashboardSetup(dashboard.setup);
 
   const fx = dashboard.riskProfiles.find(p => p.type === 'fx')?.fxConfig;
   if (fx) {
+    const protect: ProtectGoalId[] = fx.optimizationMetrics.includes('cfarCover')
+      ? ['cfar']
+      : ['var'];
     const optimize: OptimizeFrameworkId[] = [];
-    if ((fx.analyticalLayers ?? []).includes('riskMetrics') || fx.optimizationMetrics.includes('portfolioVar')) {
-      optimize.push('var');
+    if ((fx.decisionLayers ?? []).includes('hedging')) optimize.push('hedgeRatio');
+    if (fx.optimizationMetrics.includes('carryTarget')) optimize.push('carryCashInterest');
+    if ((fx.analyticalLayers ?? []).includes('sensitivity')) {
+      optimize.push('greeksSensitivity');
     }
-    if (
-      (fx.decisionLayers ?? []).includes('hedging')
-      || fx.optimizationMetrics.includes('carryTarget')
-    ) {
-      optimize.push('hedgeCarry');
-    }
-    if (optimize.length === 0) optimize.push('var');
 
-    const protect: ProtectGoalId[] = ['assetValue'];
-    if (fx.inputs.includes('liquidity')) protect.push('liquidity');
-    if ((fx.decisionLayers ?? []).includes('hedging')) protect.push('cashFlow');
-
-    return {
+    return normalizeDashboardSetup({
       riskAsset: 'currencies',
       protect,
       optimize,
@@ -997,7 +1067,7 @@ export function dashboardSetupFromDashboard(dashboard: Dashboard): DashboardSetu
         fx.currencyMode === 'selected' && fx.currencies.length > 0
           ? [...fx.currencies]
           : ['EUR', 'GBP', 'JPY'],
-    };
+    });
   }
 
   const primary = dashboard.riskProfiles[0]?.type;
@@ -1007,9 +1077,28 @@ export function dashboardSetupFromDashboard(dashboard: Dashboard): DashboardSetu
     ?? RISK_ASSETS[0];
   return {
     riskAsset: asset.id,
-    protect: ['assetValue'],
-    optimize: asset.id === 'currencies' ? ['var', 'hedgeCarry'] : ['var'],
+    protect: ['var'],
+    optimize: ['hedgeRatio', 'carryCashInterest'],
     tickers: [],
+  };
+}
+
+export function hydrateEntity(entity: Entity): Entity {
+  const dashboards = entity.dashboards.map(d =>
+    d.setup ? { ...d, setup: normalizeDashboardSetup(d.setup) } : d,
+  );
+  return {
+    ...entity,
+    allCurrencies: entityAllCurrencies(entity),
+    lpCurrencies: entityLpCurrencies(entity),
+    dashboards,
+  };
+}
+
+export function hydrateWorkspace(workspace: Workspace): Workspace {
+  return {
+    ...workspace,
+    entities: workspace.entities.map(hydrateEntity),
   };
 }
 
@@ -1026,15 +1115,16 @@ export function updateDashboardFromWizard(
   const asset = RISK_ASSETS.find(a => a.id === input.setup.riskAsset);
   const label = asset?.label ?? 'Dashboard';
   const name = input.name?.trim() || `${label} desk`;
+  const setup = normalizeDashboardSetup(input.setup);
 
   const profile: RiskProfile =
-    input.setup.riskAsset === 'currencies'
+    setup.riskAsset === 'currencies'
       ? {
           id: makeId('rp'),
           type: 'fx',
           name: 'Cash/FX',
           createdAt: new Date().toISOString(),
-          fxConfig: fxConfigFromDashboardSetup(input.setup),
+          fxConfig: fxConfigFromDashboardSetup(setup),
         }
       : {
           id: makeId('rp'),
@@ -1052,7 +1142,7 @@ export function updateDashboardFromWizard(
         return {
           ...d,
           name,
-          setup: input.setup,
+          setup,
           riskProfiles: [profile],
         };
       }),
@@ -1217,13 +1307,36 @@ export function renameEntity(
   entityId: string,
   name: string,
 ): Workspace {
-  const trimmed = name.trim();
-  if (!trimmed) return workspace;
+  return updateEntity(workspace, entityId, { name });
+}
+
+export function updateEntity(
+  workspace: Workspace,
+  entityId: string,
+  patch: {
+    name?: string;
+    allCurrencies?: string[];
+    lpCurrencies?: string[];
+  },
+): Workspace {
   return {
     ...workspace,
-    entities: workspace.entities.map(e =>
-      e.id === entityId ? { ...e, name: trimmed } : e,
-    ),
+    entities: workspace.entities.map(e => {
+      if (e.id !== entityId) return e;
+      const name = patch.name?.trim();
+      const allCurrencies = patch.allCurrencies
+        ? [...patch.allCurrencies]
+        : e.allCurrencies;
+      const allSet = new Set(allCurrencies ?? entityAllCurrencies(e));
+      const lpCurrencies = (patch.lpCurrencies ?? e.lpCurrencies ?? [])
+        .filter(c => allSet.has(c));
+      return {
+        ...e,
+        ...(name ? { name } : {}),
+        ...(allCurrencies ? { allCurrencies } : {}),
+        lpCurrencies,
+      };
+    }),
   };
 }
 

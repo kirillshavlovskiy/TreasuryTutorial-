@@ -605,6 +605,20 @@ export type HedgeInstrument = 'spot' | 'forward' | 'option';
 /** Live trade vs future roll leg (not yet executable). */
 export type HedgeTicketStatus = 'booked' | 'scheduled';
 
+/** Live IPA quote stamped when the desk Prices the ticket. */
+export type HedgeIpaQuote = {
+  strike: number | null;
+  strikeInput: string;
+  premiumUsd: number | null;
+  premiumPercent: number | null;
+  fxSpot: number | null;
+  fxOutright: number | null;
+  atmVolPercent: number | null;
+  impliedVolPercent: number | null;
+  deltaPercent: number | null;
+  errorMessage?: string;
+};
+
 export interface HedgeTicket {
   /** Stable id for the booked-transactions list / cancellation. */
   id: string;
@@ -633,6 +647,8 @@ export interface HedgeTicket {
   stripId?: string;
   /** 0-based edge index within the strip. */
   stripEdgeIndex?: number;
+  /** Refinitiv IPA quote from Book → Price (optional). */
+  ipaQuote?: HedgeIpaQuote;
 }
 
 /** Live (traded) tickets — scheduled strip legs do not count. */
@@ -713,6 +729,61 @@ export interface PreparedHedgeProfile {
    * existed.
    */
   preparedFor?: 'var' | 'carry' | 'liquidity';
+  /**
+   * Analytics stages as `draft`. Send-for-approval (VAR policy) moves to
+   * `pending`, then `approved` — only then the package is on Hedging Decision.
+   * Missing = legacy, treated as already released.
+   */
+  approvalStatus?: 'draft' | 'pending' | 'approved';
+  /** Policy signer when status is pending / approved (`varApprovalRequired`). */
+  approvalWho?: string;
+}
+
+export function isReleasedToHedgingDecision(p: PreparedHedgeProfile): boolean {
+  return p.approvalStatus == null || p.approvalStatus === 'approved';
+}
+
+export function releasedPreparedByCcy(
+  prepared: Record<string, PreparedHedgeProfile> | undefined,
+): Record<string, PreparedHedgeProfile> {
+  const out: Record<string, PreparedHedgeProfile> = {};
+  for (const [ccy, p] of Object.entries(prepared ?? {})) {
+    if (isReleasedToHedgingDecision(p)) out[ccy] = p;
+  }
+  return out;
+}
+
+export type HedgeApprovalStatus = 'draft' | 'pending' | 'approved';
+
+export function markPreparedApproval(
+  prepared: Record<string, PreparedHedgeProfile>,
+  patch: {
+    status: HedgeApprovalStatus;
+    who?: string;
+    from?: HedgeApprovalStatus;
+    /** Only touch these CCYs (portfolio include-set). */
+    onlyCcys?: ReadonlySet<string>;
+    /** Only touch packages shaped by this lens. */
+    preparedFor?: PreparedHedgeProfile['preparedFor'];
+  },
+): Record<string, PreparedHedgeProfile> {
+  const next: Record<string, PreparedHedgeProfile> = { ...prepared };
+  for (const [ccy, p] of Object.entries(next)) {
+    if (patch.onlyCcys && !patch.onlyCcys.has(ccy)) continue;
+    if (patch.preparedFor && p.preparedFor !== patch.preparedFor) continue;
+    const st = p.approvalStatus;
+    if (patch.from != null) {
+      if (st !== patch.from) continue;
+    } else if (st === 'approved') {
+      continue;
+    }
+    next[ccy] = {
+      ...p,
+      approvalStatus: patch.status,
+      approvalWho: patch.who ?? p.approvalWho,
+    };
+  }
+  return next;
 }
 
 /** Staged (prepared) FX-hedge FWD-points carry per CCY — same $M as Decision Carry. */
@@ -843,6 +914,76 @@ export function setPreparedHedgeForCcy(
   profile: PreparedHedgeProfile,
 ): Record<string, PreparedHedgeProfile> {
   return { ...(prepared ?? {}), [ccy]: profile };
+}
+
+/** FX Risk bullet staged from the selected Optimize mix (Target × weight). */
+export function preparedHedgeFromAtlasMix(input: {
+  coverLocalM: number;
+  hedgeRatio: number;
+  settleMonths: number;
+  impliedCarryUsdM: number;
+}): PreparedHedgeProfile {
+  return {
+    structure: 'bullet',
+    basis: 'totalExpected',
+    ticketBasis: 'totalBuildup',
+    legs: [],
+    coverLocalM: input.coverLocalM,
+    hedgeRatio: input.hedgeRatio,
+    settleMonths: input.settleMonths,
+    impliedCarryUsdM: input.impliedCarryUsdM,
+    preparedFor: 'var',
+    approvalStatus: 'draft',
+  };
+}
+
+/**
+ * Replace leftover carry/liquidity drafts with Optimize-mix bullets so
+ * Approve / Hedging Decision consume the same cover and locked carry.
+ *
+ * `preserveStrips`: keep an FX Risk strip the user staged in the currency
+ * modal. Book restage used to rewrite those as 12M bullets, so the table
+ * never showed Strip.
+ */
+export function stageAtlasMixPrepared(
+  prev: Record<string, PreparedHedgeProfile> | undefined,
+  legs: readonly {
+    ccy: string;
+    weight: number;
+    coverLocalM: number;
+    lockedCarryUsdM: number;
+  }[],
+  settleMonths: number,
+  opts?: { preserveStrips?: boolean },
+): Record<string, PreparedHedgeProfile> {
+  let next = { ...(prev ?? {}) };
+  for (const leg of legs) {
+    if (leg.ccy === 'USD') continue;
+    const w = Number.isFinite(leg.weight) ? Math.min(1, Math.max(0, leg.weight)) : 0;
+    if (w < 1e-9 || Math.abs(leg.coverLocalM) < 1e-9) {
+      if (leg.ccy in next) {
+        const copy = { ...next };
+        delete copy[leg.ccy];
+        next = copy;
+      }
+      continue;
+    }
+    const existing = next[leg.ccy];
+    if (
+      opts?.preserveStrips
+      && existing?.structure === 'strip'
+      && existing.preparedFor === 'var'
+    ) {
+      continue;
+    }
+    next = setPreparedHedgeForCcy(next, leg.ccy, preparedHedgeFromAtlasMix({
+      coverLocalM: leg.coverLocalM,
+      hedgeRatio: w,
+      settleMonths,
+      impliedCarryUsdM: leg.lockedCarryUsdM,
+    }));
+  }
+  return next;
 }
 
 export function setMarketRatesForCcy(

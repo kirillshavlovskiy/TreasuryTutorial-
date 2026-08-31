@@ -21,6 +21,19 @@ export type TaskStepId =
   | 'readCarryByCcy'
   | 'readCarryTotal';
 
+export const TASK_STEP_IDS: readonly TaskStepId[] = [
+  'buildWorkspace',
+  'largestMismatch',
+  'setVarConfidence',
+  'readVar',
+  'openCashCarry',
+  'readCarryByCcy',
+  'readCarryTotal',
+];
+
+export type TaskStepStatus = 'pending' | 'done';
+export type UserProgressStatus = 'not_started' | 'in_progress' | 'completed';
+
 export interface TaskProgress {
   taskId: string;
   steps: Record<TaskStepId, 'pending' | 'done'>;

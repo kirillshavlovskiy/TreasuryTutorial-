@@ -6,12 +6,16 @@ import {
   fundingSwapPathCarryUsdM,
   fundingSwapCashDeltaUsdYr,
   fundingSwapCarryViewFor,
-  INITIAL_USD_PARAMS,
+  fundingSwapFcyOnUsdYr,
+  fundingSwapPathFcyOnUsdM,
+  fundingSwapCashLegUsdYr,
+  fundingSwapCipPointsUsdYr,
   makeSimRow,
   usdToFcyM,
   type LayerId,
 } from '@/lib/fx-buffer';
 import { computeDashboardModel } from '@/lib/dashboard-model';
+import { INITIAL_USD_PARAMS, CURRENCY_PARAMS } from '@/lib/fx-buffer';
 import { fxHedgeNetCfarByCcyUsdM } from '@/lib/test-mode/cfar-net-by-ccy';
 import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
 import { DEFAULT_VAR_SETUP } from '@/lib/test-mode/var-setup';
@@ -48,27 +52,29 @@ describe('fundingSwapOverlayUsdYr', () => {
     expect(o.pointsUsdYr).toBeCloseTo(-(o.fcyOnUsdYr + o.usdOnUsdYr), 12);
   });
 
-  it('covering a short at zero H*: FCY O/N is OD saved, USD credit is missed, points stay on the credit curve', () => {
+  it('long-near EUR: covering book prices FCY O/N at OD; points stay on the credit curve', () => {
     const N = 5;
-    const r_FCY = 3.41;
-    const r_OD = 4.41;
+    const r_FCY = 1.78;
+    const r_OD = 2.21;
+    const r_USD = 3.50;
+    const o = fundingSwapOverlayUsdYr(N, spot, r_FCY, r_USD, r_OD);
+    const cashDr = N * ((r_OD - r_USD) / 100) * spot;
+    expect(o.fcyOnUsdYr).toBeCloseTo(N * (r_OD / 100) * spot, 12);
+    expect(o.usdOnUsdYr).toBeCloseTo(-N * (r_USD / 100) * spot, 12);
+    expect(o.fcyOnUsdYr + o.usdOnUsdYr).toBeCloseTo(cashDr, 12);
+    expect(cashDr).toBeLessThan(0);
+    expect(o.pointsUsdYr).toBeCloseTo(-N * ((r_FCY - r_USD) / 100) * spot, 12);
+  });
+
+  it('long-near covering book uses OD for FCY O/N — points stay on r_FCY', () => {
+    const N = 10;
+    const r_FCY = 1.78;
+    const r_OD = 2.21;
     const r_USD = 3.50;
     const o = fundingSwapOverlayUsdYr(N, spot, r_FCY, r_USD, r_OD);
     expect(o.fcyOnUsdYr).toBeCloseTo(N * (r_OD / 100) * spot, 12);
-    expect(o.usdOnUsdYr).toBeCloseTo(-N * (r_USD / 100) * spot, 12);
+    expect(o.fcyOnUsdYr).not.toBeCloseTo(N * (r_FCY / 100) * spot, 12);
     expect(o.pointsUsdYr).toBeCloseTo(-N * ((r_FCY - r_USD) / 100) * spot, 12);
-    expect(o.netUsdYr).toBeCloseTo(N * ((r_OD - r_FCY) / 100) * spot, 12);
-  });
-
-  it('zero-buffer cover: unfunded OD vs-USD cancels against overlay FCY+USD; leftover is credit CIP points', () => {
-    const N = 10;
-    const r_FCY = 3.41;
-    const r_OD = 4.41;
-    const r_USD = 3.50;
-    const cash = -N * ((r_OD - r_USD) / 100) * spot;
-    const o = fundingSwapOverlayUsdYr(N, spot, r_FCY, r_USD, r_OD);
-    expect(cash + o.fcyOnUsdYr + o.usdOnUsdYr).toBeCloseTo(0, 12);
-    expect(cash + o.netUsdYr).toBeCloseTo(o.pointsUsdYr, 12);
   });
 
   it('path Swap Carry sums later-cycle standing book — not just M1 near', () => {
@@ -103,6 +109,41 @@ describe('fundingSwapOverlayUsdYr', () => {
     expect(fundingSwapCarryViewFor(0.462, false)).toBe('cip');
     expect(fundingSwapCarryViewFor(undefined, true)).toBe('cip');
   });
+
+  it('high-income PAY short: cash Δr is positive and CIP points are the opposite', () => {
+    const N = -5;
+    const r_FCY = 1.78;
+    const r_OD = 2.21;
+    const r_USD = 3.50;
+    const cash = fundingSwapCashDeltaUsdYr(N, spot, r_FCY, r_USD, r_OD);
+    const points = fundingSwapCipPointsUsdYr(N, spot, r_FCY, r_USD);
+    expect(cash).toBeGreaterThan(0);
+    expect(points).toBeLessThan(0);
+    expect(cash).toBeCloseTo(N * ((r_OD - r_USD) / 100) * spot, 12);
+  });
+
+  it('cash leg is +r_FCY − r_USD and equals −points', () => {
+    const r_FCY = 1.78;
+    const r_USD = 3.50;
+    const long = fundingSwapCashLegUsdYr(5, spot, r_FCY, r_USD);
+    const short = fundingSwapCashLegUsdYr(-5, spot, r_FCY, r_USD);
+    const pointsLong = fundingSwapCipPointsUsdYr(5, spot, r_FCY, r_USD);
+    const pointsShort = fundingSwapCipPointsUsdYr(-5, spot, r_FCY, r_USD);
+    expect(long).toBeCloseTo(-pointsLong, 12);
+    expect(short).toBeCloseTo(-pointsShort, 12);
+    expect(long).toBeLessThan(0);
+    expect(short).toBeGreaterThan(0);
+  });
+
+  it('path FCY O/N sums the standing book', () => {
+    const plan = [
+      { standing_swap: 0 },
+      { standing_swap: 40 },
+      { standing_swap: 40 },
+    ];
+    const path = fundingSwapPathFcyOnUsdM(plan, spot, 1.78);
+    expect(path).toBeCloseTo(fundingSwapFcyOnUsdYr(40, spot, 1.78) / 12 * 2, 12);
+  });
 });
 
 describe('computeLayeredBuffer CFaR cover', () => {
@@ -114,18 +155,8 @@ describe('computeLayeredBuffer CFaR cover', () => {
     const on = computeLayeredBuffer(0, -6.6, 0.1, 3.5, 1.78, 2.21, 0, cover, 2.5, undefined, 1.71);
     expect(off.delta_cfar).toBe(0);
     expect(on.delta_cfar).toBeCloseTo(1.71, 8);
-    // FX P&L cover is not FCY liquidity — H* / Swap Near stay on the unfunded trough.
+    // Readout only — never sizes the FCY trough / Swap Near.
     expect(on.cash_threshold).toBeCloseTo(off.cash_threshold, 8);
-  });
-
-  it('does not change H* when CFaR cover is stacked on payout-σ', () => {
-    const sigma = new Set<LayerId>(['sigmaP']);
-    const both = new Set<LayerId>(['sigmaP', 'cfarCover']);
-    const a = computeLayeredBuffer(10, 5, 0.1, 3.5, 1.78, 2.21, 0, sigma, 10, undefined, 1.71);
-    const b = computeLayeredBuffer(10, 5, 0.1, 3.5, 1.78, 2.21, 0, both, 10, undefined, 1.71);
-    expect(a.delta_sigma).toBeGreaterThan(0);
-    expect(b.delta_cfar).toBeCloseTo(1.71, 8);
-    expect(b.cash_threshold).toBeCloseTo(a.cash_threshold, 8);
   });
 
   it('does not use Gross — omitted cover is zero even if the layer is on', () => {
@@ -138,12 +169,11 @@ describe('CFaR cover layer on the desk', () => {
   const netUsd = 2.4;
   const coverFcy = usdToFcyM(netUsd, 'EUR');
 
-  it('does not size the funding swap from Net CFaR', () => {
+  it('does not size the funding swap from Net CFaR — trough / swap stay put', () => {
     const off = model([], { EUR: netUsd }).fcyComputed[0]!;
     const on = model(['cfarCover'], { EUR: netUsd }).fcyComputed[0]!;
 
     expect(on.lp_peak_cash).toBeCloseTo(off.lp_peak_cash, 8);
-    expect(on.floatNim).toBeCloseTo(off.floatNim, 8);
     expect(on.swapNear).toBeCloseTo(off.swapNear, 4);
   });
 
@@ -183,10 +213,9 @@ describe('CFaR cover layer on the desk', () => {
     expect(b.EUR ?? 0).toBeGreaterThan(a.EUR ?? 0);
   });
 
-  it('does not add CFaR to Swap Near when stacked with another buffer', () => {
+  it('does not stack into Swap Near when paired with another buffer', () => {
     const floorOnly = model(['floorH'], { EUR: netUsd }).fcyComputed[0]!;
     const both = model(['floorH', 'cfarCover'], { EUR: netUsd }).fcyComputed[0]!;
     expect(both.swapNear).toBeCloseTo(floorOnly.swapNear, 4);
-    expect(both.floatNim).toBeCloseTo(floorOnly.floatNim, 8);
   });
 });

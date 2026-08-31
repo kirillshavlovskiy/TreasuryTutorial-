@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -8,6 +9,13 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { Activity, BadgeCheck, Coins, Shield, Sparkles, Target } from 'lucide-react';
+import {
+  AnalyticsWizardShell,
+  useAnalyticsWizard,
+  type AnalyticsWizardStep,
+} from '@/components/test-mode/AnalyticsWizardShell';
+import { HedgeApprovalStep } from '@/components/test-mode/HedgeApprovalStep';
 import {
   ExposureHedgePathChart,
   type HedgePathPrepareAction,
@@ -17,7 +25,6 @@ import {
   chipsFromPathSummary,
   HedgeStagingHeader,
   pathChartDraftDirty,
-  scheduleFromPreparedProfile,
 } from '@/components/test-mode/HedgeStagingHeader';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -26,7 +33,12 @@ import {
   type ForecastProfileState,
   type LiquidityCycleProjection,
 } from '@/lib/forecast-profile';
-import type { BufferChipKey, LayerId, RowState, SharedGlobals } from '@/lib/fx-buffer';
+import {
+  type BufferChipKey,
+  type LayerId,
+  type RowState,
+  type SharedGlobals,
+} from '@/lib/fx-buffer';
 import {
   analyticsForwardsFromOverlays,
   retainedFundingPlanByCcy,
@@ -49,6 +61,8 @@ import {
   residualVarFromMismatchUsdM,
   setPreparedHedgeForCcy,
   clearPreparedHedgeForCcy,
+  stageAtlasMixPrepared,
+  stagedFxHedgeCarryByCcyUsdM,
   stripTicketsForCcy,
   varSetupWithLineUncertainty,
   type HedgeTicket,
@@ -72,12 +86,42 @@ import {
 import { VAR_CONFIDENCE_OPTIONS } from '@/lib/test-mode/var-confidence';
 import { CashCarryAnalyticsView } from '@/components/test-mode/CashCarryAnalyticsView';
 import { CfarAnalysisView } from '@/components/test-mode/CfarAnalysisView';
+import { ForecastParametersForm } from '@/components/test-mode/ForecastParametersForm';
 import { LiquidityAnalyticsView } from '@/components/test-mode/LiquidityAnalyticsView';
 import type { OptimizerOverlayDesk } from '@/lib/test-mode/solution-pick';
 import {
   assignImpliedCarryFromSwapPoints,
+  cashForecastCarrySplitByCcyUsdM,
   sumCashCarryTotalUsdM,
 } from '@/lib/test-mode/cash-carry-analytics';
+import type { FxAtlasJobRequest } from '@/lib/test-mode/fx-atlas-job';
+import { useFxAtlas } from '@/components/test-mode/use-fx-atlas';
+import { atlasRiskCorrFor } from '@/lib/fx-market-risk';
+import {
+  applyAtlasMixToHedgeRows,
+  atlasMixLockedCarryUsdM,
+  formatHedgePct,
+  fxAtlasMarginalEffects,
+  fxAtlasPointAtCcyWeights,
+  fxAtlasTenorFrontier,
+  fxCarryVarFrontier,
+  fxLiveMixWeights,
+  fxMixSignedContribs,
+  type FxCarryVarPoint,
+} from '@/lib/test-mode/fx-var-frontier';
+import { diversifiedUsdRisk } from '@/lib/test-mode/portfolio-liquidity-frontier';
+import { ChartViewFrame } from '@/components/ChartViewToggle';
+import { FxCarryVarFrontierChart } from '@/components/test-mode/FxCarryVarFrontierChart';
+import { FxAtlasMarginalEffectsChart } from '@/components/test-mode/FxAtlasMarginalEffectsChart';
+import {
+  ContributionBar,
+  MixStrip,
+  ParetoScenarioCard,
+  ccyBarTone,
+  stackFromRisk,
+  VarCurrencyStackChart,
+  type FrontierSolutionCard,
+} from '@/components/test-mode/LiquidityWizardPanels';
 import {
   fxHedgeNetCfarByCcyUsdM,
   sumNetCfarUsdM,
@@ -92,6 +136,7 @@ import {
   resolveLiquidityTiming,
 } from '@/lib/liquidity-ladder';
 import {
+  resolveMarketRatesBook,
   resolveMarketRatesForCcy,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
@@ -146,7 +191,9 @@ interface VarAnalyticsPanelProps {
   hedgeRatios?: Record<string, number>;
   onHedgeRatiosChange?: (ratios: Record<string, number>) => void;
   bookedHedges?: HedgeTicket[];
-  onBookedHedgesChange?: (tickets: HedgeTicket[]) => void;
+  onBookedHedgesChange?: (
+    next: HedgeTicket[] | ((prev: HedgeTicket[]) => HedgeTicket[]),
+  ) => void;
   /** Staged packages for Hedging Decision (Send books them). */
   preparedByCcy?: Record<string, PreparedHedgeProfile>;
   onPreparedByCcyChange?: (
@@ -162,12 +209,20 @@ interface VarAnalyticsPanelProps {
   title?: string;
   /** Live FX book rows — used with forecastProfile for custom month schedules. */
   bookRows?: RowState[];
+  /** Patch Revenue / Expenses / Invoice on the live book from Forecast step. */
+  onRowFieldChange?: (
+    ccy: string,
+    field: 'collections' | 'payout' | 'fcastFX',
+    value: number,
+  ) => void;
   /** Flat or custom Revenue/Expenses schedule from FX Risk. */
   forecastProfile?: ForecastProfileState;
   /** Sync Forecast-profile line σ when Analytics / CFaR u₁ₘ chips change. */
   onForecastProfileChange?: (profile: ForecastProfileState) => void;
   /** Opens the same Forecast profile modal as FX Risk. */
   onOpenForecastProfile?: () => void;
+  /** Closes the Forecast profile modal (leave wizard step 1). */
+  onCloseForecastProfile?: () => void;
   /** Entity/group scope for overnight cash + swap-points curves (Market data). */
   ratesScopeId?: string;
   /** DB-persisted market data per currency (Market data tab uploads). */
@@ -205,17 +260,31 @@ interface VarAnalyticsPanelProps {
   onResidualByCcyChange?: (next: Record<string, number>) => void;
   portfolioScenarioId?: string | null;
   onPortfolioScenarioIdChange?: (id: string | null) => void;
+  usdCash?: number;
+  onUsdCashChange?: (usdM: number) => void;
+  usdPayout?: number;
   onStrategyCfarByCcyChange?: (byCcy: Record<string, number>) => void;
   onOptimizerOverlayByCcyChange?: (next: Record<string, OptimizerOverlayDesk>) => void;
 }
 
 function fmtVarK(usdM: number): string {
+  if (!Number.isFinite(usdM) || Math.abs(usdM) < 1e-12) return '$0K';
+  if (Math.abs(usdM) >= 0.1) return `$${usdM.toFixed(2)}M`;
   return `$${(usdM * 1000).toFixed(0)}K`;
 }
 
 /** Stable default — a `= {}` literal would be a fresh object every render, and
  * the CFaR panel keys its Monte Carlo memos on this map. */
 const EMPTY_MARKET_RATES_BY_CCY: Record<string, FxMarketRatesBundle> = {};
+
+const FX_RISK_WIZARD_STEPS: readonly AnalyticsWizardStep[] = [
+  { id: 'forecast', n: 1, label: 'Forecast', Icon: Target },
+  { id: 'setup', n: 2, label: 'VaR setup', Icon: Shield },
+  { id: 'horizon', n: 3, label: 'Horizon', Icon: Activity },
+  { id: 'optimize', n: 4, label: 'Optimize', Icon: Sparkles },
+  { id: 'book', n: 5, label: 'Book', Icon: Coins },
+  { id: 'approve', n: 6, label: 'Approve', Icon: BadgeCheck },
+];
 
 /** Tab-rail Resid VaR — $M when ≥ $0.1M, else $K. */
 function fmtTabResidVar(usdM: number): string {
@@ -235,6 +304,19 @@ function fmtTabCarryK(usdM: number): string {
 function fmtSignedM(v: number): string {
   const sign = v >= 0 ? '+' : '−';
   return `${sign}${Math.abs(v).toFixed(2)}M`;
+}
+
+function atlasScenarioLabel(
+  point: FxCarryVarPoint | null | undefined,
+  sweetId?: string | null,
+  hedgedId?: string | null,
+  openId?: string | null,
+): string {
+  if (!point) return '—';
+  if (openId && point.id === openId) return 'Leave open';
+  if (sweetId && point.id === sweetId) return 'Recommended';
+  if (hedgedId && point.id === hedgedId) return 'Fully hedge';
+  return 'Custom';
 }
 
 function shortHorizonLabel(label: string): string {
@@ -374,9 +456,11 @@ export function VarAnalyticsPanel({
   onHedgeStructureChange,
   title: _moduleTitle = 'Analytics — VaR setup',
   bookRows,
+  onRowFieldChange,
   forecastProfile = DEFAULT_FORECAST_PROFILE,
   onForecastProfileChange,
   onOpenForecastProfile,
+  onCloseForecastProfile,
   ratesScopeId,
   marketRatesByCcy = EMPTY_MARKET_RATES_BY_CCY,
   onMarketRatesByCcyChange,
@@ -399,6 +483,9 @@ export function VarAnalyticsPanel({
   onResidualByCcyChange,
   portfolioScenarioId,
   onPortfolioScenarioIdChange,
+  usdCash,
+  onUsdCashChange,
+  usdPayout,
   onStrategyCfarByCcyChange,
   onOptimizerOverlayByCcyChange,
 }: VarAnalyticsPanelProps) {
@@ -421,6 +508,15 @@ export function VarAnalyticsPanel({
   const customSchedule = forecastProfile.mode === 'custom';
   const [varParamsOpen, setVarParamsOpen] = useState(false);
   const [perspective, setPerspective] = useState<RiskPerspective>('fxRisk');
+  const fxWizard = useAnalyticsWizard(FX_RISK_WIZARD_STEPS.length);
+  useEffect(() => {
+    if (perspective !== 'fxRisk' || fxWizard.step !== 1) {
+      onCloseForecastProfile?.();
+    }
+    // Keep the full grid modal closed on Forecast step — detailed inputs
+    // render inline under FX cash flows / Liquidity trough.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perspective, fxWizard.step]);
   const u1m = setup.forecastUncertainty1m ?? 0;
   const uPresetMatch = FORECAST_UNCERTAINTY_OPTIONS.find(
     o => Math.abs(o.value - u1m) < 1e-12,
@@ -450,7 +546,24 @@ export function VarAnalyticsPanel({
     useState<HedgePathSummaryMetrics | null>(null);
   const [pathPrepareAction, setPathPrepareAction] =
     useState<HedgePathPrepareAction | null>(null);
-  const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('varNeutral');
+  const [pathBasis, setPathBasis] = useState<HedgePathBasisId>('totalExpected');
+  const mixSnapshotRef = useRef<Record<string, number> | null>(null);
+  const stagedDuringModalRef = useRef(false);
+  const [atlasSelectedId, setAtlasSelectedId] = useState<string | null>(null);
+  const [mixResetNonce, setMixResetNonce] = useState(0);
+  const [atlasChartView, setAtlasChartView] = useState<'frontier' | 'marginal'>('frontier');
+  /** Names pinned open — Optimize re-solves the mix without hedging them. */
+  const [forceOpenCcys, setForceOpenCcys] = useState<string[]>([]);
+  /**
+   * Names removed from the book entirely — no leg, no VaR/correlation
+   * contribution, as if the row never existed. Different from
+   * forceOpenCcys: "leave open" still counts the exposure in the
+   * diversified risk pool (just pins its own hedge ratio at 0); this
+   * drops the exposure altogether, to test a genuinely smaller portfolio
+   * (e.g. a vendor reference report scoped to a currency subset).
+   */
+  const [excludeCcys, setExcludeCcys] = useState<string[]>([]);
+  const [mixTuneMode, setMixTuneMode] = useState<'var' | 'carry'>('var');
   /** Last applied Cash / VN / Total per CCY — Live VaR label (not only inferred). */
   const [regimeByCcy, setRegimeByCcy] = useState<
     Record<string, HedgePathBasisId>
@@ -642,9 +755,9 @@ export function VarAnalyticsPanel({
   ]);
 
   /**
-   * Live VaR rows: honor staged Analytics packages (Cash Carry Prebook / path
-   * Book) before Decision % — otherwise carry-shaped cover never appears in
-   * Hedge N / Resid VaR until Send. Booked strips still win over prepared.
+   * Live VaR rows. Optimize mix (hedgeRatios) is % of Target and wins over
+   * Cash Carry / Liquidity packages and leftover strips — otherwise Book
+   * keeps MXN 100% strip / PLN carry N while the header shows 20% / 100%.
    */
   const liveRows = useMemo((): HedgeVarRow[] => {
     return summary.rows.map(r => {
@@ -652,6 +765,8 @@ export function VarAnalyticsPanel({
       const prep = preparedByCcy[r.ccy];
       const hasStrip = hasRollingStripForCcy(bookedHedges, r.ccy);
       const struct = structureTagFor(r.ccy, r.hedgeNotionalLocalM);
+      const mixW = hedgeRatios[r.ccy];
+      const mixDriven = typeof mixW === 'number' && Number.isFinite(mixW);
 
       const applyCover = (
         cover: number,
@@ -684,6 +799,14 @@ export function VarAnalyticsPanel({
           delta,
         };
       };
+
+      if (mixDriven) {
+        const Eref =
+          Math.abs(r.targetHedgeLocalM) > 1e-12
+            ? r.targetHedgeLocalM
+            : r.residualLocalM + r.hedgeNotionalLocalM;
+        return applyCover(mixW * Eref, r.equalVarHedgeLocalM);
+      }
 
       // 1) Booked strip — summary already has strip notionals; only refresh VN.
       if (hasStrip) {
@@ -735,6 +858,7 @@ export function VarAnalyticsPanel({
     hedgeStructure,
     stripAvailable,
     preparedByCcy,
+    hedgeRatios,
   ]);
 
   /**
@@ -803,10 +927,12 @@ export function VarAnalyticsPanel({
   const chartBar = chartCcy
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
     : undefined;
-  const stagedChartSchedule = useMemo(
-    () => scheduleFromPreparedProfile(chartCcy ? preparedByCcy[chartCcy] : undefined),
-    [chartCcy, preparedByCcy],
-  );
+  const chartStructure: ForecastHedgeStructure =
+    chartCcy
+      ? (structureByCcy[chartCcy]
+        ?? (preparedByCcy[chartCcy]?.structure === 'strip' ? 'strip' : undefined)
+        ?? hedgeStructure)
+      : hedgeStructure;
   /** Non-USD exposures available for the VaR evolution chart. */
   const evolutionCcys = useMemo(
     () =>
@@ -889,7 +1015,7 @@ export function VarAnalyticsPanel({
       );
       target = edges[edges.length - 1]?.hedgeLocalM ?? 0;
     } else {
-      target = hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartRow.ccy);
+      target = hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq);
     }
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
@@ -899,7 +1025,20 @@ export function VarAnalyticsPanel({
     onHedgeRatiosChange({ ...hedgeRatios, [chartRow.ccy]: ratio });
   };
 
-  const closePathChart = () => setChartCcy(null);
+  const closePathChart = () => {
+    if (
+      !stagedDuringModalRef.current
+      && mixSnapshotRef.current
+      && onHedgeRatiosChange
+    ) {
+      onHedgeRatiosChange(mixSnapshotRef.current);
+    }
+    mixSnapshotRef.current = null;
+    stagedDuringModalRef.current = false;
+    setChartCcy(null);
+    setPathPrepareAction(null);
+    setPathSummaryMetrics(null);
+  };
 
   /**
    * Path-chart Book → stage package for Hedging Decision.
@@ -915,6 +1054,7 @@ export function VarAnalyticsPanel({
     coverPct?: number;
   }) => {
     if (!chartRow || !chartBar || !onPreparedByCcyChange) return;
+    stagedDuringModalRef.current = true;
     const {
       structure,
       basis,
@@ -973,12 +1113,16 @@ export function VarAnalyticsPanel({
           ),
           bulletSettleMonths: defaultTf,
           ccy: chartRow.ccy,
+          bookRows,
+          forecastProfile,
+          forecastMonths: setup.forecastMonths,
         },
       );
-      onPreparedByCcyChange(prev =>
-        setPreparedHedgeForCcy(prev, chartRow.ccy, {
+      onPreparedByCcyChange(
+        setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
           ...profile,
           preparedFor: 'var',
+          approvalStatus: 'draft',
         }),
       );
       // Stay open — Stage keeps the modal up with a live "Staged" badge.
@@ -1006,7 +1150,7 @@ export function VarAnalyticsPanel({
       flowsForCcy ?? flows,
     ).amountLocalM;
     const target =
-      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartRow.ccy) * coverPct;
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -1024,20 +1168,24 @@ export function VarAnalyticsPanel({
         cashDeliveryAt,
         settleMonths: bulletSettle,
       },
-      {
-        marketRates: resolveMarketRatesForCcy(
-          marketRatesByCcy,
-          chartRow.ccy,
-          ratesScopeId,
-        ),
-        bulletSettleMonths: bulletSettle,
-        ccy: chartRow.ccy,
-      },
+        {
+          marketRates: resolveMarketRatesForCcy(
+            marketRatesByCcy,
+            chartRow.ccy,
+            ratesScopeId,
+          ),
+          bulletSettleMonths: bulletSettle,
+          ccy: chartRow.ccy,
+          bookRows,
+          forecastProfile,
+          forecastMonths: setup.forecastMonths,
+        },
     );
-    onPreparedByCcyChange(prev =>
-      setPreparedHedgeForCcy(prev, chartRow.ccy, {
+    onPreparedByCcyChange(
+      setPreparedHedgeForCcy(preparedByCcy, chartRow.ccy, {
         ...profile,
         preparedFor: 'var',
+        approvalStatus: 'draft',
       }),
     );
     // Stay open — same as Cash Carry / Decision: stage, don't dismiss.
@@ -1216,6 +1364,600 @@ export function VarAnalyticsPanel({
       }),
     [swapForwardOverlayByCcy, livePlanByCcy, setup.forecastMonths],
   );
+
+  const fxVarFrontier = useMemo(() => {
+    const split = cashForecastCarrySplitByCcyUsdM({
+      rows: bookRows ?? [],
+      forecastProfile,
+      forecastMonths: setup.forecastMonths,
+      bookedHedges,
+      preparedByCcy,
+      setup,
+      marketRatesByCcy,
+      ratesScopeId,
+      extraForwards: analyticsExtraForwards,
+    });
+    const staged = stagedFxHedgeCarryByCcyUsdM(preparedByCcy);
+    const cashByCcy: Record<string, number> = {};
+    const hedgeCarryByCcy: Record<string, number> = {};
+    for (const r of liveRows) {
+      cashByCcy[r.ccy] =
+        deskCashCarryByCcyUsdM?.[r.ccy] ?? split[r.ccy]?.cashUsdM ?? 0;
+      hedgeCarryByCcy[r.ccy] =
+        deskHedgeCarryByCcyUsdM?.[r.ccy] ?? staged[r.ccy] ?? split[r.ccy]?.fwdUsdM ?? 0;
+    }
+    return fxCarryVarFrontier({ rows: liveRows, cashByCcy, hedgeCarryByCcy });
+  }, [
+    liveRows,
+    bookRows,
+    forecastProfile,
+    setup,
+    bookedHedges,
+    preparedByCcy,
+    marketRatesByCcy,
+    ratesScopeId,
+    analyticsExtraForwards,
+    deskCashCarryByCcyUsdM,
+    deskHedgeCarryByCcyUsdM,
+  ]);
+
+  const atlasRequest = useMemo((): FxAtlasJobRequest | null => {
+    if (!bookRows?.length) return null;
+    return {
+      rows: bookRows,
+      forecastMonths: setup.forecastMonths,
+      forecastProfile,
+      confidencePct: setup.confidencePct,
+      rUsd: deskShared?.r_USD ?? 4,
+      marketRatesByCcy: resolveMarketRatesBook(
+        marketRatesByCcy,
+        bookRows.map(r => r.ccy),
+        ratesScopeId,
+      ),
+      ratesScopeId,
+      forceOpenCcys: forceOpenCcys.length ? forceOpenCcys : undefined,
+      excludeCcys: excludeCcys.length ? excludeCcys : undefined,
+    };
+  }, [
+    bookRows,
+    setup.forecastMonths,
+    setup.confidencePct,
+    forecastProfile,
+    deskShared?.r_USD,
+    marketRatesByCcy,
+    ratesScopeId,
+    forceOpenCcys,
+    excludeCcys,
+  ]);
+  const {
+    result: atlasJob,
+    pending: atlasPending,
+    error: atlasError,
+  } = useFxAtlas(atlasRequest);
+  const atlasFrontier = useMemo(() => {
+    if (forceOpenCcys.length === 0 || atlasJob.legs.length === 0) return atlasJob;
+    const corr = atlasRiskCorrFor(marketRatesByCcy);
+    const solved = fxAtlasTenorFrontier(atlasJob.legs, corr, {
+      forceOpenCcys: new Set(forceOpenCcys),
+    });
+    return {
+      ...atlasJob,
+      curve: solved.curve,
+      sweet: solved.sweet,
+      fullyHedged: solved.fullyHedged,
+      unhedged: solved.unhedged,
+    };
+  }, [atlasJob, forceOpenCcys, marketRatesByCcy]);
+  const atlasByCcy = atlasFrontier.byCcy;
+  const atlasWalk = useMemo(() => {
+    const pts = [...atlasFrontier.curve];
+    const open = atlasFrontier.unhedged;
+    if (open && !pts.some(p => p.id === open.id)) pts.push(open);
+    return pts;
+  }, [atlasFrontier.curve, atlasFrontier.unhedged]);
+  const atlasSelected =
+    atlasWalk.find(p => p.id === atlasSelectedId)
+    ?? atlasFrontier.sweet
+    ?? atlasWalk[0]
+    ?? null;
+  const mixWeightByCcy = useMemo(
+    () => fxLiveMixWeights(atlasSelected?.hedgeByCcy, hedgeRatios, forceOpenCcys),
+    [atlasSelected?.hedgeByCcy, forceOpenCcys, hedgeRatios],
+  );
+  const openOptimizeCcy = useCallback(
+    (ccy: string) => {
+      mixSnapshotRef.current = { ...mixWeightByCcy };
+      stagedDuringModalRef.current = false;
+      setPathBasis('totalExpected');
+      const staged = preparedByCcy[ccy];
+      const struct: ForecastHedgeStructure =
+        staged?.preparedFor === 'var' && staged.structure === 'strip'
+          ? 'strip'
+          : 'bullet';
+      setHedgeStructure(struct);
+      setStructureByCcy(prev => ({ ...prev, [ccy]: struct }));
+      setRegimeByCcy(prev => ({ ...prev, [ccy]: 'totalExpected' }));
+      setChartCcy(ccy);
+    },
+    [mixWeightByCcy, preparedByCcy, setHedgeStructure],
+  );
+  const mixPoint = useMemo((): FxCarryVarPoint | null => {
+    if (!atlasSelected) {
+      const hasWeights = Object.values(mixWeightByCcy).some(w => w > 1e-9);
+      if (!hasWeights) return null;
+      return {
+        id: 'live-mix',
+        t: 0,
+        carryUsdYrM: 0,
+        divVarUsdM: 0,
+        standaloneVarUsdM: 0,
+        kind: 'mix',
+        hedgeByCcy: mixWeightByCcy,
+      };
+    }
+    return {
+      ...atlasSelected,
+      hedgeByCcy: mixWeightByCcy,
+    };
+  }, [atlasSelected, mixWeightByCcy]);
+  const mixTuned = useMemo(() => {
+    if (!atlasSelected?.hedgeByCcy) return Object.values(hedgeRatios).some(w => w > 1e-9);
+    if (forceOpenCcys.some(ccy => (atlasSelected.hedgeByCcy?.[ccy] ?? 0) > 0.008)) {
+      return true;
+    }
+    return Object.entries(hedgeRatios).some(([ccy, w]) => {
+      if (typeof w !== 'number' || !Number.isFinite(w)) return false;
+      return Math.abs((atlasSelected.hedgeByCcy?.[ccy] ?? 0) - w) > 0.008;
+    });
+  }, [atlasSelected, forceOpenCcys, hedgeRatios]);
+  const liveMixPoint = useMemo(() => {
+    if (!mixTuned || atlasFrontier.legs.length === 0) return null;
+    return fxAtlasPointAtCcyWeights(
+      atlasFrontier.legs,
+      mixWeightByCcy,
+      atlasRiskCorrFor(marketRatesByCcy),
+      'live-mix',
+    );
+  }, [atlasFrontier.legs, marketRatesByCcy, mixTuned, mixWeightByCcy]);
+  // A previously-applied scenario freezes its weights into `hedgeRatios`
+  // (applyAtlasPoint), and fxLiveMixWeights lets that frozen snapshot win
+  // over ANY later backend recompute for the same currency keys — so
+  // navigating between points, or toggling which names are left open,
+  // kept showing stale numbers even after the backend recomputed a
+  // different (correct) mix for the same point id. Resync hedgeRatios to
+  // the freshly-selected point's own weights whenever what's being VIEWED
+  // changes; a manual per-bar drag afterward still overrides normally,
+  // since it fires its own onHedgeRatiosChange call and doesn't touch
+  // atlasSelected. onHedgeRatiosChange is deliberately left out of the
+  // deps — depending on it would refire this on every parent re-render
+  // triggered by the very update it makes, an infinite loop; the intent
+  // is "resync when the viewed point's data changes", not "resync
+  // whenever the setter identity changes".
+  useEffect(() => {
+    if (!atlasSelected?.hedgeByCcy || !onHedgeRatiosChange) return;
+    onHedgeRatiosChange(atlasSelected.hedgeByCcy);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [atlasSelected?.hedgeByCcy]);
+  const unhedgedBookSelected =
+    !mixTuned && atlasSelected?.id === atlasFrontier.unhedged?.id;
+  const atlasWalkIdx = atlasSelected
+    ? atlasWalk.findIndex(p => p.id === atlasSelected.id)
+    : -1;
+  const atlasMarginal = useMemo(
+    () => fxAtlasMarginalEffects(
+      atlasFrontier.legs,
+      atlasSelected?.hedgeByCcy,
+      atlasRiskCorrFor(marketRatesByCcy),
+    ),
+    [atlasFrontier.legs, atlasSelected?.hedgeByCcy, marketRatesByCcy],
+  );
+
+  const applyAtlasPoint = useCallback(
+    (point: FxCarryVarPoint, opts?: { forceBullets?: boolean; stage?: boolean }) => {
+      setAtlasSelectedId(point.id);
+      const weights = point.hedgeByCcy;
+      if (!weights) return;
+      const forceBullets = opts?.forceBullets === true;
+      // Default mix ticket is Target × w bullets. A strip staged in the
+      // currency modal is kept unless Reset to mix / forceBullets.
+      // Scenario pick on Optimize only writes hedge % — Stage / Book stages.
+      if (forceBullets && onBookedHedgesChange) {
+        let next = bookedHedges;
+        for (const ccy of Object.keys(weights)) {
+          if (hasRollingStripForCcy(next, ccy)) {
+            next = clearRollingStripForCcy(next, ccy);
+          }
+        }
+        if (next !== bookedHedges) onBookedHedgesChange(next);
+      }
+      if (opts?.stage && onPreparedByCcyChange) {
+        const settle = setup.forecastMonths || 12;
+        onPreparedByCcyChange(prev =>
+          stageAtlasMixPrepared(
+            prev ?? preparedByCcy,
+            Object.entries(weights).map(([ccy, raw]) => {
+              const w = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+              const target =
+                atlasByCcy.local[ccy]
+                ?? liveRows.find(r => r.ccy === ccy)?.targetHedgeLocalM
+                ?? 0;
+              return {
+                ccy,
+                weight: w,
+                coverLocalM: w * target,
+                lockedCarryUsdM: atlasMixLockedCarryUsdM(
+                  point,
+                  ccy,
+                  atlasByCcy.carry[ccy] ?? 0,
+                  w,
+                ),
+              };
+            }),
+            settle,
+            { preserveStrips: !forceBullets },
+          ),
+        );
+      }
+      setStructureByCcy(prev => {
+        const next = { ...prev };
+        let changed = false;
+        for (const ccy of Object.keys(weights)) {
+          if (!forceBullets) {
+            const staged = preparedByCcy[ccy];
+            if (staged?.structure === 'strip' && staged.preparedFor === 'var') {
+              if (next[ccy] !== 'strip') {
+                next[ccy] = 'strip';
+                changed = true;
+              }
+              continue;
+            }
+            if (next[ccy] === 'strip') continue;
+          }
+          if (next[ccy] && next[ccy] !== 'bullet') {
+            next[ccy] = 'bullet';
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+      if (onHedgeRatiosChange) {
+        onHedgeRatiosChange({ ...hedgeRatios, ...weights });
+      }
+    },
+    [
+      atlasByCcy.carry,
+      atlasByCcy.local,
+      bookedHedges,
+      hedgeRatios,
+      liveRows,
+      onBookedHedgesChange,
+      onHedgeRatiosChange,
+      onPreparedByCcyChange,
+      preparedByCcy,
+      setup.forecastMonths,
+    ],
+  );
+
+  const commitAtlasMixToBook = useCallback(() => {
+    if (atlasSelected) applyAtlasPoint(atlasSelected, { stage: true });
+  }, [atlasSelected, applyAtlasPoint]);
+
+  const restoreSelectedMix = useCallback(() => {
+    setForceOpenCcys([]);
+    if (atlasSelected) applyAtlasPoint(atlasSelected);
+  }, [atlasSelected, applyAtlasPoint]);
+
+  /** Restore this CCY to the selected Optimize scenario — does not stage. */
+  const resetCcyToSelectedMix = useCallback(() => {
+    if (!chartCcy || !atlasSelected) return;
+    const mixW = forceOpenCcys.includes(chartCcy)
+      ? 0
+      : (atlasSelected.hedgeByCcy?.[chartCcy] ?? 0);
+    setPathBasis('totalExpected');
+    setHedgeStructure('bullet');
+    setStructureByCcy(prev => ({ ...prev, [chartCcy]: 'bullet' }));
+    setRegimeByCcy(prev => ({ ...prev, [chartCcy]: 'totalExpected' }));
+    if (onHedgeRatiosChange) {
+      onHedgeRatiosChange({ ...hedgeRatios, [chartCcy]: mixW });
+    }
+    if (mixSnapshotRef.current) {
+      mixSnapshotRef.current = { ...mixSnapshotRef.current, [chartCcy]: mixW };
+    }
+    setMixResetNonce(n => n + 1);
+  }, [
+    atlasSelected,
+    chartCcy,
+    forceOpenCcys,
+    hedgeRatios,
+    onHedgeRatiosChange,
+  ]);
+
+  const atlasStageKeyRef = useRef('');
+  // Older sessions copied hedge % only and cleared packages. Re-stage when
+  // Book / Approve is open and the mix has no FX Risk ticket yet.
+  useEffect(() => {
+    if (fxWizard.step < 5 || !atlasSelected?.hedgeByCcy || !onPreparedByCcyChange) {
+      return;
+    }
+    const mixKey = Object.entries(atlasSelected.hedgeByCcy)
+      .filter(([ccy]) => ccy !== 'USD')
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([ccy, raw]) => {
+        const w = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+        return `${ccy}:${w.toFixed(6)}:${atlasMixLockedCarryUsdM(atlasSelected, ccy, atlasByCcy.carry[ccy] ?? 0, w).toFixed(6)}`;
+      })
+      .join('|');
+    const missing = Object.entries(atlasSelected.hedgeByCcy).some(([ccy, raw]) => {
+      if (ccy === 'USD') return false;
+      const w = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+      const p = preparedByCcy[ccy];
+      if (!(w > 1e-6)) return Boolean(p && p.preparedFor === 'var');
+      if (p?.structure === 'strip' && p.preparedFor === 'var') return false;
+      if (!p || p.preparedFor !== 'var') return true;
+      const target = atlasByCcy.local[ccy] ?? 0;
+      const locked = atlasMixLockedCarryUsdM(
+        atlasSelected,
+        ccy,
+        atlasByCcy.carry[ccy] ?? 0,
+        w,
+      );
+      if (Math.abs((p.coverLocalM ?? 0) - w * target) > 1e-6) return true;
+      if (Math.abs((p.impliedCarryUsdM ?? NaN) - locked) > 1e-6) return true;
+      return false;
+    });
+    const key = `${atlasSelected.id}|${fxWizard.step}|${mixKey}`;
+    if (!missing) {
+      atlasStageKeyRef.current = key;
+      return;
+    }
+    if (atlasStageKeyRef.current === key) return;
+    atlasStageKeyRef.current = key;
+    applyAtlasPoint(atlasSelected, { stage: true });
+  }, [
+    applyAtlasPoint,
+    atlasByCcy.carry,
+    atlasByCcy.local,
+    atlasSelected,
+    fxWizard.step,
+    onPreparedByCcyChange,
+    preparedByCcy,
+  ]);
+
+  const walkAtlasBy = useCallback(
+    (delta: number) => {
+      if (atlasWalk.length === 0) return;
+      const from = atlasWalkIdx >= 0 ? atlasWalkIdx : 0;
+      const next = atlasWalk[Math.min(atlasWalk.length - 1, Math.max(0, from + delta))];
+      if (next) applyAtlasPoint(next);
+    },
+    [atlasWalk, atlasWalkIdx, applyAtlasPoint],
+  );
+
+  const setMixCcyIncluded = useCallback((ccy: string, included: boolean) => {
+    setForceOpenCcys(prev => {
+      const next = new Set(prev);
+      if (included) next.delete(ccy);
+      else next.add(ccy);
+      return [...next].sort();
+    });
+    setAtlasSelectedId(null);
+  }, []);
+
+  /** True removal from the book — distinct from "leave open" (setMixCcyIncluded). */
+  const setMixCcyExcluded = useCallback((ccy: string, excluded: boolean) => {
+    setExcludeCcys(prev => {
+      const next = new Set(prev);
+      if (excluded) next.add(ccy);
+      else next.delete(ccy);
+      return [...next].sort();
+    });
+    // A removed name can no longer be "left open" — clear that pin too so
+    // the two controls don't fight (leave-open on a nonexistent leg is a
+    // no-op the backend already ignores, but keeping the UI checkbox
+    // stale/checked for a removed name would be confusing).
+    if (excluded) {
+      setForceOpenCcys(prev => prev.filter(c => c !== ccy));
+    }
+    setAtlasSelectedId(null);
+  }, []);
+
+  const setMixWeight = useCallback(
+    (ccy: string, pct: number) => {
+      const w = Math.min(1, Math.max(0, pct / 100));
+      if (!onHedgeRatiosChange) return;
+      const nextRatios = { ...hedgeRatios, [ccy]: w };
+      onHedgeRatiosChange(nextRatios);
+      if (fxWizard.step < 5 || !onPreparedByCcyChange) return;
+      const weights = {
+        ...(atlasSelected?.hedgeByCcy ?? {}),
+        ...nextRatios,
+      };
+      const settle = setup.forecastMonths || 12;
+      onPreparedByCcyChange(prev =>
+        stageAtlasMixPrepared(
+          prev ?? preparedByCcy,
+          Object.entries(weights).map(([name, raw]) => {
+            const ww = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+            const target =
+              atlasByCcy.local[name]
+              ?? liveRows.find(r => r.ccy === name)?.targetHedgeLocalM
+              ?? 0;
+            return {
+              ccy: name,
+              weight: ww,
+              coverLocalM: ww * target,
+              lockedCarryUsdM: atlasMixLockedCarryUsdM(
+                atlasSelected,
+                name,
+                atlasByCcy.carry[name] ?? 0,
+                ww,
+              ),
+            };
+          }),
+          settle,
+          { preserveStrips: true },
+        ),
+      );
+    },
+    [
+      atlasByCcy.carry,
+      atlasByCcy.local,
+      atlasSelected,
+      fxWizard.step,
+      hedgeRatios,
+      liveRows,
+      onHedgeRatiosChange,
+      onPreparedByCcyChange,
+      preparedByCcy,
+      setup.forecastMonths,
+    ],
+  );
+
+  const atlasScenarioCards = useMemo((): {
+    point: FxCarryVarPoint | null;
+    card: FrontierSolutionCard;
+  }[] => {
+    const unhedgedVar = atlasFrontier.unhedged?.divVarUsdM ?? 0;
+    const toCard = (
+      point: FxCarryVarPoint | null | undefined,
+      id: string,
+      name: string,
+      short: string,
+      rationale: string,
+    ): { point: FxCarryVarPoint | null; card: FrontierSolutionCard } => {
+      const p = point ?? null;
+      const risk = p?.divVarUsdM ?? 0;
+      const carry = p?.carryUsdYrM ?? 0;
+      return {
+        point: p,
+        card: {
+          id,
+          name,
+          short,
+          rationale,
+          carryUsdYrM: carry,
+          riskUsdM: risk,
+          usedPct: unhedgedVar > 1e-9 ? (risk / unhedgedVar) * 100 : 0,
+          efficiency: Math.abs(risk) > 1e-9 ? carry / risk : 0,
+          approved: false,
+          disabled: p == null,
+        },
+      };
+    };
+    return [
+      toCard(
+        atlasFrontier.unhedged,
+        'leave-open',
+        'Leave open',
+        'No hedge — full residual VaR, no locked carry',
+        'Walk away from the book. Every name stays at Δ = 1.',
+      ),
+      toCard(
+        atlasFrontier.sweet,
+        'recommended',
+        'Recommended',
+        'Sweet spot — dump costly carry, keep flat names',
+        'Recommended mix. Keep GBP-like flats; hedge names that pay carry.',
+      ),
+      toCard(
+        atlasFrontier.fullyHedged,
+        'fully-hedge',
+        'Fully hedge',
+        'All Target — lowest VaR, lock the full carry book',
+        '100% of Target on every name. Residual VaR goes to the floor.',
+      ),
+    ];
+  }, [atlasFrontier.fullyHedged, atlasFrontier.sweet, atlasFrontier.unhedged]);
+
+  const bookLiveRows = useMemo(
+    () =>
+      applyAtlasMixToHedgeRows(liveRows, mixPoint, {
+        indiv: atlasByCcy.indiv,
+        local: atlasByCcy.local,
+      }),
+    [liveRows, mixPoint, atlasByCcy.indiv, atlasByCcy.local],
+  );
+  const atlasCorr = useMemo(
+    () => atlasRiskCorrFor(marketRatesByCcy),
+    [marketRatesByCcy],
+  );
+  const beforeUsdByCcy = useMemo(() => {
+    const next: Record<string, number> = {};
+    for (const r of liveRows) {
+      if (r.ccy === 'USD') continue;
+      next[r.ccy] = atlasByCcy.indiv[r.ccy] ?? r.varBeforeUsdM;
+    }
+    return next;
+  }, [atlasByCcy.indiv, liveRows]);
+  const unhedgedVarStack = useMemo(
+    () =>
+      stackFromRisk(
+        'unhedged',
+        'Unhedged',
+        'VaR before mix',
+        diversifiedUsdRisk(
+          fxMixSignedContribs(liveRows, atlasByCcy, mixWeightByCcy, 'before'),
+          atlasCorr,
+        ),
+      ),
+    [atlasByCcy, atlasCorr, liveRows, mixWeightByCcy],
+  );
+  const hedgedVarStack = useMemo(() => {
+    const mixStatus = mixTuned
+      ? 'TUNED'
+      : atlasSelected?.id === atlasFrontier.fullyHedged?.id
+        ? 'FULL'
+        : atlasSelected?.id === atlasFrontier.unhedged?.id
+          ? 'OPEN'
+          : 'MIX';
+    return stackFromRisk(
+      'hedged',
+      'After mix',
+      mixStatus,
+      diversifiedUsdRisk(
+        fxMixSignedContribs(liveRows, atlasByCcy, mixWeightByCcy, 'after'),
+        atlasCorr,
+      ),
+    );
+  }, [
+    atlasByCcy,
+    atlasCorr,
+    atlasFrontier.fullyHedged?.id,
+    atlasFrontier.unhedged?.id,
+    atlasSelected?.id,
+    liveRows,
+    mixTuned,
+    mixWeightByCcy,
+  ]);
+
+  const mixTuneRows = useMemo(() => {
+    return bookLiveRows
+      .filter(r => r.ccy !== 'USD')
+      .map(r => {
+        const included = !forceOpenCcys.includes(r.ccy);
+        const w = mixWeightByCcy[r.ccy] ?? 0;
+        const locked = atlasMixLockedCarryUsdM(
+          mixPoint,
+          r.ccy,
+          atlasByCcy.carry[r.ccy] ?? 0,
+          w,
+        );
+        return {
+          ccy: r.ccy,
+          included,
+          hedgePct: Math.round(Math.min(1, Math.max(0, w)) * 100),
+          residVarUsdM: (atlasByCcy.indiv[r.ccy] ?? r.varBeforeUsdM) * (1 - w),
+          lockedCarryUsdM: locked,
+        };
+      });
+  }, [
+    atlasByCcy.carry,
+    atlasByCcy.indiv,
+    bookLiveRows,
+    forceOpenCcys,
+    mixPoint,
+    mixWeightByCcy,
+  ]);
 
   const retainedLivePlanByCcy = useMemo(
     () => retainedFundingPlanByCcy(livePlanByCcy, swapForwardOverlayByCcy),
@@ -1441,11 +2183,11 @@ export function VarAnalyticsPanel({
           onLayerPanelChange={onLayerPanelChange}
           livePlanByCcy={livePlanByCcy}
           swapForwardOverlayByCcy={swapForwardOverlayByCcy}
+          cfarNetByCcyUsd={cfarNetByCcyUsd}
           extraForwards={analyticsExtraForwards}
           stockNetByCcy={Object.fromEntries(
             risk.map(r => [r.bar.ccy, r.bar.stockNetM] as const),
           )}
-          cfarNetByCcyUsd={cfarNetByCcyUsd}
           deskShared={deskShared}
           deskHedgeCarryByCcyUsdM={deskHedgeCarryByCcyUsdM}
           deskCashCarryByCcyUsdM={deskCashCarryByCcyUsdM}
@@ -1455,11 +2197,23 @@ export function VarAnalyticsPanel({
           onPolicyVARChange={onPolicyVARChange}
           portfolioCarryK={portfolioCarryK}
           onPortfolioCarryKChange={onPortfolioCarryKChange}
-          onPreparedByCcyChange={onPreparedByCcyChange}
+          onPreparedByCcyChange={
+            onPreparedByCcyChange
+              ? next =>
+                  onPreparedByCcyChange(
+                    typeof next === 'function'
+                      ? next(preparedByCcy ?? {})
+                      : next,
+                  )
+              : undefined
+          }
           residualByCcy={residualByCcy}
           onResidualByCcyChange={onResidualByCcyChange}
           portfolioScenarioId={portfolioScenarioId}
           onPortfolioScenarioIdChange={onPortfolioScenarioIdChange}
+          usdCash={usdCash}
+          onUsdCashChange={onUsdCashChange}
+          usdPayout={usdPayout}
           onStrategyCfarByCcyChange={onStrategyCfarByCcyChange}
           onOptimizerOverlayByCcyChange={onOptimizerOverlayByCcyChange}
           cashCarryTabUsdM={cashCarryTabUsdM}
@@ -1469,144 +2223,41 @@ export function VarAnalyticsPanel({
           {riskPerspectiveMeta(perspective).label} view is coming soon on Analytics.
         </div>
       ) : (
+      <AnalyticsWizardShell
+        title="Group FX VaR"
+        steps={FX_RISK_WIZARD_STEPS}
+        step={fxWizard.step}
+        maxReached={fxWizard.maxReached}
+        onGoToStep={n => {
+          if (fxWizard.step === 4 && n > 4) commitAtlasMixToBook();
+          fxWizard.goToStep(n);
+        }}
+        onNext={() => {
+          if (fxWizard.step === 4) commitAtlasMixToBook();
+          fxWizard.nextStep();
+        }}
+        onPrev={fxWizard.prevStep}
+      >
+      {fxWizard.step === 1 && (
+      <ForecastParametersForm
+        setup={setup}
+        onSetupChange={onSetupChange}
+        forecastProfile={forecastProfile}
+        onForecastProfileChange={onForecastProfileChange}
+        bookRows={bookRows}
+        onRowFieldChange={onRowFieldChange}
+        u1m={u1m}
+        uncertaintyCustom={uncertaintyCustom}
+        uCustomDraft={uCustomDraft}
+        onUCustomDraftChange={setUCustomDraft}
+        onUCustomOpenChange={setUCustomOpen}
+        onUncertainty1m={patchUncertainty1m}
+        onOpenFullProfile={onOpenForecastProfile}
+      />
+      )}
+
+      {fxWizard.step === 2 && (
       <>
-      {/* ── Input exposure metrics ── */}
-      <section className="space-y-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
-              Input exposure metrics
-            </div>
-            <p className="mt-0.5 text-[10px] text-slate-500">
-              Forecast period (Tf) and optional 1m forecast uncertainty — shape Exp and VaR
-              curvature vs tenure.
-              {customSchedule ? ' Profile: custom.' : ''}
-            </p>
-          </div>
-        </div>
-
-        <div>
-          <div className="mb-1.5 text-[11px] font-medium text-slate-400">Forecast period</div>
-          <div
-            className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-            role="group"
-            aria-label="Forecast period"
-          >
-            {FORECAST_PERIOD_OPTIONS.map(opt => {
-              const on = forecastPeriodIdForMonths(setup.forecastMonths) === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  type="button"
-                  title={
-                    opt.months === 0
-                      ? 'No forecast — stock only'
-                      : `Revenue path builds for ${opt.months}m (caps growth / sets average area)`
-                  }
-                  onClick={() => patch({ forecastMonths: opt.months })}
-                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
-                    on
-                      ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                      : 'text-slate-500 hover:text-slate-300'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div>
-          <div className="mb-1.5 text-[11px] font-medium text-slate-400">
-            Incremental forecast uncertainty (1m)
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <div
-              className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
-              role="group"
-              aria-label="Forecast uncertainty"
-            >
-              {FORECAST_UNCERTAINTY_OPTIONS.map(opt => {
-                const on = !uncertaintyCustom && Math.abs(u1m - opt.value) < 1e-12;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    title={
-                      opt.value === 0
-                        ? 'FX path only — no quantity uncertainty on the forecast'
-                        : `1m relative vol of monthly flow F. Accrues as √g over g=min(Th,Tf); folds into FX √T as √(E²+σ_E²).`
-                    }
-                    disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
-                    onClick={() => {
-                      setUCustomOpen(false);
-                      patchUncertainty1m(opt.value);
-                    }}
-                    className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                      on
-                        ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                        : 'text-slate-500 hover:text-slate-300'
-                    }`}
-                  >
-                    {opt.label}
-                  </button>
-                );
-              })}
-              <button
-                type="button"
-                title="Enter an exact 1m forecast uncertainty (%)"
-                disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
-                onClick={() => {
-                  setUCustomOpen(true);
-                  setUCustomDraft(Number((u1m * 100).toFixed(2)).toString());
-                  if (u1m <= 0) {
-                    const starter = 0.15;
-                    setUCustomDraft('15');
-                    patchUncertainty1m(starter);
-                  }
-                }}
-                className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                  uncertaintyCustom
-                    ? 'bg-emerald-500/20 text-emerald-100 shadow-sm'
-                    : 'text-slate-500 hover:text-slate-300'
-                }`}
-              >
-                Custom
-              </button>
-            </div>
-            {uncertaintyCustom && (
-              <label
-                className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-950/60 px-2 py-1 text-[11px] text-slate-300"
-                title="Exact 1m relative forecast uncertainty"
-              >
-                <input
-                  type="number"
-                  min={0}
-                  step={0.1}
-                  disabled={setup.forecastMonths === 0 || setup.exposureBasis === 'stock'}
-                  className="w-16 rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 text-right font-mono text-[11px] text-slate-100 disabled:opacity-40"
-                  value={uCustomDraft}
-                  onChange={e => {
-                    setUCustomDraft(e.target.value);
-                    const pct = Number(e.target.value);
-                    if (!Number.isFinite(pct) || pct < 0) return;
-                    setUCustomOpen(true);
-                    patchUncertainty1m(pct / 100);
-                  }}
-                />
-                <span className="text-slate-500">%</span>
-              </label>
-            )}
-          </div>
-          <p className="mt-1.5 text-[10px] text-slate-500">
-            {setup.forecastMonths === 0
-              ? 'Pick a forecast period &gt; 0 to enable quantity uncertainty.'
-              : `σ_E = |F|×${(u1m * 100).toFixed(2).replace(/\.?0+$/, '')}%×√g · g=min(Th,Tf=${setup.forecastMonths}m) — synced with Forecast profile line σ (top chips clear line overrides; modal line edits update this control).`}
-          </p>
-        </div>
-      </section>
-
       {/* ── VaR setup: profile chips + gear modal (avg + σ) ── */}
       <section className="space-y-3 rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1759,8 +2410,10 @@ export function VarAnalyticsPanel({
           </div>,
           document.body,
         )}
+      </>
+      )}
 
-      {/* ── VaR evolution: bar chart (pick horizon) + confidence on the right ── */}
+      {fxWizard.step === 3 && (
       <section className="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
         <div className="mb-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2066,33 +2719,520 @@ export function VarAnalyticsPanel({
           </div>
         </div>
       </section>
+      )}
 
-      <div className="grid gap-3 sm:grid-cols-3">
+      {fxWizard.step === 4 && (
+      <>
+      <div className="space-y-6">
+      <section className="rounded-xl border border-slate-800 bg-slate-950/40 px-5 py-3">
+        <div className="grid items-stretch gap-5 lg:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
+          <div className="flex h-full flex-col gap-3.5 lg:border-r lg:border-slate-800 lg:pr-5">
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-medium text-slate-100">Scenarios</h2>
+              <span className="font-mono text-[11px] text-slate-500">
+                Leave open · Recommended · Fully hedge
+              </span>
+            </div>
+            <div className="flex flex-col gap-3">
+              {atlasScenarioCards.map(({ point, card }) => {
+                const selectedId = mixTuned
+                  ? null
+                  : atlasSelected?.id === atlasFrontier.unhedged?.id
+                    ? 'leave-open'
+                    : atlasSelected?.id === atlasFrontier.sweet?.id
+                      ? 'recommended'
+                      : atlasSelected?.id === atlasFrontier.fullyHedged?.id
+                        ? 'fully-hedge'
+                        : null;
+                return (
+                  <ParetoScenarioCard
+                    key={card.id}
+                    scenario={card}
+                    shareLabel="% unhedged"
+                    maxAbsCarryUsdYrM={Math.max(
+                      ...atlasScenarioCards.map(s => Math.abs(s.card.carryUsdYrM)),
+                      1e-9,
+                    )}
+                    isSelected={selectedId === card.id}
+                    onSelect={() => {
+                      if (point) applyAtlasPoint(point);
+                    }}
+                  />
+                );
+              })}
+            </div>
+            {atlasPending ? (
+              <span className="font-mono text-[10px] text-slate-500">Computing…</span>
+            ) : null}
+            {atlasError ? (
+              <span className="font-mono text-[10px] text-rose-400">{atlasError}</span>
+            ) : null}
+            <span className="mt-auto inline-flex items-center overflow-hidden rounded-lg border border-slate-800">
+              <button
+                type="button"
+                disabled={atlasWalk.length < 2 || atlasWalkIdx <= 0}
+                title="Previous frontier point"
+                onClick={() => walkAtlasBy(-1)}
+                className="h-9 px-2.5 font-mono text-[12px] text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:text-slate-600"
+              >
+                ◀
+              </button>
+              <span className="min-w-[148px] flex-1 border-x border-slate-800 px-2.5 text-center font-mono text-[11px] text-slate-300">
+                {atlasWalkIdx >= 0
+                  ? `${atlasWalkIdx + 1} / ${atlasWalk.length} · ${
+                      mixTuned
+                        ? 'Custom'
+                        : atlasScenarioLabel(
+                            atlasSelected,
+                            atlasFrontier.sweet?.id,
+                            atlasFrontier.fullyHedged?.id,
+                            atlasFrontier.unhedged?.id,
+                          )
+                    }`
+                  : '—'}
+              </span>
+              <button
+                type="button"
+                disabled={atlasWalk.length < 2 || atlasWalkIdx >= atlasWalk.length - 1}
+                title="Next frontier point"
+                onClick={() => walkAtlasBy(1)}
+                className="h-9 px-2.5 font-mono text-[12px] text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:text-slate-600"
+              >
+                ▶
+              </button>
+            </span>
+          </div>
+
+          <div className="flex h-full min-w-0 flex-col gap-2">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="text-base font-medium text-slate-100">
+                  {mixTuned
+                    ? 'Custom mix'
+                    : atlasScenarioLabel(
+                        atlasSelected,
+                        atlasFrontier.sweet?.id,
+                        atlasFrontier.fullyHedged?.id,
+                        atlasFrontier.unhedged?.id,
+                      )}
+                </h2>
+                <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                  Carry vs VaR on the selected mix. Pick a scenario, walk the curve, then
+                  drag names below to fine-tune the program before Book / Approve.
+                </p>
+              </div>
+              <div
+                className={`rounded-xl border px-3 py-2 ${
+                  mixTuned
+                    ? 'border-amber-500/40 bg-amber-500/10'
+                    : 'border-emerald-500/30 bg-emerald-500/10'
+                }`}
+              >
+                <div className={`text-[12px] font-medium ${mixTuned ? 'text-amber-200' : 'text-emerald-200'}`}>
+                  {mixTuned ? 'Edited off the frontier point' : 'Frontier mix selected'}
+                </div>
+                <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+                  Div VaR {fmtVarK(mixTuned ? hedgedVarStack.diversifiedTotal : (atlasSelected?.divVarUsdM ?? 0))}
+                  {' · '}Carry {fmtVarK(atlasSelected?.carryUsdYrM ?? 0)}
+                </div>
+              </div>
+            </div>
+            <ChartViewFrame
+              className="flex h-full min-h-0 flex-1 flex-col"
+              ariaLabel="Chart view"
+              value={atlasChartView}
+              onChange={setAtlasChartView}
+              options={[
+                { id: 'frontier', label: 'Frontier' },
+                { id: 'marginal', label: 'Marginal' },
+              ]}
+            >
+              {atlasChartView === 'frontier' ? (
+                <FxCarryVarFrontierChart
+                  fillHeight
+                  curve={atlasFrontier.curve}
+                  unhedged={atlasFrontier.unhedged}
+                  confidencePct={setup.confidencePct}
+                  selectedId={atlasSelected?.id}
+                  sweetId={atlasFrontier.sweet?.id}
+                  livePoint={liveMixPoint}
+                  onSelect={applyAtlasPoint}
+                  onRestoreTune={mixTuned ? restoreSelectedMix : undefined}
+                />
+              ) : atlasMarginal.length > 0 ? (
+                <FxAtlasMarginalEffectsChart points={atlasMarginal} />
+              ) : (
+                <div className="flex h-full min-h-[360px] items-center justify-center rounded-xl border border-slate-800 bg-slate-950/50 px-4 text-center font-mono text-[12px] text-slate-500">
+                  No residual risk at this mix — every name is on Target.
+                </div>
+              )}
+            </ChartViewFrame>
+          </div>
+        </div>
+      </section>
+
+      <div className="space-y-2 rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
+            Hedging parameters · selected mix
+          </div>
+          <div className="flex flex-wrap items-baseline gap-3 font-mono text-[11px] text-slate-300">
+            <span>
+              {mixTuned
+                ? 'Custom'
+                : atlasScenarioLabel(
+                    atlasSelected,
+                    atlasFrontier.sweet?.id,
+                    atlasFrontier.fullyHedged?.id,
+                    atlasFrontier.unhedged?.id,
+                  )}
+              {atlasSelected
+                ? ` · VaR ${fmtVarK(mixTuned ? hedgedVarStack.diversifiedTotal : atlasSelected.divVarUsdM)} · carry ${fmtVarK(atlasSelected.carryUsdYrM)}`
+                : ''}
+            </span>
+            {excludeCcys.length > 0 ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setExcludeCcys([]);
+                  setAtlasSelectedId(null);
+                }}
+                className="text-[10px] font-semibold uppercase tracking-wide text-rose-300 hover:text-rose-200"
+              >
+                Restore all
+              </button>
+            ) : null}
+          </div>
+        </div>
+        <p className="font-mono text-[10px] text-slate-500">
+          Uncheck a name to remove it from the book entirely (no VaR/correlation contribution) and re-solve the rest.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[640px] text-left text-xs">
+            <thead>
+              <tr className="border-b border-slate-800 text-slate-500">
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Include in Optimize calibration. Off = forced open, mix re-solves."
+                >
+                  In
+                </th>
+                <th className="py-2 pr-3 font-medium">CCY</th>
+                <th className="py-2 pr-3 font-medium">Hedge %</th>
+                <th className="py-2 pr-3 font-medium" title="Selected weight × Target (local mm)">
+                  Cover local
+                </th>
+                <th className="py-2 pr-3 font-medium" title="Selected weight × Target (USD mm)">
+                  Cover USD
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Tf swap points / CIP on the cover (w × 12M bullet on Target)"
+                >
+                  Locked carry
+                </th>
+                <th className="py-2 pr-3 font-medium" title="Individual VaR left open at this weight">
+                  Resid VaR
+                </th>
+                <th className="py-2 font-medium">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {liveRows
+                .filter(r => r.ccy !== 'USD')
+                .map(r => {
+                  const included = !excludeCcys.includes(r.ccy);
+                  const w = included
+                    ? (hedgeRatios[r.ccy] ?? atlasSelected?.hedgeByCcy?.[r.ccy] ?? 0)
+                    : 0;
+                  const fullHx = atlasByCcy.carry[r.ccy] ?? 0;
+                  const locked = atlasMixLockedCarryUsdM(mixPoint, r.ccy, fullHx, w);
+                  const local = (atlasByCcy.local[r.ccy] ?? r.targetHedgeLocalM) * w;
+                  const usd = (atlasByCcy.usd[r.ccy] ?? 0) * w;
+                  const resid = (atlasByCcy.indiv[r.ccy] ?? r.varBeforeUsdM) * (1 - w);
+                  const keep = w > 0.5;
+                  return (
+                    <tr
+                      key={r.ccy}
+                      className={`border-b border-slate-800/80 ${
+                        included ? '' : 'opacity-50'
+                      }`}
+                    >
+                      <td className="py-2 pr-3">
+                        <input
+                          type="checkbox"
+                          checked={included}
+                          onChange={e => setMixCcyExcluded(r.ccy, !e.target.checked)}
+                          aria-label={
+                            included
+                              ? `Remove ${r.ccy} from the book — no VaR/correlation contribution, re-solve the rest`
+                              : `Bring ${r.ccy} back into the book`
+                          }
+                          className="h-3.5 w-3.5 cursor-pointer accent-emerald-500"
+                        />
+                      </td>
+                      <td className="py-2 pr-3 font-semibold text-violet-200">{r.ccy}</td>
+                      <td className="py-2 pr-3 font-mono text-emerald-300/90">
+                        {formatHedgePct(w)}
+                      </td>
+                      <td className="py-2 pr-3 font-mono text-slate-300">
+                        {fmtSignedM(local)}
+                      </td>
+                      <td className="py-2 pr-3 font-mono text-slate-300">
+                        {fmtVarK(usd)}
+                      </td>
+                      <td
+                        className={`py-2 pr-3 font-mono ${
+                          locked >= 0 ? 'text-emerald-300/90' : 'text-rose-300/90'
+                        }`}
+                      >
+                        {fmtVarK(locked)}
+                      </td>
+                      <td className="py-2 pr-3 font-mono text-slate-400">
+                        {fmtVarK(resid)}
+                      </td>
+                      <td
+                        className={`py-2 font-medium ${
+                          !included
+                            ? 'text-slate-500'
+                            : w <= 1e-6
+                              ? 'text-orange-300'
+                              : keep
+                                ? 'text-emerald-300'
+                                : 'text-sky-300'
+                        }`}
+                      >
+                        {!included
+                          ? 'Removed from book'
+                          : w <= 1e-6
+                            ? 'Leave open'
+                            : keep
+                              ? 'Keep hedge'
+                              : `${formatHedgePct(w)} hedge`}
+                      </td>
+                    </tr>
+                  );
+                })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <VarCurrencyStackChart
+        unhedged={unhedgedVarStack}
+        selected={{
+          ...hedgedVarStack,
+          label: mixTuned ? 'After mix' : hedgedVarStack.label,
+          status: mixTuned ? 'TUNED' : hedgedVarStack.status,
+        }}
+        confidencePct={setup.confidencePct}
+        horizon={shortHorizonLabel(
+          VAR_HORIZON_OPTIONS.find(h => h.id === setup.horizon)?.label ?? setup.horizon,
+        )}
+        openCcy={chartCcy}
+        onOpenCcy={openOptimizeCcy}
+        selectedBook={unhedgedBookSelected ? 'unhedged' : 'selected'}
+        onSelectUnhedged={() => {
+          const point = atlasFrontier.unhedged;
+          if (point) applyAtlasPoint(point);
+        }}
+        onSelectMix={() => {
+          if (!unhedgedBookSelected) return;
+          const point = atlasFrontier.sweet ?? atlasFrontier.fullyHedged;
+          if (point) applyAtlasPoint(point);
+        }}
+        onSetAfterRatio={setMixWeight}
+        beforeUsdByCcy={beforeUsdByCcy}
+        onRestoreTune={restoreSelectedMix}
+      />
+
+      <div>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-baseline gap-2.5">
+            <h3 className="text-base font-medium text-slate-100">
+              {mixTuneMode === 'var' ? 'VaR contribution' : 'Carry contribution'}
+            </h3>
+            <span className="text-[11px] text-slate-500">
+              Drag pins hedge % of Target · click the name to open the trade · uncheck to leave open and re-solve
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {forceOpenCcys.length > 0 ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setForceOpenCcys([]);
+                  setAtlasSelectedId(null);
+                }}
+                className="text-[10px] font-semibold uppercase tracking-wide text-sky-300 hover:text-sky-200"
+              >
+                Include all
+              </button>
+            ) : null}
+            <div className="inline-flex rounded-lg border border-slate-700 bg-slate-950 p-0.5">
+              {(['var', 'carry'] as const).map(mode => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setMixTuneMode(mode)}
+                  className={`rounded-md px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wide ${
+                    mixTuneMode === mode
+                      ? 'bg-slate-700 text-slate-100'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {mode === 'var' ? 'VaR' : 'Carry'}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {mixTuneMode === 'carry' ? (
+          <MixStrip
+            title="Carry mix"
+            total={fmtVarK(
+              mixTuneRows.reduce((s, r) => s + r.lockedCarryUsdM, 0),
+            )}
+            hint="Locked Tf swap points / CIP · right of 0 earns · left of 0 pays"
+            rows={mixTuneRows.map(r => ({ ccy: r.ccy, usdM: r.lockedCarryUsdM }))}
+            portAbs={mixTuneRows.reduce((s, r) => s + Math.abs(r.lockedCarryUsdM), 0)}
+            signed
+          />
+        ) : null}
+
+        <div className="mt-3 flex flex-col gap-1.5">
+          {mixTuneRows.map(r => {
+            const usdM =
+              mixTuneMode === 'var' ? r.residVarUsdM : r.lockedCarryUsdM;
+            const open = chartCcy === r.ccy;
+            return (
+              <div
+                key={r.ccy}
+                className={`flex items-center gap-2 rounded-lg px-1.5 py-0.5 ${
+                  open ? 'bg-sky-500/10 ring-1 ring-inset ring-sky-400/30' : ''
+                } ${r.included ? '' : 'opacity-50'}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={r.included}
+                  onChange={e => setMixCcyIncluded(r.ccy, e.target.checked)}
+                  aria-label={
+                    r.included
+                      ? `Exclude ${r.ccy} from mix calibration`
+                      : `Include ${r.ccy} in mix calibration`
+                  }
+                  className="h-3.5 w-3.5 flex-none cursor-pointer accent-emerald-500"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const row = bookLiveRows.find(x => x.ccy === r.ccy);
+                    if (!row) return;
+                    openOptimizeCcy(r.ccy);
+                  }}
+                  className="w-11 flex-none text-left font-mono text-sm font-medium text-slate-100 hover:text-sky-200"
+                >
+                  {r.ccy}
+                </button>
+                <ContributionBar
+                  usdM={usdM}
+                  widthPct={r.hedgePct}
+                  fullWidthPct={100}
+                  tone={mixTuneMode === 'carry' ? 'bg-amber-300/90' : ccyBarTone(r.ccy)}
+                  signed={mixTuneMode === 'carry'}
+                  sign={usdM >= 0 ? 1 : -1}
+                  onRatio={r.included ? pct => setMixWeight(r.ccy, pct) : undefined}
+                />
+                <span className="relative z-10 w-[4.5rem] flex-none text-right font-mono text-[11px] tabular-nums text-slate-200">
+                  {fmtVarK(usdM)}
+                </span>
+                <span className="relative z-10 w-10 flex-none text-right font-mono text-[10px] text-slate-500">
+                  {r.hedgePct}%
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <p className="text-[12px] text-slate-500">
+        Book tickets and send for approval are on the next steps — Optimize stays
+        design-only (chart, scenarios, per-name VaR / carry).
+      </p>
+      </div>
+      </>
+      )}
+
+      {fxWizard.step === 5 && (
+      <>
+      <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
+            Optimize mix · Book ticket
+          </div>
+          <div className="font-mono text-[11px] text-slate-300">
+            {atlasScenarioLabel(
+              atlasSelected,
+              atlasFrontier.sweet?.id,
+              atlasFrontier.fullyHedged?.id,
+              atlasFrontier.unhedged?.id,
+            )}
+            {atlasSelected
+              ? ` · VaR ${fmtVarK(atlasSelected.divVarUsdM)} · carry ${fmtVarK(atlasSelected.carryUsdYrM)}`
+              : ''}
+          </div>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-slate-400">
+          {liveRows
+            .filter(r => r.ccy !== 'USD')
+            .map(r => {
+              const w = atlasSelected?.hedgeByCcy?.[r.ccy] ?? hedgeRatios[r.ccy] ?? 0;
+              return (
+                <span key={r.ccy}>
+                  <span className="text-violet-200">{r.ccy}</span>
+                  {' '}
+                  <span className="text-emerald-300/90">{formatHedgePct(w)}</span>
+                </span>
+              );
+            })}
+        </div>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-4">
         <Stat
-          label="VaR at Δ = 1"
-          value={fmtVarK(summary.totalVarBeforeUsdM)}
-          hint={
-            profile?.varProfile === 'path'
-              ? 'Path-integrated · undiversified Σ'
-              : '√T profile · undiversified Σ'
-          }
+          label="Unhedged Div VaR"
+          value={fmtVarK(atlasFrontier.unhedged?.divVarUsdM ?? fxVarFrontier.before.portfolioUsdM)}
+          hint="Same as Optimize"
         />
         <Stat
-          label="VaR after hedge"
-          value={fmtVarK(summary.totalVarAfterUsdM)}
+          label="Mix Div VaR"
+          value={fmtVarK(atlasSelected?.divVarUsdM ?? fxVarFrontier.after.portfolioUsdM)}
           hint={
-            hedged
-              ? 'Σ resid VaR = V·|e−H|/E (same as evolution yellow)'
-              : 'No hedge yet'
+            atlasSelected
+              ? `Optimize point · same Div VaR`
+              : 'No mix yet — same as open book'
           }
           accent
         />
         <Stat
+          label="Mix carry"
+          value={fmtVarK(atlasSelected?.carryUsdYrM ?? 0)}
+          hint="Tf swap points / CIP locked at this mix"
+        />
+        <Stat
           label="VaR reduction"
-          value={fmtVarK(summary.varReductionUsdM)}
+          value={fmtVarK(
+            (atlasFrontier.unhedged?.divVarUsdM ?? fxVarFrontier.before.portfolioUsdM)
+              - (atlasSelected?.divVarUsdM ?? fxVarFrontier.after.portfolioUsdM),
+          )}
           hint={
-            summary.totalVarBeforeUsdM > 1e-12
-              ? `${((summary.varReductionUsdM / summary.totalVarBeforeUsdM) * 100).toFixed(0)}% cut`
+            (atlasFrontier.unhedged?.divVarUsdM ?? 0) > 1e-12
+              ? `${(
+                  (((atlasFrontier.unhedged?.divVarUsdM ?? 0)
+                    - (atlasSelected?.divVarUsdM ?? 0))
+                    / (atlasFrontier.unhedged?.divVarUsdM ?? 1))
+                  * 100
+                ).toFixed(0)}% cut vs unhedged`
               : '—'
           }
         />
@@ -2100,14 +3240,12 @@ export function VarAnalyticsPanel({
 
       <div className="space-y-3">
         <div className="font-mono text-[10px] font-medium uppercase tracking-[0.09em] text-slate-500">
-          Live VaR · {setupLabel(setup)}
-          {hedged ? ' · after Hedging Decision' : ' · Δ = 1 (unhedged)'}
-          {stripBooked
-            ? ' · strip: each forward from M0 (own size + tenure VaR)'
-            : effectiveStructure === 'strip'
-              ? ' · strip sizing (Th windows)'
-              : ''}
-          {customSchedule ? ' · custom schedule' : ''}
+          Live VaR · implied σ · selected mix
+          {atlasSelected
+            ? ` · Resid VaR = Optimize Resid · Δ = 1−w`
+            : hedged
+              ? ' · after Hedging Decision'
+              : ' · Δ = 1 (unhedged)'}
           <span className="ml-2 font-normal normal-case tracking-normal text-slate-600">
             — click a currency row to select · open bullet/strip profile
           </span>
@@ -2126,55 +3264,76 @@ export function VarAnalyticsPanel({
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="VaR-neutral at Tf: growth = path CoG e(∫t e²/∫e²); simple/TW = Ē. Strip: per-window same rule."
-                >
-                  VaR-neutral N
-                </th>
-                <th
-                  className="py-2 pr-3 font-medium"
-                  title="Total expected path-end — Decision 100% Target (exposure-signed)"
+                  title="100% hedge base — same Target Optimize Cover is scaled from"
                 >
                   Target N
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="% of |Target|. Strip booked → |strip cover| / |Target| (Decision % ignored)."
+                  title="Exact Optimize weight of Target (not rounded)"
                 >
                   Hedge %
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Trade-signed hedge (offsets exposure): opposite of Stock / Target / path cover. Long book → negative Hedge N."
+                  title="w × Target — same as Optimize Cover local (exposure-signed)"
                 >
-                  Hedge N
+                  Cover local
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="VaR after / VaR @ Δ1 — 0 = fully offset, 1 = unhedged"
+                  title="Trade you buy (+) / sell (−). Opposite of Cover. JPY short book → buy yen."
+                >
+                  Hedge amount
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="CIP locked at this mix — same as Optimize Locked carry"
+                >
+                  Locked carry
+                </th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Resid / unhedged individual — 0 = fully offset, 1 = unhedged"
                 >
                   Δ
                 </th>
                 <th
                   className="py-2 pr-3 font-medium"
-                  title="Path e(Tf) − H — residual at forecast end (100% Target → 0). Same |e−H| as path modal at Tf."
+                  title="Target − Cover — residual local (100% Target → 0)"
                 >
                   Residual
                 </th>
-                <th className="py-2 pr-3 font-medium">VaR @ Δ1</th>
+                <th
+                  className="py-2 pr-3 font-medium"
+                  title="Individual VaR of the open name (implied vol × tenor legs)"
+                >
+                  VaR @ Δ1
+                </th>
                 <th
                   className="py-2 font-medium"
-                  title="Resid VaR = V·|e−H|/E(Tf) after bullet (Analytics weighted-avg profile) — same as evolution yellow"
+                  title="Resid VaR = individual × (1−w) — same as Optimize Resid VaR"
                 >
                   VaR after
                 </th>
               </tr>
             </thead>
             <tbody>
-              {liveRows.map(r => {
+              {bookLiveRows.map(r => {
                 const selected = chartCcy === r.ccy;
+                const mixDriven =
+                  typeof hedgeRatios[r.ccy] === 'number'
+                  && Number.isFinite(hedgeRatios[r.ccy]);
                 const prep = preparedByCcy[r.ccy];
-                const struct = structureTagFor(r.ccy, r.hedgeNotionalLocalM);
-                const legs = stripMetaByCcy[r.ccy]?.legs;
+                const struct = structureTagFor(r.ccy, r.hedgeNotionalLocalM)
+                  ?? (mixDriven ? 'bullet' : null);
+                const legs = struct === 'strip' ? stripMetaByCcy[r.ccy]?.legs : undefined;
+                const lockedCarry = atlasMixLockedCarryUsdM(
+                  mixPoint,
+                  r.ccy,
+                  atlasByCcy.carry[r.ccy] ?? 0,
+                  r.hedgeRatio,
+                );
                 const isHedged =
                   Math.abs(r.hedgeNotionalLocalM) > 1e-9 ||
                   (prep != null && Math.abs(prep.coverLocalM) >= 1e-12) ||
@@ -2187,29 +3346,7 @@ export function VarAnalyticsPanel({
                   className={`cursor-pointer border-b border-slate-800/80 hover:bg-violet-500/10 ${
                     selected ? 'bg-violet-500/10' : ''
                   }`}
-                  onClick={() => {
-                    // Prefer last applied chip; else infer from Live VaR Hedge N.
-                    const inferred =
-                      regimeByCcy[r.ccy] ??
-                      (Math.abs(r.hedgeNotionalLocalM) > 1e-9
-                        ? inferHedgePathBasis(
-                            r.hedgeNotionalLocalM,
-                            r.stockHedgeLocalM,
-                            r.targetHedgeLocalM,
-                            r.equalVarHedgeLocalM,
-                          )
-                        : prep?.basis === 'cash'
-                          ? 'cash'
-                          : prep?.basis === 'totalExpected'
-                            ? 'totalExpected'
-                            : 'varNeutral');
-                    const nextStruct =
-                      struct ??
-                      (prep?.structure === 'strip' ? 'strip' : 'bullet');
-                    setPathBasis(inferred);
-                    setHedgeStructure(nextStruct);
-                    setChartCcy(r.ccy);
-                  }}
+                  onClick={() => openOptimizeCcy(r.ccy)}
                   onKeyDown={e => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
@@ -2258,10 +3395,14 @@ export function VarAnalyticsPanel({
                                       ? 'Liquidity'
                                       : 'VaR'
                                 } package · Σ ${fmtSignedM(prep.coverLocalM)}`
-                              : 'Hedging regime: Stock (Cash) · VaR-neutral · Total (Target)'
+                              : mixDriven
+                                ? `Optimize mix · ${formatHedgePct(r.hedgeRatio)} of Target`
+                                : 'Hedging regime: Stock (Cash) · VaR-neutral · Total (Target)'
                           }
                         >
-                          {prep && !hasRollingStripForCcy(bookedHedges, r.ccy)
+                          {mixDriven
+                            ? `${formatHedgePct(r.hedgeRatio)} mix`
+                            : prep && !hasRollingStripForCcy(bookedHedges, r.ccy)
                             ? 'Hedged'
                             : hedgeRegimeShortLabel(
                                 regimeByCcy[r.ccy] ??
@@ -2283,29 +3424,27 @@ export function VarAnalyticsPanel({
                   <td className="py-2 pr-3 font-mono text-slate-300">
                     {fmtSignedM(r.stockHedgeLocalM)}
                   </td>
-                  <td
-                    className="py-2 pr-3 font-mono text-sky-300/90"
-                    title={
-                      struct === 'strip'
-                        ? 'Strip VaR-neutral = last-window Equal-VaR cover (same as path modal VN chip)'
-                        : r.hedgeCapped
-                          ? 'Equal-VaR on open book — capped by accrued position at Th'
-                          : 'Equal-VaR bullet matching open-book VaR @ Δ1 (Decision mid)'
-                    }
-                  >
-                    {fmtSignedM(r.equalVarHedgeLocalM)}
-                    {r.hedgeCapped && struct !== 'strip' ? (
-                      <span className="ml-1 text-[9px] text-amber-400/90">cap</span>
-                    ) : null}
-                  </td>
                   <td className="py-2 pr-3 font-mono text-violet-200/90">
                     {fmtSignedM(r.targetHedgeLocalM)}
                   </td>
                   <td className="py-2 pr-3 font-mono text-emerald-300/90">
-                    {Math.round(r.hedgeRatio * 100)}%
+                    {formatHedgePct(r.hedgeRatio)}
                   </td>
-                  <td className="py-2 pr-3 font-mono text-emerald-200">
+                  <td className="py-2 pr-3 font-mono text-slate-300">
+                    {fmtSignedM(r.hedgeNotionalLocalM)}
+                  </td>
+                  <td
+                    className="py-2 pr-3 font-mono text-emerald-200"
+                    title="Buy (+) / sell (−) local notional"
+                  >
                     {fmtSignedM(-r.hedgeNotionalLocalM)}
+                  </td>
+                  <td
+                    className={`py-2 pr-3 font-mono ${
+                      lockedCarry >= 0 ? 'text-emerald-300/90' : 'text-rose-300/90'
+                    }`}
+                  >
+                    {fmtVarK(lockedCarry)}
                   </td>
                   <td className="py-2 pr-3 font-mono text-amber-300">
                     {r.delta.toFixed(2)}
@@ -2327,6 +3466,32 @@ export function VarAnalyticsPanel({
         </div>
       </div>
 
+      <VarCurrencyStackChart
+        unhedged={unhedgedVarStack}
+        selected={hedgedVarStack}
+        confidencePct={setup.confidencePct}
+        horizon={shortHorizonLabel(
+          VAR_HORIZON_OPTIONS.find(h => h.id === setup.horizon)?.label ?? setup.horizon,
+        )}
+        openCcy={chartCcy}
+        onOpenCcy={openOptimizeCcy}
+        selectedBook={unhedgedBookSelected ? 'unhedged' : 'selected'}
+        onSetAfterRatio={setMixWeight}
+        beforeUsdByCcy={beforeUsdByCcy}
+        onRestoreTune={restoreSelectedMix}
+      />
+      </>
+      )}
+
+      {fxWizard.step === 6 && (
+        <HedgeApprovalStep
+          preparedByCcy={preparedByCcy}
+          onPreparedByCcyChange={onPreparedByCcyChange}
+          varUsdM={atlasSelected?.divVarUsdM ?? summary.totalVarAfterUsdM}
+          emptyHint="The Optimize mix is staged as FX Risk tickets on Book. Send them for approval here."
+        />
+      )}
+
       {chartCcy &&
         chartRow &&
         chartBar &&
@@ -2343,6 +3508,46 @@ export function VarAnalyticsPanel({
           >
             <div className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
               <div className="sticky top-0 z-30 shrink-0 border-b border-slate-800 bg-slate-900 px-4 pb-3 pt-4 shadow-[0_8px_24px_-12px_rgba(0,0,0,0.75)]">
+                {(() => {
+                  const stagedPkg = preparedByCcy[chartCcy];
+                  const selectedMixW = atlasSelected
+                    ? (forceOpenCcys.includes(chartCcy)
+                      ? 0
+                      : (atlasSelected.hedgeByCcy?.[chartCcy] ?? 0))
+                    : (mixWeightByCcy[chartCcy] ?? chartRow.hedgeRatio);
+                  const offSelectedMix = Boolean(
+                    atlasSelected && (
+                      pathBasis !== 'totalExpected'
+                      || chartStructure !== 'bullet'
+                      || Math.abs((chartRow.hedgeRatio ?? 0) - selectedMixW) > 0.008
+                    ),
+                  );
+                  const stagedDirty = Boolean(
+                    stagedPkg
+                    && pathSummaryMetrics
+                    && pathChartDraftDirty(stagedPkg, pathSummaryMetrics),
+                  );
+                  const mixDraftChanged = offSelectedMix || stagedDirty;
+                  const stageAction =
+                    onPreparedByCcyChange
+                      ? (pathPrepareAction
+                        ?? {
+                            label: 'Stage hedging strategy',
+                            title:
+                              'Stage this path — then Book under this CCY',
+                            disabled: false,
+                            run: () =>
+                              bookHedgeProfile({
+                                structure: chartStructure,
+                                basis: pathBasis,
+                                edges: [],
+                                bulletSettleMonths:
+                                  pathSummaryMetrics?.settleMonths,
+                                coverPct: chartRow.hedgeRatio,
+                              }),
+                          })
+                      : null;
+                  return (
                 <HedgeStagingHeader
                   titleId="exposure-path-title"
                   title={`${chartCcy} — hedge profile`}
@@ -2350,7 +3555,7 @@ export function VarAnalyticsPanel({
                     <>
                       Structure:{' '}
                       <span className="font-semibold text-violet-200">
-                        {effectiveStructure === 'strip' ? 'Strip' : 'Bullet'}
+                        {chartStructure === 'strip' ? 'Strip' : 'Bullet'}
                       </span>
                       {' · '}
                       Regime:{' '}
@@ -2368,46 +3573,33 @@ export function VarAnalyticsPanel({
                       ? chipsFromPathSummary(pathSummaryMetrics)
                       : undefined
                   }
-                  isPrebooked={Boolean(chartCcy && preparedByCcy[chartCcy])}
-                  draftDirty={Boolean(
-                    chartCcy
-                    && preparedByCcy[chartCcy]
-                    && pathSummaryMetrics
-                    && pathChartDraftDirty(
-                      preparedByCcy[chartCcy]!,
-                      pathSummaryMetrics,
-                    ),
-                  )}
-                  prepareAction={
-                    pathPrepareAction
-                    ?? (onPreparedByCcyChange
-                      ? {
-                          label: 'Stage hedging strategy',
-                          title: 'Stage this path — then Book under this CCY',
-                          disabled: false,
-                          run: () =>
-                            bookHedgeProfile({
-                              structure: effectiveStructure,
-                              basis: pathBasis,
-                              edges: [],
-                            }),
-                        }
-                      : null)
-                  }
+                  isPrebooked={Boolean(stagedPkg)}
+                  draftDirty={mixDraftChanged && Boolean(stagedPkg)}
+                  prepareAction={stageAction}
                   onReset={
-                    chartCcy && preparedByCcy[chartCcy] && onPreparedByCcyChange
-                      ? () =>
-                          onPreparedByCcyChange(prev =>
-                            clearPreparedHedgeForCcy(prev, chartCcy),
-                          )
-                      : undefined
+                    atlasSelected && mixDraftChanged
+                      ? resetCcyToSelectedMix
+                      : !atlasSelected && stagedPkg && onPreparedByCcyChange
+                        ? () =>
+                            onPreparedByCcyChange(
+                              clearPreparedHedgeForCcy(preparedByCcy, chartCcy),
+                            )
+                        : undefined
+                  }
+                  resetLabel={atlasSelected ? 'Reset to mix' : 'Reset'}
+                  resetTitle={
+                    atlasSelected
+                      ? 'Restore the selected Optimize scenario (Target × mix %)'
+                      : 'Clear staged package — Decision and Liquidity drop this CCY'
                   }
                   onClose={closePathChart}
                 />
+                  );
+                })()}
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
               <ExposureHedgePathChart
-                key={`${chartRow.ccy}-${pathBasis}-${effectiveStructure}-${setup.horizon}-${chartSizingSetup.horizon}-${setup.forecastMonths}-${setup.exposureBasis}-${hasRollingStripForCcy(bookedHedges, chartRow.ccy) ? 'strip' : 'open'}`}
+                key={`${chartRow.ccy}-${atlasSelected?.id ?? 'open'}-${mixResetNonce}-${setup.horizon}-${chartSizingSetup.horizon}-${setup.forecastMonths}-${setup.exposureBasis}-${hasRollingStripForCcy(bookedHedges, chartRow.ccy) ? 'strip' : 'open'}`}
                 ccy={chartRow.ccy}
                 stockM={chartBar.stockNetM}
                 monthlyFlowM={
@@ -2432,20 +3624,19 @@ export function VarAnalyticsPanel({
                 endExposureM={chartRow.openExposureLocalM}
                 selectedBasis={pathBasis}
                 onSelectedBasisChange={setPathBasis}
-                onApplyBasis={applyPathBasis}
-                onBookHedgeProfile={
-                  onPreparedByCcyChange ? bookHedgeProfile : undefined
-                }
+                onApplyBasis={() => {}}
+                onBookHedgeProfile={bookHedgeProfile}
                 summaryMetricsPlacement="none"
                 onSummaryMetricsChange={setPathSummaryMetrics}
                 prepareCtaPlacement="external"
                 onPrepareActionChange={setPathPrepareAction}
+                lockOptimizeMix
                 stripAlreadyBooked={
                   chartRow
                     ? hasRollingStripForCcy(bookedHedges, chartRow.ccy)
                     : false
                 }
-                hedgeStructure={hedgeStructure}
+                hedgeStructure={chartStructure}
                 onHedgeStructureChange={s => {
                   setHedgeStructure(s);
                   if (chartRow) {
@@ -2456,13 +3647,10 @@ export function VarAnalyticsPanel({
                   }
                 }}
                 stripLegCount={
-                  stagedChartSchedule.stripLegCount
-                  ?? (chartRow
+                  chartRow
                     ? (stripLegCountByCcy[chartRow.ccy] ?? null)
-                    : null)
+                    : null
                 }
-                scheduleEndMonths={stagedChartSchedule.ends}
-                scheduleHedgeWeights={stagedChartSchedule.weights}
                 onStripLegCountChange={n => {
                   if (!chartRow) return;
                   setStripLegCountByCcy(prev => ({
@@ -2476,7 +3664,7 @@ export function VarAnalyticsPanel({
           </div>,
           document.body,
         )}
-      </>
+      </AnalyticsWizardShell>
       )}
     </div>
   );

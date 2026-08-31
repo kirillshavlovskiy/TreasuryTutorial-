@@ -109,11 +109,11 @@ export function CfarDrawdownChart({
   const pts = bands.points;
   if (pts.length < 2) return null;
   const W = 560;
-  const H = height;
   const padL = 48;
   const padR = 12;
-  const padT = 14;
+  const padT = showHeader ? 14 : 36;
   const padB = 24;
+  const H = showHeader ? height : height + 16;
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
   const T = pts[pts.length - 1]!.t || 1;

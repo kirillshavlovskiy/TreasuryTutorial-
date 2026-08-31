@@ -423,6 +423,37 @@ export const POLICY_VAR_LIMITS = [
   { usd: 20, label: '$20M', who: 'CFO' },
 ] as const;
 
+/** Default overlay Policy VAR rung — Treasury $5M. */
+export const DEFAULT_POLICY_VAR_USD_M = POLICY_VAR_LIMITS[0].usd;
+
+/**
+ * Default Controls stack: Portfolio level, $5M Policy VAR, plus the
+ * curvature layers `setBufferLevel('portfolio')` would turn on.
+ * Empty desk layers used to land on Currency; this is the starting mix.
+ */
+export const DEFAULT_BUFFER_LAYERS: readonly LayerId[] = [
+  'floorH',
+  'sigmaP',
+  'carryOptim',
+  'cfarCover',
+  'portfolioDiv',
+];
+
+/** Who must sign off to run this residual VAR (fx-hedging-policy.md, 95%). */
+export type VarApprovalWho = 'Treasury' | 'Director of Finance' | 'CFO' | 'CEO';
+
+export function varApprovalRequired(varUsdM: number): {
+  needed: boolean;
+  who: VarApprovalWho;
+  rungUsd: number | null;
+} {
+  const v = Number.isFinite(varUsdM) ? varUsdM : 0;
+  if (v > 20) return { needed: true, who: 'CEO', rungUsd: 20 };
+  if (v > 10) return { needed: true, who: 'CFO', rungUsd: 10 };
+  if (v > 5) return { needed: true, who: 'Director of Finance', rungUsd: 5 };
+  return { needed: false, who: 'Treasury', rungUsd: null };
+}
+
 /**
  * Approval-rung cap for Conservative / Balanced / Max Carry placement.
  * A selected fill (Conservative $2.1M, a custom sample) is not a cap —
@@ -690,6 +721,55 @@ export function fundingSwapPathCarryUsdM(
     ),
     0,
   );
+}
+
+/** Deposit-rate CIP points path (Σ monthly points) — alias used by cash-carry tests. */
+export function fundingSwapPathPointsUsdM(
+  plan: readonly { standing_swap: number }[] | undefined,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+): number | null {
+  if (!plan?.length) return null;
+  return plan.reduce(
+    (s, p) => s + fundingSwapCipPointsUsdYr(p.standing_swap, spot, r_FCY, r_USD) / FUNDING_SWAP_MONTHS_PA,
+    0,
+  );
+}
+
+/** FCY O/N leg of the funding-swap overlay ($M/yr). */
+export function fundingSwapFcyOnUsdYr(
+  standingSwap: number,
+  spot: number,
+  r_FCY: number,
+): number {
+  return standingSwap * (r_FCY / 100) * spot;
+}
+
+/** Path Σ of monthly FCY O/N on each cycle's standing book. */
+export function fundingSwapPathFcyOnUsdM(
+  plan: readonly { standing_swap: number }[] | undefined,
+  spot: number,
+  r_FCY: number,
+): number | null {
+  if (!plan?.length) return null;
+  return plan.reduce(
+    (s, p) => s + fundingSwapFcyOnUsdYr(p.standing_swap, spot, r_FCY) / FUNDING_SWAP_MONTHS_PA,
+    0,
+  );
+}
+
+/**
+ * Cash leg at the credit curve (r_FCY − r_USD) — equals −CIP points.
+ * Distinct from {@link fundingSwapCashDeltaUsdYr} which uses OD on shorts.
+ */
+export function fundingSwapCashLegUsdYr(
+  standingSwap: number,
+  spot: number,
+  r_FCY: number,
+  r_USD: number,
+): number {
+  return standingSwap * ((r_FCY - r_USD) / 100) * spot;
 }
 
 /** Path CIP P&L lives in fx-market-rates (`fundingSwapPathFarCipUsdM`) — far-leg swap points. */
@@ -1836,6 +1916,66 @@ export function computeEffectiveUsdBudget(usdCash_M: number, usdPayout_M: number
   return Math.max(0, usdCash_M + Math.min(0, usdPayout_M));
 }
 
+export interface LiquidityCapitalAllocation {
+  totalCapitalUsdM: number;
+  /** USD payout H* reserved first — NWC that must stay in USD. */
+  usdNwcReservedM: number;
+  /** Residual FX Net CFaR ring-fenced when Forecast accuracy / CFaR cover is on. */
+  cfarCoverageAllocatedM: number;
+  /** Overlay / hedge cover funded from leftover capital (net USD drawn into FCY). */
+  fcyNwcAllocatedM: number;
+  /** Capital still free after USD NWC + CFaR cover + FCY overlay. */
+  unallocatedUsdM: number;
+  /** True when USD reserve, CFaR cover, or FCY overlay ask exceeds remaining capital. */
+  capitalBinding: boolean;
+}
+
+/**
+ * Split treasury capital for the liquidity model.
+ *
+ * Total capital is the input. USD payout NWC is reserved first (same priority
+ * as `assessUsdLiquidityPriority`). CFaR cover is next, then FCY overlay/hedge
+ * from what remains. Unallocated is leftover after all three.
+ */
+export function allocateLiquidityCapital(args: {
+  totalCapitalUsdM: number;
+  usdPayoutBufferM: number;
+  fcyOverlayUsdM: number;
+  /** Residual FX-only Net CFaR to ring-fence (0 when CFaR cover is off). */
+  cfarCoverageUsdM?: number;
+}): LiquidityCapitalAllocation {
+  const total = Math.max(0, Number.isFinite(args.totalCapitalUsdM) ? args.totalCapitalUsdM : 0);
+  const usdAsk = Math.max(0, Number.isFinite(args.usdPayoutBufferM) ? args.usdPayoutBufferM : 0);
+  const cfarAsk = Math.max(0, Number.isFinite(args.cfarCoverageUsdM) ? args.cfarCoverageUsdM! : 0);
+  const fcyAsk = Math.max(0, Number.isFinite(args.fcyOverlayUsdM) ? args.fcyOverlayUsdM : 0);
+  const usdNwcReservedM = Math.min(usdAsk, total);
+  const afterUsd = Math.max(0, total - usdNwcReservedM);
+  const cfarCoverageAllocatedM = Math.min(cfarAsk, afterUsd);
+  const afterCfar = Math.max(0, afterUsd - cfarCoverageAllocatedM);
+  const fcyNwcAllocatedM = Math.min(fcyAsk, afterCfar);
+  return {
+    totalCapitalUsdM: total,
+    usdNwcReservedM,
+    cfarCoverageAllocatedM,
+    fcyNwcAllocatedM,
+    unallocatedUsdM: Math.max(0, afterCfar - fcyNwcAllocatedM),
+    capitalBinding:
+      usdAsk > total + 0.001
+      || cfarAsk > afterUsd + 0.001
+      || fcyAsk > afterCfar + 0.001,
+  };
+}
+
+/** Net USD drawn by a long-FCY overlay (short FCY returns USD). */
+export function overlayUsdCapitalDrawM(legs: readonly { usdM: number }[]): number {
+  let net = 0;
+  for (const leg of legs) {
+    if (Number.isFinite(leg.usdM)) net += leg.usdM;
+  }
+  return Math.max(0, net);
+}
+
+
 // ─── helpers used in optimizePortfolioCarry ──────────────────────────────────
 
 /** Carry delta for a given scale using Lagrangian penalties (λ_var, λ_usd). */
@@ -2334,6 +2474,8 @@ export interface PortfolioCarryFrontier {
    * book-scale walk, which is what the default Portfolio chart renders.
    */
   tangencyIndex?: number;
+  /** Desk target carry in millions USD/yr. Used by all regimes except unhedged. */
+  carryTargetUsdYrM?: number | null;
 }
 
 export function sweepPortfolioCarryFrontier(

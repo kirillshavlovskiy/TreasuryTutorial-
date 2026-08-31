@@ -2,11 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   clampCoverRatio,
   decisionRowFor,
+  decisionRowFromPrepared,
+  pickDecisionRow,
   scaleDecisionRow,
 } from '@/components/LiquiditySwapDecision';
 import type { FcyComputedRow } from '@/lib/dashboard-model';
 import type { LiquidityCycleProjection } from '@/lib/forecast-profile';
 import { ccySpotRate } from '@/lib/fx-buffer';
+import type { PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
 
 /**
  * Only the fields decisionRowFor / swapLegSchedule actually read — the real
@@ -215,5 +218,96 @@ describe('scaleDecisionRow', () => {
     const none = scaleDecisionRow(d, 0);
     expect(none.nearLeg).toBe(0);
     expect(none.usdFunded).toBe(0);
+  });
+});
+
+describe('decisionRowFromPrepared — Exposure · hedge structuring', () => {
+  const twelveCycleH = mkPlan(
+    Array.from({ length: 12 }, (_, i) => ({
+      swap_needed: i === 0 ? -2.5 : 0.9,
+      standing_swap: i === 0 ? -2.5 : -1.6,
+      drawdown: 4.11,
+    })),
+  );
+
+  const eurRow = mkRow({
+    ccy: 'EUR',
+    r_FCY: 1.78,
+    swapNear: -2.5,
+    liquidityPlan: twelveCycleH,
+  });
+
+  const eurStrip: PreparedHedgeProfile = {
+    structure: 'strip',
+    basis: 'totalExpected',
+    ticketBasis: 'stock',
+    coverLocalM: 16.3,
+    hedgeRatio: 1,
+    legs: [
+      {
+        index: 0,
+        startMonth: 0,
+        endMonth: 4,
+        settleMonths: 4,
+        hedgeLocalM: 5.433,
+        tradeNotionalLocalM: 5.433,
+        label: 'L1',
+      },
+      {
+        index: 1,
+        startMonth: 0,
+        endMonth: 8,
+        settleMonths: 8,
+        hedgeLocalM: 10.866,
+        tradeNotionalLocalM: 5.433,
+        label: 'L2',
+      },
+      {
+        index: 2,
+        startMonth: 0,
+        endMonth: 12,
+        settleMonths: 12,
+        hedgeLocalM: 16.3,
+        tradeNotionalLocalM: 5.434,
+        label: 'L3',
+      },
+    ],
+  };
+
+  it('a staged 3-leg strip replaces the 12-cycle H* plan — Target is package cover', () => {
+    const fromPlan = decisionRowFor(eurRow, 3.5)!;
+    expect(fromPlan.schedule.length).toBeGreaterThan(3);
+
+    const d = decisionRowFromPrepared(eurStrip, eurRow, 3.5)!;
+    expect(d.nearLeg).toBeCloseTo(16.3, 6);
+    expect(d.schedule).toHaveLength(3);
+    expect(d.cycles).toBe(3);
+    expect(d.endingBook).toBeCloseTo(16.3, 6);
+    expect(d.schedule[0]!.newLeg).toBeCloseTo(5.433, 6);
+    expect(d.schedule.filter(l => l.preBookable)).toHaveLength(2);
+  });
+
+  it('pickDecisionRow prefers the staged package over Liquidity H*', () => {
+    const d = pickDecisionRow(eurRow, 3.5, eurStrip)!;
+    expect(d.nearLeg).toBeCloseTo(16.3, 6);
+    expect(d.schedule).toHaveLength(3);
+  });
+
+  it('pickDecisionRow keeps the H* plan when nothing is staged', () => {
+    const d = pickDecisionRow(eurRow, 3.5)!;
+    expect(d.nearLeg).toBeCloseTo(-2.5, 6);
+  });
+
+  it('a staged 0-cover bullet does not hide a real H* plan', () => {
+    const empty: PreparedHedgeProfile = {
+      structure: 'bullet',
+      basis: 'cash',
+      ticketBasis: 'stock',
+      coverLocalM: 0,
+      hedgeRatio: 0,
+      legs: [],
+    };
+    const d = pickDecisionRow(eurRow, 3.5, empty)!;
+    expect(d.nearLeg).toBeCloseTo(-2.5, 6);
   });
 });

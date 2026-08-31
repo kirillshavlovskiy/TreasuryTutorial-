@@ -19,7 +19,6 @@ import {
   chipsFromPathSummary,
   HedgeStagingHeader,
   pathChartDraftDirty,
-  scheduleFromPreparedProfile,
 } from '@/components/test-mode/HedgeStagingHeader';
 import {
   DEFAULT_FORECAST_PROFILE,
@@ -48,8 +47,10 @@ import {
   overlayRiskFromFxBook,
   proposeBookHedge,
   setPreparedHedgeForCcy,
+  releasedPreparedByCcy,
   stagedFxHedgeCarryByCcyUsdM,
   varSetupWithLineUncertainty,
+  type HedgeIpaQuote,
   type HedgeInstrument,
   type HedgeTicket,
   type PreparedHedgeLeg,
@@ -58,8 +59,13 @@ import {
 import { assignImpliedCarryFromSwapPoints } from '@/lib/test-mode/cash-carry-analytics';
 import {
   resolveMarketRatesForCcy,
+  usdMarketPair,
   type FxMarketRatesBundle,
 } from '@/lib/fx-market-rates';
+import { todayIso } from '@/lib/isoDates';
+import { dateFromTenor } from '@/lib/marketTenors';
+import { priceWithRefinitiv } from '@/lib/refinitivPriceClient';
+import { strikeInputToContract } from '@/lib/strikeNotation';
 import {
   buildRollingHedgeEdges,
   bulletMaturityForForecast,
@@ -175,8 +181,25 @@ function ticketLabel(t: HedgeTicket): string {
       : t.instrument === 'option'
         ? `${side} ${t.ccy} opt ${tenor ?? ''} ${amt}`.replace(/\s+/g, ' ').trim()
         : `${side} ${t.ccy} fwd ${tenor ?? ''} ${amt}`.replace(/\s+/g, ' ').trim();
-  return t.entityName ? `${base} · ${t.entityName}` : base;
+  const prem =
+    t.ipaQuote?.premiumUsd != null && Number.isFinite(t.ipaQuote.premiumUsd)
+      ? ` · IPA $${(t.ipaQuote.premiumUsd / 1000).toFixed(1)}K`
+      : t.ipaQuote?.fxOutright != null
+        ? ` · F ${t.ipaQuote.fxOutright.toFixed(4)}`
+        : '';
+  return t.entityName ? `${base}${prem} · ${t.entityName}` : `${base}${prem}`;
 }
+
+const HORIZON_TO_IPA_TENOR: Record<VarHorizonId, string> = {
+  '1w': '1W',
+  '1m': '1M',
+  '3m': '3M',
+  '6m': '6M',
+  '9m': '9M',
+  '1y': '1Y',
+};
+
+const STRIKE_CHIPS = ['ATMF', 'ATM', '25d', '10d'] as const;
 
 /**
  * Strip leg shaping — how the target notional splits across legs.
@@ -352,7 +375,8 @@ export function HedgingDecisionLayer({
   };
   const ratios = controlledRatios ?? localRatios;
   const booked = controlledBooked ?? localBooked;
-  const preparedByCcy = controlledPrepared ?? localPrepared;
+  const allPrepared = controlledPrepared ?? localPrepared;
+  const preparedByCcy = releasedPreparedByCcy(allPrepared);
   const setRatios = (next: Record<string, number>) => {
     if (onHedgeRatiosChange) onHedgeRatiosChange(next);
     else setLocalRatios(next);
@@ -513,7 +537,11 @@ export function HedgingDecisionLayer({
     setChartCcy(ccy);
   };
 
-  const closePathChart = () => setChartCcy(null);
+  const closePathChart = () => {
+    setChartCcy(null);
+    setPathPrepareAction(null);
+    setPathSummaryMetrics(null);
+  };
 
   const chartRow = chartCcy
     ? summary.rows.find(r => r.ccy === chartCcy)
@@ -521,10 +549,6 @@ export function HedgingDecisionLayer({
   const chartBar = chartCcy
     ? risk.find(r => r.bar.ccy === chartCcy)?.bar
     : undefined;
-  const stagedChartSchedule = useMemo(
-    () => scheduleFromPreparedProfile(chartCcy ? preparedByCcy[chartCcy] : undefined),
-    [chartCcy, preparedByCcy],
-  );
 
   const applyPathBasis = (
     basis: HedgePathBasisId,
@@ -567,7 +591,6 @@ export function HedgingDecisionLayer({
       startM,
       endM,
       bulletEq,
-      chartRow.ccy,
     );
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
@@ -644,12 +667,16 @@ export function HedgingDecisionLayer({
           ),
           bulletSettleMonths: defaultTf,
           ccy: chartRow.ccy,
+          bookRows,
+          forecastProfile,
+          forecastMonths: varSetup.forecastMonths,
         },
       );
       setPreparedByCcy(prev =>
         setPreparedHedgeForCcy(prev, chartRow.ccy, {
           ...profile,
           preparedFor: 'var',
+          approvalStatus: 'approved',
         }),
       );
       // Stay open — Stage keeps the modal up with a live "Staged" badge.
@@ -678,7 +705,7 @@ export function HedgingDecisionLayer({
       flowsForCcy ?? flows,
     ).amountLocalM;
     const target =
-      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq, chartRow.ccy) * coverPct;
+      hedgeBasisNotionalLocalM(basis, startM, endM, bulletEq) * coverPct;
     const target100 = Math.abs(chartRow.targetHedgeLocalM);
     const ratio =
       target100 < 1e-12
@@ -704,12 +731,16 @@ export function HedgingDecisionLayer({
         ),
         bulletSettleMonths,
         ccy: chartRow.ccy,
+        bookRows,
+        forecastProfile,
+        forecastMonths: varSetup.forecastMonths,
       },
     );
     setPreparedByCcy(prev =>
       setPreparedHedgeForCcy(prev, chartRow.ccy, {
         ...profile,
         preparedFor: 'var',
+        approvalStatus: 'approved',
       }),
     );
     // Stay open — Stage keeps the modal up with a live "Staged" badge.
@@ -936,12 +967,16 @@ export function HedgingDecisionLayer({
         bulletSettleMonths:
           varSetup.forecastMonths || horizonMonths(varSetup.horizon),
         ccy: rollingStrip.ccy,
+        bookRows,
+        forecastProfile,
+        forecastMonths: varSetup.forecastMonths,
       },
     );
     setPreparedByCcy(prev =>
       setPreparedHedgeForCcy(prev, rollingStrip.ccy, {
         ...profile,
         preparedFor: 'var',
+        approvalStatus: 'approved',
       }),
     );
   };
@@ -1023,7 +1058,14 @@ export function HedgingDecisionLayer({
           hedgeRatio: 0,
           settleMonths: cfg.t[0] ?? bulletTf,
         },
-        { marketRates: rates, bulletSettleMonths: bulletTf, ccy },
+        {
+          marketRates: rates,
+          bulletSettleMonths: bulletTf,
+          ccy,
+          bookRows,
+          forecastProfile,
+          forecastMonths: varSetup.forecastMonths,
+        },
       );
     }
     const preset =
@@ -1058,7 +1100,14 @@ export function HedgingDecisionLayer({
         coverLocalM: cum,
         hedgeRatio: 0,
       },
-      { marketRates: rates, bulletSettleMonths: bulletTf, ccy },
+      {
+        marketRates: rates,
+        bulletSettleMonths: bulletTf,
+        ccy,
+        bookRows,
+        forecastProfile,
+        forecastMonths: varSetup.forecastMonths,
+      },
     );
   };
 
@@ -1115,6 +1164,7 @@ export function HedgingDecisionLayer({
       setPreparedHedgeForCcy(prev, ccy, {
         ...profile,
         preparedFor: 'var',
+        approvalStatus: 'approved',
       }),
     );
   };
@@ -1123,10 +1173,7 @@ export function HedgingDecisionLayer({
     const cfg = structCfg[ccy] ?? deriveStructCfg(ccy);
     const structure = structureFor(ccy);
     setHedgeStructure(structure);
-    const pct = structPctFor(ccy);
-    const usePct = pct < 1 ? 100 : pct;
-    if (pct < 1) setStructRatio(ccy, 100);
-    commitStructured(ccy, usePct, structure, cfg);
+    commitStructured(ccy, structPctFor(ccy), structure, cfg);
   };
 
   /** Cash / VaR-neutral / Target quick-apply — sets ratio; Restage if a package is already staged. */
@@ -1575,7 +1622,8 @@ export function HedgingDecisionLayer({
                 prepared != null
                 && previewProfile != null
                 && structuredDraftDirty(previewProfile, prepared);
-              const showStage = !flat;
+              const showStage =
+                !flat && Math.abs(structPctFor(r.ccy)) >= 1e-9;
               const shapeBtn = (on: boolean) =>
                 `rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
                   on
@@ -1640,11 +1688,7 @@ export function HedgingDecisionLayer({
                     <span className="text-right font-mono text-[11px] font-semibold tabular-nums text-emerald-300">
                       {overview ? fmtVarK(overview.varTotal) : '—'}
                     </span>
-                    <span
-                      className={`truncate text-[9px] ${muted}`}
-                      onClick={e => e.stopPropagation()}
-                      onKeyDown={e => e.stopPropagation()}
-                    >
+                    <span className={`truncate text-[9px] ${muted}`}>
                       {tradeCount === 0
                         ? isStrip
                           ? `${cfg.legCount}-leg strip`
@@ -1663,21 +1707,6 @@ export function HedgingDecisionLayer({
                           ]
                             .filter(Boolean)
                             .join(' · ')}
-                      {prepared ? (
-                        <button
-                          type="button"
-                          title="Drop this staged package"
-                          onClick={e => {
-                            e.stopPropagation();
-                            discardPrepared(r.ccy);
-                          }}
-                          className="ml-1.5 rounded border border-rose-600/40 bg-rose-500/10 px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide text-rose-200 hover:bg-rose-500/20"
-                        >
-                          {prepared.structure === 'strip' && prepared.legs.length > 1
-                            ? 'Unstage strip'
-                            : 'Unstage'}
-                        </button>
-                      ) : null}
                     </span>
                     <span className="text-right font-mono text-[11px] font-semibold tabular-nums text-sky-300">
                       {fmtLocal(r.hedgeNotionalLocalM, r.ccy)}
@@ -2158,7 +2187,7 @@ export function HedgingDecisionLayer({
                         {showStage ? (
                         <button
                           type="button"
-                          disabled={flat}
+                          disabled={flat || Math.abs(structPctFor(r.ccy)) < 1e-9}
                           title={
                             prepared
                               ? 'Restage — write this draft over the staged package'
@@ -2173,13 +2202,11 @@ export function HedgingDecisionLayer({
                         <button
                           type="button"
                           disabled={!prepared}
-                          title="Drop this staged package from Decision / Cash Carry / Liquidity — does not cancel a booked ticket"
+                          title="Reset staged package — Decision and Liquidity drop this CCY"
                           onClick={() => discardPrepared(r.ccy)}
-                          className="rounded-md border border-rose-600/50 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-30"
+                          className="rounded-md border border-slate-600 px-2.5 py-1 text-[11px] font-semibold text-slate-400 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-30"
                         >
-                          {prepared?.structure === 'strip' && prepared.legs.length > 1
-                            ? `Unstage ${prepared.legs.length}-leg strip`
-                            : 'Unstage'}
+                          Reset
                         </button>
                         <button
                           type="button"
@@ -2260,6 +2287,7 @@ export function HedgingDecisionLayer({
         forecastMonths={forecastMonths ?? varSetup.forecastMonths ?? 1}
         onSizingBasisChange={onSizingBasisChange}
         onBookingModeChange={onBookingModeChange}
+        preparedByCcy={preparedByCcy}
         embedded={embedded}
       />
 
@@ -2321,16 +2349,20 @@ export function HedgingDecisionLayer({
                   prepareAction={
                     pathPrepareAction
                     ?? {
-                      label: 'Stage hedging strategy',
-                      title: 'Stage this path — then Book under this CCY',
-                      disabled: false,
-                      run: () =>
-                        bookHedgeProfileFromChart({
-                          structure: effectiveStructure,
-                          basis: pathBasis,
-                          edges: [],
-                        }),
-                    }
+                        label: 'Stage hedging strategy',
+                        title:
+                          'Stage this path — then Book under this CCY',
+                        disabled: false,
+                        run: () =>
+                          bookHedgeProfileFromChart({
+                            structure: effectiveStructure,
+                            basis: pathBasis,
+                            edges: [],
+                            bulletSettleMonths:
+                              pathSummaryMetrics?.settleMonths,
+                            coverPct: chartRow.hedgeRatio,
+                          }),
+                      }
                   }
                   onReset={
                     chartCcy && preparedByCcy[chartCcy]
@@ -2342,7 +2374,7 @@ export function HedgingDecisionLayer({
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4">
               <ExposureHedgePathChart
-                key={`${chartRow.ccy}-${pathBasis}-${effectiveStructure}-${hedgeSizingSetup.horizon}-${varSetup.forecastMonths}-${varSetup.exposureBasis}-${hasRollingStripForCcy(booked, chartRow.ccy) ? 'strip' : 'open'}`}
+                key={`${chartRow.ccy}-${hedgeSizingSetup.horizon}-${varSetup.forecastMonths}-${varSetup.exposureBasis}-${hasRollingStripForCcy(booked, chartRow.ccy) ? 'strip' : 'open'}`}
                 ccy={chartRow.ccy}
                 stockM={chartBar.stockNetM}
                 monthlyFlowM={
@@ -2380,9 +2412,6 @@ export function HedgingDecisionLayer({
                 )}
                 hedgeStructure={hedgeStructure}
                 onHedgeStructureChange={setHedgeStructure}
-                stripLegCount={stagedChartSchedule.stripLegCount}
-                scheduleEndMonths={stagedChartSchedule.ends}
-                scheduleHedgeWeights={stagedChartSchedule.weights}
               />
               </div>
             </div>
@@ -2411,6 +2440,10 @@ function BookHedgeModal({
       : varSetup.horizon;
   const [instrument, setInstrument] = useState<HedgeInstrument>(ticket.instrument);
   const [tenor, setTenor] = useState<VarHorizonId>(defaultTenor);
+  const [strikeInput, setStrikeInput] = useState(ticket.ipaQuote?.strikeInput ?? 'ATMF');
+  const [quote, setQuote] = useState<HedgeIpaQuote | null>(ticket.ipaQuote ?? null);
+  const [priceBusy, setPriceBusy] = useState(false);
+  const [priceError, setPriceError] = useState<string | null>(null);
 
   const side = ticket.amountLocalM >= 0 ? 'Sell' : 'Buy';
   const basisLabel =
@@ -2420,12 +2453,14 @@ function BookHedgeModal({
     varSetup.exposureBasis;
 
   const draftTicket: HedgeTicket = useMemo(() => {
+    const stamped = quote ? { ipaQuote: quote } : {};
     if (instrument === 'spot') {
       return {
         ...ticket,
         instrument: 'spot',
         maturity: null,
         maturityLabel: null,
+        ...stamped,
       };
     }
     return {
@@ -2433,8 +2468,59 @@ function BookHedgeModal({
       instrument,
       maturity: tenor,
       maturityLabel: tenorLabel(tenor),
+      ...stamped,
     };
-  }, [ticket, instrument, tenor]);
+  }, [ticket, instrument, tenor, quote]);
+
+  const runPrice = async () => {
+    setPriceError(null);
+    setPriceBusy(true);
+    try {
+      const valuationDate = todayIso();
+      const ipaTenor = instrument === 'spot' ? '1W' : HORIZON_TO_IPA_TENOR[tenor];
+      const endDate = dateFromTenor(valuationDate, ipaTenor);
+      if (!endDate) throw new Error(`Cannot map tenor ${ipaTenor} to an expiry`);
+      const longFcy = ticket.amountLocalM >= 0;
+      const callPut = longFcy ? 'Put' : 'Call';
+      const strikeFields = strikeInputToContract(strikeInput, callPut);
+      if (!strikeFields) throw new Error('Strike must be ATMF / ATM / 25d or a positive number');
+      const pair = usdMarketPair(ticket.ccy);
+      const { quotes } = await priceWithRefinitiv({
+        valuationDate,
+        contracts: [{
+          instrumentTag: `${ticket.ccy}_${instrument}_${ipaTenor}`,
+          fxCrossCode: pair,
+          structure: 'vanilla',
+          callPut,
+          buySell: 'Buy',
+          ...strikeFields,
+          endDate,
+          notionalAmount: Math.abs(ticket.amountLocalM) * 1_000_000,
+          notionalCcy: ticket.ccy,
+          exerciseStyle: 'EURO',
+        }],
+      });
+      const q = quotes[0];
+      if (!q) throw new Error('IPA returned no quote');
+      if (q.errorMessage) throw new Error(q.errorMessage);
+      setQuote({
+        strike: q.strike,
+        strikeInput,
+        premiumUsd: q.marketValueDomestic,
+        premiumPercent: q.premiumPercent,
+        fxSpot: q.fxSpot,
+        fxOutright: q.fxOutright,
+        atmVolPercent: q.atmVolPercent,
+        impliedVolPercent: q.impliedVolPercent,
+        deltaPercent: q.deltaPercent,
+      });
+    } catch (e) {
+      setQuote(null);
+      setPriceError(e instanceof Error ? e.message : 'IPA price failed');
+    } finally {
+      setPriceBusy(false);
+    }
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -2460,8 +2546,8 @@ function BookHedgeModal({
         </h4>
         <p className="mt-1 text-xs text-slate-400">
           Size follows Hedge add % on the Analytics-selected exposure (
-          {activeBasisLabel}) · {varSetup.confidencePct}% · {varSetup.horizon}. Choose instrument
-          and tenor, then confirm.
+          {activeBasisLabel}) · {varSetup.confidencePct}% · {varSetup.horizon}.
+          Price pulls a live IPA quote (same session as Market data). Then confirm.
         </p>
 
         <div className="mt-4 space-y-3">
@@ -2489,6 +2575,46 @@ function BookHedgeModal({
               })}
             </div>
           </div>
+
+          {instrument !== 'spot' && (
+            <div>
+              <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                Strike
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {STRIKE_CHIPS.map(chip => {
+                  const on = strikeInput.toUpperCase() === chip.toUpperCase();
+                  return (
+                    <button
+                      key={chip}
+                      type="button"
+                      onClick={() => {
+                        setStrikeInput(chip);
+                        setQuote(null);
+                      }}
+                      className={`rounded-md border px-2.5 py-1 text-[11px] font-semibold ${
+                        on
+                          ? 'border-sky-500 bg-sky-500/20 text-sky-100'
+                          : 'border-slate-700 text-slate-400 hover:border-slate-500'
+                      }`}
+                    >
+                      {chip === '25d' ? '25Δ' : chip === '10d' ? '10Δ' : chip}
+                    </button>
+                  );
+                })}
+                <input
+                  type="text"
+                  value={strikeInput}
+                  onChange={ev => {
+                    setStrikeInput(ev.target.value);
+                    setQuote(null);
+                  }}
+                  title="ATMF, ATM, 25d, or an absolute strike"
+                  className="h-7 w-24 rounded-md border border-slate-700 bg-slate-950 px-2 font-mono text-[11px] text-slate-200 outline-none focus:border-sky-500"
+                />
+              </div>
+            </div>
+          )}
 
           {instrument !== 'spot' && (
             <div>
@@ -2565,7 +2691,61 @@ function BookHedgeModal({
               <span className="font-mono text-xs text-slate-300">{ticketLabel(draftTicket)}</span>
             }
           />
+          {quote && (
+            <>
+              <Row
+                term="IPA strike"
+                detail={
+                  <span className="font-mono text-xs">
+                    {quote.strike != null ? quote.strike.toFixed(5) : '—'}
+                    <span className="ml-1 text-slate-500">{quote.strikeInput}</span>
+                  </span>
+                }
+              />
+              <Row
+                term="Spot / outright"
+                detail={
+                  <span className="font-mono text-xs">
+                    {quote.fxSpot != null ? quote.fxSpot.toFixed(5) : '—'}
+                    {' → '}
+                    {quote.fxOutright != null ? quote.fxOutright.toFixed(5) : '—'}
+                  </span>
+                }
+              />
+              <Row
+                term="Premium"
+                detail={
+                  <span className="font-mono text-xs text-sky-200">
+                    {quote.premiumUsd != null
+                      ? `$${quote.premiumUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+                      : '—'}
+                    {quote.premiumPercent != null
+                      ? ` · ${quote.premiumPercent.toFixed(3)}%`
+                      : ''}
+                  </span>
+                }
+              />
+              <Row
+                term="Vol / Δ"
+                detail={
+                  <span className="font-mono text-xs">
+                    {quote.impliedVolPercent != null
+                      ? `${quote.impliedVolPercent.toFixed(2)}%`
+                      : quote.atmVolPercent != null
+                        ? `${quote.atmVolPercent.toFixed(2)}% ATM`
+                        : '—'}
+                    {quote.deltaPercent != null
+                      ? ` · Δ ${quote.deltaPercent.toFixed(1)}`
+                      : ''}
+                  </span>
+                }
+              />
+            </>
+          )}
         </dl>
+        {priceError && (
+          <p className="mt-2 text-[11px] text-rose-300">{priceError}</p>
+        )}
 
         <div className="mt-5 flex justify-end gap-2">
           <button
@@ -2574,6 +2754,15 @@ function BookHedgeModal({
             className="rounded-md border border-slate-600 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
           >
             Cancel
+          </button>
+          <button
+            type="button"
+            disabled={priceBusy}
+            onClick={() => void runPrice()}
+            title="Fetch a live Refinitiv IPA quote for this ticket"
+            className="rounded-md border border-sky-500/50 bg-sky-500/15 px-3 py-1.5 text-xs font-semibold text-sky-100 hover:bg-sky-500/25 disabled:opacity-40"
+          >
+            {priceBusy ? 'Pricing…' : quote ? 'Reprice' : 'Price'}
           </button>
           <button
             type="button"

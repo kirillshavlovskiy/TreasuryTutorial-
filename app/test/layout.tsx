@@ -1,13 +1,12 @@
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import type { Session } from 'next-auth';
-import { auth, signIn } from '@/auth';
+import { auth, type AuthSession } from '@/auth';
 import { BrandMark } from '@/components/BrandMark';
 import { ModeNav } from '@/components/ModeNav';
 import { UserAvatarMenu } from '@/components/UserAvatarMenu';
 import { isTestModeEnabled, TEST_GUEST_EMAIL } from '@/lib/test-mode/enabled';
 
-function isAuthenticatedUser(session: Session | null): boolean {
+function isAuthenticatedUser(session: AuthSession | null): boolean {
   const user = session?.user;
   if (!user) return false;
   if ((user as { isTestGuest?: boolean }).isTestGuest) return false;
@@ -20,7 +19,8 @@ export default async function TestLayout({
 }: {
   children: React.ReactNode;
 }) {
-  if (!isTestModeEnabled()) {
+  const sandboxEnabled = isTestModeEnabled();
+  if (!sandboxEnabled) {
     redirect('/');
   }
 
@@ -32,7 +32,7 @@ export default async function TestLayout({
         <header className="border-b border-slate-800">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-4">
             <BrandMark href="/" label="Treasury Workbench Practice" />
-            <ModeNav sandboxEnabled />
+            <ModeNav sandboxEnabled={sandboxEnabled} />
           </div>
         </header>
         <main className="mx-auto flex max-w-lg flex-col items-center px-6 py-24 text-center">
@@ -40,21 +40,13 @@ export default async function TestLayout({
           <p className="mt-3 text-sm text-slate-400">
             Sign in with your Google account to access the practice sandbox and Sigma Tasks.
           </p>
-          <form
-            action={async () => {
-              'use server';
-              await signIn('google', { redirectTo: '/test' });
-            }}
-            className="mt-8"
+          <Link
+            href="/api/auth/login"
+            className="mt-8 inline-flex items-center gap-3 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-slate-800 shadow-lg transition-colors hover:bg-slate-100"
           >
-            <button
-              type="submit"
-              className="inline-flex items-center gap-3 rounded-lg bg-white px-6 py-3 text-sm font-semibold text-slate-800 shadow-lg transition-colors hover:bg-slate-100"
-            >
-              <GoogleIcon />
-              Sign in with Google
-            </button>
-          </form>
+            <GoogleIcon />
+            Sign in with Google
+          </Link>
           <Link href="/" className="mt-6 text-sm text-slate-400 hover:text-slate-200">
             ← Back to home
           </Link>
@@ -70,12 +62,12 @@ export default async function TestLayout({
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-4">
           <BrandMark href="/" label="Treasury Workbench Practice" />
           <div className="flex flex-wrap items-center gap-3">
-            <ModeNav sandboxEnabled />
+            <ModeNav sandboxEnabled={sandboxEnabled} />
             <UserAvatarMenu
               name={session!.user?.name}
               email={session!.user?.email}
               image={session!.user?.image}
-              sandboxEnabled
+              sandboxEnabled={sandboxEnabled}
             />
           </div>
         </div>

@@ -1,4 +1,4 @@
-import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
+import { analyticsSpotUsd, NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   type VarConfidencePct,
   isVarConfidencePct,
@@ -631,7 +631,7 @@ export function computeParametricVarUsdM(
   setup: Pick<VarSetup, 'confidencePct' | 'horizon'> &
     Partial<Pick<VarSetup, 'volSource'>>,
 ): number {
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const z = zForConfidence(setup.confidencePct);
   const vol = volForHorizon(setup.horizon, setup);
   return Math.abs(exposureLocalM) * spotUsd * vol * z;
@@ -649,7 +649,7 @@ export function linearBulletNotionalFromVarUsdM(
     Partial<Pick<VarSetup, 'volSource'>>,
 ): number {
   if (!(varUsdM > 0) || !Number.isFinite(varUsdM)) return 0;
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const unit =
     spotUsd *
     monthlyVolForSetup(setup) *
@@ -820,7 +820,7 @@ export function computeGrowingExposureVarUsdM(
   ccy: string,
   setup: Pick<VarSetup, 'confidencePct' | 'horizon' | 'forecastMonths' | 'volSource'>,
 ): number {
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const z = zForConfidence(setup.confidencePct);
   const path = growingExposurePathFactor(
     stockM,
@@ -975,7 +975,7 @@ export function computeForecastUncertaintyVarUsdM(
 ): number {
   const σE = forecastErrorStdForSetupM(monthlyFlowM, setup);
   if (σE <= 0) return 0;
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const z = zForConfidence(setup.confidencePct);
   const Th = horizonMonths(setup.horizon);
   return σE * spotUsd * monthlyVolForSetup(setup) * Math.sqrt(Th) * z;
@@ -1016,7 +1016,7 @@ export function computeAnalyticsVarUsdM(
    */
   tenureMonths?: number,
 ): number {
-  const spotUsd = NORDTECH_VAR.spotUsd[ccy] ?? 1;
+  const spotUsd = analyticsSpotUsd(ccy);
   const z = zForConfidence(setup.confidencePct);
   const Th =
     typeof tenureMonths === 'number' && tenureMonths > 0

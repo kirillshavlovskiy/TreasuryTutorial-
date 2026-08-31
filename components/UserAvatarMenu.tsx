@@ -2,13 +2,13 @@
 
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
-import { signOutToHome } from '@/app/test/sign-out';
 
 type UserAvatarMenuProps = {
   name?: string | null;
   email?: string | null;
   image?: string | null;
-  sandboxEnabled?: boolean;
+  /** Same `isTestModeEnabled()` value that gates `/test`; no implicit default. */
+  sandboxEnabled: boolean;
 };
 
 const itemCls =
@@ -18,7 +18,7 @@ export function UserAvatarMenu({
   name,
   email,
   image,
-  sandboxEnabled = true,
+  sandboxEnabled,
 }: UserAvatarMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -100,12 +100,20 @@ export function UserAvatarMenu({
           >
             Workbench · live desk
           </Link>
+          <Link
+            href="/treasury/rates"
+            role="menuitem"
+            className={itemCls}
+            onClick={() => setOpen(false)}
+          >
+            FX Rates · Treasury MCP
+          </Link>
           <div className="my-1 border-t border-slate-800" />
-          <form action={signOutToHome}>
-            <button type="submit" role="menuitem" className={itemCls}>
-              Log out
-            </button>
-          </form>
+          {/* Native navigation — avoid form action="/…" in client components
+              (Next.js treats action as a Server Action and throws). */}
+          <Link href="/api/auth/logout" role="menuitem" className={itemCls}>
+            Log out
+          </Link>
         </div>
       )}
     </div>

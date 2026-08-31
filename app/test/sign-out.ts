@@ -1,7 +1,7 @@
 'use server';
 
-import { signOut } from '@/auth';
+import { redirect } from 'next/navigation';
 
 export async function signOutToHome() {
-  await signOut({ redirectTo: '/' });
+  redirect('/api/auth/logout');
 }

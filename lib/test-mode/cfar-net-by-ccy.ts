@@ -42,7 +42,7 @@ import {
 } from '@/lib/test-mode/cfar-montecarlo';
 import { rateVolBpYrFor } from '@/lib/test-mode/cfar-residual';
 import type { CfarBandsResult } from '@/lib/test-mode/cfar-drawdown';
-import { NORDTECH_VAR } from '@/lib/test-mode/fixtures/nordtech-var';
+import { analyticsSpotUsd } from '@/lib/test-mode/fixtures/nordtech-var';
 import {
   isLiveHedgeTicket,
   stripTicketsForCcy,
@@ -207,7 +207,7 @@ function mcInputForRow(
     monthlyInflows,
     monthlyOutflows,
     tenureMonths: T,
-    spotUsd: NORDTECH_VAR.spotUsd[ccy] ?? 1,
+    spotUsd: analyticsSpotUsd(ccy),
     sigmaFxMonthly: monthlyVolForSetup(input.setup),
     confidencePct: input.setup.confidencePct,
     forecastUncertainty1m: effectiveForecastUncertainty1m(
@@ -250,7 +250,8 @@ export function fxHedgeMcCfarByCcy(
   const extraForwards = input.extraForwards
     ?? analyticsForwardsFromOverlays({
       overlayByCcy: input.swapForwardOverlayByCcy,
-      planByCcy: input.fundingPlanByCcy,
+      // FX-only path — funding plan is intentionally omitted from this input.
+      planByCcy: undefined,
       forecastMonths: T,
     });
   const out: Record<string, CfarBandsResult> = {};
@@ -287,7 +288,7 @@ function displayedNetFromFx(
     const bridge = fundingSwapBridgeBands({
       outstandingM: funding.outstandingM,
       T,
-      spotUsd: NORDTECH_VAR.spotUsd[ccy] ?? 1,
+      spotUsd: analyticsSpotUsd(ccy),
       sigmaMonthly: rateVolBpYrFor(ccy, input.setup) / 10000 / Math.sqrt(12),
       confidencePct: input.setup.confidencePct,
       termSettles: funding.termSettles,
@@ -369,7 +370,7 @@ export function displayedCfarUsdMFromFxNet(
   const bridge = fundingSwapBridgeBands({
     outstandingM: funding.outstandingM,
     T,
-    spotUsd: NORDTECH_VAR.spotUsd[ccy] ?? 1,
+    spotUsd: analyticsSpotUsd(ccy),
     sigmaMonthly: rateVolBpYrFor(ccy, setup) / 10000 / Math.sqrt(12),
     confidencePct: setup.confidencePct,
     termSettles: funding.termSettles,

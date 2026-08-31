@@ -1,8 +1,9 @@
-'use client';
+﻿'use client';
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { BrandMark } from '@/components/BrandMark';
 import { ModeNav } from '@/components/ModeNav';
+import type { TreasurySnapshot } from '@/lib/treasury/snapshot';
 import {
   IconBuilding,
   IconDashboard,
@@ -16,9 +17,6 @@ import {
 } from '@/components/WorkbenchIcons';
 import {
   OptimizeFrameworkIcon,
-  ProtectGoalIcon,
-  RateInstrumentIcon,
-  TickerGlyph,
 } from '@/components/RiskTaxonomyIcons';
 import { INITIAL_ROWS } from '@/lib/fx-buffer';
 import { WorkbenchFxDesk } from '@/components/workbench/WorkbenchFxDesk';
@@ -29,11 +27,7 @@ import type { ForecastProfileState } from '@/lib/forecast-profile';
 import {
   DEFAULT_VAR_SETUP,
   emptyHedgeBook,
-  hedgeBookHasContent,
-  hedgeBookLooksLikeAccidentalWipe,
-  hedgeLedgerChanged,
   mergeHedgeBooksPreservingPrepared,
-  pickHedgeBooksForWrite,
   normalizeVarSetup,
   subscribeSandboxPersist,
   type EntityHedgeBook,
@@ -47,8 +41,6 @@ import {
   createRiskProfile,
   applyStructureWizard,
   OPTIMIZE_FRAMEWORKS,
-  PROTECT_GOALS,
-  RATE_INSTRUMENTS,
   RISK_ASSETS,
   deleteEntity,
   deleteDashboard,
@@ -68,12 +60,14 @@ import {
   DECISION_LAYERS,
   ANALYTICAL_LAYERS,
   loadWorkspaceDetailed,
+  FX_CURRENCY_UNIVERSE,
+  DEFAULT_LP_CURRENCIES,
+  updateEntity,
   type Workspace,
   type Entity,
   type Dashboard,
   type RiskProfileType,
   type OptimizeFrameworkId,
-  type RateInstrument,
   type FxInput,
   type OptMetric,
   type DecisionLayer,
@@ -83,7 +77,8 @@ import {
   type FlowTiming,
 } from '@/lib/workspace-store';
 import { StructureWizard } from '@/app/workspace/StructureWizard';
-import { CreateDashboardWizard } from '@/app/workspace/CreateDashboardWizard';
+import { CreateDashboardWizard, CurrencyUniverseFields, EntityEditModal } from '@/app/workspace/CreateDashboardWizard';
+import { DashboardDeskCard } from '@/components/workspace/DashboardDeskCard';
 
 const SIM_CURRENCIES = INITIAL_ROWS.map(r => r.ccy);
 const BASE_CURRENCIES = ['USD', ...[...SIM_CURRENCIES].sort()];
@@ -93,11 +88,16 @@ interface WorkspaceAppProps {
   userName: string;
   accountMenu: ReactNode;
   sandboxEnabled?: boolean;
+  /** Whether Treasury OAuth is configured server-side at all (OKTA_* env set). */
+  treasuryAvailable?: boolean;
+  /** Live Treasury snapshot for the signed-in user, or null if not fetched. */
+  treasury?: TreasurySnapshot | null;
 }
 
 type Modal =
   | { kind: 'none' }
   | { kind: 'entity' }
+  | { kind: 'entityEdit'; entityId: string }
   | { kind: 'dashboard'; editDashboardId?: string }
   | { kind: 'profile' }
   | { kind: 'structure' };
@@ -107,6 +107,8 @@ export function WorkspaceApp({
   userName,
   accountMenu,
   sandboxEnabled = true,
+  treasuryAvailable = false,
+  treasury = null,
 }: WorkspaceAppProps) {
   const [workspace, setWorkspace] = useState<Workspace>({ entities: [] });
   const [loaded, setLoaded] = useState(false);
@@ -114,7 +116,6 @@ export function WorkspaceApp({
     tone: 'ok' | 'error' | 'warn';
     message: string;
   } | null>(null);
-  const [dbPersistent, setDbPersistent] = useState<boolean | null>(null);
 
   const [entityId, setEntityId] = useState<string | null>(null);
   const [dashboardId, setDashboardId] = useState<string | null>(null);
@@ -131,12 +132,7 @@ export function WorkspaceApp({
   const workspaceRef = useRef(workspace);
   workspaceRef.current = workspace;
   const hedgesRef = useRef(hedgesByEntityId);
-  if (
-    hedgeBookHasContent(hedgesByEntityId)
-    || !hedgeBookHasContent(hedgesRef.current)
-  ) {
-    hedgesRef.current = hedgesByEntityId;
-  }
+  hedgesRef.current = hedgesByEntityId;
   const varSetupRef = useRef(varSetup);
   varSetupRef.current = varSetup;
   const hedgesUpdatedAtRef = useRef<string | undefined>(undefined);
@@ -172,22 +168,13 @@ export function WorkspaceApp({
     }
 
     void (async () => {
-      const { book, persistent, error } = await loadWorkspacePersistent(userKey);
+      const { book, persistent } = await loadWorkspacePersistent(userKey);
       if (cancelled) return;
-      if (error) {
-        setDbPersistent(false);
-        setSaveStatus({
-          tone: error.startsWith('Sign in') ? 'error' : 'warn',
-          message: error,
-        });
-      } else if (!persistent) {
-        setDbPersistent(false);
+      if (!persistent) {
         setSaveStatus({
           tone: 'warn',
           message: 'Hedges saved in this browser — database sync is off.',
         });
-      } else {
-        setDbPersistent(true);
       }
       setWorkspace(book.workspace);
       setHedgesByEntityId(prev => {
@@ -221,12 +208,8 @@ export function WorkspaceApp({
   useEffect(() => {
     return subscribeSandboxPersist(event => {
       if (event.taskId !== WORKSPACE_SANDBOX_TASK_ID) return;
-      if (event.ok && event.persistent) {
-        setDbPersistent(true);
-        return;
-      }
+      if (event.ok && event.persistent) return;
       if (event.status === 401) {
-        setDbPersistent(false);
         setSaveStatus({
           tone: 'error',
           message: 'Sign in to save hedges to the database.',
@@ -234,7 +217,6 @@ export function WorkspaceApp({
         return;
       }
       if (event.status === 503) {
-        setDbPersistent(false);
         setSaveStatus({
           tone: 'warn',
           message: 'Database not configured — hedges stay in this browser.',
@@ -242,7 +224,6 @@ export function WorkspaceApp({
         return;
       }
       if (!event.ok) {
-        setDbPersistent(false);
         setSaveStatus({
           tone: 'error',
           message: event.error
@@ -254,7 +235,7 @@ export function WorkspaceApp({
   }, []);
 
   useEffect(() => {
-    if (!saveStatus || saveStatus.tone !== 'ok') return;
+    if (!saveStatus || saveStatus.tone === 'error') return;
     const t = window.setTimeout(() => setSaveStatus(null), 4000);
     return () => window.clearTimeout(t);
   }, [saveStatus]);
@@ -289,30 +270,17 @@ export function WorkspaceApp({
   ) => {
     setHedgesByEntityId(prev => {
       const resolved = typeof next === 'function' ? next(prev) : next;
-      const prevClock = hedgesUpdatedAtRef.current;
-      const wipe = hedgeBookLooksLikeAccidentalWipe(resolved, prev);
-      const nextClock =
-        hedgeLedgerChanged(prev, resolved) && !wipe
-          ? new Date().toISOString()
-          : prevClock;
-      const picked = pickHedgeBooksForWrite(
-        resolved,
-        prev,
-        nextClock,
-        prevClock,
-      );
-      const hedges = picked.hedgesByEntityId;
-      hedgesRef.current = hedges;
-      hedgesUpdatedAtRef.current = picked.hedgesUpdatedAt ?? nextClock;
+      hedgesRef.current = resolved;
+      hedgesUpdatedAtRef.current = new Date().toISOString();
       if (loaded) {
         flushBook(
           workspaceRef.current,
-          hedges,
+          resolved,
           varSetupRef.current,
           hedgesUpdatedAtRef.current,
         );
       }
-      return hedges;
+      return resolved;
     });
   };
 
@@ -356,6 +324,7 @@ export function WorkspaceApp({
         >
           <BrandMark href="/" label="Treasury Workbench" />
           <div className="flex flex-wrap items-center gap-3">
+            {treasuryAvailable && <TreasuryStatusBadge treasury={treasury} />}
             {saveStatus && (
               <span
                 role="status"
@@ -368,14 +337,6 @@ export function WorkspaceApp({
                 }`}
               >
                 {saveStatus.message}
-              </span>
-            )}
-            {!saveStatus && dbPersistent === true && (
-              <span className="text-[11px] text-slate-500">Saved to database</span>
-            )}
-            {!saveStatus && dbPersistent === false && (
-              <span className="rounded-full bg-amber-900/40 px-3 py-1 text-xs text-amber-100">
-                Browser only — database sync is off
               </span>
             )}
             <ModeNav sandboxEnabled={sandboxEnabled} />
@@ -426,6 +387,7 @@ export function WorkspaceApp({
             }}
             onCreate={() => setModal({ kind: 'entity' })}
             onGuidedSetup={() => setModal({ kind: 'structure' })}
+            onEdit={id => setModal({ kind: 'entityEdit', entityId: id })}
             onDelete={id => update(deleteEntity(workspace, id), 'Entity deleted')}
           />
         ) : !dashboard ? (
@@ -444,6 +406,7 @@ export function WorkspaceApp({
           <DashboardView
             entity={entity}
             dashboard={dashboard}
+            treasury={treasury}
             activeProfileId={activeProfileId}
             onSelect={setActiveProfileId}
             onAdd={() => setModal({ kind: 'profile' })}
@@ -536,6 +499,8 @@ export function WorkspaceApp({
               baseCurrency: input.baseCurrency,
               description: input.description,
               riskAssets: ['currencies', 'interestRates'],
+              allCurrencies: input.allCurrencies,
+              lpCurrencies: input.lpCurrencies,
             });
             let ws = createdWs;
             if (input.withFxSetup) {
@@ -543,9 +508,11 @@ export function WorkspaceApp({
                 name: input.dashboardName.trim() || `${input.name.trim()} FX`,
                 setup: {
                   riskAsset: 'currencies',
-                  protect: ['assetValue', 'cashFlow'],
-                  optimize: ['var', 'hedgeCarry', 'cfar'],
-                  tickers: ['EUR', 'GBP', 'JPY'],
+                  protect: ['var'],
+                  optimize: ['hedgeRatio', 'carryCashInterest'],
+                  tickers: input.lpCurrencies.length
+                    ? input.lpCurrencies
+                    : input.allCurrencies,
                 },
               });
               // Prefer explicit curriculum fxConfig when provided.
@@ -587,6 +554,21 @@ export function WorkspaceApp({
           }}
         />
       )}
+
+      {modal.kind === 'entityEdit' &&
+        workspace.entities
+          .filter(e => e.id === modal.entityId)
+          .map(row => (
+            <EntityEditModal
+              key={row.id}
+              entity={row}
+              onClose={() => setModal({ kind: 'none' })}
+              onSave={patch => {
+                update(updateEntity(workspace, row.id, patch), 'Entity updated');
+                setModal({ kind: 'none' });
+              }}
+            />
+          ))}
 
       {modal.kind === 'dashboard' && entity && (
         <CreateDashboardWizard
@@ -667,6 +649,85 @@ export function WorkspaceApp({
   );
 }
 
+// ── Treasury connection badge ────────────────────────────────────────────
+
+/** Offered in every state that has a stored link — including `error` and
+ *  `reauth_required`. A broken link is exactly when dropping it is most
+ *  useful, and previously only the `live` state exposed this. */
+function DisconnectTreasuryButton() {
+  return (
+    <form action="/api/treasury/oauth/disconnect" method="post">
+      <button
+        type="submit"
+        className="text-xs text-slate-500 transition-colors hover:text-red-400"
+        title="Drop the stored Treasury link for your account — the book falls back to static values"
+      >
+        Disconnect
+      </button>
+    </form>
+  );
+}
+
+function TreasuryStatusBadge({ treasury }: { treasury: TreasurySnapshot | null }) {
+  if (!treasury || treasury.status === 'not_connected') {
+    return (
+      <form action="/api/treasury/oauth/connect" method="get">
+        <button
+          type="submit"
+          className="rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-blue-500 hover:text-blue-300"
+          title="Connect Treasury to pull live NP cash balances into this book"
+        >
+          Connect Treasury
+        </button>
+      </form>
+    );
+  }
+
+  if (treasury.status === 'reauth_required') {
+    return (
+      <div className="flex items-center gap-2">
+        <form action="/api/treasury/oauth/connect" method="get">
+          <button
+            type="submit"
+            className="rounded-lg border border-amber-700 bg-amber-950/40 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:border-amber-500"
+            title="Treasury connection expired — reconnect to resume live data"
+          >
+            Reconnect Treasury
+          </button>
+        </form>
+        <DisconnectTreasuryButton />
+      </div>
+    );
+  }
+
+  if (treasury.status === 'error') {
+    return (
+      <div className="flex items-center gap-2">
+        <span
+          className="rounded-lg border border-red-800 bg-red-950/30 px-3 py-1.5 text-xs font-medium text-red-300"
+          title={treasury.errorMessage ?? 'Treasury data unavailable'}
+        >
+          Treasury data unavailable
+        </span>
+        <DisconnectTreasuryButton />
+      </div>
+    );
+  }
+
+  const ccyCount = treasury.liveCurrencies.length + (treasury.usdCashIsLive ? 1 : 0);
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className="rounded-lg border border-emerald-800 bg-emerald-950/30 px-3 py-1.5 text-xs font-medium text-emerald-300"
+        title={`Live NP cash for ${ccyCount} currencies${treasury.usdCashIsLive ? ' (incl. USD)' : ' (USD leg still static)'} — every figure is current as of at least ${new Date(treasury.asOf).toLocaleDateString()}`}
+      >
+        Treasury live · {ccyCount} ccy
+      </span>
+      <DisconnectTreasuryButton />
+    </div>
+  );
+}
+
 type EntityAssetCard = {
   id: string;
   /** Risk asset class label (Currencies, Interest rates, …). */
@@ -676,22 +737,6 @@ type EntityAssetCard = {
   tickerTags: string[];
   optimizeTags: { id: OptimizeFrameworkId; label: string }[];
 };
-
-/** Chip text for a scoped instrument: "EUR loan · EURIBOR +50bp · 12m". */
-function describeInstrument(inst: RateInstrument): string {
-  const label = RATE_INSTRUMENTS.find(i => i.id === inst.kind)?.label ?? inst.kind;
-  const pair = inst.legCurrency ? `${inst.currency}/${inst.legCurrency}` : inst.currency;
-  const rate =
-    inst.rateType === 'floating'
-      ? [inst.index, inst.spreadBp ? `${inst.spreadBp > 0 ? '+' : ''}${inst.spreadBp}bp` : null]
-          .filter(Boolean)
-          .join(' ')
-      : inst.ratePct != null
-        ? `${inst.ratePct}% fixed`
-        : 'fixed';
-  const tenor = inst.tenorMonths ? `${inst.tenorMonths}m` : null;
-  return [`${pair} ${label}`, rate, tenor].filter(Boolean).join(' · ');
-}
 
 function inferRiskAsset(d: Dashboard): {
   label: string;
@@ -876,7 +921,7 @@ function Breadcrumb({
 // ── Entities ────────────────────────────────────────────────────────────────
 
 function EntitiesView({
-  userName, workspace, onOpen, onOpenGroup, onCreate, onGuidedSetup, onDelete,
+  userName, workspace, onOpen, onOpenGroup, onCreate, onGuidedSetup, onEdit, onDelete,
 }: {
   userName: string;
   workspace: Workspace;
@@ -884,6 +929,7 @@ function EntitiesView({
   onOpenGroup: () => void;
   onCreate: () => void;
   onGuidedSetup: () => void;
+  onEdit: (id: string) => void;
   onDelete: (id: string) => void;
 }) {
   const entities = workspace.entities;
@@ -1024,15 +1070,26 @@ function EntitiesView({
                   : 'border-slate-800 bg-slate-900/60 hover:border-blue-500/50'
               }`}
             >
-              <button
-                type="button"
-                title={`Delete ${e.name}`}
-                aria-label={`Delete ${e.name}`}
-                onClick={() => onDelete(e.id)}
-                className="absolute right-3 top-3 z-10 inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900/90 text-slate-400 opacity-70 transition-all hover:border-rose-500/60 hover:text-rose-400 group-hover:opacity-100"
-              >
-                <IconTrash className="h-3.5 w-3.5" />
-              </button>
+              <div className="absolute right-3 top-3 z-10 flex gap-1.5">
+                <button
+                  type="button"
+                  title={`Edit ${e.name}`}
+                  aria-label={`Edit ${e.name}`}
+                  onClick={() => onEdit(e.id)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900/90 text-slate-400 opacity-70 transition-all hover:border-sky-500/50 hover:text-sky-300 group-hover:opacity-100"
+                >
+                  <IconPencil className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  title={`Delete ${e.name}`}
+                  aria-label={`Delete ${e.name}`}
+                  onClick={() => onDelete(e.id)}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 bg-slate-900/90 text-slate-400 opacity-70 transition-all hover:border-rose-500/60 hover:text-rose-400 group-hover:opacity-100"
+                >
+                  <IconTrash className="h-3.5 w-3.5" />
+                </button>
+              </div>
               <button
                 type="button"
                 onClick={() => onOpen(e.id)}
@@ -1137,167 +1194,21 @@ function DashboardsView({
         <EmptyState
           icon={<IconDashboard className="h-7 w-7" />}
           title="No dashboards yet"
-          body="Open the create wizard: pick a risk asset, protect goals, optimize frameworks, then tickers."
+          body="Open the create wizard: pick a risk asset, one protect metric, then optimize and tickers."
           cta="Create dashboard"
           onCta={onCreate}
         />
       ) : (
         <div className="grid gap-4 lg:grid-cols-2">
-          {entity.dashboards.map(d => {
-            const setup = dashboardSetupFromDashboard(d);
-            const assetMeta = RISK_ASSETS.find(a => a.id === setup.riskAsset);
-            const protect = setup.protect.map(id => ({
-              id,
-              label: PROTECT_GOALS.find(g => g.id === id)?.label ?? id,
-            }));
-            const optimize = setup.optimize.map(id => ({
-              id,
-              label: OPTIMIZE_FRAMEWORKS.find(g => g.id === id)?.longLabel ?? id,
-            }));
-            return (
-              <div
-                key={d.id}
-                className="rounded-xl border border-slate-800 bg-slate-900/60 p-5 transition-colors hover:border-slate-600"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex min-w-0 items-start gap-3">
-                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-700 bg-slate-950 text-slate-300">
-                      <ProfileTypeIcon
-                        type={assetMeta?.profileType ?? 'fx'}
-                        className="h-5 w-5"
-                      />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h3 className="text-base font-semibold text-white">
-                          {assetMeta?.label ?? 'Risk asset'}
-                        </h3>
-                        <span className="rounded border border-violet-700/40 bg-violet-950/40 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-violet-200">
-                          {assetMeta?.live ? 'Live' : 'Soon'}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 truncate text-xs text-slate-400">{d.name}</p>
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 gap-1.5">
-                    <button
-                      type="button"
-                      title="Edit dashboard setup"
-                      aria-label={`Edit ${d.name}`}
-                      onClick={() => onEdit(d.id)}
-                      className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 text-slate-400 transition-colors hover:border-sky-500/50 hover:text-sky-300"
-                    >
-                      <IconPencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      title="Delete dashboard"
-                      aria-label={`Delete ${d.name}`}
-                      onClick={() => onDelete(d.id)}
-                      className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-slate-700 text-slate-400 transition-colors hover:border-rose-500/60 hover:text-rose-400"
-                    >
-                      <IconTrash className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="mt-4 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
-                  <div>
-                    <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                      Protect
-                    </div>
-                    {protect.length > 0 ? (
-                      <div className="flex flex-wrap gap-1.5">
-                        {protect.map(t => (
-                          <TagChip
-                            key={t.id}
-                            label={t.label}
-                            tone="rose"
-                            size="md"
-                            icon={<ProtectGoalIcon id={t.id} className="h-3.5 w-3.5 shrink-0" />}
-                          />
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-[10px] text-slate-600">None — edit to set</p>
-                    )}
-                  </div>
-                  <div>
-                    <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                      Optimize
-                    </div>
-                    {optimize.length > 0 ? (
-                      <div className="flex flex-wrap gap-1.5">
-                        {optimize.map(t => (
-                          <TagChip
-                            key={t.id}
-                            label={t.label}
-                            tone="emerald"
-                            size="md"
-                            icon={
-                              <OptimizeFrameworkIcon id={t.id} className="h-3.5 w-3.5 shrink-0" />
-                            }
-                          />
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-[10px] text-slate-600">None — edit to set</p>
-                    )}
-                  </div>
-                  <div>
-                    <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                      Tickers
-                    </div>
-                    {setup.tickers.length > 0 ? (
-                      <div className="flex flex-wrap gap-1.5">
-                        {setup.tickers.map(t => (
-                          <span
-                            key={t}
-                            className="inline-flex items-center gap-1.5 rounded-md border border-violet-700/40 bg-violet-950/30 px-2 py-1 font-mono text-xs font-semibold text-violet-200"
-                          >
-                            <TickerGlyph code={t} className="w-3 text-center text-violet-300/80" />
-                            {t}
-                          </span>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="text-[10px] text-slate-600">None — edit to set</p>
-                    )}
-                  </div>
-                  {setup.instruments && setup.instruments.length > 0 && (
-                    <div>
-                      <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                        Instruments
-                      </div>
-                      <div className="flex flex-wrap gap-1.5">
-                        {setup.instruments.map(inst => (
-                          <TagChip
-                            key={inst.uid}
-                            label={describeInstrument(inst)}
-                            tone="amber"
-                            size="md"
-                            icon={
-                              <RateInstrumentIcon id={inst.kind} className="h-3.5 w-3.5 shrink-0" />
-                            }
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => onOpen(d.id)}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-blue-500"
-                  >
-                    Open desk →
-                  </button>
-                </div>
-              </div>
-            );
-          })}
+          {entity.dashboards.map(d => (
+            <DashboardDeskCard
+              key={d.id}
+              dashboard={d}
+              onOpen={() => onOpen(d.id)}
+              onEdit={() => onEdit(d.id)}
+              onDelete={() => onDelete(d.id)}
+            />
+          ))}
         </div>
       )}
     </>
@@ -1309,6 +1220,7 @@ function DashboardsView({
 function DashboardView({
   entity,
   dashboard,
+  treasury,
   activeProfileId,
   onSelect,
   onAdd,
@@ -1325,6 +1237,7 @@ function DashboardView({
 }: {
   entity: Entity;
   dashboard: Dashboard;
+  treasury: TreasurySnapshot | null;
   activeProfileId: string | null;
   onSelect: (id: string) => void;
   onAdd: () => void;
@@ -1480,6 +1393,7 @@ function DashboardView({
                     onVarSetupChange={onVarSetupChange}
                     hedgeBook={hedgeBook}
                     onHedgeBookChange={onHedgeBookChange}
+                    treasury={treasury}
                     onFormulaChange={onFormulaChange}
                     onFormulaChanges={onFormulaChanges}
                     onForecastProfileChange={onForecastProfileChange}
@@ -1764,6 +1678,8 @@ function EntityModal({
     withFxSetup: boolean;
     dashboardName: string;
     fxConfig?: FxProfileConfig;
+    allCurrencies: string[];
+    lpCurrencies: string[];
   }) => void;
 }) {
   const [name, setName] = useState('');
@@ -1771,6 +1687,8 @@ function EntityModal({
   const [description, setDescription] = useState('');
   const [withFxSetup, setWithFxSetup] = useState(true);
   const [dashboardName, setDashboardName] = useState('');
+  const [allCurrencies, setAllCurrencies] = useState<string[]>([...FX_CURRENCY_UNIVERSE]);
+  const [lpCurrencies, setLpCurrencies] = useState<string[]>([...DEFAULT_LP_CURRENCIES]);
 
   return (
     <ModalShell
@@ -1784,7 +1702,7 @@ function EntityModal({
           <button className={ghostBtn} onClick={onClose}>Cancel</button>
           <button
             className={primaryBtn}
-            disabled={!name.trim()}
+            disabled={!name.trim() || allCurrencies.length === 0}
             onClick={() =>
               onCreate({
                 name: name.trim(),
@@ -1793,6 +1711,8 @@ function EntityModal({
                 withFxSetup,
                 dashboardName: dashboardName.trim() || `${name.trim()} FX`,
                 fxConfig: withFxSetup ? defaultCurriculumFxConfig() : undefined,
+                allCurrencies,
+                lpCurrencies,
               })
             }
           >
@@ -1873,6 +1793,21 @@ function EntityModal({
             )}
           </div>
         </button>
+
+        <div className="rounded-xl border border-slate-700 bg-slate-950/40 p-4">
+          <div className="mb-2 text-[11px] font-semibold text-slate-100">Currencies</div>
+          <p className="mb-3 text-[11px] text-slate-500">
+            All currencies is the desk universe. LP currencies are the liquidity-pool book used by
+            Select LP when creating a dashboard.
+          </p>
+          <CurrencyUniverseFields
+            universe={FX_CURRENCY_UNIVERSE}
+            allCurrencies={allCurrencies}
+            lpCurrencies={lpCurrencies}
+            onChangeAll={setAllCurrencies}
+            onChangeLp={setLpCurrencies}
+          />
+        </div>
       </div>
     </ModalShell>
   );
