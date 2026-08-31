@@ -253,6 +253,7 @@ export function applySettleWamToPrepared(input: {
         settleMonths: leg.settleMonths ?? leg.endMonth,
         recognizeMonths: 0,
         structure: 'strip' as const,
+        notionalKind: 'trade' as const,
       };
     });
     const naturalWam = hedgeSettleWamMonths(samples);
