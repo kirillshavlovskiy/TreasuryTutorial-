@@ -1,6 +1,7 @@
 'use client';
 
 import type { ReactNode } from 'react';
+import { DeskIcon, type DeskIconName } from '@/components/DeskIcons';
 
 export type RiskPerspective =
   | 'fxRisk'
@@ -15,6 +16,15 @@ export type RiskPerspectiveTabStat = {
   value: string;
   /** Uppercase caption under the figure (e.g. `Resid VaR`). */
   label: string;
+};
+
+const PERSPECTIVE_ICONS: Record<RiskPerspective, DeskIconName> = {
+  fxRisk: 'metric-var',
+  cashCarry: 'opt-carry',
+  cfar: 'metric-cfar',
+  liquidity: 'metric-liquidity',
+  dv01: 'opt-hedge-ratio',
+  greeks: 'opt-greeks',
 };
 
 export const RISK_PERSPECTIVES: {
@@ -133,12 +143,13 @@ export function RiskPerspectiveSelector({
               key={p.id}
               type="button"
               onClick={() => onChange(p.id)}
-              className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                 value === p.id
                   ? 'border-sky-500 bg-sky-500/15 text-sky-100'
                   : 'border-slate-700 text-slate-400 hover:border-slate-500'
               } ${!p.active ? 'opacity-70' : ''}`}
             >
+              <DeskIcon name={PERSPECTIVE_ICONS[p.id]} className="h-3.5 w-3.5" />
               {p.label}
               {!p.active && (
                 <span className="ml-1 text-[9px] uppercase text-slate-600">
@@ -215,6 +226,16 @@ export function RiskPerspectiveSelector({
               }`}
             >
               <span className="inline-flex items-center gap-1.5">
+                <DeskIcon
+                  name={PERSPECTIVE_ICONS[p.id]}
+                  className={`h-3.5 w-3.5 ${
+                    on
+                      ? 'text-sky-300'
+                      : soon
+                        ? 'text-slate-700'
+                        : 'text-slate-500'
+                  }`}
+                />
                 <span
                   className={`text-xs ${
                     on
@@ -272,30 +293,12 @@ export function RiskPerspectiveSelector({
                 onClick={onOpenSettings}
                 className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
               >
-                <GearIcon className="h-3.5 w-3.5" />
+                <DeskIcon name="action-forecast-profile" className="h-3.5 w-3.5" />
               </button>
             ) : null}
           </div>
         </div>
       )}
     </div>
-  );
-}
-
-function GearIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.75"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
-      <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1.01 1.55 1.01H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z" />
-    </svg>
   );
 }

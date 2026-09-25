@@ -38,18 +38,3 @@ export async function uploadToS3(
 
   return body as StorageUploadResult;
 }
-
-export async function listS3Uploads(prefix = 'uploads/'): Promise<{
-  bucket: string;
-  prefix: string;
-  objects: Array<{ relativeKey: string; size?: number; lastModified?: string }>;
-}> {
-  const res = await fetch(
-    `/api/storage?prefix=${encodeURIComponent(prefix)}`,
-  );
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    throw new Error(body.error || `List failed (${res.status})`);
-  }
-  return res.json();
-}

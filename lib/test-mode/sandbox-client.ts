@@ -1,6 +1,8 @@
 import {
   hedgeBookContentScore,
   mergeHedgeBooksPreservingPrepared,
+  hedgeBookLooksLikeAccidentalWipe,
+  mergeHedgeBooksKeepingPrimaryTickets,
   pickHedgeBooksForWrite,
 } from '@/lib/hedge-book-normalize';
 import {
@@ -37,7 +39,7 @@ export interface SandboxPersistEvent {
 type PersistListener = (event: SandboxPersistEvent) => void;
 const persistListeners = new Set<PersistListener>();
 
-/** UI hook for last Neon PUT (success / 401 / 503). */
+/** UI hook for last Postgres PUT (success / 401 / 503). */
 export function subscribeSandboxPersist(listener: PersistListener): () => void {
   persistListeners.add(listener);
   return () => {
@@ -105,7 +107,7 @@ export async function loadSandboxPersistent(
   try {
   const remote = await fetchSandboxApi(taskId);
   // Fast Refresh / Strict Mode remount started a newer GET — do not let this
-  // stale response rewrite localStorage or queue an empty Neon PUT.
+  // stale response rewrite localStorage or queue an empty Postgres PUT.
   if (!isSandboxHydrationCurrent(taskId, gen)) {
     return { state: loadSandbox(userKey), persistent: false };
   }
@@ -115,7 +117,7 @@ export async function loadSandboxPersistent(
   if (!remote.body) {
     const live = loadSandbox(userKey);
     loaded = live;
-    // Failed GET must not PUT a local seed over an unknown Neon row.
+    // Failed GET must not PUT a local seed over an unknown Postgres row.
     return { state: live, persistent: false, error: remote.error };
   }
 
@@ -138,16 +140,25 @@ export async function loadSandboxPersistent(
   });
   const newer = newerSandboxState(local, remoteState);
   const older = newer === local ? remoteState : local;
-  const remoteMergedHedges = mergeHedgeBooksPreservingPrepared(
-    newer.hedgesByEntityId,
-    older.hedgesByEntityId,
-  );
-  // Re-read: a hedge can land in localStorage while GET/merge was running.
   const live = loadSandbox(userKey);
-  const hedgesMerged = mergeHedgeBooksPreservingPrepared(
-    live.hedgesByEntityId,
-    remoteMergedHedges,
+  const liveNewer =
+    (Date.parse(live.hedgesUpdatedAt ?? '') || 0)
+    >= (Date.parse(remoteState.hedgesUpdatedAt ?? '') || 0);
+  const ticketSrc = liveNewer ? live : remoteState;
+  const ticketOther = liveNewer ? remoteState : live;
+  const wipe = hedgeBookLooksLikeAccidentalWipe(
+    ticketSrc.hedgesByEntityId,
+    ticketOther.hedgesByEntityId,
   );
+  const hedgesMerged = wipe
+    ? mergeHedgeBooksPreservingPrepared(
+        ticketOther.hedgesByEntityId,
+        ticketSrc.hedgesByEntityId,
+      )
+    : mergeHedgeBooksKeepingPrimaryTickets(
+        ticketSrc.hedgesByEntityId,
+        ticketOther.hedgesByEntityId,
+      );
   const remoteSetup = preferWorkspaceSetup(newer, older);
   const setup = preferWorkspaceSetup(live, {
     ...newer,
@@ -176,7 +187,7 @@ export async function loadSandboxPersistent(
   try {
     saveSandbox(userKey, merged);
   } catch {
-    // Quota — still return the merged book; Neon PUT may still land.
+    // Quota — still return the merged book; Postgres PUT may still land.
   }
 
   const mergedScore = hedgeBookContentScore(hedgesMerged);
@@ -229,7 +240,7 @@ export function saveSandboxPersistent(
     saveSandbox(userKey, next);
   } catch (err) {
     console.warn(
-      '[sandbox] localStorage save failed — still pushing Neon',
+      '[sandbox] localStorage save failed — still pushing Postgres',
       err,
     );
   }
@@ -238,7 +249,7 @@ export function saveSandboxPersistent(
 }
 
 const PERSIST_DEBOUNCE_MS = process.env.NODE_ENV === 'test' ? 0 : 400;
-/** Cold Neon + first compile often takes ~8s; 8s used to time out mid-GET. */
+/** Cold Postgres + first compile often takes ~8s; 8s used to time out mid-GET. */
 const HYDRATION_MAX_MS = process.env.NODE_ENV === 'test' ? 0 : 30_000;
 
 type PersistWaiter = (event: SandboxPersistEvent) => void;
@@ -276,7 +287,7 @@ function bindUnloadFlush(): void {
   });
 }
 
-/** Block Neon PUTs until the first GET merge finishes so a thin unmount cannot wipe Postgres. */
+/** Block Postgres PUTs until the first GET merge finishes so a thin unmount cannot wipe Postgres. */
 export function startSandboxHydration(taskId: string): number {
   const gen = (hydrateGen.get(taskId) ?? 0) + 1;
   hydrateGen.set(taskId, gen);
@@ -314,19 +325,23 @@ export function finishSandboxHydration(
   const queued = latestByTask.get(taskId);
   if (merged && queued) {
     const setup = preferWorkspaceSetup(queued, merged);
+    // Queued saves during GET are usually Cancel / un-stage. Prefer the
+    // newer hedge clock's ticket+prepared membership so a stale GET merge
+    // cannot PUT deleted EUR strip rows back to Postgres.
+    const queuedAt = Date.parse(queued.hedgesUpdatedAt ?? '') || 0;
+    const mergedAt = Date.parse(merged.hedgesUpdatedAt ?? '') || 0;
+    const primary = queuedAt >= mergedAt ? queued : merged;
+    const secondary = queuedAt >= mergedAt ? merged : queued;
     latestByTask.set(taskId, {
       ...queued,
       workspace: setup.workspace,
       group: setup.group,
-      hedgesByEntityId: mergeHedgeBooksPreservingPrepared(
-        queued.hedgesByEntityId,
-        merged.hedgesByEntityId,
+      hedgesByEntityId: mergeHedgeBooksKeepingPrimaryTickets(
+        primary.hedgesByEntityId,
+        secondary.hedgesByEntityId,
       ),
       hedgesUpdatedAt:
-        (Date.parse(queued.hedgesUpdatedAt ?? '') || 0)
-        >= (Date.parse(merged.hedgesUpdatedAt ?? '') || 0)
-          ? queued.hedgesUpdatedAt
-          : merged.hedgesUpdatedAt,
+        queuedAt >= mergedAt ? queued.hedgesUpdatedAt : merged.hedgesUpdatedAt,
     });
   }
   hydrating.delete(taskId);
@@ -367,7 +382,7 @@ async function putSandboxJson(
       },
     );
     if (!res.ok) {
-      let error = `Neon PUT failed (${res.status})`;
+      let error = `Postgres PUT failed (${res.status})`;
       try {
         const json = (await res.json()) as { error?: string };
         if (json.error) error = json.error;
@@ -375,7 +390,7 @@ async function putSandboxJson(
         // ignore parse
       }
       console.warn(
-        `[sandbox] Neon PUT failed status=${res.status} taskId=${taskId} — ${error}`,
+        `[sandbox] Postgres PUT failed status=${res.status} taskId=${taskId} — ${error}`,
       );
       return {
         taskId,
@@ -388,7 +403,7 @@ async function putSandboxJson(
     const json = (await res.json()) as ApiSandboxResponse;
     if (!json.persistent) {
       console.warn(
-        `[sandbox] Neon PUT ok but persistent=false taskId=${taskId} — check DATABASE_URL / session`,
+        `[sandbox] Postgres PUT ok but persistent=false taskId=${taskId} — check DATABASE_URL / session`,
       );
     }
     return {
@@ -398,7 +413,7 @@ async function putSandboxJson(
       status: res.status,
     };
   } catch (err) {
-    console.warn('[sandbox] Neon PUT network error — localStorage still saved', err);
+    console.warn('[sandbox] Postgres PUT network error — localStorage still saved', err);
     return {
       taskId,
       ok: false,
@@ -432,7 +447,7 @@ async function putSandboxOnce(
 }
 
 async function flushPersist(taskId: string): Promise<void> {
-  // A GET merge is still in flight — do not PUT a remount shell over Neon.
+  // A GET merge is still in flight — do not PUT a remount shell over Postgres.
   // finishSandboxHydration flushes the queued book once the merge lands.
   if (hydrating.has(taskId)) return;
   if (inflight.has(taskId)) {

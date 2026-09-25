@@ -8,6 +8,7 @@
 import { useMemo, useState, type Dispatch, type SetStateAction } from 'react';
 import { Simulator } from '@/app/dashboard/Simulator';
 import { HedgingDecisionLayer } from '@/components/test-mode/HedgingDecisionLayer';
+import { WORKSPACE_SANDBOX_TASK_ID } from '@/lib/workspace-client';
 import { ConsolidatedLiveLadder } from '@/components/test-mode/ConsolidatedLiveLadder';
 import { VarAnalyticsPanel } from '@/components/test-mode/VarAnalyticsPanel';
 import { DataUploadPanel } from '@/components/test-mode/DataUploadPanel';
@@ -218,6 +219,7 @@ export function WorkbenchGroupDesk({
           onAnalyticsBookChange={setAnalyticsBook}
           hedgingPanel={
             <HedgingDecisionLayer
+              sandboxTaskId={WORKSPACE_SANDBOX_TASK_ID}
               risk={risk}
               title="Decision layer — consolidated hedge & VaR"
               hedgeRatios={hedgeRatios}
@@ -247,6 +249,8 @@ export function WorkbenchGroupDesk({
               bookedHedges={bookedHedges}
               varSetup={varSetup}
               forecastProfile={analyticsBook.forecastProfile}
+              preparedByCcy={preparedByCcy}
+              marketRatesByCcy={marketRatesByCcy}
               title="Consolidated Live Ladder — Group FX"
             />
           }

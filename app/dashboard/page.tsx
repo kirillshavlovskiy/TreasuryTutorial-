@@ -1,5 +1,5 @@
 import { redirect } from 'next/navigation';
-import { auth } from '@/auth';
+import { auth, signOut } from '@/auth';
 import { Simulator } from './Simulator';
 
 export default async function DashboardPage() {
@@ -31,12 +31,19 @@ export default async function DashboardPage() {
           <div className="text-xs text-gray-400">{email}</div>
         </div>
       </div>
-      <a
-        href="/api/auth/logout"
-        className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-900"
+      <form
+        action={async () => {
+          'use server';
+          await signOut({ redirectTo: '/' });
+        }}
       >
-        Sign out
-      </a>
+        <button
+          type="submit"
+          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50 hover:text-gray-900"
+        >
+          Sign out
+        </button>
+      </form>
     </div>
   );
 

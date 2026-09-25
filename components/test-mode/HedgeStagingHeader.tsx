@@ -6,7 +6,6 @@ import type {
   HedgePathSummaryMetrics,
 } from '@/components/test-mode/ExposureHedgePathChart';
 import type { PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
-import { notionalWeightsFromAmounts } from '@/lib/test-mode/rolling-hedge';
 
 /** Cover / Legs / Resid / BE (+ optional module chips) in the sticky hedge-modal header. */
 export type HedgeStagingChip = {
@@ -17,35 +16,16 @@ export type HedgeStagingChip = {
   tone: string;
 };
 
-/** Staged strip settles / weights so FX Risk · Decision replay Cash Carry. */
-export function scheduleFromPreparedProfile(
-  staged: PreparedHedgeProfile | undefined,
-): {
-  ends: number[] | null;
-  weights: number[] | null;
-  stripLegCount: number | null;
-} {
-  if (!staged || staged.structure !== 'strip' || staged.legs.length < 2) {
-    return { ends: null, weights: null, stripLegCount: null };
+function stagedLegsSig(staged: PreparedHedgeProfile): string {
+  if (staged.structure === 'strip' && staged.legs.length > 0) {
+    return staged.legs
+      .map(
+        l =>
+          `${(l.settleMonths ?? l.endMonth).toFixed(4)}:${l.hedgeLocalM.toFixed(6)}`,
+      )
+      .join('|');
   }
-  const ends = staged.legs.map(l =>
-    Math.max(0.05, l.settleMonths ?? l.endMonth),
-  );
-  const amounts = staged.legs.map((l, i) => {
-    if (
-      typeof l.tradeNotionalLocalM === 'number'
-      && Number.isFinite(l.tradeNotionalLocalM)
-    ) {
-      return l.tradeNotionalLocalM;
-    }
-    const prev = i > 0 ? staged.legs[i - 1]!.hedgeLocalM : 0;
-    return l.hedgeLocalM - prev;
-  });
-  return {
-    ends,
-    weights: notionalWeightsFromAmounts(amounts),
-    stripLegCount: ends.length,
-  };
+  return `${(staged.settleMonths ?? 0).toFixed(4)}:${staged.coverLocalM.toFixed(6)}`;
 }
 
 /** True when the path-chart draft no longer matches the staged package. */
@@ -53,17 +33,30 @@ export function pathChartDraftDirty(
   staged: PreparedHedgeProfile,
   metrics: HedgePathSummaryMetrics,
 ): boolean {
+  if (metrics.structure && metrics.structure !== staged.structure) return true;
+  if (metrics.basis && metrics.basis !== staged.basis) return true;
   const stagedLegs =
     staged.structure === 'strip' && staged.legs.length > 0
       ? staged.legs.length
       : 1;
   if (metrics.legCount !== stagedLegs) return true;
-  const chartStrip = metrics.legCount >= 2;
+  const chartStrip = metrics.legCount >= 2 || metrics.structure === 'strip';
   if (chartStrip !== (staged.structure === 'strip')) return true;
-  return (
+  if (
     Math.abs(Math.abs(metrics.coverLocalM) - Math.abs(staged.coverLocalM))
     > 0.015
-  );
+  ) {
+    return true;
+  }
+  if (
+    staged.structure === 'bullet'
+    && metrics.settleMonths != null
+    && Math.abs((staged.settleMonths ?? 0) - metrics.settleMonths) > 0.05
+  ) {
+    return true;
+  }
+  if (metrics.legsSig && metrics.legsSig !== stagedLegsSig(staged)) return true;
+  return false;
 }
 
 export function chipsFromPathSummary(
@@ -113,7 +106,12 @@ export function HedgeStagingHeader({
   draftDirty = false,
   prepareAction,
   extraActions,
+  ccys,
+  selectedCcy,
+  onSelectCcy,
   onReset,
+  resetLabel = 'Reset',
+  resetTitle = 'Clear staged package — Decision and Liquidity drop this CCY',
   onClose,
 }: {
   titleId: string;
@@ -125,10 +123,18 @@ export function HedgeStagingHeader({
   draftDirty?: boolean;
   prepareAction?: HedgePathPrepareAction | null;
   extraActions?: ReactNode;
+  /** Book currencies — same tab group as CFaR / Path. */
+  ccys?: readonly string[];
+  selectedCcy?: string;
+  onSelectCcy?: (ccy: string) => void;
   /** Drop the staged package (Decision, Analytics, Liquidity all drop this CCY). */
   onReset?: () => void;
+  resetLabel?: string;
+  resetTitle?: string;
   onClose: () => void;
 }) {
+  const showCcyTabs =
+    Boolean(onSelectCcy) && (ccys?.length ?? 0) > 1 && selectedCcy != null;
   return (
     <>
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -140,6 +146,32 @@ export function HedgeStagingHeader({
             <p className="mt-0.5 text-[11px] text-slate-400">{subtitle}</p>
           ) : null}
         </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+        {showCcyTabs && ccys && onSelectCcy ? (
+          <div
+            className="inline-flex shrink-0 flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+            role="group"
+            aria-label="Currency"
+          >
+            {ccys.map(ccy => {
+              const on = selectedCcy === ccy;
+              return (
+                <button
+                  key={ccy}
+                  type="button"
+                  onClick={() => onSelectCcy(ccy)}
+                  className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+                    on
+                      ? 'bg-violet-500/25 text-violet-100 shadow-sm'
+                      : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {ccy}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
         <div className="flex shrink-0 flex-nowrap items-center justify-end gap-1">
           {isPrebooked ? (
             <span
@@ -177,10 +209,10 @@ export function HedgeStagingHeader({
             <button
               type="button"
               onClick={onReset}
-              title="Drop this staged package from Decision / Cash Carry / Liquidity"
-              className="rounded border border-rose-600/50 bg-rose-500/15 px-2 py-1 text-[10px] font-semibold text-rose-200 hover:bg-rose-500/25"
+              title={resetTitle}
+              className="rounded border border-slate-600 px-2 py-1 text-[10px] text-slate-300 hover:bg-slate-800"
             >
-              Unstage
+              {resetLabel}
             </button>
           ) : null}
           <button
@@ -190,6 +222,7 @@ export function HedgeStagingHeader({
           >
             Close
           </button>
+        </div>
         </div>
       </div>
       {chips && chips.length > 0 ? (

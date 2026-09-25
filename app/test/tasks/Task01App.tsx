@@ -1692,6 +1692,7 @@ function GroupConsolidatedView({
           onAnalyticsBookChange={setAnalyticsBook}
           hedgingPanel={
             <HedgingDecisionLayer
+              sandboxTaskId={taskId}
               risk={risk}
               title="Decision layer — consolidated hedge & VaR"
               hedgeRatios={hedgeRatios}
@@ -2644,6 +2645,7 @@ function DashboardView({
                     tabLabels={TASK01_TAB_LABELS}
                     hedgingPanel={
                       <HedgingDecisionLayer
+                        sandboxTaskId={taskId}
                         risk={entityRisk}
                         title={`Decision layer — ${entity.name}`}
                         hedgeRatios={hedgeRatios}

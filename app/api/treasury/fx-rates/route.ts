@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { isTokenEncryptionConfigured } from '@/lib/treasury/crypto';
 import { getTreasuryFxRatesForUser, parsePairsInput } from '@/lib/treasury/fx-rates';
 import { isTreasuryMcpConfigured } from '@/lib/treasury/mcp-client';
@@ -13,7 +13,7 @@ export const runtime = 'nodejs';
  *  MCP connection per request. Requires an existing Treasury OAuth link —
  *  see app/api/treasury/oauth/connect/route.ts. */
 export async function POST(request: Request) {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim() ?? '';
   if (!email || email === TEST_GUEST_EMAIL) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

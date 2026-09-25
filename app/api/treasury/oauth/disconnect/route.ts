@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { treasuryCanonicalOrigin } from '@/lib/treasury/okta-client';
 import { disconnectTreasury } from '@/lib/treasury/token-store';
 
@@ -7,7 +7,7 @@ export const runtime = 'nodejs';
 
 /** POST — drop the stored Treasury OAuth link for the signed-in user. */
 export async function POST(request: Request) {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim();
   if (!email) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

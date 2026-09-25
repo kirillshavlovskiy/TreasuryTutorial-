@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "matcher": "Write|Delete",
+        "command": "node ./.cursor/hooks/protected-paths-cursor.mjs",
+        "timeout": 10
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "type": "command",
+        "command": "node ./.cursor/hooks/protected-paths-cursor.mjs",
+        "timeout": 10
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "matcher": "Write|Delete",
+        "command": "node ./.cursor/hooks/protected-paths-cursor.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -44,7 +44,7 @@ Report it like this:
 | `lib/test-mode/**` | financial |
 | `lib/treasury/**` | financial, security |
 | `lib/db/**` | database, security |
-| `lib/auth-url.ts`, `lib/s3.ts` | security |
+| `lib/s3.ts` | security |
 | `lib/db/models/**` | database, typescript |
 | `lib/agent/**` | security, typescript |
 | `app/api/**` | nextjs-api, security |

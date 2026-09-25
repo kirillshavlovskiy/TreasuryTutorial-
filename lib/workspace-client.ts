@@ -1,9 +1,14 @@
 /**
- * Workbench persistence: localStorage envelope + best-effort Neon via
+ * Workbench persistence: localStorage envelope + best-effort Postgres via
  * /api/test/sandbox?taskId=workspace (same sandbox_progress table as Task 01).
  */
 
-import { hedgeBookContentScore } from '@/lib/hedge-book-normalize';
+import {
+  hedgeBookContentScore,
+  hedgeBookLooksLikeAccidentalWipe,
+  mergeHedgeBooksKeepingPrimaryTickets,
+  mergeHedgeBooksPreservingPrepared,
+} from '@/lib/hedge-book-normalize';
 import {
   finishSandboxHydration,
   persistSandboxRemote,
@@ -12,7 +17,6 @@ import {
 import {
   defaultTaskProgress,
   emptyAnswers,
-  mergeHedgeBooksPreservingPrepared,
   normalizeSandboxState,
   preferWorkspaceSetup,
   workspaceFxProfileCount,
@@ -101,7 +105,7 @@ export async function persistWorkspaceRemote(
 }
 
 /**
- * Load workspace: localStorage immediately, then merge a newer Neon copy when
+ * Load workspace: localStorage immediately, then merge a newer Postgres copy when
  * the signed-in sandbox API is available.
  */
 export async function loadWorkspacePersistent(
@@ -134,10 +138,19 @@ export async function loadWorkspacePersistent(
   const localNewer = localAt > remoteAt;
   const newer = localNewer ? local : remoteBook;
   const older = localNewer ? remoteBook : local;
-  const hedgesMerged = mergeHedgeBooksPreservingPrepared(
+  const ticketWipe = hedgeBookLooksLikeAccidentalWipe(
     newer.hedgesByEntityId,
     older.hedgesByEntityId,
   );
+  const hedgesMerged = ticketWipe
+    ? mergeHedgeBooksPreservingPrepared(
+        older.hedgesByEntityId,
+        newer.hedgesByEntityId,
+      )
+    : mergeHedgeBooksKeepingPrimaryTickets(
+        newer.hedgesByEntityId,
+        older.hedgesByEntityId,
+      );
   const setup = preferWorkspaceSetup(
     asSandboxShell(newer),
     asSandboxShell(older),
@@ -154,10 +167,24 @@ export async function loadWorkspacePersistent(
         : remoteBook.hedgesUpdatedAt,
   };
   const live = loadWorkspaceDetailed(userKey);
-  const liveHedges = mergeHedgeBooksPreservingPrepared(
-    live.hedgesByEntityId,
-    hedgesMerged,
+  const liveNewer =
+    (Date.parse(live.hedgesUpdatedAt ?? '') || 0)
+    >= (Date.parse(merged.hedgesUpdatedAt ?? '') || 0);
+  const liveSrc = liveNewer ? live : merged;
+  const liveOther = liveNewer ? merged : live;
+  const liveWipe = hedgeBookLooksLikeAccidentalWipe(
+    liveSrc.hedgesByEntityId,
+    liveOther.hedgesByEntityId,
   );
+  const liveHedges = liveWipe
+    ? mergeHedgeBooksPreservingPrepared(
+        liveOther.hedgesByEntityId,
+        liveSrc.hedgesByEntityId,
+      )
+    : mergeHedgeBooksKeepingPrimaryTickets(
+        liveSrc.hedgesByEntityId,
+        liveOther.hedgesByEntityId,
+      );
   const liveSetup = preferWorkspaceSetup(
     asSandboxShell(live),
     asSandboxShell(merged),
@@ -209,7 +236,7 @@ export async function loadWorkspacePersistent(
   }
 }
 
-/** Save to localStorage and best-effort sync to Neon (even if local quota fails). */
+/** Save to localStorage and best-effort sync to Postgres (even if local quota fails). */
 export function saveWorkspacePersistent(
   userKey: string,
   book: WorkspaceLoadResult,

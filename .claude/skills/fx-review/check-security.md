@@ -48,8 +48,8 @@ Source: `CLAUDE.md` → Security → Encryption at rest; `.claude/rules/project/
 - [ ] Server-to-server OAuth uses Authorization Code with PKCE for anything beyond a simple login.
 - [ ] A random `state` (CSRF protection) and `nonce` (id_token replay protection) per attempt. Both
       single-use, both with a short TTL.
-- [ ] The session returned by `auth()` (exported from `auth.ts`) is checked **first** in every API
-      route. This repository has no `getServerSession` — do not flag its absence.
+- [ ] The session returned by `getServerSession` / `auth()` (exported from `auth.ts`) is
+      checked **first** in every API route.
 - [ ] Never trust a user id, organisation id or role passed from the client.
 
 Source: `CLAUDE.md` → Security → Auth & sessions, Next.js Patterns.

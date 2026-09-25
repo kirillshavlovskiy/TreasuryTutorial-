@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -21,6 +22,8 @@ import {
   buildExposurePathPoints,
   hedgeBasisNotionalLocalM,
   hedgeBreakevenMonths,
+  mapPathToUncoveredIncrement,
+  monthlyFlowsFromPath,
   overhedgeGapM,
   resolveChartMonthlyFlows,
   resolveBulletCashSettleMonths,
@@ -34,9 +37,12 @@ import {
 } from '@/lib/test-mode/hedge-var';
 import {
   buildRollingHedgeEdges,
+  DEFAULT_STRIP_LEGS_MAX,
+  maxStripLegsForForecast,
   stripForwardLegsFromEdges,
   needsRollingHedges,
   normalizeStripEndMonths,
+  alignStripScheduleWeightsToEnds,
   normalizeStripScheduleWeights,
   equalStripScheduleWeights,
   rampStripScheduleWeights,
@@ -52,6 +58,7 @@ import {
   type StripForwardLeg,
   type StripScheduleWeightPreset,
 } from '@/lib/test-mode/rolling-hedge';
+import { collapseStripScheduleIfDuplicateMonths } from '@/lib/test-mode/cash-carry-analytics';
 import { horizonMonths, type VarSetup } from '@/lib/test-mode/var-setup';
 
 function GearIcon({ className }: { className?: string }) {
@@ -183,6 +190,17 @@ interface ExposureHedgePathChartProps {
    * so Prepare is not required for analytics to update.
    */
   autoStagePrepared?: boolean;
+  /**
+   * Optimize / Book inspect: keep the wizard mix on open (no auto Cash / VN /
+   * Target apply, no strip→bullet VN flip). Structure + regime chips stay live
+   * so the user can tweak from that mix.
+   */
+  lockOptimizeMix?: boolean;
+  /**
+   * Book ticket: draw the exposure profile + forward ladder only.
+   * Hides structure / regime chips, Prepare, and the Performance table.
+   */
+  profileOnly?: boolean;
   /** Where to render the cover / legs / resid VaR / breakeven cards. */
   summaryMetricsPlacement?: 'inline' | 'none';
   /** Live snapshot of the summary cards (for hosting outside this chart). */
@@ -220,6 +238,38 @@ interface ExposureHedgePathChartProps {
   scheduleHedgeWeights?: readonly number[] | null;
   /** Persist Hedge % edits when schedule is parent-controlled (Cash Carry). */
   onScheduleHedgeWeightsChange?: (weights: number[] | null) => void;
+  /**
+   * Live booked cover. With profileOnly (Book ticket) or lockOptimizeMix
+   * (Live VaR profile), the path is the uncovered increment after this
+   * cover — not the gross S+ΣF book.
+   */
+  bookedCoverLocalM?: number;
+  /** Gross forecast E used to scale the path before subtracting booked. */
+  forecastTargetLocalM?: number;
+  /** Ticket settle (spot ≈ 0, forward tenor). Overrides cash-delivery mode. */
+  bulletSettleMonthsOverride?: number | null;
+  /**
+   * Book ticket: portal the Performance · tick-trades table in place of
+   * the staged-ladder list (works even when profileOnly hides the inline table).
+   */
+  tickTradesHost?: HTMLElement | null;
+  /**
+   * Whether THIS instance portals the tick-trades table into
+   * `tickTradesHost`. The Book overlay keeps several instances of the same
+   * chart mounted at once (visible Chart pane, Option pane, hidden
+   * Structure-pane copy) and each one used to portal its own copy of the
+   * table into the shared host — a duplicated card. Exactly one instance
+   * (the always-mounted hidden copy) keeps this on.
+   */
+  tickTradesPortalEnabled?: boolean;
+  /** Highlight / fill-select a strip leg from the portaled tick-trades table. */
+  selectedTickTradeLegIndex?: number | null;
+  onTickTradeLegSelect?: (legIndex: number) => void;
+  /** Book ticket: On / Hedge Δ write back to the staged strip. */
+  tickTradesLocked?: boolean;
+  tickTradeEnabled?: Record<number, boolean>;
+  onTickTradeLegEnabledChange?: (legIndex: number, enabled: boolean) => void;
+  onTickTradeDeltaChange?: (legIndex: number, deltaAbsM: number) => void;
 }
 
 /** Read-only strip / bullet summary cards (cover, legs, resid VaR, breakeven). */
@@ -235,6 +285,14 @@ export type HedgePathSummaryMetrics = {
   legsSub: string;
   /** 0 = none, 1 = bullet, ≥2 = strip legs. */
   legCount: number;
+  /** Live chart structure — used to detect bullet ↔ strip edits. */
+  structure?: 'bullet' | 'strip';
+  /** Live chart regime. */
+  basis?: 'cash' | 'varNeutral' | 'totalExpected';
+  /** Bullet cash settle from M0 (months). */
+  settleMonths?: number;
+  /** Fingerprint of live legs / bullet settle+cover — detects schedule edits. */
+  legsSig?: string;
   residVarValue: string;
   residVarPct: string | null;
   residVarSub: string;
@@ -588,6 +646,8 @@ export function ExposureHedgePathChart({
   stripLegCount: stripLegCountProp,
   onStripLegCountChange,
   autoStagePrepared = false,
+  lockOptimizeMix = false,
+  profileOnly = false,
   summaryMetricsPlacement = 'inline',
   onSummaryMetricsChange,
   prepareCtaPlacement = 'footer',
@@ -600,6 +660,18 @@ export function ExposureHedgePathChart({
   onScheduleEndMonthsChange,
   scheduleHedgeWeights: scheduleHedgeWeightsProp,
   onScheduleHedgeWeightsChange,
+  endExposureM,
+  bookedCoverLocalM = 0,
+  forecastTargetLocalM,
+  bulletSettleMonthsOverride = null,
+  tickTradesHost = null,
+  tickTradesPortalEnabled = true,
+  selectedTickTradeLegIndex = null,
+  onTickTradeLegSelect,
+  tickTradesLocked = false,
+  tickTradeEnabled,
+  onTickTradeLegEnabledChange,
+  onTickTradeDeltaChange,
 }: ExposureHedgePathChartProps) {
   const schedulePanelExternal = schedulePanelPlacement === 'external';
   const [localStructure, setLocalStructure] =
@@ -710,7 +782,6 @@ export function ExposureHedgePathChart({
   const setStructure = (s: ForecastHedgeStructure) => {
     if (!controlled) setLocalStructure(s);
     onHedgeStructureChange?.(s);
-    // Wire Cash/VN/Target into Live VaR under the new structure immediately.
     onApplyBasis(selectedBasis, s);
   };
   const Th = horizonMonths(setup.horizon);
@@ -719,24 +790,31 @@ export function ExposureHedgePathChart({
       ? setup.forecastMonths
       : 0;
   /**
-   * Cash Carry (external performance panel): strip whenever Tf ≥ 2.
-   * FX Risk: strip only when VaR tenor &lt; forecast (rolling windows).
+   * Cash Carry (external): strip whenever Tf ≥ 2.
+   * FX Risk / Decision: rolling windows (Tf > Th), or an already-staged
+   * Cash Carry / path strip schedule (do not collapse it to a 12M bullet).
    */
   const rollingAvailable =
-    performancePanelPlacement === 'external'
+    profileOnly || performancePanelPlacement === 'external'
       ? Tf >= 2
-      : needsRollingHedges(setup);
+      : needsRollingHedges(setup)
+        || (scheduleEndMonthsProp != null && scheduleEndMonthsProp.length >= 2)
+        || (typeof stripLegCount === 'number' && stripLegCount >= 2);
   /** Structure + regime live in the gear panel (Cash Carry modal top). */
-  const pathControlsInGear = performancePanelPlacement === 'external';
-  const showStructurePicker = Tf > 0;
+  const pathControlsInGear =
+    profileOnly || performancePanelPlacement === 'external';
+  const showStructurePicker =
+    Tf > 0 && (!profileOnly || Boolean(tickTradesHost));
   const effectiveStructure: ForecastHedgeStructure =
     hedgeStructure === 'strip' && rollingAvailable ? 'strip' : 'bullet';
   useEffect(() => {
+    if (profileOnly) return;
     if (!rollingAvailable && hedgeStructure === 'strip') {
       if (!controlled) setLocalStructure('bullet');
       onHedgeStructureChange?.('bullet');
     }
   }, [
+    profileOnly,
     rollingAvailable,
     hedgeStructure,
     controlled,
@@ -746,27 +824,67 @@ export function ExposureHedgePathChart({
   /** When switching strip → bullet, drop Target default so residual P&L uses VN. */
   const prevStructureRef = useRef(effectiveStructure);
   useEffect(() => {
+    if (lockOptimizeMix) return;
     const prev = prevStructureRef.current;
     prevStructureRef.current = effectiveStructure;
     if (prev === 'strip' && effectiveStructure === 'bullet') {
       onSelectedBasisChange('varNeutral');
     }
-  }, [effectiveStructure, onSelectedBasisChange]);
+  }, [effectiveStructure, lockOptimizeMix, onSelectedBasisChange]);
   /** Bullet Th=Tf; stock profile → path totalBuildup so VN ≠ Cash. */
   const sizingSetup = useMemo(
     () => varSetupForPathHedgeRegime(setup, effectiveStructure),
     [setup, effectiveStructure],
   );
 
-  const { flows, windowMonths, startM, endM: pathEndM } = useMemo(
-    () => resolveChartMonthlyFlows(stockM, monthlyFlowM, setup, monthlyFlows),
-    [stockM, monthlyFlowM, setup, monthlyFlows],
-  );
+  const incrementOnly =
+    (profileOnly || lockOptimizeMix) && Math.abs(bookedCoverLocalM) > 1e-12;
 
-  const path = useMemo(
-    () => buildExposurePathPoints(startM, flows, windowMonths),
-    [startM, flows, windowMonths],
-  );
+  const { flows, windowMonths, startM, pathEndM, path } = useMemo(() => {
+    const resolved = resolveChartMonthlyFlows(
+      stockM,
+      monthlyFlowM,
+      setup,
+      monthlyFlows,
+    );
+    const raw = buildExposurePathPoints(
+      resolved.startM,
+      resolved.flows,
+      resolved.windowMonths,
+    );
+    if (!incrementOnly) {
+      return {
+        flows: resolved.flows,
+        windowMonths: resolved.windowMonths,
+        startM: resolved.startM,
+        pathEndM: resolved.endM,
+        path: raw,
+      };
+    }
+    const E =
+      forecastTargetLocalM != null && Number.isFinite(forecastTargetLocalM)
+        ? forecastTargetLocalM
+        : Number.isFinite(endExposureM)
+          ? endExposureM
+          : resolved.endM;
+    const remapped = mapPathToUncoveredIncrement(raw, bookedCoverLocalM, E);
+    return {
+      flows: monthlyFlowsFromPath(remapped, resolved.windowMonths),
+      windowMonths: resolved.windowMonths,
+      startM: remapped[0]?.exposureM ?? 0,
+      pathEndM: remapped[remapped.length - 1]?.exposureM ?? 0,
+      path: remapped,
+    };
+  }, [
+    stockM,
+    monthlyFlowM,
+    setup,
+    monthlyFlows,
+    incrementOnly,
+    bookedCoverLocalM,
+    forecastTargetLocalM,
+    endExposureM,
+  ]);
 
   /**
    * Path-VaR CoG H for bullet chips / Decision %. Strip: per-window CoG
@@ -774,7 +892,7 @@ export function ExposureHedgePathChart({
    */
   const matchedEqualVarLocalM = useMemo(() => {
     const local = equalVarLinearHedgeNotionalLocalM(
-      stockM,
+      startM,
       monthlyFlowM,
       ccy,
       sizingSetup,
@@ -782,14 +900,16 @@ export function ExposureHedgePathChart({
       flows,
     ).amountLocalM;
     if (Math.abs(local) > 1e-12) return local;
-    return equalVarHedgeLocalM;
+    return incrementOnly ? pathEndM : equalVarHedgeLocalM;
   }, [
     equalVarHedgeLocalM,
-    stockM,
+    startM,
     monthlyFlowM,
     ccy,
     sizingSetup,
     flows,
+    incrementOnly,
+    pathEndM,
   ]);
 
   const coverScale = Math.min(1, Math.max(0, targetCoverPct / 100));
@@ -802,40 +922,82 @@ export function ExposureHedgePathChart({
         startM,
         pathEndM,
         matchedEqualVarLocalM,
-        ccy,
       ),
-    [selectedBasis, startM, pathEndM, matchedEqualVarLocalM, ccy],
+    [selectedBasis, startM, pathEndM, matchedEqualVarLocalM],
   );
 
   /** Bullet cover under the selected regime × cover %. */
   const bulletCoverLocalM = regimeTargetLocalM * coverScale;
 
-  // Restore cover % from prepared package when CCY changes (or ratio
-  // meaningfully drifts). Never setState when the rounded % is unchanged —
-  // coverScale → ladder → autoStage → hedgeRatio would otherwise loop.
+  // Seed cover % from the prepared package when CCY changes.
+  // Cash Carry auto-stage writes hedgeRatio := coverScale; feeding that
+  // echo back into the slider rebuilds the ladder and loops (max update depth).
   const coverSyncCcyRef = useRef<string | null>(null);
+  const lastSyncedRatioRef = useRef<number | null>(null);
   useEffect(() => {
     const ccyChanged = coverSyncCcyRef.current !== ccy;
-    coverSyncCcyRef.current = ccy;
-    if (hedgeRatio > 1e-9 && hedgeRatio <= 1 + 1e-9) {
-      const next = Math.min(100, Math.max(0, Math.round(hedgeRatio * 100)));
-      setTargetCoverPct(prev => (prev === next ? prev : next));
+    if (ccyChanged) {
+      coverSyncCcyRef.current = ccy;
+      lastSyncedRatioRef.current = null;
+    }
+    const ratio = Number(hedgeRatio);
+    const usable =
+      Number.isFinite(ratio) && ratio > 1e-9 && ratio <= 1 + 1e-9;
+    const roundedPct = (r: number) =>
+      Math.min(100, Math.max(0, Math.round(r * 1000) / 10));
+
+    if (incrementOnly || profileOnly) {
+      lastSyncedRatioRef.current = 1;
+      setTargetCoverPct(prev => (prev === 100 ? prev : 100));
       return;
     }
-    if (ccyChanged) setTargetCoverPct(100);
-  }, [ccy, hedgeRatio]);
+
+    if (ccyChanged) {
+      if (usable) {
+        lastSyncedRatioRef.current = ratio;
+        const next = roundedPct(ratio);
+        setTargetCoverPct(prev => (prev === next ? prev : next));
+      } else {
+        setTargetCoverPct(100);
+      }
+      return;
+    }
+
+    if (autoStagePrepared) return;
+    if (!usable) return;
+    if (
+      lastSyncedRatioRef.current != null &&
+      Math.abs(lastSyncedRatioRef.current - ratio) < 1e-6
+    ) {
+      return;
+    }
+    lastSyncedRatioRef.current = ratio;
+    const next = roundedPct(ratio);
+    setTargetCoverPct(prev => (Math.abs(prev - next) < 0.05 ? prev : next));
+  }, [ccy, hedgeRatio, autoStagePrepared, incrementOnly, profileOnly]);
 
   /** Bullet cash settle from M0 under Period end / start / e∩H. */
-  const bulletSettleMonths = useMemo(
-    () =>
-      resolveBulletCashSettleMonths(
-        bulletCoverLocalM,
-        path,
-        stripCashDeliveryAt,
-        Tf,
-      ),
-    [bulletCoverLocalM, path, stripCashDeliveryAt, Tf],
-  );
+  const bulletSettleMonths = useMemo(() => {
+    if (
+      bulletSettleMonthsOverride != null &&
+      Number.isFinite(bulletSettleMonthsOverride)
+    ) {
+      return Math.min(windowMonths, Math.max(0, bulletSettleMonthsOverride));
+    }
+    return resolveBulletCashSettleMonths(
+      bulletCoverLocalM,
+      path,
+      stripCashDeliveryAt,
+      Tf,
+    );
+  }, [
+    bulletSettleMonthsOverride,
+    windowMonths,
+    bulletCoverLocalM,
+    path,
+    stripCashDeliveryAt,
+    Tf,
+  ]);
 
   const bookProfile =
     onBookHedgeProfile || onBookRollingStrip
@@ -869,17 +1031,44 @@ export function ExposureHedgePathChart({
         }
       : undefined;
 
-  const defaultStripLegs = useMemo(() => {
-    if (!(Tf > 0) || !(Th > 0)) return 2;
-    return Math.max(2, Math.ceil(Tf / Th - 1e-12));
-  }, [Tf, Th]);
-  const maxStripLegs = useMemo(
-    () => Math.max(2, Math.min(24, Math.ceil(Tf) || 2)),
-    [Tf],
-  );
+  /**
+   * Fallback leg count when NOTHING explicit is supplied — no parent schedule
+   * and no parent leg count. It used to be ceil(Tf/Th), which fabricated a
+   * 4-leg strip from a 12m forecast over a 3m VaR tenure (12 legs over 1m)
+   * that nobody asked for, in every screen that passes stripLegCount = null.
+   * Desk rule: with no strip explicitly created, a structure is at most 3
+   * legs — a ladder is only bigger because someone actually chose it.
+   */
+  const defaultStripLegs = DEFAULT_STRIP_LEGS_MAX;
+  const maxStripLegs = useMemo(() => maxStripLegsForForecast(Tf), [Tf]);
+  const parentCollapsedSchedule = useMemo(() => {
+    if (scheduleEndMonthsProp == null || scheduleEndMonthsProp.length < 1) {
+      return null;
+    }
+    return collapseStripScheduleIfDuplicateMonths(
+      scheduleEndMonthsProp,
+      scheduleHedgeWeightsProp,
+    );
+  }, [scheduleEndMonthsProp, scheduleHedgeWeightsProp]);
+  const parentEndsCount = (() => {
+    if (
+      parentCollapsedSchedule == null ||
+      parentCollapsedSchedule.ends.length < 2
+    ) {
+      return 0;
+    }
+    return normalizeStripEndMonths([...parentCollapsedSchedule.ends], Tf, {
+      forceThroughTf: false,
+    }).length;
+  })();
   const effectiveStripLegs = Math.min(
     maxStripLegs,
-    Math.max(2, stripLegCount ?? defaultStripLegs),
+    Math.max(
+      2,
+      parentEndsCount >= 2
+        ? parentEndsCount
+        : (stripLegCount ?? defaultStripLegs),
+    ),
   );
   const equalEndMonths = useMemo(() => {
     if (!(Tf > 0) || effectiveStripLegs < 1) return [] as number[];
@@ -941,7 +1130,11 @@ export function ExposureHedgePathChart({
     const weightsChanged =
       scheduleHedgeWeightsSig !== lastScheduleHedgeWeightsSigRef.current;
     if (!endsChanged && !weightsChanged) return;
-    const norm = normalizeStripEndMonths([...scheduleEndMonthsProp], Tf, {
+    const collapsed = collapseStripScheduleIfDuplicateMonths(
+      scheduleEndMonthsProp,
+      scheduleHedgeWeightsProp,
+    );
+    const norm = normalizeStripEndMonths([...collapsed.ends], Tf, {
       forceThroughTf: false,
     });
     if (norm.length < 1) return;
@@ -951,11 +1144,17 @@ export function ExposureHedgePathChart({
       customEndMonths != null &&
       customEndMonths.length === norm.length &&
       customEndMonths.every((m, i) => Math.abs(m - norm[i]!) < 1e-6);
+    const alignedShares = alignStripScheduleWeightsToEnds(
+      collapsed.ends,
+      collapsed.weights,
+      norm,
+    );
     const nextHedgeShares =
-      scheduleHedgeWeightsProp != null &&
-      scheduleHedgeWeightsProp.length === norm.length
-        ? normalizeStripScheduleWeights([...scheduleHedgeWeightsProp])
-        : null;
+      alignedShares.length === norm.length
+        ? alignedShares
+        : collapsed.weights.length === norm.length
+          ? normalizeStripScheduleWeights([...collapsed.weights])
+          : null;
     const weightsAlready =
       nextHedgeShares == null
         ? hedgeShareWeights == null
@@ -982,7 +1181,7 @@ export function ExposureHedgePathChart({
     if (!weightsAlready && nextHedgeShares != null) {
       setHedgeShareWeights(nextHedgeShares);
     }
-    setStripScheduleOpen(true);
+    if (!profileOnly) setStripScheduleOpen(true);
   }, [
     scheduleEndsSig,
     scheduleEndMonthsProp,
@@ -992,6 +1191,7 @@ export function ExposureHedgePathChart({
     stripScheduleMode,
     customEndMonths,
     hedgeShareWeights,
+    profileOnly,
   ]);
 
   /**
@@ -1000,25 +1200,29 @@ export function ExposureHedgePathChart({
    * never stage an equal M1/M4/M7 ladder over the applied M3/M5/M7.
    */
   const parentScheduleEnds = useMemo(() => {
-    if (scheduleEndMonthsProp == null || scheduleEndMonthsProp.length === 0) {
+    if (parentCollapsedSchedule == null || parentCollapsedSchedule.ends.length === 0) {
       return null;
     }
-    const norm = normalizeStripEndMonths([...scheduleEndMonthsProp], Tf, {
+    const norm = normalizeStripEndMonths([...parentCollapsedSchedule.ends], Tf, {
       forceThroughTf: false,
     });
     return norm.length > 0 ? norm : null;
-  }, [scheduleEndMonthsProp, Tf]);
+  }, [parentCollapsedSchedule, Tf]);
 
   const parentHedgeShares = useMemo(() => {
-    if (
-      parentScheduleEnds == null ||
-      scheduleHedgeWeightsProp == null ||
-      scheduleHedgeWeightsProp.length !== parentScheduleEnds.length
-    ) {
+    if (parentScheduleEnds == null || parentCollapsedSchedule == null) {
       return null;
     }
-    return normalizeStripScheduleWeights([...scheduleHedgeWeightsProp]);
-  }, [parentScheduleEnds, scheduleHedgeWeightsProp]);
+    if (parentCollapsedSchedule.weights.length === parentScheduleEnds.length) {
+      return normalizeStripScheduleWeights([...parentCollapsedSchedule.weights]);
+    }
+    const aligned = alignStripScheduleWeightsToEnds(
+      parentCollapsedSchedule.ends,
+      parentCollapsedSchedule.weights,
+      parentScheduleEnds,
+    );
+    return aligned.length === parentScheduleEnds.length ? aligned : null;
+  }, [parentScheduleEnds, parentCollapsedSchedule]);
 
   const stripEdgeOpts = useMemo(() => {
     if (!rolling) return undefined;
@@ -1103,7 +1307,6 @@ export function ExposureHedgePathChart({
         startM,
         pathEndM,
         matchedEqualVarLocalM,
-        ccy,
       ) * scale;
     if (Math.abs(amount) < 1e-12) return [];
     return [
@@ -1173,6 +1376,11 @@ export function ExposureHedgePathChart({
   useEffect(() => {
     setEnabledLegIds({});
   }, [selectedBasis, effectiveStructure]);
+
+  useEffect(() => {
+    if (tickTradeEnabled == null) return;
+    setEnabledLegIds(prev => ({ ...prev, ...tickTradeEnabled }));
+  }, [tickTradeEnabled]);
 
   // Keep checkbox map in sync when legs change (default: all on).
   useEffect(() => {
@@ -1393,7 +1601,6 @@ export function ExposureHedgePathChart({
           startM,
           pathEndM,
           matchedEqualVarLocalM,
-          ccy,
         );
     const beT =
       Math.abs(coverForBe) > 1e-9
@@ -1489,6 +1696,7 @@ export function ExposureHedgePathChart({
   ]);
 
   const resetStripToDefault = () => {
+    if (tickTradesLocked) return;
     setStripLegCount(null);
     setEnabledLegIds({});
     setStripScheduleMode('equal');
@@ -1501,7 +1709,30 @@ export function ExposureHedgePathChart({
     setSchedPctDraft(null);
   };
 
-  /** Shared Reset | Legs − n + | ⚙ control (Performance header and/or schedule host). */
+  /** Equal Sched % windows for current leg count (keeps n; clears custom settles). */
+  const resetSchedulePct = () => {
+    setStripScheduleMode('equal');
+    commitCustomEnds(null);
+    setScheduleWeights(null);
+    setWeightPreset('equal');
+    setSchedPctDraft(null);
+  };
+
+  const applyScheduleWeights = (
+    rawWeights: readonly number[],
+    preset: StripScheduleWeightPreset | 'equal' | 'custom',
+  ) => {
+    const w = normalizeStripScheduleWeights(rawWeights);
+    if (w.length < 2) return;
+    const ends = endMonthsFromScheduleWeights(w, Tf);
+    setScheduleWeights(w);
+    commitCustomEnds(ends);
+    setStripScheduleMode('custom');
+    setStripLegCount(Math.max(2, ends.length));
+    setWeightPreset(preset);
+  };
+
+  /** Shared Reset | Legs − n + | Shaping | ⚙ (Performance header and/or schedule host). */
   const renderStripLegsToolbar = (opts?: {
     showGear?: boolean;
     trailing?: ReactNode;
@@ -1517,6 +1748,7 @@ export function ExposureHedgePathChart({
         stripScheduleMode === 'custom' ||
         stripCashDeliveryAt !== 'periodEnd');
     const bumpLegs = (next: number) => {
+      if (tickTradesLocked) return;
       if (stripScheduleMode === 'custom') {
         setStripScheduleMode('equal');
         commitCustomEnds(null);
@@ -1530,7 +1762,8 @@ export function ExposureHedgePathChart({
         <button
           type="button"
           onClick={resetStripToDefault}
-          className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+          disabled={tickTradesLocked}
+          className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-200 disabled:opacity-30"
           title={`Reset to equal ${defaultStripLegs}-leg strip (ceil(Tf/Th)), all trades on`}
         >
           Reset
@@ -1540,14 +1773,14 @@ export function ExposureHedgePathChart({
           {weightPreset === 'front'
             ? 'Front-loaded'
             : weightPreset === 'back'
-              ? 'Back-loaded'
+              ? 'Carry-shaped'
               : stripScheduleMode === 'custom'
                 ? 'Custom · legs'
                 : 'Strip legs'}
         </span>
         <button
           type="button"
-          disabled={effectiveStripLegs <= 2}
+          disabled={tickTradesLocked || effectiveStripLegs <= 2}
           onClick={() => bumpLegs(Math.max(2, effectiveStripLegs - 1))}
           className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-30"
           title="Fewer strip forwards (min 2) — equal spacing"
@@ -1561,7 +1794,7 @@ export function ExposureHedgePathChart({
         </span>
         <button
           type="button"
-          disabled={effectiveStripLegs >= maxStripLegs}
+          disabled={tickTradesLocked || effectiveStripLegs >= maxStripLegs}
           onClick={() =>
             bumpLegs(Math.min(maxStripLegs, effectiveStripLegs + 1))
           }
@@ -1570,6 +1803,60 @@ export function ExposureHedgePathChart({
         >
           +
         </button>
+        <span className="text-[9px] text-slate-600">|</span>
+        <span className="text-[9px] text-slate-500">Shaping</span>
+        {(
+          [
+            { id: 'equal' as const, label: 'Equal' },
+            { id: 'front' as const, label: 'Front-loaded' },
+            { id: 'carry' as const, label: 'Carry-shaped' },
+          ] as const
+        ).map(opt => {
+          const on =
+            opt.id === 'equal'
+              ? stripScheduleMode === 'equal' && weightPreset === 'equal'
+              : opt.id === 'front'
+                ? weightPreset === 'front'
+                : weightPreset === 'back';
+          return (
+            <button
+              key={opt.id}
+              type="button"
+              disabled={tickTradesLocked}
+              aria-pressed={on}
+              title={
+                opt.id === 'equal'
+                  ? 'Even windows Tf/n'
+                  : opt.id === 'front'
+                    ? 'More cover on the near tenors'
+                    : 'More cover on the far tenors (carry)'
+              }
+              onClick={() => {
+                if (tickTradesLocked) return;
+                if (opt.id === 'equal') {
+                  resetSchedulePct();
+                  return;
+                }
+                applyScheduleWeights(
+                  rampStripScheduleWeights(
+                    effectiveStripLegs,
+                    opt.id === 'front' ? 'front' : 'back',
+                  ),
+                  opt.id === 'front' ? 'front' : 'back',
+                );
+              }}
+              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold disabled:opacity-30 ${
+                on
+                  ? opt.id === 'equal'
+                    ? 'bg-emerald-500/20 text-emerald-100'
+                    : 'bg-sky-500/20 text-sky-100'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
         {showGear && (
           <>
             <span className="text-[9px] text-slate-600">|</span>
@@ -1607,29 +1894,6 @@ export function ExposureHedgePathChart({
         {opts?.trailing}
       </div>
     );
-  };
-
-  /** Equal Sched % windows for current leg count (keeps n; clears custom settles). */
-  const resetSchedulePct = () => {
-    setStripScheduleMode('equal');
-    commitCustomEnds(null);
-    setScheduleWeights(null);
-    setWeightPreset('equal');
-    setSchedPctDraft(null);
-  };
-
-  const applyScheduleWeights = (
-    rawWeights: readonly number[],
-    preset: StripScheduleWeightPreset | 'equal' | 'custom',
-  ) => {
-    const w = normalizeStripScheduleWeights(rawWeights);
-    if (w.length < 2) return;
-    const ends = endMonthsFromScheduleWeights(w, Tf);
-    setScheduleWeights(w);
-    commitCustomEnds(ends);
-    setStripScheduleMode('custom');
-    setStripLegCount(Math.max(2, ends.length));
-    setWeightPreset(preset);
   };
 
   const openCustomSchedule = () => {
@@ -1795,7 +2059,9 @@ export function ExposureHedgePathChart({
 
   /** Detail rows under the chart: each FWD (checkbox) + Tf. */
   const hedgePerfRows = useMemo(() => {
-    if (performancePanelPlacement === 'external') return [];
+    if (performancePanelPlacement === 'external' && tickTradesHost == null) {
+      return [];
+    }
     if (hedgeLegs.length === 0) return [];
     type Row = {
       key: string;
@@ -1865,7 +2131,10 @@ export function ExposureHedgePathChart({
     const rows: Row[] = [];
     for (const leg of hedgeLegs) {
       const p = at(leg.tenureMonths);
-      const enabled = enabledLegIds[leg.index] !== false;
+      const enabled =
+        tickTradeEnabled != null
+          ? tickTradeEnabled[leg.index] !== false
+          : enabledLegIds[leg.index] !== false;
       const openVarUsdM = p?.openVarUsdM ?? 0;
       const hedgedVarUsdM = p?.hedgedVarUsdM ?? 0;
       // H = Σ live M0 cover from profile (same as Resid VaR) — not path e.
@@ -1963,6 +2232,8 @@ export function ExposureHedgePathChart({
     marketRates,
     bulletSettleMonths,
     performancePanelPlacement,
+    tickTradesHost,
+    tickTradeEnabled,
   ]);
 
   /** Cover from ticked legs only (unticked legs excluded from green H & resid). */
@@ -1976,45 +2247,36 @@ export function ExposureHedgePathChart({
 
   const basisTarget = showRollingStrip
     ? activeStripCoverM
-    : hedgeBasisNotionalLocalM(
-        selectedBasis,
-        startM,
-        pathEndM,
-        matchedEqualVarLocalM,
-        ccy,
-      );
+    : incrementOnly
+      ? pathEndM
+      : hedgeBasisNotionalLocalM(
+          selectedBasis,
+          startM,
+          pathEndM,
+          matchedEqualVarLocalM,
+        );
 
-  // Bullet only: sync Decision % when Cash/VN/Target or structure changes.
-  // Strip must not auto-apply here — booking is explicit via "Book … forwards".
-  const onApplyBasisRef = useRef(onApplyBasis);
-  onApplyBasisRef.current = onApplyBasis;
-  const applySigRef = useRef('');
-  useEffect(() => {
-    if (effectiveStructure === 'strip') return;
-    const sig = `${effectiveStructure}|${selectedBasis}|${matchedEqualVarLocalM.toFixed(6)}|${pathEndM.toFixed(6)}`;
-    if (applySigRef.current === sig) return;
-    applySigRef.current = sig;
-    onApplyBasisRef.current(selectedBasis, effectiveStructure);
-  }, [
-    effectiveStructure,
-    selectedBasis,
-    matchedEqualVarLocalM,
-    pathEndM,
-  ]);
+  // Regime chips and structure clicks call onApplyBasis explicitly.
+  // Do not auto-apply on mount / path-size settle — that overwrites Optimize
+  // mix weights just by opening (or closing) the modal.
 
   /**
    * Flat H = Σ ticked strip cover (all live from M0) or bullet level.
-   * One breakeven: where |e| crosses that flat H (strip ladder still stepped).
+   * Ticket / mix lock: use the proposed / approved clip, not 100% of e(Tf).
    */
+  const pinnedCover =
+    Math.abs(appliedHedgeLocalM) > 1e-12 ? appliedHedgeLocalM : 0;
   const hedgeLevel = showRollingStrip
-    ? Math.abs(activeStripCoverM) > 1e-12
-      ? activeStripCoverM
-      : 0
-    : Math.abs(basisTarget) > 1e-12
-      ? basisTarget
-      : Math.abs(appliedHedgeLocalM) < 1e-12
-        ? 0
-        : Math.sign(pathEndM || startM || 1) * Math.abs(appliedHedgeLocalM);
+    ? incrementOnly && pinnedCover !== 0
+      ? pinnedCover
+      : Math.abs(activeStripCoverM) > 1e-12
+        ? activeStripCoverM
+        : 0
+    : (profileOnly || lockOptimizeMix) && pinnedCover !== 0
+      ? pinnedCover
+      : Math.abs(basisTarget) > 1e-12
+        ? basisTarget
+        : pinnedCover;
 
   const hasFlatHedge = Math.abs(hedgeLevel) > 1e-9;
 
@@ -2040,15 +2302,16 @@ export function ExposureHedgePathChart({
     // Stable Y domain from exposure path + full strip program (not ticked subset).
     const fullProgramCover = showRollingStrip
       ? stripTotalCoverM
-      : Math.abs(appliedHedgeLocalM) > 1e-12
-        ? Math.sign(pathEndM || startM || 1) * Math.abs(appliedHedgeLocalM)
-        : hedgeBasisNotionalLocalM(
-            selectedBasis,
-            startM,
-            pathEndM,
-            matchedEqualVarLocalM,
-            ccy,
-          );
+      : (profileOnly || lockOptimizeMix) && pinnedCover !== 0
+        ? pinnedCover
+        : Math.abs(appliedHedgeLocalM) > 1e-12
+          ? appliedHedgeLocalM
+          : hedgeBasisNotionalLocalM(
+              selectedBasis,
+              startM,
+              pathEndM,
+              matchedEqualVarLocalM,
+            );
     const values = [
       ...path.map(p => p.exposureM),
       startM,
@@ -2110,6 +2373,9 @@ export function ExposureHedgePathChart({
     showRollingStrip,
     stripTotalCoverM,
     appliedHedgeLocalM,
+    pinnedCover,
+    profileOnly,
+    lockOptimizeMix,
     selectedBasis,
     matchedEqualVarLocalM,
     rollingEdges,
@@ -2540,6 +2806,17 @@ export function ExposureHedgePathChart({
         : hasHedge
           ? 1
           : 0,
+      structure: showRollingStrip ? 'strip' : 'bullet',
+      basis: selectedBasis,
+      settleMonths: showRollingStrip ? undefined : bulletSettleMonths,
+      legsSig: showRollingStrip
+        ? activeLadderEdges
+            .map(
+              e =>
+                `${e.endMonth.toFixed(4)}:${e.hedgeLocalM.toFixed(6)}`,
+            )
+            .join('|')
+        : `${bulletSettleMonths.toFixed(4)}:${(hasHedge ? hedgeLevel : 0).toFixed(6)}`,
       legsSub: showRollingStrip
         ? anyStripLegOff
           ? `${activeHedgeLegs.length} ticked · ${rollingEdges.length} program`
@@ -2581,6 +2858,8 @@ export function ExposureHedgePathChart({
     unhedgedVarPct,
     breakevenT,
     startGap,
+    bulletSettleMonths,
+    activeLadderEdges,
   ]);
 
   const onSummaryMetricsChangeRef = useRef(onSummaryMetricsChange);
@@ -2600,6 +2879,10 @@ export function ExposureHedgePathChart({
       summaryMetrics.residVarSub,
       summaryMetrics.breakevenValue,
       summaryMetrics.breakevenSub ?? '',
+      summaryMetrics.structure ?? '',
+      summaryMetrics.basis ?? '',
+      summaryMetrics.settleMonths?.toFixed(4) ?? '',
+      summaryMetrics.legsSig ?? '',
     ].join('\0');
     // Parent setState on every paint (new object identity) → Maximum update depth.
     if (lastSummaryMetricsSigRef.current === sig) return;
@@ -2609,7 +2892,6 @@ export function ExposureHedgePathChart({
   useEffect(() => {
     return () => {
       lastSummaryMetricsSigRef.current = null;
-      onSummaryMetricsChangeRef.current?.(null);
     };
   }, []);
 
@@ -2669,7 +2951,7 @@ export function ExposureHedgePathChart({
   const onPrepareActionChangeRef = useRef(onPrepareActionChange);
   onPrepareActionChangeRef.current = onPrepareActionChange;
   const lastPrepareActionKeyRef = useRef<string | null>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!prepareMeta || !bookProfileRef.current) {
       if (lastPrepareActionKeyRef.current !== null) {
         lastPrepareActionKeyRef.current = null;
@@ -2687,9 +2969,6 @@ export function ExposureHedgePathChart({
       run: () => bookProfileRef.current?.(structure, edges),
     });
   }, [prepareMeta, prepareActionKey]);
-  useEffect(() => {
-    return () => onPrepareActionChangeRef.current?.(null);
-  }, []);
   const autoStageSig = useMemo(() => {
     if (!autoStagePrepared || !canBookProfile) return '';
     if (showRollingStrip) {
@@ -2863,7 +3142,7 @@ export function ExposureHedgePathChart({
         Hedge structure · VaR {Th}m · forecast {Tf}m
       </div>
       <div
-        className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+        className="inline-flex max-w-full flex-wrap rounded-lg border border-slate-700/80 bg-slate-900/80 p-0.5 shadow-[0_10px_20px_-18px_rgba(15,23,42,0.9)]"
         role="group"
         aria-label="Hedge structure"
       >
@@ -2918,10 +3197,10 @@ export function ExposureHedgePathChart({
           forwards; each expires and delivers cash at its tenor.
         </p>
       )}
-      <div className="border-t border-slate-800 pt-2">
+      <div className="pt-2">
         <div className="mb-1 text-[10px] text-slate-500">Apply hedge regime</div>
         <div
-          className="inline-flex max-w-full min-w-0 flex-wrap rounded-lg border border-slate-700 bg-slate-950/60 p-0.5"
+          className="inline-flex max-w-full min-w-0 flex-wrap rounded-lg border border-slate-700/80 bg-slate-900/80 p-0.5 shadow-[0_10px_20px_-18px_rgba(15,23,42,0.9)]"
           role="group"
           aria-label="Apply hedge regime"
         >
@@ -2943,7 +3222,6 @@ export function ExposureHedgePathChart({
                   startM,
                   pathEndM,
                   matchedEqualVarLocalM,
-                  ccy,
                 );
             const n0 = useStrip ? stripEdges[0]!.hedgeLocalM : n;
             return (
@@ -2996,11 +3274,14 @@ export function ExposureHedgePathChart({
   );
 
   return (
+    <>
     <div
       className={
-        pathControlsInGear
-          ? 'space-y-3'
-          : 'rounded-lg border border-slate-700 bg-slate-950/50 p-3'
+        profileOnly
+          ? 'contents'
+          : pathControlsInGear
+            ? 'space-y-3 overflow-x-auto rounded-md border border-slate-700 bg-slate-900/80 p-2 shadow-lg shadow-slate-950/35'
+            : 'overflow-x-auto rounded-md border border-slate-700 bg-slate-900/80 p-2 shadow-lg shadow-slate-950/35'
       }
     >
       {renderCoverModal()}
@@ -3382,6 +3663,8 @@ export function ExposureHedgePathChart({
                 )}
 
                 {(() => {
+                  const scheduleEditing =
+                    !schedulePanelExternal || scheduleExternalEditing;
                   const stripScheduleEditor = showRollingStrip ? (
                     <div
                       className={
@@ -3397,17 +3680,32 @@ export function ExposureHedgePathChart({
                               ? 'Schedule setup · gear'
                               : 'Strip schedule · tick trades · review'}
                           </div>
-                          {renderStripLegsToolbar({
-                            showGear: true,
-                            gearPressed:
-                              scheduleExternalEditing ||
-                              stripScheduleMode === 'custom',
-                            gearTitle: scheduleExternalEditing
-                              ? 'Close schedule setup'
-                              : 'Schedule setup — settle dates · Sched % · Hedge %',
-                            onGearClick: () =>
-                              setScheduleExternalEditing(v => !v),
-                          })}
+                          {scheduleExternalEditing ? (
+                            renderStripLegsToolbar({
+                              showGear: true,
+                              gearPressed: true,
+                              gearTitle: 'Close schedule setup',
+                              onGearClick: () =>
+                                setScheduleExternalEditing(false),
+                            })
+                          ) : (
+                            <div className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-950/60 px-1.5 py-0.5">
+                              <span className="text-[9px] text-slate-500">
+                                {hedgeLegs.length} legs
+                              </span>
+                              <span className="text-[9px] text-slate-600">|</span>
+                              <button
+                                type="button"
+                                title="Schedule setup — settle dates · Sched % · Hedge %"
+                                aria-label="Schedule setup settings"
+                                aria-pressed={false}
+                                onClick={() => setScheduleExternalEditing(true)}
+                                className="inline-flex h-6 w-6 items-center justify-center rounded text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+                              >
+                                <GearIcon className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -3483,14 +3781,14 @@ export function ExposureHedgePathChart({
                                   'back',
                                 );
                               }}
-                              title="More Sched % / hedge on the back (far) — e.g. to pick up higher long-end rates / carry"
+                              title="More Sched % / hedge on the back (far) — pick up longer-tenor carry"
                               className={`rounded-md px-2.5 py-1 text-[10px] font-semibold ${
                                 weightPreset === 'back'
                                   ? 'bg-sky-500/20 text-sky-100'
                                   : 'text-slate-500 hover:text-slate-300'
                               }`}
                             >
-                              Back-loaded
+                              Carry-shaped
                             </button>
                             <button
                               type="button"
@@ -3511,9 +3809,9 @@ export function ExposureHedgePathChart({
                           </div>
                           <InfoTip label="Strip schedule mode help">
                             <p>
-                              Equal = even windows Tf/n. Front / Back skew Sched
-                              %. Type any Sched % in a row — that row keeps your
-                              value; others rescale to 100%.
+                              Equal = even windows Tf/n. Front / Carry-shaped
+                              skew Sched %. Type any Sched % in a row — that row
+                              keeps your value; others rescale to 100%.
                             </p>
                           </InfoTip>
                         </div>
@@ -3592,114 +3890,52 @@ export function ExposureHedgePathChart({
                         </div>
                       </div>
                       )}
-                      {/* External review: tick-trades table (Performance model) */}
-                      {schedulePanelExternal && !scheduleExternalEditing && (
-                        <table className="w-full min-w-[560px] text-left text-[10px]">
-                          <thead>
-                            <tr className="text-slate-500">
-                              <th
-                                className="py-1 pr-1 font-medium"
-                                title="Include in resid VaR / green H"
-                              >
-                                On
-                              </th>
-                              <th className="py-1 pr-2 font-medium">Forward</th>
-                              <th className="py-1 pr-2 font-medium text-amber-200/80">
-                                Settle
-                              </th>
-                              <th className="py-1 pr-2 text-right font-medium text-amber-200/80">
-                                Sched %
-                              </th>
-                              <th className="py-1 pr-2 text-right font-medium text-sky-300/90">
-                                Hedge %
-                              </th>
-                              <th className="py-1 pr-2 text-right font-medium">
-                                Δ
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {hedgeLegs.map((leg, i) => {
-                              const on = enabledLegIds[leg.index] !== false;
-                              const sw = displayScheduleWeights[i] ?? 0;
-                              const nw = notionalWeights[i] ?? 0;
-                              const settleMonths =
-                                (customEndMonths ?? activeEndMonths)[i] ??
-                                leg.tenureMonths;
-                              return (
-                                <tr
-                                  key={`rev-${leg.index}`}
-                                  className={`border-t border-slate-800/80 font-mono text-slate-300 ${
-                                    on ? '' : 'opacity-40'
-                                  }`}
-                                >
-                                  <td className="py-1 pr-1">
-                                    <input
-                                      type="checkbox"
-                                      checked={on}
-                                      onChange={() =>
-                                        setEnabledLegIds(prev => ({
-                                          ...prev,
-                                          [leg.index]: !on,
-                                        }))
-                                      }
-                                      className="h-3.5 w-3.5 cursor-pointer rounded border-slate-600 bg-slate-900 text-emerald-500 focus:ring-emerald-500/40"
-                                      title={
-                                        on
-                                          ? 'Exclude trade from resid VaR profile'
-                                          : 'Include trade in resid VaR profile'
-                                      }
-                                    />
-                                  </td>
-                                  <td className="py-1 pr-2 text-slate-300">
-                                    {leg.label}
-                                  </td>
-                                  <td className="py-1 pr-2 text-amber-200/90">
-                                    M
-                                    {settleMonths.toFixed(
-                                      settleMonths % 1 === 0 ? 0 : 1,
-                                    )}
-                                  </td>
-                                  <td className="py-1 pr-2 text-right text-slate-400">
-                                    {(sw * 100).toFixed(1)}%
-                                  </td>
-                                  <td className="py-1 pr-2 text-right text-sky-200/90">
-                                    {(nw * 100).toFixed(1)}%
-                                  </td>
-                                  <td className="py-1 pr-2 text-right text-emerald-300/90">
-                                    {fmtM(leg.amountLocalM)}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      )}
-                      {/* Schedule setup — settle + Sched % in one editable table */}
-                      {(!schedulePanelExternal || scheduleExternalEditing) && (
-                      <div className="mt-2 rounded border border-amber-500/30 bg-slate-950/50 p-1.5">
+                      {/* Review = read-only ticks; gear opens the settle / % editor. */}
+                      <div
+                        className={`mt-2 min-h-[12.5rem] rounded border bg-slate-950/50 p-1.5 ${
+                          scheduleEditing
+                            ? 'border-amber-500/30'
+                            : 'border-slate-700/80'
+                        }`}
+                      >
                         <div className="mb-1 flex flex-wrap items-center justify-between gap-1">
-                          <div className="text-[9px] font-semibold uppercase tracking-wide text-amber-200/90">
-                            Schedule setup
-                            <span className="ml-1 font-normal normal-case tracking-normal text-slate-500">
-                              ·{' '}
-                              {weightPreset === 'front'
-                                ? 'front-loaded'
-                                : weightPreset === 'back'
-                                  ? 'back-loaded'
-                                  : weightPreset === 'equal' ||
-                                      stripScheduleMode === 'equal'
-                                    ? 'equal'
-                                    : 'custom'}
-                              {stripScheduleMode === 'custom'
-                                ? ' · M0 → each settle'
-                                : ''}
-                            </span>
-                          </div>
-                          <div className="text-[8px] text-slate-500">
-                            Settle = today + Sched% × Tf days · all dates
-                            editable (≤ Tf)
-                          </div>
+                          {scheduleEditing ? (
+                            <>
+                              <div className="text-[9px] font-semibold uppercase tracking-wide text-amber-200/90">
+                                Schedule setup
+                                <span className="ml-1 font-normal normal-case tracking-normal text-slate-500">
+                                  ·{' '}
+                                  {weightPreset === 'front'
+                                    ? 'front-loaded'
+                                    : weightPreset === 'back'
+                                      ? 'carry-shaped'
+                                      : weightPreset === 'equal' ||
+                                          stripScheduleMode === 'equal'
+                                        ? 'equal'
+                                        : 'custom'}
+                                  {stripScheduleMode === 'custom'
+                                    ? ' · M0 → each settle'
+                                    : ''}
+                                </span>
+                              </div>
+                              <div className="text-[8px] text-slate-500">
+                                Settle = today + Sched% × Tf days · all dates
+                                editable (≤ Tf)
+                              </div>
+                            </>
+                          ) : (
+                            <>
+                              <div className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
+                                Tick trades
+                                <span className="ml-1 font-normal normal-case tracking-normal text-slate-600">
+                                  · toggle legs on the path
+                                </span>
+                              </div>
+                              <div className="text-[8px] text-slate-600">
+                                Gear → edit settle / Sched % / Hedge %
+                              </div>
+                            </>
+                          )}
                         </div>
                         <table className="w-full text-left text-[9px]">
                           <thead>
@@ -3750,11 +3986,25 @@ export function ExposureHedgePathChart({
                                   key={`w-${leg.index}`}
                                   className="border-t border-slate-800/80 font-mono text-slate-300"
                                 >
-                                  <td className="py-0.5 pr-1 text-slate-400">
-                                    {i + 1}
+                                  <td className="h-7 py-0 pr-1 text-slate-400">
+                                    <span className="inline-flex h-6 items-center gap-1">
+                                      <input
+                                        type="checkbox"
+                                        checked={enabledLegIds[leg.index] !== false}
+                                        onChange={() =>
+                                          setEnabledLegIds(prev => ({
+                                            ...prev,
+                                            [leg.index]: !(enabledLegIds[leg.index] !== false),
+                                          }))
+                                        }
+                                        className="h-3.5 w-3.5 cursor-pointer rounded border-slate-600 bg-slate-900 text-emerald-500 focus:ring-emerald-500/40"
+                                      />
+                                      {i + 1}
+                                    </span>
                                   </td>
-                                  <td className="py-0.5 pr-1">
-                                    <span className="inline-flex flex-col gap-0.5">
+                                  <td className="h-7 py-0 pr-1">
+                                    <span className="inline-flex h-6 items-center">
+                                      {scheduleEditing ? (
                                       <input
                                         type="date"
                                         value={settleIso}
@@ -3788,127 +4038,144 @@ export function ExposureHedgePathChart({
                                             ev.target.value,
                                           )
                                         }
-                                        className="rounded border border-amber-500/40 bg-slate-900 px-1 py-0.5 text-[10px] text-amber-200 focus:border-amber-400 focus:outline-none"
+                                        className="h-6 rounded border border-amber-500/40 bg-slate-900 px-1 py-0 text-[10px] text-amber-200 focus:border-amber-400 focus:outline-none"
                                         title={
                                           isLast
                                             ? `Final settle (editable, ≤ Tf=${Tf}m). Today + ${settleDays}d · M${settleMonths.toFixed(settleMonths % 1 === 0 ? 0 : 1)}`
                                             : `Default: today + ${settleDays}d (Sched share of Tf=${Tf}m ≈ ${Math.round(Tf * DAYS_PER_MONTH)}d)`
                                         }
                                       />
-                                      <span className="text-[8px] font-sans text-slate-500">
-                                        +{settleDays}d · M
-                                        {settleMonths.toFixed(
-                                          settleMonths % 1 === 0 ? 0 : 1,
-                                        )}
-                                        {isLast ? ' · final' : ''}
-                                      </span>
+                                      ) : (
+                                        <span className="text-amber-200/90">
+                                          M{settleMonths.toFixed(settleMonths % 1 === 0 ? 0 : 1)}
+                                          {' · +'}{settleDays}d
+                                        </span>
+                                      )}
                                     </span>
                                   </td>
                                   <td className="py-0.5 pr-1">
                                     <span className="inline-flex items-center gap-0.5">
-                                      <input
-                                        type="number"
-                                        min={1}
-                                        max={99}
-                                        step="any"
-                                        value={draft}
-                                        onFocus={() =>
-                                          setSchedPctDraft({
-                                            index: i,
-                                            value: String(
-                                              Math.round(sw * 1000) / 10,
-                                            ),
-                                          })
-                                        }
-                                        onChange={ev =>
-                                          setSchedPctDraft({
-                                            index: i,
-                                            value: ev.target.value,
-                                          })
-                                        }
-                                        onBlur={() => {
-                                          if (schedPctDraft?.index !== i) {
-                                            setSchedPctDraft(null);
-                                            return;
-                                          }
-                                          const n = Number(schedPctDraft.value);
-                                          setSchedPctDraft(null);
-                                          if (Number.isFinite(n) && n > 0) {
-                                            updateScheduleWeightAt(i, n);
-                                          }
-                                        }}
-                                        onKeyDown={ev => {
-                                          if (ev.key === 'Enter') {
-                                            (
-                                              ev.target as HTMLInputElement
-                                            ).blur();
-                                          }
-                                        }}
-                                        className="w-14 rounded border border-amber-500/40 bg-slate-900 px-1 py-0.5 text-amber-200 focus:border-amber-400 focus:outline-none"
-                                        title={`Type any % for this leg (1–99). It keeps that value; other legs share the rest. Tf=${Tf}m ≈ ${Math.round(Tf * DAYS_PER_MONTH)}d.`}
-                                      />
-                                      <span className="text-slate-500">%</span>
+                                      {scheduleEditing ? (
+                                        <>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={99}
+                                            step="any"
+                                            value={draft}
+                                            onFocus={() =>
+                                              setSchedPctDraft({
+                                                index: i,
+                                                value: String(
+                                                  Math.round(sw * 1000) / 10,
+                                                ),
+                                              })
+                                            }
+                                            onChange={ev =>
+                                              setSchedPctDraft({
+                                                index: i,
+                                                value: ev.target.value,
+                                              })
+                                            }
+                                            onBlur={() => {
+                                              if (schedPctDraft?.index !== i) {
+                                                setSchedPctDraft(null);
+                                                return;
+                                              }
+                                              const n = Number(
+                                                schedPctDraft.value,
+                                              );
+                                              setSchedPctDraft(null);
+                                              if (Number.isFinite(n) && n > 0) {
+                                                updateScheduleWeightAt(i, n);
+                                              }
+                                            }}
+                                            onKeyDown={ev => {
+                                              if (ev.key === 'Enter') {
+                                                (
+                                                  ev.target as HTMLInputElement
+                                                ).blur();
+                                              }
+                                            }}
+                                            className="h-6 w-14 rounded border border-amber-500/40 bg-slate-900 px-1 py-0 text-amber-200 focus:border-amber-400 focus:outline-none"
+                                            title={`Type any % for this leg (1–99). It keeps that value; other legs share the rest. Tf=${Tf}m ≈ ${Math.round(Tf * DAYS_PER_MONTH)}d.`}
+                                          />
+                                          <span className="text-slate-500">%</span>
+                                        </>
+                                      ) : (
+                                        <span className="text-amber-200/90">
+                                          {Math.round(sw * 1000) / 10}%
+                                        </span>
+                                      )}
                                     </span>
                                   </td>
                                   <td className="py-0.5 pr-1">
                                     <span className="inline-flex items-center gap-0.5">
-                                      <input
-                                        type="number"
-                                        min={1}
-                                        max={99}
-                                        step="any"
-                                        value={
-                                          hedgeShareDraft?.index === i
-                                            ? hedgeShareDraft.value
-                                            : String(
-                                                Math.round(nw * 1000) / 10,
-                                              )
-                                        }
-                                        onFocus={() =>
-                                          setHedgeShareDraft({
-                                            index: i,
-                                            value: String(
-                                              Math.round(nw * 1000) / 10,
-                                            ),
-                                          })
-                                        }
-                                        onChange={ev =>
-                                          setHedgeShareDraft({
-                                            index: i,
-                                            value: ev.target.value,
-                                          })
-                                        }
-                                        onBlur={() => {
-                                          if (hedgeShareDraft?.index !== i) {
-                                            setHedgeShareDraft(null);
-                                            return;
-                                          }
-                                          const n = Number(
-                                            hedgeShareDraft.value,
-                                          );
-                                          setHedgeShareDraft(null);
-                                          if (Number.isFinite(n) && n > 0) {
-                                            updateHedgeShareAt(i, n);
-                                          }
-                                        }}
-                                        onKeyDown={ev => {
-                                          if (ev.key === 'Enter') {
-                                            (
-                                              ev.target as HTMLInputElement
-                                            ).blur();
-                                          }
-                                        }}
-                                        className="w-14 rounded border border-sky-500/40 bg-slate-900 px-1 py-0.5 text-sky-200 focus:border-sky-400 focus:outline-none"
-                                        title="Share of total strip hedge notional on this leg. Keeps your %; other legs rescale."
-                                      />
-                                      <span className="text-slate-500">%</span>
+                                      {scheduleEditing ? (
+                                        <>
+                                          <input
+                                            type="number"
+                                            min={1}
+                                            max={99}
+                                            step="any"
+                                            value={
+                                              hedgeShareDraft?.index === i
+                                                ? hedgeShareDraft.value
+                                                : String(
+                                                    Math.round(nw * 1000) / 10,
+                                                  )
+                                            }
+                                            onFocus={() =>
+                                              setHedgeShareDraft({
+                                                index: i,
+                                                value: String(
+                                                  Math.round(nw * 1000) / 10,
+                                                ),
+                                              })
+                                            }
+                                            onChange={ev =>
+                                              setHedgeShareDraft({
+                                                index: i,
+                                                value: ev.target.value,
+                                              })
+                                            }
+                                            onBlur={() => {
+                                              if (hedgeShareDraft?.index !== i) {
+                                                setHedgeShareDraft(null);
+                                                return;
+                                              }
+                                              const n = Number(
+                                                hedgeShareDraft.value,
+                                              );
+                                              setHedgeShareDraft(null);
+                                              if (Number.isFinite(n) && n > 0) {
+                                                updateHedgeShareAt(i, n);
+                                              }
+                                            }}
+                                            onKeyDown={ev => {
+                                              if (ev.key === 'Enter') {
+                                                (
+                                                  ev.target as HTMLInputElement
+                                                ).blur();
+                                              }
+                                            }}
+                                            className="h-6 w-14 rounded border border-sky-500/40 bg-slate-900 px-1 py-0 text-sky-200 focus:border-sky-400 focus:outline-none"
+                                            title="Share of total strip hedge notional on this leg. Keeps your %; other legs rescale."
+                                          />
+                                          <span className="text-slate-500">%</span>
+                                        </>
+                                      ) : (
+                                        <span className="text-sky-200/90">
+                                          {Math.round(nw * 1000) / 10}%
+                                        </span>
+                                      )}
                                     </span>
                                   </td>
                                   <td className="py-0.5 pr-1 text-emerald-300/90">
                                     {fmtM(leg.amountLocalM)}
                                   </td>
-                                  <td className="py-0.5">
-                                    {!isLast && hedgeLegs.length > 2 ? (
+                                  <td className="h-7 py-0">
+                                    {scheduleEditing && !isLast && hedgeLegs.length > 2 ? (
                                       <button
                                         type="button"
                                         onClick={() => removeCustomEndAt(i)}
@@ -3924,7 +4191,8 @@ export function ExposureHedgePathChart({
                             })}
                           </tbody>
                         </table>
-                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        <div className="mt-1.5 flex min-h-[2rem] flex-wrap items-center gap-1.5">
+                          {scheduleEditing && (
                           <button
                             type="button"
                             disabled={hedgeLegs.length >= maxStripLegs}
@@ -3933,6 +4201,8 @@ export function ExposureHedgePathChart({
                           >
                             + Add maturity
                           </button>
+                          )}
+                          {scheduleEditing && (
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="text-[8px] text-slate-600">
                               Sched % = timing windows. Hedge % = notional mix
@@ -3965,9 +4235,9 @@ export function ExposureHedgePathChart({
                               </button>
                             )}
                           </div>
+                          )}
                         </div>
                       </div>
-                      )}
                       {schedulePanelExternal && scheduleExternalEditing && (
                         <div className="flex justify-end border-t border-slate-800 pt-2">
                           <button
@@ -4413,6 +4683,7 @@ export function ExposureHedgePathChart({
                     );
                   const schedulePortal =
                     schedulePanelExternal
+                    && scheduleExternalEditing
                     && stripScheduleEditor
                     && schedulePanelHost
                       ? createPortal(stripScheduleEditor, schedulePanelHost)
@@ -4490,7 +4761,6 @@ export function ExposureHedgePathChart({
                 startM,
                 pathEndM,
                 matchedEqualVarLocalM,
-                ccy,
               );
               return (
                 <button
@@ -4532,13 +4802,8 @@ export function ExposureHedgePathChart({
         </div>
       )}
 
-      <div
-        className={
-          pathControlsInGear
-            ? 'rounded-lg border border-slate-700 bg-slate-950/40 p-2.5'
-            : undefined
-        }
-      >
+      <div className={profileOnly ? 'pt-8' : pathControlsInGear ? 'rounded-lg border border-slate-700 bg-slate-950/40 p-2.5' : undefined}>
+        {!profileOnly && (
         <div className="mb-1.5 flex flex-wrap items-start justify-between gap-2">
           {pathControlsInGear ? (
             <div className="text-[11px] font-semibold text-sky-300/90">
@@ -4581,10 +4846,15 @@ export function ExposureHedgePathChart({
             </div>
           )}
         </div>
+        )}
 
       <svg
         viewBox={`0 0 ${W} ${svgTotalH}`}
-        className="h-auto w-full max-w-full rounded-lg border border-slate-700 bg-slate-950"
+        className={
+          profileOnly
+            ? 'h-auto w-full max-w-full bg-slate-950'
+            : 'h-auto w-full max-w-full rounded-lg border border-slate-700 bg-slate-950'
+        }
         style={{ display: 'block' }}
         role="img"
         aria-label={`${ccy} exposure profile`}
@@ -4867,7 +5137,7 @@ export function ExposureHedgePathChart({
           fontWeight={600}
           fontFamily="ui-monospace, monospace"
         >
-          S {fmtM(startM)}
+          {incrementOnly ? 'Δ' : 'S'} {fmtM(startM)}
         </text>
         <circle
           cx={xScale(Tf > 0 && windowMonths > Tf + 1e-9 ? Tf : windowMonths)}
@@ -4936,7 +5206,11 @@ export function ExposureHedgePathChart({
               fontWeight={600}
               letterSpacing={0.5}
             >
-              FORWARD LADDER · M0 → SETTLE
+              {showRollingStrip
+                ? 'STRIP LADDER · M0 → SETTLE'
+                : bulletSettleMonths < 0.15
+                  ? 'SPOT · T+2'
+                  : 'FORWARD LADDER · M0 → SETTLE'}
             </text>
             {forwardLadderRows.map((row, i) => {
               const rowY = ladderRowTopY + i * ladderRowH;
@@ -5025,7 +5299,13 @@ export function ExposureHedgePathChart({
         )}
       </svg>
 
-      <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-slate-800 pt-2 text-[10px] text-slate-500">
+      <div
+        className={
+          profileOnly
+            ? 'flex flex-wrap items-center gap-3 px-2 pb-2 pt-1.5 text-[10px] text-slate-500'
+            : 'mt-2 flex flex-wrap items-center gap-3 border-t border-slate-800 pt-2 text-[10px] text-slate-500'
+        }
+      >
         <span className="inline-flex items-center gap-1.5">
           <span className="inline-block h-[3px] w-4 rounded-sm bg-sky-400" />{' '}
           Exposure e(t)
@@ -5045,7 +5325,11 @@ export function ExposureHedgePathChart({
         <span className="h-3 w-px bg-slate-700" />
         <span className="inline-flex items-center gap-1">
           <span className="inline-block h-1.5 w-4 rounded-sm bg-emerald-500/55" />{' '}
-          Ticked forward · M0 → settle
+          {showRollingStrip
+            ? 'Ticked strip · M0 → settle'
+            : bulletSettleMonths < 0.15
+              ? 'Spot · T+2'
+              : 'Forward bullet · M0 → settle'}
         </span>
         <span className="inline-flex items-center gap-1">
           <span className="inline-block h-2 w-2 rounded-full bg-amber-400" />{' '}
@@ -5068,7 +5352,10 @@ export function ExposureHedgePathChart({
         )}
       </div>
 
-      {hasHedge && netExposureSeries.length > 0 && netCashSeries.length > 0 && (
+      {hasHedge
+      && !profileOnly
+      && netExposureSeries.length > 0
+      && netCashSeries.length > 0 && (
         <div className="mt-2 rounded-lg border border-slate-700 bg-slate-950/40 p-2.5">
           <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-2">
             <div>
@@ -5362,5 +5649,180 @@ export function ExposureHedgePathChart({
       </div>
 
     </div>
+    {tickTradesPortalEnabled
+    && tickTradesHost
+    && !scheduleExternalEditing
+    && hedgePerfRows.length > 0
+      ? createPortal(
+          <div className="overflow-x-auto rounded-md border border-slate-800 bg-slate-950/80 p-2">
+            <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[9px] font-semibold uppercase tracking-wide text-slate-500">
+                Strip setup · tick trades
+              </div>
+              {showRollingStrip ? (
+                renderStripLegsToolbar({
+                  showGear: true,
+                  gearPressed: false,
+                  gearTitle: 'Schedule setup — settle dates · Sched % · Hedge %',
+                  onGearClick: () => {
+                    if (tickTradesLocked) return;
+                    setScheduleExternalEditing(true);
+                  },
+                })
+              ) : (
+                <span className="font-mono text-[9px] text-slate-500">
+                  Settle M{Math.round(bulletSettleMonths)}
+                </span>
+              )}
+            </div>
+            <table className="w-full min-w-[640px] text-left text-[10px]">
+              <thead>
+                <tr className="text-slate-500">
+                  <th className="py-1 pr-1 font-medium" title="Include in cover / resid VaR">
+                    On
+                  </th>
+                  <th className="py-1 pr-2 font-medium">
+                    {showRollingStrip ? 'Forward / t' : 'Forward'}
+                  </th>
+                  <th className="py-1 pr-2 font-medium">Hedge Δ</th>
+                  <th className="py-1 pr-2 font-medium">H @ t</th>
+                  <th className="py-1 pr-2 font-medium">e @ t</th>
+                  <th className="py-1 pr-2 font-medium">|e−H|</th>
+                  <th className="py-1 pr-2 font-medium">Open VaR</th>
+                  <th className="py-1 pr-2 font-medium">Resid VaR</th>
+                  <th className="py-1 pr-2 font-medium">Carry</th>
+                  <th className="py-1 font-medium">Δ</th>
+                </tr>
+              </thead>
+              <tbody>
+                {hedgePerfRows.map(row => (
+                  <tr
+                    key={row.key}
+                    className={`border-t border-slate-800/80 font-mono text-slate-300 ${
+                      row.kind === 'leg' && !row.enabled ? 'opacity-40' : ''
+                    } ${
+                      row.legIndex != null
+                      && selectedTickTradeLegIndex === row.legIndex
+                        ? 'bg-sky-500/15'
+                        : ''
+                    }`}
+                  >
+                    <td className="py-1 pr-1">
+                      {row.legIndex != null ? (
+                        <input
+                          type="checkbox"
+                          aria-label={`Include ${row.label}`}
+                          checked={row.enabled}
+                          disabled={tickTradesLocked}
+                          onClick={ev => ev.stopPropagation()}
+                          onChange={() => {
+                            if (tickTradesLocked) return;
+                            const next = !row.enabled;
+                            setEnabledLegIds(prev => ({
+                              ...prev,
+                              [row.legIndex!]: next,
+                            }));
+                            onTickTradeLegEnabledChange?.(row.legIndex!, next);
+                          }}
+                          className="h-3.5 w-3.5 cursor-pointer rounded border-slate-600 bg-slate-900 text-emerald-500 focus:ring-emerald-500/40 disabled:cursor-not-allowed disabled:opacity-40"
+                        />
+                      ) : (
+                        <span className="text-slate-600">—</span>
+                      )}
+                    </td>
+                    <td className="py-1 pr-2 text-slate-300">
+                      {row.legIndex != null && onTickTradeLegSelect ? (
+                        <button
+                          type="button"
+                          disabled={tickTradesLocked}
+                          onClick={() => onTickTradeLegSelect(row.legIndex!)}
+                          className="text-left hover:text-slate-100 disabled:cursor-not-allowed"
+                        >
+                          {row.label}
+                        </button>
+                      ) : (
+                        row.label
+                      )}
+                    </td>
+                    <td className="py-1 pr-2 text-emerald-300/90">
+                      {row.legIndex != null && onTickTradeDeltaChange ? (
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          disabled={tickTradesLocked || !row.enabled}
+                          value={
+                            row.hedgeDeltaM == null
+                              ? ''
+                              : Math.round(Math.abs(row.hedgeDeltaM) * 100) / 100
+                          }
+                          onClick={ev => ev.stopPropagation()}
+                          onChange={ev => {
+                            const n = Number(ev.target.value);
+                            if (!Number.isFinite(n)) return;
+                            onTickTradeDeltaChange(row.legIndex!, Math.max(0, n));
+                          }}
+                          className="w-[4.5rem] rounded border border-slate-700 bg-slate-950 px-1 py-0.5 text-right font-mono text-[10px] text-emerald-200 disabled:cursor-not-allowed disabled:opacity-40"
+                        />
+                      ) : row.hedgeDeltaM != null ? (
+                        fmtM(row.hedgeDeltaM)
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td className="py-1 pr-2 text-emerald-200/90">
+                      {fmtM(row.cumulCoverLocalM)}
+                    </td>
+                    <td className="py-1 pr-2 text-slate-400">
+                      {row.endExposureM != null ? fmtM(row.endExposureM) : '—'}
+                    </td>
+                    <td className="py-1 pr-2 text-amber-300/90">
+                      {fmtM(row.residualLocalM)}
+                    </td>
+                    <td className="py-1 pr-2 text-slate-400">
+                      {fmtVarK(row.openVarUsdM)}
+                    </td>
+                    <td
+                      className={`py-1 pr-2 font-semibold ${
+                        row.hedgedVarUsdM < 1e-6
+                          ? 'text-emerald-300'
+                          : 'text-amber-200'
+                      }`}
+                    >
+                      {fmtVarK(row.hedgedVarUsdM)}
+                    </td>
+                    <td
+                      className={`py-1 pr-2 ${
+                        row.carryTotalUsdM == null
+                          ? 'text-slate-600'
+                          : (row.carryTotalUsdM ?? 0) >= 0
+                            ? 'text-sky-300'
+                            : 'text-rose-300/90'
+                      }`}
+                    >
+                      {row.carryTotalUsdM == null
+                        ? '—'
+                        : fmtCarryK(row.carryTotalUsdM)}
+                    </td>
+                    <td
+                      className={`py-1 font-semibold ${
+                        row.delta < 1e-6 ? 'text-emerald-300' : 'text-amber-200'
+                      }`}
+                    >
+                      {row.delta.toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="mt-1.5 font-mono text-[9px] text-slate-500">
+              On includes the leg · Hedge Δ resizes it · click the tenor to
+              price that fill
+            </p>
+          </div>,
+          tickTradesHost,
+        )
+      : null}
+    </>
   );
 }

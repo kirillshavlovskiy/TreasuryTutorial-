@@ -111,6 +111,127 @@ export function buildExposurePathPoints(
   return pts;
 }
 
+/** Live booked cover expressed on the forecast (same sign as E). */
+function bookedCoverSameSignAsForecast(
+  forecastTargetLocalM: number,
+  bookedCoverLocalM: number,
+): number {
+  const E = Number.isFinite(forecastTargetLocalM) ? forecastTargetLocalM : 0;
+  const B = Number.isFinite(bookedCoverLocalM) ? bookedCoverLocalM : 0;
+  if (Math.abs(E) < 1e-12) return B;
+  return Math.sign(E) * Math.abs(B);
+}
+
+/** Linear e(t) on a piecewise path. */
+export function exposureAtT(
+  path: readonly ExposurePathPoint[],
+  t: number,
+): number {
+  if (path.length === 0) return 0;
+  const first = path[0]!;
+  if (t <= first.t) return first.exposureM;
+  const last = path[path.length - 1]!;
+  if (t >= last.t) return last.exposureM;
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1]!;
+    const b = path[i]!;
+    if (t <= b.t + 1e-15) {
+      const span = b.t - a.t;
+      if (span < 1e-15) return b.exposureM;
+      return a.exposureM + ((t - a.t) / span) * (b.exposureM - a.exposureM);
+    }
+  }
+  return last.exposureM;
+}
+
+/**
+ * Stretch (or flatten) the path so it ends at forecast E.
+ * Chart-native e(Tf) (~11.19) must not be used as E when booked is 12.10 —
+ * that floors the leftover increment to 0.
+ */
+export function scalePathToForecastEnd(
+  path: readonly ExposurePathPoint[],
+  forecastTargetLocalM: number,
+): ExposurePathPoint[] {
+  if (path.length === 0) return [];
+  const E = Number.isFinite(forecastTargetLocalM) ? forecastTargetLocalM : 0;
+  const start = path[0]!.exposureM;
+  const end = path[path.length - 1]!.exposureM;
+  if (Math.abs(end - E) <= 1e-6) return path.map(p => ({ ...p }));
+  const grow = end - start;
+  const T = path[path.length - 1]!.t;
+  if (Math.abs(grow) < 1e-9) {
+    return path.map(p => ({
+      t: p.t,
+      exposureM: T < 1e-12 ? E : start + (E - start) * (p.t / T),
+    }));
+  }
+  return path.map(p => ({
+    t: p.t,
+    exposureM: start + (E - start) * ((p.exposureM - start) / grow),
+  }));
+}
+
+/**
+ * Unbooked forecast clip: E − booked (same sign as E).
+ * Path shape is applied separately — do not subtract booked from e(t)
+ * or the increment sits at 0 until the last months (giant over-hedge wedge).
+ */
+export function uncoveredIncrementLocalM(
+  _exposureM: number,
+  bookedCoverLocalM: number,
+  forecastTargetLocalM: number,
+): number {
+  const E = Number.isFinite(forecastTargetLocalM) ? forecastTargetLocalM : 0;
+  if (Math.abs(E) < 1e-12) return 0;
+  const B = bookedCoverSameSignAsForecast(E, bookedCoverLocalM);
+  const leftover = E - B;
+  return Math.abs(leftover) <= 1e-12 ? 0 : leftover;
+}
+
+/**
+ * Remap a gross path to the new forecast increment only.
+ * Same growth shape as e(t), scaled onto leftover (0 → +2.55), not
+ * max(0, e−booked) which stays flat until booked is exhausted.
+ */
+export function mapPathToUncoveredIncrement(
+  path: readonly ExposurePathPoint[],
+  bookedCoverLocalM: number,
+  forecastTargetLocalM: number,
+): ExposurePathPoint[] {
+  const E = Number.isFinite(forecastTargetLocalM) ? forecastTargetLocalM : 0;
+  const leftover = uncoveredIncrementLocalM(0, bookedCoverLocalM, E);
+  const scaled = scalePathToForecastEnd(path, E);
+  if (scaled.length === 0) return [];
+  const start = scaled[0]!.exposureM;
+  const grow = E - start;
+  const T = scaled[scaled.length - 1]!.t;
+  return scaled.map(p => {
+    const w =
+      Math.abs(grow) < 1e-9
+        ? T < 1e-12
+          ? 1
+          : p.t / T
+        : (p.exposureM - start) / grow;
+    return { t: p.t, exposureM: leftover * w };
+  });
+}
+
+/** Month-net series implied by a path (for strip sizing on the increment). */
+export function monthlyFlowsFromPath(
+  path: readonly ExposurePathPoint[],
+  windowMonths: number,
+): number[] {
+  const T = windowMonths > 0 && Number.isFinite(windowMonths) ? windowMonths : 0;
+  const n = Math.max(0, Math.ceil(T - 1e-12));
+  const flows: number[] = [];
+  for (let m = 0; m < n; m++) {
+    const t1 = Math.min(m + 1, T);
+    flows.push(exposureAtT(path, t1) - exposureAtT(path, m));
+  }
+  return flows;
+}
+
 /** Resolve month-net series for the chart window (custom or flat F×Tf). */
 export function resolveChartMonthlyFlows(
   stockM: number,

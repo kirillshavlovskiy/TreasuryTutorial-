@@ -1,15 +1,11 @@
 /**
- * Test Dashboard is sandbox-only. Requires TEST_MODE_ENABLED=true.
- * In production it stays off unless TEST_MODE_ALLOW_PROD=true is set explicitly.
+ * Single gate for Sandbox / Sigma Tasks (`/test`) and all Sandbox UI links.
+ *
+ * The module is always present: local and production behave identically and
+ * TEST_MODE_ENABLED / TEST_MODE_ALLOW_PROD are no longer consulted, so the
+ * Sandbox link can never point at a route that redirects home.
  */
 export function isTestModeEnabled(): boolean {
-  if (process.env.TEST_MODE_ENABLED !== 'true') return false;
-  if (
-    process.env.NODE_ENV === 'production' &&
-    process.env.TEST_MODE_ALLOW_PROD !== 'true'
-  ) {
-    return false;
-  }
   return true;
 }
 

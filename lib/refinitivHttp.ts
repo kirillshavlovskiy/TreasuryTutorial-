@@ -30,19 +30,23 @@ export function errorMessageFromRefinitivBody(text: string, status: number): str
   return `Refinitiv Quantitative Analytics failed (${status})`;
 }
 
-export async function postRefinitivJson(
+export async function fetchRefinitivJson(
   url: string,
   accessToken: string,
-  body: unknown
+  init?: { method?: "GET" | "POST"; body?: unknown },
 ): Promise<unknown> {
+  const method = init?.method ?? (init?.body !== undefined ? "POST" : "GET");
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    Authorization: `Bearer ${accessToken}`,
+  };
+  if (method === "POST") headers["content-type"] = "application/json";
   const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: JSON.stringify(body),
+    method,
+    headers,
+    body: method === "POST" ? JSON.stringify(init?.body ?? {}) : undefined,
     cache: "no-store",
+    redirect: "follow",
   });
   const text = await res.text();
   if (!res.ok) {
@@ -53,6 +57,21 @@ export async function postRefinitivJson(
   } catch {
     throw new Error("Refinitiv returned non-JSON data");
   }
+}
+
+export async function postRefinitivJson(
+  url: string,
+  accessToken: string,
+  body: unknown
+): Promise<unknown> {
+  return fetchRefinitivJson(url, accessToken, { method: "POST", body });
+}
+
+export async function getRefinitivJson(
+  url: string,
+  accessToken: string,
+): Promise<unknown> {
+  return fetchRefinitivJson(url, accessToken, { method: "GET" });
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

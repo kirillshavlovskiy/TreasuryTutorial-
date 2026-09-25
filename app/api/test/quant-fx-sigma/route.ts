@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import {
   computeFxAtlasJob,
   parseFxAtlasJobRequest,
@@ -14,7 +14,7 @@ export const dynamic = 'force-dynamic';
  * on the server.
  */
 export async function POST(request: Request) {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim() ?? '';
   if (!email || email === TEST_GUEST_EMAIL) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

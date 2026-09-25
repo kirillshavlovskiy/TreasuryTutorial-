@@ -9,6 +9,8 @@ const sessionEmail = { value: 'analyst@example.com' as string | null };
 vi.mock('@/auth', () => ({
   auth: async () =>
     sessionEmail.value ? { user: { email: sessionEmail.value } } : null,
+  getServerSession: async () =>
+    sessionEmail.value ? { user: { email: sessionEmail.value } } : null,
 }));
 
 /** Sentinel seed that makes the engine throw, so the route's per-job error

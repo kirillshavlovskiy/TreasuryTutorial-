@@ -6,7 +6,7 @@ import {
   streamText,
   type UIMessage,
 } from 'ai';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { TEST_GUEST_EMAIL } from '@/lib/test-mode/enabled';
 import { AGENT_GEMINI_MODEL } from '@/lib/agent/model';
 import { buildAgentTools } from '@/lib/agent/tools';
@@ -59,7 +59,7 @@ interface AgentChatRequest {
 }
 
 export async function POST(request: Request) {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim() ?? '';
   if (!email || email === TEST_GUEST_EMAIL) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

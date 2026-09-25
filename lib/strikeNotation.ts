@@ -159,3 +159,18 @@ export function strikeExpressionHint(raw: string, callPut: CallPut): string | nu
   if (!mapped || !("strikeExpression" in mapped)) return null;
   return mapped.strikeExpression;
 }
+
+/** Map an IPA signed delta (−25 / 0 / 25, or −0.25) onto the desk strike field. */
+export function strikeInputFromSignedDelta(signed: number): {
+  strikeInput: string;
+  optionPut?: boolean;
+} {
+  if (!Number.isFinite(signed)) return { strikeInput: "ATMF" };
+  let mag = Math.abs(signed);
+  if (mag < 1e-9 || mag >= 49.5) return { strikeInput: "ATMF" };
+  if (mag <= 1) mag *= 100;
+  mag = Math.round(mag);
+  if (mag < 5 || mag >= 50) return { strikeInput: "ATMF" };
+  const put = signed < 0;
+  return { strikeInput: `${mag}D${put ? "P" : "C"}`, optionPut: put };
+}

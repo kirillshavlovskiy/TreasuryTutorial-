@@ -36,6 +36,18 @@ export function getS3Prefix(): string {
   return normalizePrefix(process.env.S3_PREFIX || DEFAULT_PREFIX);
 }
 
+/**
+ * S3-compatible endpoint to talk to instead of AWS.
+ *
+ * Set only for local development, where the stack runs MinIO
+ * (`docker-compose.yml`). NEVER set in the cluster: there the bucket is real
+ * AWS S3 reached through IRSA, and this must stay undefined so the client is
+ * built exactly as it always was.
+ */
+export function getS3Endpoint(): string | undefined {
+  return process.env.S3_ENDPOINT?.trim() || undefined;
+}
+
 export function getS3Region(): string {
   return (
     process.env.S3_REGION?.trim()
@@ -63,7 +75,14 @@ export function getS3Client(): S3Client {
     if (process.env.AWS_EC2_METADATA_DISABLED === undefined) {
       process.env.AWS_EC2_METADATA_DISABLED = 'true';
     }
-    client = new S3Client({ region: getS3Region() });
+    // Path-style addressing is set only together with an explicit endpoint.
+    // MinIO has no per-bucket DNS locally so it needs path style; AWS does not,
+    // and with S3_ENDPOINT unset this builds the same client it always built.
+    const endpoint = getS3Endpoint();
+    client = new S3Client({
+      region: getS3Region(),
+      ...(endpoint ? { endpoint, forcePathStyle: true } : {}),
+    });
   }
   return client;
 }
@@ -83,6 +102,25 @@ export function s3Key(relativeKey: string): string {
     throw new Error('S3 key path is empty');
   }
   return `${getS3Prefix()}${clean}`;
+}
+
+/**
+ * The path segment that owns a user's objects: the email, lower-cased, with
+ * every byte outside `[a-z0-9@._-]` percent-encoded. It is one-to-one — two
+ * different emails never share a segment, which a replace-with-`_` slug did
+ * (`a+b@x.com` and `a_b@x.com`), and it is never truncated. An email made only
+ * of those characters keeps exactly the segment it always had.
+ */
+export function s3OwnerSegment(email: string): string {
+  let out = '';
+  for (const byte of Buffer.from(email.trim().toLowerCase(), 'utf8')) {
+    const ch = String.fromCharCode(byte);
+    // A `.` right after a `.` is encoded too: `s3Key` deletes every `..`, so
+    // `a..b@x.com` would otherwise land on `ab@x.com`'s key.
+    const isSafe = /[a-z0-9@._-]/.test(ch) && !(ch === '.' && out.endsWith('.'));
+    out += isSafe ? ch : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return out;
 }
 
 /** Reject keys that escape the playground prefix (defence in depth). */

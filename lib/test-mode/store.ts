@@ -279,7 +279,7 @@ function writeHedgeSidecar(
       payload,
     );
   } catch {
-    // Quota — full blob write may still succeed, or Neon PUT will.
+    // Quota — full blob write may still succeed, or Postgres PUT will.
   }
 }
 

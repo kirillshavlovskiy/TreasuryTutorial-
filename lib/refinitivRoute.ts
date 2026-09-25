@@ -29,10 +29,15 @@ export async function readJsonBody(
 export function refinitivErrorResponse(err: unknown): NextResponse {
   if (err instanceof RefinitivHttpError) {
     const status = err.status === 401 || err.status === 403 ? err.status : 502;
-    return NextResponse.json({ error: err.message }, { status });
+    return NextResponse.json(
+      { error: err.message, tokenExpired: err.status === 401 },
+      { status },
+    );
   }
   const message = err instanceof Error ? err.message : "Refinitiv request failed";
   const lower = message.toLowerCase();
+  const tokenExpired =
+    lower.includes("has expired") || lower.includes("paste a fresh bearer");
   const status =
     message.includes("must be") ||
     message.includes("Request body") ||
@@ -42,12 +47,16 @@ export function refinitivErrorResponse(err: unknown): NextResponse {
     message.includes("fxCrossCode") ||
     message.includes("underlying")
       ? 400
-      : lower.includes("not configured") ||
+      : tokenExpired ||
+          lower.includes("not configured") ||
           lower.includes("auth failed") ||
           lower.includes("missing access_token")
         ? 401
         : 500;
-  return NextResponse.json({ error: message }, { status });
+  return NextResponse.json(
+    { error: message, tokenExpired },
+    { status },
+  );
 }
 
 export async function resolveRequestToken(req: NextRequest): Promise<string> {

@@ -99,6 +99,27 @@ export type ForecastFlowField =
 
 export type ForecastFlowSide = 'in' | 'out';
 
+/**
+ * How a cash line meets the FX hedge flow.
+ * `fx` — full signed amount stays in the hedge.
+ * `book_conversion` — cash vs an opening stock, capped; excess stays in FX.
+ * `cash_only` — stripped from the hedge entirely.
+ * Absent overrides use {@link defaultFxAttribution}.
+ */
+export type FxAttribution = 'fx' | 'book_conversion' | 'cash_only';
+
+export const FX_ATTRIBUTION_CYCLE: readonly FxAttribution[] = [
+  'fx',
+  'book_conversion',
+  'cash_only',
+];
+
+export const FX_ATTRIBUTION_SHORT: Record<FxAttribution, string> = {
+  fx: 'FX',
+  book_conversion: 'Book',
+  cash_only: 'Cash',
+};
+
 export const FORECAST_FLOW_LINES: {
   key: ForecastFlowField;
   label: string;
@@ -262,6 +283,11 @@ export interface ForecastProfileState {
    * keeps the lump-sum trough (cash + payout).
    */
   liquidity?: LiquidityTiming;
+  /**
+   * Explicit FX attribution per CCY × cash line.
+   * Missing entries keep {@link defaultFxAttribution} (today's strip).
+   */
+  fxAttributionByCcy?: Record<string, Partial<Record<ForecastFlowField, FxAttribution>>>;
 }
 
 export const DEFAULT_FORECAST_PROFILE: ForecastProfileState = {
@@ -691,27 +717,68 @@ export function seedMonthsFromRowWithLineGrowth(
   );
 }
 
-/** Resize a series when the forecasting period changes. */
+/**
+ * Advance one month flow `stepsAhead` months using per-line MoM growth
+ * (`flatGrowthByCcy` override, else `growthRateMoM`). stepsAhead=1 → next month.
+ */
+export function growMonthFlowFrom(
+  last: ForecastMonthFlow,
+  profile: ForecastProfileState | null | undefined,
+  ccy: string,
+  stepsAhead: number,
+): ForecastMonthFlow {
+  const steps = Math.max(0, Math.floor(stepsAhead));
+  const base = normalizeMonthFlow(last);
+  if (steps === 0) return { ...base };
+  const out = emptyMonthFlow();
+  for (const line of FORECAST_FLOW_LINES) {
+    const v0 = flowFieldValue(base, line.key);
+    const g = lineGrowthMoM(profile, ccy, line.key);
+    out[line.key] =
+      Math.abs(g) < 1e-15 ? v0 : roundMoney(v0 * Math.pow(1 + g, steps));
+  }
+  return normalizeMonthFlow(out);
+}
+
+/**
+ * Resize a series when the forecasting period changes.
+ * Extending past known months compounds each cash line from the last month
+ * using default / per-category MoM growth on `profile` (repeat-last when g=0).
+ */
 export function resizeMonthSeries(
   prev: ForecastMonthFlow[] | undefined,
   months: number,
   fallback: RowState,
   extras?: Partial<ForecastCashExtras> | null,
+  profile?: ForecastProfileState | null,
 ): ForecastMonthFlow[] {
   const T = Math.max(0, Math.floor(months));
   if (T === 0) return [];
-  const base =
-    prev && prev.length > 0
-      ? prev.map(normalizeMonthFlow)
-      : seedMonthsFromRow(fallback, T, 0, extras);
+  if (!prev || prev.length === 0) {
+    return seedMonthsFromRowWithLineGrowth(fallback, T, profile, extras);
+  }
+  const base = prev.map(normalizeMonthFlow);
   if (base.length === T) return base.map(m => ({ ...m }));
   if (base.length > T) return base.slice(0, T).map(m => ({ ...m }));
-  const last =
-    base[base.length - 1] ?? seedMonthsFromRow(fallback, 1, 0, extras)[0]!;
+  const last = base[base.length - 1]!;
   return [
     ...base.map(m => ({ ...m })),
-    ...Array.from({ length: T - base.length }, () => ({ ...last })),
+    ...Array.from({ length: T - base.length }, (_, i) =>
+      growMonthFlowFrom(last, profile, fallback.ccy, i + 1),
+    ),
   ];
+}
+
+/**
+ * Ensure custom `byCcy` series reach `months` (default horizon: 12), growing
+ * any shortfall with Default g MoM / per-line flatGrowthByCcy.
+ */
+export function extrapolateProfileToMonths(
+  profile: ForecastProfileState,
+  rows: readonly RowState[],
+  months: number = DEFAULT_FORECAST_MONTHS,
+): ForecastProfileState {
+  return ensureProfileForRows(profile, rows, months);
 }
 
 export function ensureProfileForRows(
@@ -727,7 +794,7 @@ export function ensureProfileForRows(
     if (r.ccy === 'USD') continue;
     const extras = normalizeExtras(extrasByCcy[r.ccy]);
     extrasByCcy[r.ccy] = extras;
-    byCcy[r.ccy] = resizeMonthSeries(byCcy[r.ccy], months, r, extras);
+    byCcy[r.ccy] = resizeMonthSeries(byCcy[r.ccy], months, r, extras, profile);
   }
   const calcRowsByCcy: Record<string, ForecastCalcRow[]> = {
     ...(profile.calcRowsByCcy ?? {}),
@@ -781,6 +848,7 @@ export function periodFlowSumLocalM(
       T,
       row,
       profile.extrasByCcy?.[row.ccy],
+      profile,
     );
     return sumPeriodFlow(months);
   }
@@ -825,6 +893,7 @@ export function forecastMonthFlowSeries(
       T,
       row,
       profile.extrasByCcy?.[row.ccy],
+      profile,
     );
   }
   const extras = normalizeExtras(profile?.extrasByCcy?.[row.ccy]);
@@ -847,28 +916,206 @@ export function monthlyFlowSeriesLocalM(
   );
 }
 
+const FX_ATTRIBUTION_TAGS = new Set<FxAttribution>(FX_ATTRIBUTION_CYCLE);
+
+/** Opening stock a book-conversion line can consume (M FCY, ≥ 0). */
+type ConversionStock = 'receivables' | 'payables' | 'debt' | 'investments';
+
+const CONVERSION_STOCK: Partial<Record<ForecastFlowField, ConversionStock>> = {
+  nwcIn: 'receivables',
+  nwcOut: 'payables',
+  debtOut: 'debt',
+  investIn: 'investments',
+};
+
+/**
+ * Lines that create stock rather than consume it. Book conversion has nothing
+ * to cap, so the whole amount is a cash/BS swap (same strip as cash-only).
+ */
+const STOCK_INCREASE_LINES = new Set<ForecastFlowField>(['debtIn', 'investOut']);
+
+/**
+ * Default strip, matching the pre-tag engine:
+ * NWC in converts receivables, debt draw is cash-only, debt repay converts
+ * the debt stock, every other line is FX.
+ */
+export function defaultFxAttribution(field: ForecastFlowField): FxAttribution {
+  if (field === 'nwcIn' || field === 'debtOut') return 'book_conversion';
+  if (field === 'debtIn') return 'cash_only';
+  return 'fx';
+}
+
+export function hasFxAttributionOverride(
+  profile: ForecastProfileState | null | undefined,
+  ccy: string,
+  field: ForecastFlowField,
+): boolean {
+  const tag = profile?.fxAttributionByCcy?.[ccy]?.[field];
+  return tag != null && FX_ATTRIBUTION_TAGS.has(tag);
+}
+
+export function effectiveFxAttribution(
+  profile: ForecastProfileState | null | undefined,
+  ccy: string,
+  field: ForecastFlowField,
+): FxAttribution {
+  const tag = profile?.fxAttributionByCcy?.[ccy]?.[field];
+  if (tag && FX_ATTRIBUTION_TAGS.has(tag)) return tag;
+  return defaultFxAttribution(field);
+}
+
+export function nextFxAttribution(tag: FxAttribution): FxAttribution {
+  const i = FX_ATTRIBUTION_CYCLE.indexOf(tag);
+  return FX_ATTRIBUTION_CYCLE[(i + 1) % FX_ATTRIBUTION_CYCLE.length]!;
+}
+
+/** Setting the default tag drops the override so old profiles stay unchanged. */
+export function withFxAttribution(
+  profile: ForecastProfileState,
+  ccy: string,
+  field: ForecastFlowField,
+  tag: FxAttribution,
+): ForecastProfileState {
+  const byCcy = { ...(profile.fxAttributionByCcy ?? {}) };
+  const line = { ...(byCcy[ccy] ?? {}) };
+  if (tag === defaultFxAttribution(field)) delete line[field];
+  else line[field] = tag;
+  if (Object.keys(line).length === 0) delete byCcy[ccy];
+  else byCcy[ccy] = line;
+  return { ...profile, fxAttributionByCcy: byCcy };
+}
+
+export function fxAttributionTitle(
+  field: ForecastFlowField,
+  tag: FxAttribution,
+): string {
+  if (tag === 'fx') return 'Full amount stays in the FX hedge flow';
+  if (tag === 'cash_only') return 'Stripped from the FX hedge flow entirely';
+  const stock = CONVERSION_STOCK[field];
+  if (stock === 'receivables') {
+    return 'Book conversion vs opening receivables; excess stays in FX';
+  }
+  if (stock === 'payables') {
+    return 'Book conversion vs opening payables; excess stays in FX';
+  }
+  if (stock === 'debt') {
+    return 'Book conversion vs opening debt; excess stays in FX';
+  }
+  if (stock === 'investments') {
+    return 'Book conversion vs opening investments; excess stays in FX';
+  }
+  if (STOCK_INCREASE_LINES.has(field)) {
+    return 'No opening stock to cap — the whole amount swaps cash and the balance sheet, off FX';
+  }
+  return 'No linked opening stock — this tag does not change the hedge; use Cash to strip the line';
+}
+
+export interface FlowAttributionTotals {
+  /** Signed period sum of the line (M FCY). */
+  signed: number;
+  /** Portion that stays in the FX hedge flow. */
+  fx: number;
+  /** Portion that converts an opening stock (signed). */
+  conversion: number;
+  /** Portion stripped from FX with no stock cap (signed). */
+  cashOnly: number;
+}
+
+function emptyAttributionTotals(): FlowAttributionTotals {
+  return { signed: 0, fx: 0, conversion: 0, cashOnly: 0 };
+}
+
+function openingConversionStocks(row: RowState): Record<ConversionStock, number> {
+  return {
+    receivables: Math.max(0, row.nonCashAsset ?? 0),
+    payables: Math.max(0, -(row.nonCash ?? 0)),
+    debt: Math.max(0, row.ir_liab_notional ?? 0),
+    investments: Math.max(0, row.ir_invest_notional ?? 0),
+  };
+}
+
+/**
+ * Split each cash line into FX / book conversion / cash-only over the horizon.
+ * With no `fxAttributionByCcy` overrides this is the historical strip: NWC
+ * collections up to receivables, debt draw in full, debt repay up to the
+ * debt stock.
+ */
+export function attributeForecastLines(
+  row: RowState,
+  forecastMonths: number,
+  profile?: ForecastProfileState | null,
+): {
+  fxMonths: number[];
+  totals: Record<ForecastFlowField, FlowAttributionTotals>;
+} {
+  const months = forecastMonthFlowSeries(row, forecastMonths, profile);
+  const stocks = openingConversionStocks(row);
+  const totals = Object.fromEntries(
+    FORECAST_FLOW_LINES.map(l => [l.key, emptyAttributionTotals()]),
+  ) as Record<ForecastFlowField, FlowAttributionTotals>;
+  const fxMonths = months.map(m => {
+    const n = normalizeMonthFlow(m);
+    let fx = monthNet(n);
+    for (const line of FORECAST_FLOW_LINES) {
+      const signed = n[line.key];
+      const tag = effectiveFxAttribution(profile, row.ccy, line.key);
+      let fxPart = signed;
+      let conv = 0;
+      let cash = 0;
+      if (tag === 'cash_only') {
+        fxPart = 0;
+        cash = signed;
+        fx -= signed;
+      } else if (
+        tag === 'book_conversion' &&
+        STOCK_INCREASE_LINES.has(line.key)
+      ) {
+        fxPart = 0;
+        cash = signed;
+        fx -= signed;
+      } else if (tag === 'book_conversion') {
+        const link = CONVERSION_STOCK[line.key];
+        if (link) {
+          const cap = stocks[link];
+          if (line.side === 'in') {
+            const take = Math.min(Math.max(0, signed), cap);
+            stocks[link] = roundMoney(Math.max(0, cap - take));
+            conv = take;
+            fxPart = signed - take;
+            fx -= take;
+          } else {
+            const take = Math.min(Math.max(0, -signed), cap);
+            stocks[link] = roundMoney(Math.max(0, cap - take));
+            conv = -take;
+            fxPart = signed + take;
+            fx += take;
+          }
+        }
+      }
+      const bucket = totals[line.key];
+      bucket.signed = roundMoney(bucket.signed + signed);
+      bucket.fx = roundMoney(bucket.fx + fxPart);
+      bucket.conversion = roundMoney(bucket.conversion + conv);
+      bucket.cashOnly = roundMoney(bucket.cashOnly + cash);
+    }
+    return roundMoney(fx);
+  });
+  return { fxMonths, totals };
+}
+
 /**
  * Collecting AR already on the book (nwcIn vs nonCashAsset) or drawing/repaying
  * debt already in Stock does not change net FX — cash and the BS item swap.
  * Those legs stay on the cash path; stripping them here stops a 2.4 receivable
  * from sitting in Stock and again as 0.2×12 in the hedge flow.
+ * An explicit `fxAttributionByCcy` tag replaces that default for one line.
  */
 export function monthlyFxFlowSeriesLocalM(
   row: RowState,
   forecastMonths: number,
   profile?: ForecastProfileState | null,
 ): number[] {
-  const months = forecastMonthFlowSeries(row, forecastMonths, profile);
-  let nwcLeft = Math.max(0, row.nonCashAsset ?? 0);
-  let debtLeft = Math.max(0, row.ir_liab_notional);
-  return months.map(m => {
-    const n = normalizeMonthFlow(m);
-    const convNwc = Math.min(Math.max(0, n.nwcIn), nwcLeft);
-    nwcLeft = roundMoney(Math.max(0, nwcLeft - convNwc));
-    const repay = Math.min(Math.max(0, -n.debtOut), debtLeft);
-    debtLeft = roundMoney(Math.max(0, debtLeft - repay));
-    return roundMoney(monthNet(n) - convNwc - n.debtIn + repay);
-  });
+  return attributeForecastLines(row, forecastMonths, profile).fxMonths;
 }
 
 /** Horizon Σ of FX-changing flow (cash Σ minus book conversions). */
@@ -921,6 +1168,7 @@ export function monthlyInflowSeriesLocalM(
       T,
       row,
       profile.extrasByCcy?.[row.ccy],
+      profile,
     );
     return months.map(m => roundMoney(monthInflows(m)));
   }
@@ -958,6 +1206,7 @@ export function monthlyOutflowSeriesLocalM(
       T,
       row,
       profile.extrasByCcy?.[row.ccy],
+      profile,
     );
     return months.map(m => roundMoney(monthOutflowsAbs(m)));
   }
@@ -1200,6 +1449,7 @@ function cycleFlowAt(
       monthIndex + 1,
       row,
       forecastProfile.extrasByCcy?.[row.ccy],
+      forecastProfile,
     );
     const m = normalizeMonthFlow(months[monthIndex]);
     return { payout: m.payout, collections: m.collections, invoiceFcast: m.invoiceFcast };

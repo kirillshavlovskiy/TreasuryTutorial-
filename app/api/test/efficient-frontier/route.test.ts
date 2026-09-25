@@ -4,6 +4,8 @@ const sessionEmail = { value: 'analyst@example.com' as string | null };
 vi.mock('@/auth', () => ({
   auth: async () =>
     sessionEmail.value ? { user: { email: sessionEmail.value } } : null,
+  getServerSession: async () =>
+    sessionEmail.value ? { user: { email: sessionEmail.value } } : null,
 }));
 
 const { POST } = await import('@/app/api/test/efficient-frontier/route');

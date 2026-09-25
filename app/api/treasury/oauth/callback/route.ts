@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { AAD_OAUTH_STATE_COOKIE, decryptSecret } from '@/lib/treasury/crypto';
 import {
   exchangeCodeForTokens,
@@ -40,7 +40,7 @@ function failure(request: NextRequest, reason: string): NextResponse {
  *  approves. Verifies state, exchanges the code, confirms the Okta identity
  *  matches the signed-in Nexus session, then persists the tokens. */
 export async function GET(request: NextRequest) {
-  const session = await auth();
+  const session = await getServerSession();
   const sessionEmail = session?.user?.email?.trim().toLowerCase();
   if (!sessionEmail) {
     // No Nexus session to link to — clear any pending state cookie too, so

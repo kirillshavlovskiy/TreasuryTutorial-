@@ -147,16 +147,17 @@ export function buildVolSurfacesRequest(input: VolSurfacesInput): Record<string,
   };
 }
 
-/** FX vol matrix from the IPA surfaces sample (Date × Strike, ATM included). */
+/** FX vol matrix. Default is Tenor × Delta (term structure + smile). */
 export function fxVolSurfaceRequest(
   fxCrossCode: string,
-  calculationDate?: string
+  calculationDate?: string,
+  axes: { xAxis?: SurfaceAxis; yAxis?: SurfaceAxis } = {},
 ): VolSurfacesInput {
   return parseVolSurfacesRequest({
     fxCrossCode,
     surfaceTag: `FxVol-${fxCrossCode.toUpperCase()}`,
-    xAxis: "Date",
-    yAxis: "Strike",
+    xAxis: axes.xAxis ?? "Tenor",
+    yAxis: axes.yAxis ?? "Delta",
     returnAtm: true,
     ...(calculationDate ? { calculationDate } : {}),
   });

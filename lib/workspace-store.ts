@@ -886,7 +886,7 @@ export function saveWorkspace(
         serializeHedgeSidecar(picked.hedgesByEntityId, blob.hedgesUpdatedAt),
       );
     } catch {
-      // Quota — still try the full envelope / Neon PUT.
+      // Quota — still try the full envelope / Postgres PUT.
     }
     window.localStorage.setItem(storageKey(userKey), JSON.stringify(blob));
     return { ok: true };

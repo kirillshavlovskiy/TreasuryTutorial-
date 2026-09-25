@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { AAD_OAUTH_STATE_COOKIE, encryptSecret, isTokenEncryptionConfigured } from '@/lib/treasury/crypto';
 import {
   buildAuthorizeUrl,
@@ -20,7 +20,7 @@ export const runtime = 'nodejs';
  *  Requires an existing Nexus (Google) session; additive to it, never
  *  touches auth.ts. See app/api/treasury/oauth/callback/route.ts. */
 export async function GET(request: Request) {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim();
   if (!email) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

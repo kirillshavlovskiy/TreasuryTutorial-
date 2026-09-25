@@ -828,7 +828,7 @@ export function LiquiditySwapDecision({
                   }`}
                 >
                   <div className="flex flex-col gap-3 px-3 py-3.5">
-                    <div className="flex flex-wrap items-end gap-5">
+                    <div className="flex flex-wrap items-center gap-4">
                       <div className="flex flex-col gap-1">
                         <span className="text-[9px] uppercase tracking-wide text-slate-500">
                           Cycle drain
@@ -859,7 +859,8 @@ export function LiquiditySwapDecision({
                         suffix={`→ ${fmtLocal(d.nearLeg, full.ccy)}`}
                         editable
                         tickValues={[0, 25, 50, 75, 100]}
-                        className="min-w-[280px] w-[280px]"
+                        layout="inline"
+                        className="w-[22rem] sm:w-[26rem] lg:w-[30rem] xl:w-[34rem] max-w-full"
                         title="Scale funding cover of the proposed strip (0% unfunded, 100% full H* · remaining Δ = 1 − cover)"
                         ariaLabel="Funding cover percent"
                       />

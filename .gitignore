@@ -39,7 +39,15 @@ next-env.d.ts
 
 # local tooling / archives
 .claude.zip
-.cursor/
+# working files written by the fx-ship skill (diff snapshots)
+.claude/tmp/
+# .cursor/ holds both shared team config and per-machine state. Ignore it by
+# default, then un-ignore only the parts that are meant to be committed.
+.cursor/*
+!.cursor/hooks.json
+!.cursor/hooks/*.mjs
+!.cursor/hooks/*.test.ts
+!.cursor/rules/*.mdc
 .test-trigger
 .DS_Store
 .tmp-handover*/

@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
+import { signOutToHome } from '@/app/test/sign-out';
 
 type UserAvatarMenuProps = {
   name?: string | null;
@@ -109,11 +110,11 @@ export function UserAvatarMenu({
             FX Rates · Treasury MCP
           </Link>
           <div className="my-1 border-t border-slate-800" />
-          {/* Native navigation — avoid form action="/…" in client components
-              (Next.js treats action as a Server Action and throws). */}
-          <Link href="/api/auth/logout" role="menuitem" className={itemCls}>
-            Log out
-          </Link>
+          <form action={signOutToHome}>
+            <button type="submit" role="menuitem" className={itemCls}>
+              Log out
+            </button>
+          </form>
         </div>
       )}
     </div>

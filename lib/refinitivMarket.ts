@@ -14,14 +14,34 @@ import {
 } from '@/lib/refinitivForwardCurves';
 import { postRefinitivJson } from '@/lib/refinitivHttp';
 import {
+  REFINITIV_XCCY_CURVES_URL,
+  buildXccyCurvesRequest,
+  parseXccyCurvesResponse,
+  type XccyCurvesInput,
+  type XccyCurvesResult,
+} from '@/lib/refinitivCrossCurrencyCurves';
+import {
+  REFINITIV_XCCY_DEFINITIONS_URL,
+  buildXccyDefinitionsRequest,
+  parseXccyDefinitionsResponse,
+  type XccyDefinitionsInput,
+  type XccyDefinitionsResult,
+} from '@/lib/refinitivXccyDefinitions';
+import {
   REFINITIV_SURFACES_URL,
   buildVolSurfacesRequest,
   parseVolSurfacesResponse,
   type VolSurfacesInput,
   type VolSurfacesResult,
 } from '@/lib/refinitivVolSurfaces';
+import {
+  fetchFxSpotWithRefinitiv,
+  type FxSpotQuote,
+} from '@/lib/refinitivFxSpot';
 
 export { RefinitivHttpError } from '@/lib/refinitivHttp';
+export { fetchFxSpotWithRefinitiv };
+export type { FxSpotQuote };
 
 export async function priceFxOptionsWithRefinitiv(
   input: PriceContractsInput,
@@ -45,6 +65,30 @@ export async function fetchForwardCurvesWithRefinitiv(
     buildForwardCurvesRequest(input),
   );
   return parseForwardCurvesResponse(payload);
+}
+
+export async function fetchXccyCurvesWithRefinitiv(
+  input: XccyCurvesInput,
+  accessToken: string,
+): Promise<XccyCurvesResult> {
+  const payload = await postRefinitivJson(
+    REFINITIV_XCCY_CURVES_URL,
+    accessToken,
+    buildXccyCurvesRequest(input),
+  );
+  return parseXccyCurvesResponse(payload);
+}
+
+export async function fetchXccyDefinitionsWithRefinitiv(
+  input: XccyDefinitionsInput,
+  accessToken: string,
+): Promise<XccyDefinitionsResult> {
+  const payload = await postRefinitivJson(
+    REFINITIV_XCCY_DEFINITIONS_URL,
+    accessToken,
+    buildXccyDefinitionsRequest(input),
+  );
+  return parseXccyDefinitionsResponse(payload);
 }
 
 export async function fetchVolSurfacesWithRefinitiv(

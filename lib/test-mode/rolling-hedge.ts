@@ -6,11 +6,15 @@
  * S₁ = e(Th), etc.
  */
 
-import type { HedgeTicket } from '@/lib/test-mode/hedge-var';
+import type { HedgeTicket, PreparedHedgeProfile } from '@/lib/test-mode/hedge-var';
 import {
   equalVarNotionalAtTenureLocalM,
   isLiveHedgeTicket,
+  isMarketExecutedHedgeTicket,
+  isPreparedStrip,
   newHedgeTicketId,
+  settleMonthsFromHedgeTicket,
+  stripSchedulesAgree,
 } from '@/lib/test-mode/hedge-var';
 import {
   accruedPositionFromScheduleM,
@@ -166,6 +170,40 @@ export function normalizeStripEndMonths(
   return [...new Set(uniq.map(m => Math.round(m * 1000) / 1000))].sort(
     (a, b) => a - b,
   );
+}
+
+/**
+ * Map raw per-bin weights onto unique settle months (optimizer 8-bin
+ * WAM-pin → 5 advertised months). Sums weights that land on the same end.
+ */
+export function alignStripScheduleWeightsToEnds(
+  rawEnds: readonly number[],
+  rawWeights: readonly number[],
+  uniqueEnds: readonly number[],
+): number[] {
+  if (uniqueEnds.length === 0) return [];
+  if (rawWeights.length === uniqueEnds.length) {
+    return normalizeStripScheduleWeights(rawWeights);
+  }
+  if (rawEnds.length !== rawWeights.length || rawEnds.length === 0) {
+    return [];
+  }
+  const acc = uniqueEnds.map(() => 0);
+  for (let i = 0; i < rawEnds.length; i++) {
+    const m = rawEnds[i]!;
+    let best = 0;
+    let bestD = Number.POSITIVE_INFINITY;
+    for (let j = 0; j < uniqueEnds.length; j++) {
+      const d = Math.abs(uniqueEnds[j]! - m);
+      if (d < bestD) {
+        bestD = d;
+        best = j;
+      }
+    }
+    const w = rawWeights[i]!;
+    if (Number.isFinite(w) && w > 0) acc[best] += w;
+  }
+  return normalizeStripScheduleWeights(acc);
 }
 
 /** Preset window-duration weights (share of Tf); renormalized to sum 1. */
@@ -374,6 +412,50 @@ export function applyStripHedgeShareWeights(
  * (stock at window start, tenure = window length) — not EQ(path 0→Tf).
  * Leg count changes window widths ⇒ changes levels and final cover.
  */
+/**
+ * The ladder a strip was actually built and executed on.
+ *
+ * `settleMonths` is the CASH settle, and a spot strip settles every leg at
+ * T+2 — so after execution they are all ~0. Read naively as the schedule that
+ * collapses the ladder: the Decision card rendered every leg as "M0", and
+ * normalizeStripEndMonths (which keeps only m > 0) dropped the lot, returning
+ * a single Tf edge that made an executed 3-leg strip redraw as one bullet.
+ * The window structure survives in `endMonth`, so fall back to it whenever the
+ * settles are not a usable ladder. Forward strips have real settles and keep
+ * them.
+ */
+export function stripLadderMonths(
+  legs: readonly { settleMonths?: number; endMonth: number }[],
+): number[] {
+  const settles = legs.map(l => l.settleMonths ?? l.endMonth);
+  const settlesAreLadder = settles.every(
+    m => typeof m === 'number' && Number.isFinite(m) && m > 1e-9,
+  );
+  return settlesAreLadder ? settles : legs.map(l => l.endMonth);
+}
+
+/**
+ * Ceiling on the leg count of a strip nobody explicitly sized. Every fallback
+ * used to derive ceil(Tf/Th) — a 12m forecast over a 3m VaR tenure silently
+ * became a 4-leg strip (over 1m, 12 legs) in whichever screen passed no leg
+ * count, and each screen then disagreed with the next. Desk rule: with no
+ * strip explicitly created, a default structure is at most 3 legs.
+ */
+export const DEFAULT_STRIP_LEGS_MAX = 3;
+
+/**
+ * Ceiling on a strip the desk sizes by hand — one leg per forecast month, up
+ * to 24. Distinct from DEFAULT_STRIP_LEGS_MAX, which caps a strip nobody
+ * asked for; this caps one they did.
+ *
+ * Shared so the Hedging Decision card's Legs stepper and the hedge-path
+ * chart's own stepper clamp identically. They carried separate copies of
+ * this expression and could disagree whenever their forecast inputs did.
+ */
+export function maxStripLegsForForecast(forecastMonths: number): number {
+  return Math.max(2, Math.min(24, Math.ceil(forecastMonths) || 2));
+}
+
 export function buildRollingHedgeEdges(
   stockM: number,
   monthlyFlows: readonly number[],
@@ -401,7 +483,13 @@ export function buildRollingHedgeEdges(
     ];
   }
   const edgeTh = Th > 1e-12 ? Th : Tf;
-  const nDefault = Math.max(1, Math.ceil(Tf / edgeTh - 1e-12));
+  // Uncapped ceil(Tf/edgeTh) is the same fabrication as the UI fallbacks —
+  // callers that pass neither endMonths nor legCount get the desk's 3-leg
+  // ceiling, not a ladder invented from the VaR setup.
+  const nDefault = Math.max(
+    1,
+    Math.min(DEFAULT_STRIP_LEGS_MAX, Math.ceil(Tf / edgeTh - 1e-12)),
+  );
   // Keep caller settles as-is (applied optimal strip may end before Tf).
   // Re-locking to Tf here invented a phantom final leg (e.g. M5/M8/M9 → +M12).
   const customEnds =
@@ -841,6 +929,13 @@ export function proposeRollingHedgeTickets(
   const stripId = `strip-${ccy}-${newHedgeTicketId()}`;
   const tickets: HedgeTicket[] = [];
   for (const leg of stripForwardLegsFromEdges(edges)) {
+    // A flat stretch of the cumulative ladder produces legs that trade
+    // nothing (or scaling dust). Booking them created ghost 0.00M forward
+    // tickets that were BLOTTER-booked at a rate and then cancelled —
+    // eleven "Sell EUR 0.00M forward" lines per strip in the exec log,
+    // pure book pollution. Below half the smallest displayable size
+    // (0.01M, 2dp) a leg is not a trade and gets no ticket.
+    if (Math.abs(leg.amountLocalM) < 0.005) continue;
     const settleMonths =
       settleMonthsByEdgeIndex?.[leg.index] ?? leg.tenureMonths;
     const maturity = edgeMaturityHorizonId(settleMonths, setup.horizon);
@@ -858,6 +953,7 @@ export function proposeRollingHedgeTickets(
       amountLocalM: leg.amountLocalM,
       maturity,
       maturityLabel: `${leg.label} · settle ${settleTag} · ${maturityLabel}`,
+      maturityMonths: settleMonths,
       varUsdM: computeParametricVarUsdM(leg.amountLocalM, ccy, {
         ...setup,
         horizon: maturity,
@@ -876,7 +972,9 @@ export function hasRollingStripForCcy(
   booked: readonly HedgeTicket[],
   ccy: string,
 ): boolean {
-  return booked.some(t => t.ccy === ccy && Boolean(t.stripId));
+  return booked.some(
+    t => t.ccy === ccy && Boolean(t.stripId) && t.status !== 'cancelled',
+  );
 }
 
 /** Map path-chart Cash / VN / Target → edge sizing. */
@@ -953,6 +1051,329 @@ export function mergeRollingStripIntoBook(
 ): HedgeTicket[] {
   const withoutPrior = booked.filter(t => !(t.ccy === ccy && t.stripId));
   return [...stripTickets, ...withoutPrior];
+}
+
+function isLiveStripCoverTicket(t: HedgeTicket): boolean {
+  return Boolean(
+    t.stripId
+    && t.status !== 'cancelled'
+    && t.instrument !== 'option'
+    && !t.bracketRole,
+  );
+}
+
+/** Rounded settle months for a strip cover, or null when only a coarse bucket exists. */
+export function stripCoverSlotMonths(t: HedgeTicket): number | null {
+  const fromLeg =
+    t.sourcePackage?.structure === 'strip'
+      ? t.sourcePackage.legs[t.stripEdgeIndex ?? 0]
+      : undefined;
+  const raw = fromLeg?.settleMonths ?? fromLeg?.endMonth ?? t.maturityMonths;
+  if (raw != null && Number.isFinite(raw) && raw > 0) {
+    return Math.max(1, Math.round(raw));
+  }
+  return null;
+}
+
+export function occupiedStripTenorMonths(
+  tickets: readonly HedgeTicket[],
+  ccy: string,
+): Set<number> {
+  const out = new Set<number>();
+  for (const t of tickets) {
+    if (t.ccy !== ccy || !isLiveStripCoverTicket(t)) continue;
+    if (!isMarketExecutedHedgeTicket(t) && t.status !== 'scheduled') continue;
+    const m = stripCoverSlotMonths(t);
+    if (m != null) out.add(m);
+  }
+  return out;
+}
+
+export function occupiedStripEdgeIndices(
+  tickets: readonly HedgeTicket[],
+  ccy: string,
+): Set<number> {
+  const out = new Set<number>();
+  for (const t of tickets) {
+    if (t.ccy !== ccy || !isLiveStripCoverTicket(t)) continue;
+    if (!isMarketExecutedHedgeTicket(t) && t.status !== 'scheduled') continue;
+    out.add(t.stripEdgeIndex ?? 0);
+  }
+  return out;
+}
+
+export function nextFreeStripEdgeIndex(occupied: ReadonlySet<number>): number {
+  let i = 0;
+  while (occupied.has(i)) i++;
+  return i;
+}
+
+export function nextFreeStripEdges(
+  occupied: ReadonlySet<number>,
+  count: number,
+): number[] {
+  const out: number[] = [];
+  let i = 0;
+  while (out.length < count) {
+    if (!occupied.has(i)) out.push(i);
+    i++;
+  }
+  return out;
+}
+
+export function nextFreeStripTenorMonths(
+  occupied: ReadonlySet<number>,
+  prefer: number,
+  forecastMonths = 12,
+): number {
+  const tf = Math.max(1, Math.round(forecastMonths > 0 ? forecastMonths : 12));
+  const want = Math.max(1, Math.round(prefer > 0 && Number.isFinite(prefer) ? prefer : 1));
+  const tryAt = (m: number) => m >= 1 && !occupied.has(m);
+  if (tryAt(want) && want <= tf) return want;
+  for (let d = 1; d <= tf + occupied.size + 8; d++) {
+    const down = want - d;
+    const up = want + d;
+    if (down >= 1 && tryAt(down)) return down;
+    if (tryAt(up)) return up;
+  }
+  return want;
+}
+
+/**
+ * N settle months inside Tf that no live CCY strip ticket already occupies.
+ * Fewer than N free months → every remaining tenor, so leftover clip can
+ * still flatten on the contracts that are actually bookable.
+ */
+export function freeStripSettleEnds(
+  forecastMonths: number,
+  legCount: number,
+  occupied: ReadonlySet<number>,
+): number[] {
+  const n = Math.max(1, legCount);
+  const tf = Math.max(1, Math.round(forecastMonths > 0 ? forecastMonths : 12));
+  const free: number[] = [];
+  for (let m = 1; m <= tf; m++) {
+    if (!occupied.has(m)) free.push(m);
+  }
+  if (free.length === 0) {
+    const taken = new Set(occupied);
+    return Array.from({ length: n }, (_, k) => {
+      const prefer = Math.round(((k + 1) * tf) / n);
+      const m = nextFreeStripTenorMonths(taken, prefer, tf);
+      taken.add(m);
+      return m;
+    });
+  }
+  if (free.length <= n) return free;
+  const used = new Set<number>();
+  const picked: number[] = [];
+  for (let k = 0; k < n; k++) {
+    const idx = n === 1 ? 0 : Math.round((k * (free.length - 1)) / (n - 1));
+    const m = free[idx]!;
+    if (!used.has(m)) {
+      used.add(m);
+      picked.push(m);
+    }
+  }
+  for (const m of free) {
+    if (picked.length >= n) break;
+    if (!used.has(m)) {
+      used.add(m);
+      picked.push(m);
+    }
+  }
+  return picked.sort((a, b) => a - b);
+}
+
+function shouldPreserveLeftoverStripNotional(
+  incoming: HedgeTicket,
+  occupying: HedgeTicket,
+): boolean {
+  if (!isLiveStripCoverTicket(incoming) || !isLiveStripCoverTicket(occupying)) {
+    return false;
+  }
+  const im = stripCoverSlotMonths(incoming);
+  const om = stripCoverSlotMonths(occupying);
+  if (im != null && om != null && im !== om) return true;
+  return (
+    isPreparedStrip(incoming.sourcePackage)
+    && isPreparedStrip(occupying.sourcePackage)
+    && !stripSchedulesAgree(incoming.sourcePackage, occupying.sourcePackage)
+  );
+}
+
+function stripTicketSlotKey(
+  t: Pick<HedgeTicket, 'ccy' | 'stripEdgeIndex' | 'bracketRole'> & HedgeTicket,
+): string {
+  const months = stripCoverSlotMonths(t);
+  const slot = months != null ? `m${months}` : `e${t.stripEdgeIndex ?? 0}`;
+  return `${t.ccy}|${slot}|${t.bracketRole ?? 'cover'}`;
+}
+
+function stripSlotRank(t: HedgeTicket): number {
+  if (isMarketExecutedHedgeTicket(t)) return 3;
+  if (t.status === 'booked') return 2;
+  if (t.status === 'scheduled') return 1;
+  return 0;
+}
+
+function preferStripSlotTicket(a: HedgeTicket, b: HedgeTicket): HedgeTicket {
+  const ra = stripSlotRank(a);
+  const rb = stripSlotRank(b);
+  if (rb > ra) return b;
+  if (ra > rb) return a;
+  if (ra === 3) {
+    const at =
+      a.filledAtMs != null && Number.isFinite(a.filledAtMs)
+        ? a.filledAtMs
+        : Number.POSITIVE_INFINITY;
+    const bt =
+      b.filledAtMs != null && Number.isFinite(b.filledAtMs)
+        ? b.filledAtMs
+        : Number.POSITIVE_INFINITY;
+    if (bt < at) return b;
+    if (at < bt) return a;
+  }
+  return a;
+}
+
+function unifyCcyStripIds(tickets: HedgeTicket[]): HedgeTicket[] {
+  const best = new Map<string, HedgeTicket>();
+  for (const t of tickets) {
+    if (!t.stripId || t.status === 'cancelled' || t.instrument === 'option') continue;
+    const prev = best.get(t.ccy);
+    if (!prev || stripSlotRank(t) > stripSlotRank(prev)) {
+      best.set(t.ccy, t);
+    }
+  }
+  const canon = new Map(
+    [...best].map(([ccy, t]) => [ccy, t.stripId!]),
+  );
+  let changed = false;
+  const next = tickets.map(t => {
+    if (!t.stripId || t.status === 'cancelled' || t.instrument === 'option') return t;
+    const id = canon.get(t.ccy);
+    if (!id || t.stripId === id) return t;
+    changed = true;
+    return { ...t, stripId: id };
+  });
+  return changed ? next : tickets;
+}
+
+/**
+ * One active cover / TP / SL per tenor (or edge when tenor is unknown).
+ * Live prints win over a later working order on the same slot, so filling
+ * M1–M2 by hand then leaving the rest does not book a second execution of
+ * M1–M2.
+ *
+ * A leftover remaining program that Analytics restaged onto new tenors is
+ * not a resume of those slots. Collapsing it by shared edge index dropped
+ * the leftover clip (HD still showed millions pending after "executing"
+ * the proposed ladder). Those notionals move onto free tenors / edges.
+ */
+export function collapseDuplicateStripSlots(
+  tickets: readonly HedgeTicket[],
+): HedgeTicket[] {
+  if (tickets.length === 0) return [];
+  const winner = new Map<string, HedgeTicket>();
+  for (const t of tickets) {
+    // Options are a paid standalone position. A Book overlay opened from a
+    // strip card still stamps stripId on the draft; collapsing that slot
+    // against the M0 cover dropped the option so Hedging Decision never
+    // grew a new OPTION row.
+    if (!t.stripId || t.status === 'cancelled' || t.instrument === 'option') {
+      continue;
+    }
+    const slot = stripTicketSlotKey(t);
+    const prev = winner.get(slot);
+    winner.set(slot, prev ? preferStripSlotTicket(prev, t) : t);
+  }
+  const keep = new Set<string>();
+  for (const t of tickets) {
+    if (!t.stripId || t.status === 'cancelled' || t.instrument === 'option') {
+      keep.add(t.id);
+      continue;
+    }
+    const w = winner.get(stripTicketSlotKey(t));
+    if (w && w.id === t.id) keep.add(t.id);
+  }
+  const occTenors = new Set<number>();
+  const occEdges = new Set<number>();
+  for (const t of tickets) {
+    if (!keep.has(t.id) || !isLiveStripCoverTicket(t)) continue;
+    const m = stripCoverSlotMonths(t);
+    if (m != null) occTenors.add(m);
+    occEdges.add(t.stripEdgeIndex ?? 0);
+  }
+  const remapped = new Map<string, HedgeTicket>();
+  for (const t of tickets) {
+    if (keep.has(t.id) || !isLiveStripCoverTicket(t)) continue;
+    const occupying = winner.get(stripTicketSlotKey(t));
+    if (!occupying || occupying.id === t.id) continue;
+    if (!shouldPreserveLeftoverStripNotional(t, occupying)) continue;
+    const horizon =
+      t.sourcePackage?.settleMonths
+      ?? occupying.sourcePackage?.settleMonths
+      ?? 12;
+    let months = stripCoverSlotMonths(t);
+    if (months == null || occTenors.has(months)) {
+      months = nextFreeStripTenorMonths(occTenors, months ?? 1, horizon);
+    }
+    let edge = t.stripEdgeIndex ?? 0;
+    if (occEdges.has(edge)) edge = nextFreeStripEdgeIndex(occEdges);
+    remapped.set(t.id, {
+      ...t,
+      stripEdgeIndex: edge,
+      maturityMonths: months,
+      maturity: horizonIdForForecastMonths(months),
+    });
+    keep.add(t.id);
+    occTenors.add(months);
+    occEdges.add(edge);
+  }
+  const filtered =
+    keep.size === tickets.length && remapped.size === 0
+      ? (tickets as HedgeTicket[])
+      : tickets
+          .map(t => remapped.get(t.id) ?? t)
+          .filter(t => keep.has(t.id));
+  return unifyCcyStripIds(filtered);
+}
+
+/**
+ * Upsert strip tickets onto the book without duplicating an edge that
+ * already printed live. Incoming tickets are preferred on a rank tie
+ * (reprice a working rest); a market print always keeps the earlier fill.
+ */
+export function mergeStripTicketsIntoBook(
+  booked: readonly HedgeTicket[],
+  incoming: readonly HedgeTicket[],
+): HedgeTicket[] {
+  if (incoming.length === 0) return collapseDuplicateStripSlots(booked);
+  return collapseDuplicateStripSlots([...incoming, ...booked]);
+}
+
+/**
+ * Overlay a client `setBooked` result onto the parent-controlled book so the
+ * Decision row can count pending/filled on the same tick as the blotter,
+ * even if persist/merge is a frame behind. A live fill in `parent` wins over
+ * a stale scheduled copy of the same id.
+ */
+export function mergeOptimisticHedgeTickets(
+  parent: readonly HedgeTicket[],
+  optimistic: readonly HedgeTicket[] | null | undefined,
+): HedgeTicket[] {
+  if (!optimistic || optimistic.length === 0) {
+    return parent as HedgeTicket[];
+  }
+  const byId = new Map<string, HedgeTicket>();
+  for (const t of parent) byId.set(t.id, t);
+  for (const t of optimistic) {
+    const prev = byId.get(t.id);
+    if (prev?.status === 'booked' && t.status === 'scheduled') continue;
+    byId.set(t.id, t);
+  }
+  return collapseDuplicateStripSlots([...byId.values()]);
 }
 
 /** Drop all strip legs for a CCY (bullet regime / clear Decision strip). */
@@ -1113,19 +1534,120 @@ export function resyncBookedRollingStrips(
         );
       });
     if (same) continue;
-    next = mergeRollingStripIntoBook(next, tickets, ccy);
+    next = mergeRollingStripIntoBook(
+      next,
+      carryStripSourcePackage(prevStrip, tickets),
+      ccy,
+    );
     changed = true;
   }
   return changed ? next : null;
 }
 
-/** Drop an entire strip (or a single non-strip ticket) on cancellation. */
+/**
+ * Move the Book-time package onto a rebuilt strip, retimed to the new legs.
+ *
+ * A resync replaces every leg, so without this the `sourcePackage` stamped at
+ * Book is dropped and Cancel falls back to reconstructing from the tickets —
+ * which loses the ranked ladders, the settle skew, the hedge ratio and the
+ * approval, collapsing an approved strip schedule. Legs and cover are re-derived
+ * from the rebuilt tickets so the restaged package describes the strip that is
+ * actually on the book, not the pre-resync one.
+ */
+export function carryStripSourcePackage(
+  prevStrip: readonly HedgeTicket[],
+  tickets: readonly HedgeTicket[],
+): HedgeTicket[] {
+  const prior = prevStrip.find(t => t.sourcePackage)?.sourcePackage;
+  if (!prior || tickets.length === 0) return [...tickets];
+  let cum = 0;
+  const legs = tickets.map((t, i) => {
+    cum += t.amountLocalM;
+    const settle = settleMonthsFromHedgeTicket(t);
+    return {
+      index: t.stripEdgeIndex ?? i,
+      startMonth: 0,
+      endMonth: settle,
+      settleMonths: settle,
+      hedgeLocalM: cum,
+      tradeNotionalLocalM: t.amountLocalM,
+      label: `L${i + 1}`,
+    };
+  });
+  const retimed: PreparedHedgeProfile = {
+    ...prior,
+    structure: 'strip',
+    legs,
+    coverLocalM: cum,
+  };
+  return tickets.map((t, i) =>
+    i === 0 ? { ...t, sourcePackage: retimed } : { ...t },
+  );
+}
+
+/** Tickets a cancellation of `ticket` takes off the book. */
+export function hedgeTicketsRemovedBy(
+  booked: readonly HedgeTicket[],
+  ticket: HedgeTicket,
+): HedgeTicket[] {
+  // Cancelling an UNFILLED leg spares its filled group members: those are
+  // executed trades and must not leave the book (nor publish CANCELLED
+  // lifecycle events) as collateral of cancelling the working remainder.
+  // Explicitly cancelling a FILLED ticket is a deliberate removal of the
+  // executed trade from the sandbox book and sweeps its whole group.
+  const spareFilled = !isMarketExecutedHedgeTicket(ticket);
+  const spared = (t: HedgeTicket) =>
+    spareFilled && isMarketExecutedHedgeTicket(t);
+  if (ticket.stripId) {
+    return booked.filter(t => t.stripId === ticket.stripId && !spared(t));
+  }
+  // An OCO pair is one order with two legs — removing only the edited/
+  // cancelled leg leaves its sibling behind as an orphaned leftover.
+  if (ticket.ocoGroupId) {
+    return booked.filter(
+      t => t.ocoGroupId === ticket.ocoGroupId && !spared(t),
+    );
+  }
+  return booked.filter(t => t.id === ticket.id);
+}
+
+/**
+ * Retire ONE order — the one an edit replaces, or a leg's own Cancel — and
+ * its OCO sibling, never the rest of its strip. Both went through the
+ * strip-wide cancel (`removeHedgeTicketOrStrip`), so touching one leg's
+ * order cancelled every other leg's working order as well.
+ */
+export function retireOneOrder(
+  booked: readonly HedgeTicket[],
+  original: HedgeTicket,
+): HedgeTicket[] {
+  return removeHedgeTicketOrStrip(booked, { ...original, stripId: undefined });
+}
+
+/**
+ * Drop an entire strip (or a single non-strip ticket) on cancellation.
+ * Unfilled remainder is kept as `cancelled` so the executed strip can still
+ * show those legs as Cancelled instead of resurrecting them as Pending.
+ * Explicitly cancelling a filled trade still removes it from the book.
+ *
+ * Retention is deliberate for standalone orders too, and must stay that way: a
+ * cancelled ticket is the only source of its leg's grey "where it rested" chart
+ * level. Hiding a dead row from the blotter is `dismissedAtMs`' job (see
+ * `HedgeTicket.dismissedAtMs` and `reconcileDismissals`), NOT this function's —
+ * narrowing this to `ticket.stripId && …` was tried and reverted, because it
+ * fixes the blotter by destroying charting state.
+ */
 export function removeHedgeTicketOrStrip(
   booked: readonly HedgeTicket[],
   ticket: HedgeTicket,
 ): HedgeTicket[] {
-  if (ticket.stripId) {
-    return booked.filter(t => t.stripId !== ticket.stripId);
+  const drop = new Set(hedgeTicketsRemovedBy(booked, ticket).map(t => t.id));
+  if (!isMarketExecutedHedgeTicket(ticket)) {
+    return booked.map(t =>
+      drop.has(t.id) && t.status !== 'cancelled'
+        ? { ...t, status: 'cancelled' as const }
+        : t,
+    );
   }
-  return booked.filter(t => t.id !== ticket.id);
+  return booked.filter(t => !drop.has(t.id));
 }

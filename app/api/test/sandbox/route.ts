@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { TEST_GUEST_EMAIL } from '@/lib/test-mode/enabled';
 import {
   deleteSandboxProgress,
@@ -22,7 +22,7 @@ function taskIdFrom(searchParams: URLSearchParams, bodyTaskId?: unknown): string
 }
 
 async function requireUserEmail(): Promise<string | NextResponse> {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim() ?? '';
   if (!email || email === TEST_GUEST_EMAIL) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

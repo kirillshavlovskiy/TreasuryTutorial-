@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import {
   appendDeskAction,
   isDeskDatabaseAvailable,
@@ -13,7 +13,7 @@ export const runtime = 'nodejs';
 const MODULES = new Set<DeskModule>(['workspace', 'fx', 'liquidity', 'analytics', 'hedging']);
 
 async function requireUserEmail(): Promise<string | NextResponse> {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim() ?? '';
   if (!email || email === TEST_GUEST_EMAIL) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

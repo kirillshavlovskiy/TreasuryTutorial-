@@ -13,6 +13,45 @@ npm install
 npm run dev
 ```
 
+## Local development stack
+
+`npm run dev` starts Postgres, Redis and an S3-compatible store first, through
+`docker compose`, and then fills in the connection strings. There is no separate
+command to remember and nothing to configure by hand.
+
+The only prerequisite is a running container runtime — Docker Desktop, Rancher
+Desktop or Colima. Without one the app still starts: sandbox and desk state fall
+back to browser-only persistence, the execution journal is not saved at all (the
+browser console says so once), and the script says so instead of failing.
+
+| Service | Host port | Stands in for |
+|---------|-----------|---------------|
+| Postgres 16 | 5432 | the managed CloudNativePG instance the cluster provisions |
+| Redis 7.4 | 16379 | the cluster's Redis deployment — same image version, same `--save "" --appendonly no` arguments, no authentication |
+| MinIO (S3 API) | 9000 | the real AWS S3 bucket the cluster reaches through IRSA |
+| MinIO console | 9001 | — (browse the bucket at http://localhost:9001, minioadmin / minioadmin) |
+
+```bash
+npm run stack:up       # start and wait for health; configure .env.local
+npm run stack:status   # what is running, and what the app will actually talk to
+npm run stack:down     # stop (shared across every checkout — see handover docs)
+```
+
+Redis defaults to **16379**, not 6379. Ports can be moved with `FX_PG_PORT`,
+`FX_REDIS_PORT`, `FX_MINIO_PORT` or `FX_MINIO_CONSOLE_PORT`. `STACK_SKIP=1`
+skips the stack entirely. Those are read by the script, not by the app.
+
+The script creates `.env.local` if missing and fills in `DATABASE_URL`,
+`REDIS_URL`, `S3_ENDPOINT`, the `S3_*` settings and MinIO credentials. **It
+never overwrites a value you have already set.** `AUTH_SECRET` is generated
+when empty; `TOKEN_ENCRYPTION_KEY` is never invented. Existing Neon /
+Vercel `DATABASE_URL` values keep winning — use `npm run stack:status` to see
+what the app will actually connect to.
+
+For a longer walkthrough of shared volumes, MinIO journal layout, and
+production parity, see `docs/handover-order-execution-tape.md` and
+`docs/handover-spot-tape.md`.
+
 ## Environment Variables
 
 Copy `.env.example` to `.env.local` and fill in the values. This table and
@@ -29,28 +68,42 @@ node .claude/skills/fx-review/scripts/env-drift.mjs
 
 | Variable | Description | Required | Example |
 |----------|-------------|----------|---------|
-| `AUTH_SECRET` | HMAC signing secret for this app's session cookie (`openssl rand -base64 33`) | **Yes** — sign-in cannot work without it | — |
-| `AUTH_URL` | Canonical origin for building the OAuth `redirect_uri` | **Yes in production** — the app refuses to derive it from the `Host` header and throws | `https://ssigma.dp.com` |
-| `NEXTAUTH_URL` | Legacy override for this app's callback URL (`${NEXTAUTH_URL}/api/auth/callback`) | No — the request origin is used when omitted | `http://localhost:3000` |
-| `GOOGLE_CLIENT_ID` | Shared Google OAuth client | **Yes** — sign-in fails without it | — |
-| `GOOGLE_OAUTH_PROJECT_ID` | This project's platform routing ID on the login proxy | **Yes** — sign-in fails without it | — |
-| `GOOGLE_REDIRECT_URI` | Platform proxy URL Google redirects to after sign-in | **Yes** — same value locally and in production | `https://login.dp.com/api/gcp-oauth/callback` |
+| `AUTH_SECRET` | Auth.js session secret (`openssl rand -base64 33`). Alias: `NEXTAUTH_SECRET` | **Yes** — Google sign-in cannot work without it | — |
+| `AUTH_URL` | Canonical origin for Auth.js and Treasury Okta `redirect_uri`. Alias: `NEXTAUTH_URL` | **Yes in production** — the app refuses to derive it from the `Host` header and throws | `https://ssigma.app` |
+| `AUTH_GOOGLE_ID` | Google OAuth client ID | **Yes** — sign-in fails without it (or `GOOGLE_CLIENT_ID`) | — |
+| `AUTH_GOOGLE_SECRET` | Google OAuth client secret | **Yes** — sign-in fails without it (or `GOOGLE_CLIENT_SECRET`) | — |
+| `GOOGLE_CLIENT_ID` | Fallback Google OAuth client ID if `AUTH_GOOGLE_ID` is unset | No — used only when `AUTH_GOOGLE_ID` is empty | — |
+| `GOOGLE_CLIENT_SECRET` | Fallback Google OAuth client secret if `AUTH_GOOGLE_SECRET` is unset | No — used only when `AUTH_GOOGLE_SECRET` is empty | — |
+| `AUTH_ALLOW_INSECURE_TLS` | Relax TLS verification for Google OIDC discovery behind a corporate proxy | No — local dev only; ignored in production | `true` |
+| `NODE_TLS_REJECT_UNAUTHORIZED` | Written by `auth.ts` when `AUTH_ALLOW_INSECURE_TLS=true`. Do not set by hand | No | — |
 
 ### PostgreSQL (sandbox and desk snapshots)
 
-The connection string is taken from the first of the four URL variables that is set, in that
-order. The Neon/Vercel Marketplace integration injects the `ssigma_*` names. Set only one.
+Local docker-compose Postgres, Neon on Vercel, or any managed Postgres. Neon
+hosts use the HTTPS/WSS driver on `:443` (`lib/db/sequelize.ts`); other URLs use
+plain `pg`. The connection string is taken from the first of the four URL
+variables that is set, in that order. The Neon/Vercel Marketplace integration
+injects the `ssigma_*` names. Set only one.
 
 | Variable | Description | Required | Example |
 |----------|-------------|----------|---------|
-| `DATABASE_URL` | Postgres connection string, first choice | No — without any URL, sandbox and desk state persist in the browser only | `postgres://user:pass@ep-xxxx.neon.tech/neondb?sslmode=require` |
+| `DATABASE_URL` | Postgres connection string, first choice | No — without any URL, sandbox and desk state persist in the browser only | `postgres://postgres:postgres@localhost:5432/fx_test_project` |
 | `ssigma_DATABASE_URL` | Same, second choice; injected by the Marketplace integration | No — same degradation as above | — |
 | `POSTGRES_URL` | Same, third choice | No — same degradation as above | — |
 | `ssigma_POSTGRES_URL` | Same, fourth choice | No — same degradation as above | — |
 | `DATABASE_SSL` | Force SSL on the connection; Neon hosts and `sslmode=require` enable it anyway | No — inferred from the URL | `true` |
 | `DATABASE_SSL_REJECT_UNAUTHORIZED` | Allow a self-signed certificate on the database connection | No — defaults to rejecting | `false` |
 | `DATABASE_IP_FAMILY` | IP family for the connection: `6` selects IPv6, anything else IPv4 | No — defaults to IPv4 | `4` |
-| `SANDBOX_STORAGE_ENV` | Force the storage partition instead of deriving it from `VERCEL_ENV` | No — `production` on Vercel production, `uat` elsewhere | `uat` |
+| `SANDBOX_STORAGE_ENV` | Force the storage partition instead of deriving it from `VERCEL_ENV` | No — `production` on Vercel production, `uat` elsewhere; `local` for the docker stack | `uat` |
+
+### Redis
+
+Provided by the local development stack. **Nothing in this codebase reads this
+variable today** — documented so local and cluster values share the same shape.
+
+| Variable | Description | Required | Example |
+|----------|-------------|----------|---------|
+| `REDIS_URL` | Redis connection string | No — unread by this codebase today | `redis://localhost:16379` |
 
 ### AI agent
 
@@ -68,6 +121,18 @@ SDK reads the three credential variables directly from the environment.
 | `S3_BUCKET` | Playground bucket for uploaded market-rate files | No — uploads still parse and persist in the book without S3 | `deel-playgrounds-data` |
 | `S3_PREFIX` | Prefix this project is restricted to inside the bucket | No — same degradation as above | `fx-test-project/` |
 | `S3_REGION` | Bucket region | No — same degradation as above | `eu-west-1` |
+| `S3_ENDPOINT` | S3-compatible endpoint instead of AWS (local MinIO); also forces path-style addressing | No — **must stay unset in the cluster** | `http://localhost:9000` |
+
+### Recorded-tape store
+
+The matcher writes the recorded tape to exactly one store. Unset means `s3`
+(cluster). Local checkouts usually set `postgres` so the tape lands in
+`leg_tape_ticks` without AWS credentials.
+
+| Variable | Description | Required | Example |
+|----------|-------------|----------|---------|
+| `EXECUTION_STORE` | Where the recorded tape is written and read: `s3` or `postgres` | No — unset means `s3` | `postgres` |
+| `TAPE_INTERVAL_MS` | Interval between tape ticks for the background matcher | No — defaults to `100` | `100` |
 
 ### Refinitiv IPA (Market data pull)
 

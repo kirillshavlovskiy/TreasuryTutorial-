@@ -192,6 +192,26 @@
 .sim-dark [class*="border-red-"]     { border-color: rgba(239,68,68,0.40); }
 .sim-dark [class*="border-rose-"]    { border-color: rgba(244,63,94,0.40); }
 
+/* Sticky thead: collapsed/alpha borders are a window onto scrolling rows.
+   Paint solid outlines and an opaque ledge under the header. */
+.sim-dark thead th {
+  border-color: #334155;
+  box-shadow: 0 2px 0 0 #0f172a;
+}
+.sim-dark thead [class*="border-sky-"]     { border-color: #0f5076; }
+.sim-dark thead [class*="border-blue-"]    { border-color: #21427c; }
+.sim-dark thead [class*="border-indigo-"]  { border-color: #3a327c; }
+.sim-dark thead [class*="border-violet-"]  { border-color: #41327c; }
+.sim-dark thead [class*="border-purple-"]  { border-color: #4c307c; }
+.sim-dark thead [class*="border-emerald-"] { border-color: #0f584d; }
+.sim-dark thead [class*="border-green-"]   { border-color: #1a5c3e; }
+.sim-dark thead [class*="border-amber-"]   { border-color: #6b4d1d; }
+.sim-dark thead [class*="border-orange-"]  { border-color: #6e3a1e; }
+.sim-dark thead [class*="border-red-"]     { border-color: #6b2732; }
+.sim-dark thead [class*="border-rose-"]    { border-color: #6b273f; }
+.sim-dark thead [class*="border-gray-"],
+.sim-dark thead [class*="border-slate-"]   { border-color: #334155; }
+
 /* ── Light spreadsheet panels inside dark sim (portaled modals) ─────────── */
 .sim-light-panel,
 .sim-dark .sim-light-panel {

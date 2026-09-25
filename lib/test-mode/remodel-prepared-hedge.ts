@@ -15,6 +15,7 @@ import {
   shapedStripScheduleWeights,
   sizingForHedgePathBasis,
   type ForecastHedgeStructure,
+  DEFAULT_STRIP_LEGS_MAX,
 } from '@/lib/test-mode/rolling-hedge';
 import { fcyCcyOf, type FxMarketRatesBundle } from '@/lib/fx-market-rates';
 import {
@@ -29,7 +30,10 @@ export function defaultStripLegCount(setup: VarSetup): number {
   const Tf = setup.forecastMonths;
   const Th = horizonMonths(setup.horizon);
   if (!(Tf > 0) || !(Th > 0)) return 2;
-  return Math.max(2, Math.ceil(Tf / Th - 1e-12));
+  // Capped: uncapped ceil(Tf/Th) fabricated a strip from the VaR setup for any
+  // caller with no explicit leg count (ticket panel, Cash Carry). Desk rule —
+  // no explicit strip means at most 3 legs.
+  return Math.max(2, Math.min(DEFAULT_STRIP_LEGS_MAX, Math.ceil(Tf / Th - 1e-12)));
 }
 
 function skewToRampMode(
@@ -253,6 +257,7 @@ export function applySettleWamToPrepared(input: {
         settleMonths: leg.settleMonths ?? leg.endMonth,
         recognizeMonths: 0,
         structure: 'strip' as const,
+        notionalKind: 'trade' as const,
       };
     });
     const naturalWam = hedgeSettleWamMonths(samples);

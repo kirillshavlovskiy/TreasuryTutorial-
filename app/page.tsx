@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { auth } from '@/auth';
+import { auth, signIn } from '@/auth';
 import { BrandMark } from '@/components/BrandMark';
 import { isTestModeEnabled } from '@/lib/test-mode/enabled';
 
@@ -60,7 +60,7 @@ export default async function LandingPage() {
               Workbench
             </Link>
           ) : (
-            <SignInButton compact />
+            <SignInButton compact redirectTo="/workspace" />
           )}
         </div>
       </header>
@@ -106,6 +106,7 @@ export default async function LandingPage() {
                 signedIn={Boolean(user)}
                 href="/test"
                 cta="Enter sandbox"
+                signInRedirect="/test"
               />
             )}
 
@@ -122,6 +123,7 @@ export default async function LandingPage() {
               signedIn={Boolean(user)}
               href="/workspace"
               cta="Open workbench"
+              signInRedirect="/workspace"
             />
           </div>
         </section>
@@ -181,6 +183,7 @@ function ModeCard({
   signedIn,
   href,
   cta,
+  signInRedirect,
 }: {
   eyebrow: string;
   title: string;
@@ -190,6 +193,7 @@ function ModeCard({
   signedIn: boolean;
   href: string;
   cta: string;
+  signInRedirect: string;
 }) {
   const border =
     accent === 'emerald'
@@ -231,6 +235,7 @@ function ModeCard({
           </Link>
         ) : (
           <SignInButton
+            redirectTo={signInRedirect}
             label={`Sign in · ${cta}`}
             className={`inline-flex w-full items-center justify-center gap-2 rounded-lg px-5 py-3 text-sm font-semibold transition-colors ${btnCls}`}
           />
@@ -242,16 +247,24 @@ function ModeCard({
 
 function SignInButton({
   compact = false,
+  redirectTo = '/workspace',
   label = 'Sign in with Google',
   className,
 }: {
   compact?: boolean;
+  redirectTo?: string;
   label?: string;
   className?: string;
 }) {
   return (
-    <Link href="/api/auth/login">
-      <span
+    <form
+      action={async () => {
+        'use server';
+        await signIn('google', { redirectTo });
+      }}
+    >
+      <button
+        type="submit"
         className={
           className ??
           (compact
@@ -261,8 +274,8 @@ function SignInButton({
       >
         {(compact || !className) && <GoogleIcon />}
         {label}
-      </span>
-    </Link>
+      </button>
+    </form>
   );
 }
 

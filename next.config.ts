@@ -17,6 +17,21 @@ process.env.NODE_PATH = [nodePath, process.env.NODE_PATH]
 
 const nextConfig: NextConfig = {
   distDir,
+  // Lint debt is warnings + the occasional prefer-const error. Keep `next lint`
+  // / CI as the place that reports it; do not fail `next build` / Vercel.
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+  // The live spot poll runs ~2x/second per open ticket and Next logs every
+  // request in dev, which buried the [fx-exec] / [tape-load] / [strip-open]
+  // lines this app is actually diagnosed from. Matched against path AND
+  // query, so /api/fx-spot/candles — one request per From-window click, and
+  // the line that settles "which window did the chart ask for" — stays.
+  logging: {
+    incomingRequests: {
+      ignore: [/^\/api\/fx-spot\?/],
+    },
+  },
   // OneDrive path quirks can break generated route types under nested dirs.
   typescript: {
     ignoreBuildErrors: __dirname.includes('OneDrive'),
@@ -25,6 +40,8 @@ const nextConfig: NextConfig = {
   outputFileTracingRoot: path.join(__dirname),
   serverExternalPackages: [
     'pg',
+    'pg-native',
+    'pg-connection-string',
     'pg-hstore',
     'sequelize',
     '@neondatabase/serverless',
@@ -33,6 +50,29 @@ const nextConfig: NextConfig = {
     'utf-8-validate',
     'undici',
   ],
+  webpack: (config, { isServer }) => {
+    if (isServer) {
+      const extra = [
+        'pg',
+        'pg-native',
+        'pg-connection-string',
+        'pg-hstore',
+        'sequelize',
+      ];
+      const externals = config.externals;
+      const mark = ({ request }: { request?: string }, next: (err?: null, result?: string) => void) => {
+        if (request && extra.includes(request)) {
+          next(null, `commonjs ${request}`);
+          return;
+        }
+        next();
+      };
+      if (Array.isArray(externals)) externals.push(mark);
+      else if (externals) config.externals = [externals, mark];
+      else config.externals = [mark];
+    }
+    return config;
+  },
 };
 
 export default nextConfig;

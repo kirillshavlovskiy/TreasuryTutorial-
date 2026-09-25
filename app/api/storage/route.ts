@@ -10,6 +10,7 @@ import {
   isS3Configured,
   listS3Objects,
   putS3Object,
+  s3OwnerSegment,
   safeFileName,
 } from '@/lib/s3';
 
@@ -24,11 +25,46 @@ async function requireUserEmail(): Promise<string | NextResponse> {
   return email;
 }
 
-function emailSlug(email: string): string {
-  return email.toLowerCase().replace(/[^a-z0-9@._-]+/g, '_').slice(0, 80);
+/**
+ * Top-level folders the app writes itself. This gateway neither uploads into
+ * them nor reads or deletes from them — the execution journal's matcher part
+ * has exactly one writer, and a DELETE here would erase it.
+ */
+const RESERVED_FOLDERS = new Set(['db_backup', 'execution-journal']);
+const FOLDER_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** Same normalisation `lib/s3.ts` applies before a key reaches the API. */
+function normalizeRelative(raw: string): string {
+  return raw
+    .replace(/\\/g, '/')
+    .replace(/\.\./g, '')
+    .replace(/\/+/g, '/')
+    .replace(/^\/+/, '');
 }
 
-/** GET — list under a relative prefix, or download one object by relative key. */
+/**
+ * Every object a user can reach sits at `{folder}/{emailSlug}/…` — the layout
+ * POST writes. The slug must be a whole path segment: a bare string prefix
+ * would let `a@x.com` reach `a@x.com.au`'s objects.
+ */
+function ownedSegments(relative: string, slug: string): string[] | null {
+  const segments = relative.replace(/\/+$/, '').split('/');
+  if (segments.length < 2 || !segments[0] || segments[1] !== slug) return null;
+  if (RESERVED_FOLDERS.has(segments[0])) return null;
+  return segments;
+}
+
+function forbidden(): NextResponse {
+  return NextResponse.json(
+    { error: 'Forbidden — only your own objects are accessible' },
+    { status: 403 },
+  );
+}
+
+/**
+ * GET — list under a relative prefix, or download one object by relative key.
+ * Both are limited to the caller's own `{folder}/{emailSlug}/` space.
+ */
 export async function GET(request: Request) {
   const emailOrErr = await requireUserEmail();
   if (emailOrErr instanceof NextResponse) return emailOrErr;
@@ -41,11 +77,15 @@ export async function GET(request: Request) {
   }
 
   const { searchParams } = new URL(request.url);
-  const key = searchParams.get('key')?.trim() ?? '';
-  const prefix = searchParams.get('prefix')?.trim() ?? '';
+  const key = normalizeRelative(searchParams.get('key')?.trim() ?? '');
+  const prefix = normalizeRelative(searchParams.get('prefix')?.trim() ?? '');
+  const slug = s3OwnerSegment(emailOrErr);
 
   try {
     if (key) {
+      const segments = ownedSegments(key, slug);
+      // A key names an object, so it needs a file segment after the slug.
+      if (!segments || segments.length < 3) return forbidden();
       const obj = await getS3Object(key);
       return new NextResponse(Buffer.from(obj.body), {
         status: 200,
@@ -57,7 +97,12 @@ export async function GET(request: Request) {
       });
     }
 
-    const objects = await listS3Objects(prefix, 200);
+    const segments = ownedSegments(prefix, slug);
+    if (!segments) return forbidden();
+    // `{folder}/{slug}` alone gets its trailing slash so it lists that folder,
+    // not every slug that merely starts with this one.
+    const ownedPrefix = segments.length === 2 ? `${segments.join('/')}/` : prefix;
+    const objects = await listS3Objects(ownedPrefix, 200);
     return NextResponse.json({
       bucket: getS3Bucket(),
       prefix: getS3Prefix(),
@@ -65,11 +110,12 @@ export async function GET(request: Request) {
       objects,
     });
   } catch (err) {
+    const name = err instanceof Error ? err.name : '';
+    if (name === 'NoSuchKey') {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    }
     console.error('[api/storage] GET failed', err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to read S3' },
-      { status: 500 },
-    );
+    return NextResponse.json({ error: 'Failed to read S3' }, { status: 500 });
   }
 }
 
@@ -97,8 +143,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Missing file' }, { status: 400 });
     }
 
-    const folderRaw = String(form.get('folder') ?? 'uploads').trim() || 'uploads';
-    const folder = folderRaw.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').replace(/\.\./g, '') || 'uploads';
+    const folder = String(form.get('folder') ?? 'uploads').trim() || 'uploads';
+    // One plain segment, so the key is always `{folder}/{you}/…` and GET /
+    // DELETE can tell whose object it is from its second segment.
+    if (!FOLDER_PATTERN.test(folder) || RESERVED_FOLDERS.has(folder)) {
+      return NextResponse.json({ error: 'Invalid folder' }, { status: 400 });
+    }
     const ccy = String(form.get('ccy') ?? '').trim().toUpperCase();
     const scopeId = String(form.get('scopeId') ?? '').trim();
 
@@ -113,14 +163,14 @@ export async function POST(request: Request) {
 
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const name = safeFileName(file.name || 'upload.bin');
-    const relativeKey = `${folder}/${emailSlug(emailOrErr)}/${stamp}-${name}`;
+    const relativeKey = `${folder}/${s3OwnerSegment(emailOrErr)}/${stamp}-${name}`;
 
     const uploaded = await putS3Object({
       relativeKey,
       body: bytes,
       contentType: file.type || 'application/octet-stream',
       metadata: {
-        uploader: emailSlug(emailOrErr),
+        uploader: s3OwnerSegment(emailOrErr),
         ...(ccy ? { ccy } : {}),
         ...(scopeId ? { scope: scopeId.slice(0, 64) } : {}),
         original: name.slice(0, 180),
@@ -138,14 +188,11 @@ export async function POST(request: Request) {
     });
   } catch (err) {
     console.error('[api/storage] POST failed', err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to upload to S3' },
-      { status: 500 },
-    );
+    return NextResponse.json({ error: 'Failed to upload to S3' }, { status: 500 });
   }
 }
 
-/** DELETE — remove an object by relative key. */
+/** DELETE — remove one of the caller's own objects by relative key. */
 export async function DELETE(request: Request) {
   const emailOrErr = await requireUserEmail();
   if (emailOrErr instanceof NextResponse) return emailOrErr;
@@ -158,19 +205,18 @@ export async function DELETE(request: Request) {
   }
 
   const { searchParams } = new URL(request.url);
-  const key = searchParams.get('key')?.trim() ?? '';
+  const key = normalizeRelative(searchParams.get('key')?.trim() ?? '');
   if (!key) {
     return NextResponse.json({ error: 'Missing key' }, { status: 400 });
   }
+  const segments = ownedSegments(key, s3OwnerSegment(emailOrErr));
+  if (!segments || segments.length < 3) return forbidden();
 
   try {
     await deleteS3Object(key);
     return NextResponse.json({ ok: true, relativeKey: key });
   } catch (err) {
     console.error('[api/storage] DELETE failed', err);
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to delete from S3' },
-      { status: 500 },
-    );
+    return NextResponse.json({ error: 'Failed to delete from S3' }, { status: 500 });
   }
 }

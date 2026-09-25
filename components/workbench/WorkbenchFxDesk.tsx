@@ -13,6 +13,7 @@ import { Simulator } from '@/app/dashboard/Simulator';
 import { AgentDock } from '@/components/workbench/AgentPanel';
 import { buildDeskContextSnapshot } from '@/lib/agent/desk-context';
 import { HedgingDecisionLayer } from '@/components/test-mode/HedgingDecisionLayer';
+import { WORKSPACE_SANDBOX_TASK_ID } from '@/lib/workspace-client';
 import { ConsolidatedLiveLadder } from '@/components/test-mode/ConsolidatedLiveLadder';
 import { VarAnalyticsPanel } from '@/components/test-mode/VarAnalyticsPanel';
 import { DataUploadPanel } from '@/components/test-mode/DataUploadPanel';
@@ -318,6 +319,7 @@ export function WorkbenchFxDesk({
       tabLabels={CURRICULUM_TAB_LABELS}
       hedgingPanel={
         <HedgingDecisionLayer
+          sandboxTaskId={WORKSPACE_SANDBOX_TASK_ID}
           risk={entityRisk}
           title={`Decision layer — ${entity.name}`}
           hedgeRatios={hedgeRatios}
@@ -347,6 +349,8 @@ export function WorkbenchFxDesk({
           bookedHedges={bookedHedges}
           varSetup={varSetup}
           forecastProfile={analyticsBook.forecastProfile}
+          preparedByCcy={preparedByCcy}
+          marketRatesByCcy={marketRatesByCcy}
           title={`Live Ladder — ${entity.name}`}
         />
       }

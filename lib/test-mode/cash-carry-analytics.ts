@@ -1997,6 +1997,102 @@ function pinSettleMonthsToWam(
   return ends.map(e => clamp(e * scale));
 }
 
+/** Same month the rank table prints (`M2/M4/M8`). */
+function settleMonthKey(m: number): number {
+  if (!(m > 0.5)) return 0;
+  return Math.max(1, Math.round(m));
+}
+
+/**
+ * CoM/kurtosis search uses N bins; WAM-pin then stacks several onto the
+ * same month with dust notionals. Merge those bins so the scored strip,
+ * rank table (`strip · 5` · M2/M4/M6/M7/M8), and tick-trades table agree.
+ */
+export function collapseStripShapeLegsByMonth(
+  legs: readonly { settleMonths: number; amountLocalM: number }[],
+  weights: readonly number[],
+): {
+  legs: { settleMonths: number; amountLocalM: number }[];
+  weights: number[];
+} {
+  if (legs.length === 0) return { legs: [], weights: [] };
+  const n = Math.min(legs.length, weights.length || legs.length);
+  const byMonth = new Map<number, { amount: number; weight: number }>();
+  for (let i = 0; i < n; i++) {
+    const month = settleMonthKey(legs[i]!.settleMonths);
+    const cur = byMonth.get(month) ?? { amount: 0, weight: 0 };
+    cur.amount += legs[i]!.amountLocalM;
+    const w = weights[i];
+    cur.weight += typeof w === 'number' && Number.isFinite(w) ? Math.abs(w) : 0;
+    byMonth.set(month, cur);
+  }
+  const merged = [...byMonth.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([settleMonths, v]) => ({
+      settleMonths,
+      amountLocalM: v.amount,
+      weight: v.weight,
+    }));
+  const origAbs = legs.reduce((s, l) => s + Math.abs(l.amountLocalM), 0);
+  const minAbs = Math.max(0.05, origAbs * 0.0025);
+  const kept = merged.filter(
+    l => Math.abs(l.amountLocalM) >= minAbs || l.weight >= 0.0025,
+  );
+  const use = kept.length > 0 ? kept : merged;
+  const amtSum = use.reduce((s, l) => s + l.amountLocalM, 0);
+  const origSigned = legs.reduce((s, l) => s + l.amountLocalM, 0);
+  const scale =
+    Math.abs(amtSum) > 1e-12 ? origSigned / amtSum : 1;
+  const outLegs = use.map(l => ({
+    settleMonths: l.settleMonths === 0 ? 0.05 : l.settleMonths,
+    amountLocalM: l.amountLocalM * scale,
+  }));
+  const wSum = use.reduce((s, l) => s + l.weight, 0);
+  const outW =
+    wSum > 1e-12
+      ? use.map(l => l.weight / wSum)
+      : outLegs.map(() => 1 / Math.max(1, outLegs.length));
+  return { legs: outLegs, weights: outW };
+}
+
+/**
+ * Keep exact tenors when each prints as a distinct Mm (custom 6.4/8.4/8.8).
+ * Merge only when several bins round to the same rank-table month
+ * (optimizer WAM-pin dust at M8).
+ */
+export function collapseStripScheduleIfDuplicateMonths(
+  ends: readonly number[],
+  weights?: readonly number[] | null,
+): { ends: number[]; weights: number[] } {
+  if (ends.length === 0) return { ends: [], weights: [] };
+  const wIn =
+    weights != null && weights.length === ends.length
+      ? weights.map(w => (Number.isFinite(w) && w > 0 ? w : 0))
+      : ends.map(() => 1);
+  const keys = ends.map(m => settleMonthKey(m));
+  if (new Set(keys).size === ends.length) {
+    const wSum = wIn.reduce((s, w) => s + w, 0);
+    return {
+      ends: [...ends],
+      weights:
+        wSum > 1e-12
+          ? wIn.map(w => w / wSum)
+          : ends.map(() => 1 / ends.length),
+    };
+  }
+  const collapsed = collapseStripShapeLegsByMonth(
+    ends.map((settleMonths, i) => ({
+      settleMonths,
+      amountLocalM: wIn[i]!,
+    })),
+    wIn,
+  );
+  return {
+    ends: collapsed.legs.map(l => l.settleMonths),
+    weights: collapsed.weights,
+  };
+}
+
 /**
  * Explicit per-leg override for scoreStripShapeAroundWam — e.g. hand-tuned
  * "Strip schedule · tick trades" edits (settle date + Hedge % per leg).
@@ -2141,6 +2237,9 @@ export function scoreStripShapeAroundWam(input: {
       settleMonths,
       amountLocalM: amounts[i]!,
     }));
+    const collapsed = collapseStripShapeLegsByMonth(legs, weights);
+    legs = collapsed.legs;
+    weights = collapsed.weights;
   }
   const effectiveLegCount = legs.length;
 
@@ -2159,6 +2258,7 @@ export function scoreStripShapeAroundWam(input: {
       settleMonths: l.settleMonths,
       recognizeMonths: 0,
       structure: effectiveLegCount === 1 ? ('bullet' as const) : ('strip' as const),
+      notionalKind: 'cover' as const,
     })),
   );
   const legBars: StripShapeLegBar[] = legs.map((l, i) => ({
@@ -2273,14 +2373,25 @@ export function optimizeStripShapeAroundWam(input: {
   }
 
   candidates.sort((a, b) => b.enhancementUsdM - a.enhancementUsdM);
-  const best = candidates[0]!;
+  const seen = new Set<string>();
+  const unique: StripShapeScore[] = [];
+  for (const c of candidates) {
+    const key = `${c.structure}|${c.settleScheduleLabel}|${c.legs
+      .map(l => l.weight.toFixed(2))
+      .join(',')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(c);
+  }
+  const ranked = unique.length > 0 ? unique : candidates;
+  const best = ranked[0]!;
   return {
     targetWamMonths: target,
     startConversion,
     bullet: { ...bullet, vsBulletUsdM: 0 },
     best,
-    top: candidates.slice(0, topN),
-    candidates,
+    top: ranked.slice(0, topN),
+    candidates: ranked,
   };
 }
 

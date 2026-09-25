@@ -1,0 +1,105 @@
+# Local development stack: Postgres, Redis and an S3-compatible store.
+#
+# Start it with `npm run stack:up`, or just `npm run dev` — the `predev` script
+# brings it up first. See README.md → "Local development stack".
+#
+# The project name is PINNED. Compose otherwise derives it from the directory
+# name, so each git worktree under .claude/worktrees/ would create its own
+# rival project and the second one would fail on an already-published port.
+# Pinning it means every worktree joins the one stack and shares one data
+# volume — and a container already running from another checkout is adopted,
+# not duplicated.
+#
+# Two consequences worth knowing:
+#   - `npm run stack:down` is stack-wide. Run from any worktree it stops the
+#     Postgres that another checkout's dev server is using.
+#   - Changing a published port changes the service's config hash, so Compose
+#     RECREATES the shared container rather than adopting it — which drops the
+#     connections another checkout is holding. scripts/local-stack.mjs refuses
+#     to do that silently; see `classifyPorts`.
+#
+# Every port is bound to 127.0.0.1 on purpose. Published without a bind address,
+# Docker listens on 0.0.0.0 — measured reachable on this machine's LAN interface
+# on 5432, 16379 and 9000. Redis here has no authentication, MinIO has default
+# credentials, and the shared Postgres volume holds desk snapshots and encrypted
+# Treasury tokens. Nothing in this design needs off-host reachability.
+name: fx-test-project
+
+services:
+  # Matches production's postgresVersion: "16" (CloudNativePG in the cluster).
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fx_test_project
+    ports:
+      - '127.0.0.1:${FX_PG_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Image tag and args copied from helm/templates/redis.yaml so the local
+  # server behaves like the cluster one: no persistence, no authentication.
+  # The cluster pulls the same version from public.ecr.aws; this pulls it from
+  # Docker Hub.
+  #
+  # Default host port is 16379, not 6379: 6379 is commonly held by another
+  # repository's stack on a developer machine, and a default that collides is
+  # not a default.
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ['--save', '', '--appendonly', 'no']
+    ports:
+      - '127.0.0.1:${FX_REDIS_PORT:-16379}:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Stands in for AWS S3, which the cluster reaches through IRSA. MinIO is
+  # API-compatible, not AWS — see README.md for what that does and does not
+  # buy you.
+  #
+  # Pinned to an exact release, like every other image here. This was the newest
+  # tag published on Docker Hub when it was chosen — MinIO's release cadence is
+  # slow, so an apparently old date is not necessarily a stale pin. Check the
+  # registry before assuming it needs bumping. MINIO_SITE_REGION
+  # is deliberately NOT set: MinIO enforces the SigV4 signing region only when
+  # a site region is configured, so setting it would start rejecting requests
+  # from any .env.local carrying a different S3_REGION. Unset, it accepts any.
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - '127.0.0.1:${FX_MINIO_PORT:-9000}:9000'
+      - '127.0.0.1:${FX_MINIO_CONSOLE_PORT:-9001}:9001'
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+# There is deliberately no one-shot bucket-creation service here.
+# `docker compose up -d --wait` returns exit 1 when a one-shot container exits
+# 0, even though every long-running service is healthy — measured with Compose
+# v5.3.1. That would make `predev` fail on every single start. The bucket is
+# created by scripts/local-stack.mjs instead, using the @aws-sdk/client-s3 that
+# is already a dependency.
+
+volumes:
+  postgres-data:
+  minio-data:

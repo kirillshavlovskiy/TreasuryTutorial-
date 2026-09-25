@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { auth } from '@/auth';
+import { getServerSession } from '@/auth';
 import { computeMonteCarloMismatchCfar } from '@/lib/test-mode/cfar-montecarlo';
 import {
   parseCfarJobsRequest,
@@ -20,7 +20,7 @@ export const dynamic = 'force-dynamic';
  * results land instead of blocking on the slowest job.
  */
 export async function POST(request: Request) {
-  const session = await auth();
+  const session = await getServerSession();
   const email = session?.user?.email?.trim() ?? '';
   if (!email || email === TEST_GUEST_EMAIL) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

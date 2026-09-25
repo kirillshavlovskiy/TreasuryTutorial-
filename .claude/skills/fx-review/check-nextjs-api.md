@@ -16,9 +16,8 @@ Source: `CLAUDE.md` → Next.js Patterns.
 ## 2. API routes
 
 - [ ] API routes live under `app/api/`.
-- [ ] **The session is validated first**, before any other work in the handler. Use `auth()`,
-      exported from `auth.ts`. This repository has **no** `getServerSession` — do not flag its
-      absence, and do not suggest adding it.
+- [ ] **The session is validated first**, before any other work in the handler. Use
+      `getServerSession` / `auth()`, exported from `auth.ts`.
 - [ ] The handler never trusts a user id, organisation id, or role supplied by the client. Identity
       comes from the session only.
 - [ ] Every external call — Treasury MCP, the database, any third-party service — is wrapped in
