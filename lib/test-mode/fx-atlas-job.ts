@@ -138,11 +138,11 @@ export function parseFxAtlasJobRequest(
 
   const forecastProfile = rec.forecastProfile == null
     ? null
-    : asRecord(rec.forecastProfile) as ForecastProfileState;
+    : asRecord(rec.forecastProfile) as unknown as ForecastProfileState;
 
   const marketRatesByCcy = rec.marketRatesByCcy == null
     ? undefined
-    : asRecord(rec.marketRatesByCcy) as Record<string, FxMarketRatesBundle>;
+    : asRecord(rec.marketRatesByCcy) as unknown as Record<string, FxMarketRatesBundle>;
 
   const ratesScopeId = typeof rec.ratesScopeId === 'string'
     ? rec.ratesScopeId

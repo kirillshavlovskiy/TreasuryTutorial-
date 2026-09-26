@@ -249,8 +249,6 @@ export function WorkbenchGroupDesk({
               bookedHedges={bookedHedges}
               varSetup={varSetup}
               forecastProfile={analyticsBook.forecastProfile}
-              preparedByCcy={preparedByCcy}
-              marketRatesByCcy={marketRatesByCcy}
               title="Consolidated Live Ladder — Group FX"
             />
           }

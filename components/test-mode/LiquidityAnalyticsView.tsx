@@ -77,6 +77,7 @@ import {
   persistScenarioId,
   pointForScenario,
   policyVarForSelection,
+  relHedgeFarPoint,
   remapSelectionToFrontier,
   resolveFrontierScenarioId,
   selectionPointsEqual,
@@ -518,12 +519,23 @@ function GearIcon({ className }: { className?: string }) {
   );
 }
 
-type PortfolioScenarioId = 'unhedged' | 'carryTarget' | 'balanced' | 'maxCarry' | 'maxReturn';
+type PortfolioScenarioId =
+  | 'unhedged'
+  | 'carryTarget'
+  | 'relHedge'
+  | 'balanced'
+  | 'maxCarry'
+  | 'maxReturn';
 
 function asPortfolioScenarioId(raw: string | null | undefined): PortfolioScenarioId | null {
   if (raw === 'conservative' || raw === 'carryTarget') return 'carryTarget';
   if (raw === 'maxPolicyRisk' || raw === 'maxCarry') return 'maxCarry';
-  if (raw === 'unhedged' || raw === 'balanced' || raw === 'maxReturn') return raw;
+  if (
+    raw === 'unhedged'
+    || raw === 'relHedge'
+    || raw === 'balanced'
+    || raw === 'maxReturn'
+  ) return raw;
   return null;
 }
 
@@ -675,6 +687,14 @@ function portfolioScenarioDefs(
         : (typeof carryTargetUsdYr === 'number' && Number.isFinite(carryTargetUsdYr)
           ? `Target Carry ${fmtSignedK(carryTargetUsdYr)}/yr is off the open arm`
           : 'Target Carry $32k/yr is off the open arm — raise Total Carry in Buffer Carry target setup or extend the walk'),
+      breached: false,
+    },
+    {
+      // CIP-on far twin at hold scale (k=1) — same pick as solution-pick.
+      id: 'relHedge',
+      label: 'Rel Hedge',
+      point: frontier ? relHedgeFarPoint(frontier) : null,
+      disabledHint: 'no CIP-on far twin at hold scale on this walk',
       breached: false,
     },
     {
@@ -1354,6 +1374,7 @@ export function LiquidityAnalyticsView({
       solutionFrontier
       && kind !== 'custom'
       && kind !== 'maxReturn'
+      && kind !== 'relHedge'
     ) {
       const chartHit = chartPresetPointForScenario({
         scenarioId: kind as ChartPresetScenarioId,
@@ -3662,6 +3683,8 @@ function SweetStripSplit({
 const PORTFOLIO_SCENARIO_COLORS: Record<string, string> = {
   unhedged: '#94a3b8',
   carryTarget: '#60a5fa',
+  // Far-leg pink — matches LiquidityFrontierModal swapHedged / CIP-on twin.
+  relHedge: '#fb7185',
   balanced: '#f59e0b',
   // Was #f87171 — nearly identical to the far-leg's #fb7185 (both
   // reddish-pink), read as the same curve at a glance. Violet is distinct
@@ -3680,6 +3703,10 @@ const PORTFOLIO_SCENARIO_CHIP_TONE: Record<string, { on: string; off: string }> 
   carryTarget: {
     on: 'border-sky-400 bg-sky-500/25 text-sky-100',
     off: 'border-sky-500/45 bg-sky-500/10 text-sky-200 hover:border-sky-400 hover:bg-sky-500/20',
+  },
+  relHedge: {
+    on: 'border-rose-400 bg-rose-500/25 text-rose-100',
+    off: 'border-rose-500/45 bg-rose-500/10 text-rose-200 hover:border-rose-400 hover:bg-rose-500/20',
   },
   balanced: {
     on: 'border-amber-400 bg-amber-500/25 text-amber-100',

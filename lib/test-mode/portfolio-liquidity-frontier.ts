@@ -38,6 +38,7 @@ import type {
   LiquidityStrategy,
   LiquidityStrategyResult,
 } from '@/lib/test-mode/liquidity-strategies';
+import type { UsdRiskLeg } from '@/lib/fx-market-risk';
 
 export type PortfolioFrontierEngine = Omit<
   LiquidityFrontierInput,
@@ -138,9 +139,13 @@ export function pairCorr(a: string, b: string): number {
 /**
  * √(v' ρ v) on signed USD risk. Same mechanics as computePortfolioVAR's
  * variance sum, but the vector is already in USD (CFaR), not z×vol(FCY).
+ *
+ * Optional `corr` lets callers inject Atlas tenor-decay ρ (or a live
+ * market matrix). Default is the desk 14×14 pairCorr on currency only.
  */
 export function diversifiedUsdRisk(
-  contribs: readonly { ccy: string; usdM: number }[],
+  contribs: readonly UsdRiskLeg[],
+  corr: (a: UsdRiskLeg, b: UsdRiskLeg) => number = (a, b) => pairCorr(a.ccy, b.ccy),
 ): DiversifiedUsdRisk {
   const xs = contribs.filter(c => Number.isFinite(c.usdM) && Math.abs(c.usdM) > 1e-12);
   const standaloneUsdM = xs.reduce((s, c) => s + Math.abs(c.usdM), 0);
@@ -156,7 +161,7 @@ export function diversifiedUsdRisk(
   let variance = 0;
   const rhoV = xs.map(a => {
     let s = 0;
-    for (const b of xs) s += pairCorr(a.ccy, b.ccy) * b.usdM;
+    for (const b of xs) s += corr(a, b) * b.usdM;
     return s;
   });
   for (let i = 0; i < xs.length; i++) variance += xs[i]!.usdM * rhoV[i]!;
@@ -1020,5 +1025,54 @@ export function toSwapHedgeCoverageFrontier(
       points, origin.portfolioVarUsd, origin.totalCarryUsdYr,
     ),
   };
+}
+
+export type OverlayFillPriceInput = {
+  result: LiquidityStrategyResult;
+  rows: readonly RowState[];
+  engine: PortfolioFrontierEngine;
+  overlayFcyByCcy: Readonly<Record<string, number>>;
+  /** When the live plan already embeds today's overlay, subtract it before adding the scenario fill. */
+  liveOverlayFcyByCcy?: Readonly<Record<string, number>>;
+};
+
+/**
+ * Per-name cash Δr of the live strip plus a named overlay fill
+ * (hold + overlay FCY). Sum is the desk number on a scenario card.
+ */
+export function priceOverlayFillCashSwapByCcy(
+  input: OverlayFillPriceInput,
+): { ccy: string; usdM: number }[] {
+  const rowByCcy = new Map(input.rows.map(r => [r.ccy, r] as const));
+  const rows: { ccy: string; usdM: number }[] = [];
+  for (const c of input.result.byCcy) {
+    const row = rowByCcy.get(c.ccy);
+    if (!row) continue;
+    const live = signedPeakStanding(c.plan);
+    const liveOv = input.liveOverlayFcyByCcy?.[c.ccy] ?? 0;
+    const fill = live - liveOv + (input.overlayFcyByCcy[c.ccy] ?? 0);
+    const bookCashK = bookCashCarryK(
+      live,
+      ccySpotRate(row.ccy),
+      row.r_FCY,
+      input.engine.shared.r_USD,
+      row.r_OD,
+    );
+    const priced = priceLiquidityStanding(
+      {
+        ...input.engine,
+        row,
+        bookingMode: input.result.strategy.regime?.bookingMode,
+      },
+      fill,
+      bookCashK,
+    );
+    rows.push({ ccy: c.ccy, usdM: priced.open.cashCarryUsdYrM });
+  }
+  return rows;
+}
+
+export function priceOverlayFillCashSwapUsdYr(input: OverlayFillPriceInput): number {
+  return priceOverlayFillCashSwapByCcy(input).reduce((s, r) => s + r.usdM, 0);
 }
 

@@ -1,6 +1,11 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { ZodType } from 'zod';
+import {
+  getValidTreasuryAccessToken,
+  TreasuryReauthRequiredError,
+  TreasuryTemporarilyUnavailableError,
+} from '@/lib/treasury/token-store';
 
 /**
  * Thin wrapper over the Treasury Finance MCP server (POST /mcp, JSON-RPC over
@@ -111,4 +116,68 @@ export function parseToolResult<T>(result: unknown, toolName: string, schema: Zo
     throw new Error(`Treasury MCP tool "${toolName}" returned an unexpected shape: ${validated.error.message}`);
   }
   return validated.data;
+}
+
+export type TreasuryClientStatus = 'not_connected' | 'live' | 'reauth_required' | 'error';
+
+export type WithTreasuryClientOutcome<T> =
+  | { status: 'live'; data: T }
+  | { status: 'not_connected' }
+  | { status: 'reauth_required' }
+  | { status: 'error'; errorMessage: string };
+
+/**
+ * Shared token + connect + close wrapper used by every read-only Treasury
+ * tool helper (accounts, notional pool, blotter, FX P&L). Never throws —
+ * maps auth/connect/tool failures onto the same status union the UI already
+ * knows how to render.
+ */
+export async function withTreasuryClient<T>(
+  email: string,
+  logPrefix: string,
+  fn: (client: TreasuryMcpClient) => Promise<T>,
+): Promise<WithTreasuryClientOutcome<T>> {
+  if (!isTreasuryMcpConfigured()) return { status: 'not_connected' };
+
+  let accessToken: string | null;
+  try {
+    accessToken = await getValidTreasuryAccessToken(email);
+  } catch (err) {
+    if (err instanceof TreasuryReauthRequiredError) return { status: 'reauth_required' };
+    if (err instanceof TreasuryTemporarilyUnavailableError) {
+      console.warn(`${logPrefix} token refresh temporarily unavailable`, err);
+      return { status: 'error', errorMessage: err.message };
+    }
+    console.error(`${logPrefix} token lookup failed`, err);
+    return { status: 'error', errorMessage: 'Could not verify your Treasury connection.' };
+  }
+  if (!accessToken) return { status: 'not_connected' };
+
+  let client: TreasuryMcpClient;
+  try {
+    client = await connectTreasuryMcpClient(accessToken);
+  } catch (err) {
+    console.error(`${logPrefix} MCP connect failed`, err);
+    return {
+      status: 'error',
+      errorMessage: 'Treasury data is temporarily unavailable — try again shortly.',
+    };
+  }
+
+  try {
+    const data = await fn(client);
+    return { status: 'live', data };
+  } catch (err) {
+    console.error(`${logPrefix} tool call failed`, err);
+    return {
+      status: 'error',
+      errorMessage: err instanceof Error
+        ? err.message
+        : 'Treasury data is temporarily unavailable — try again shortly.',
+    };
+  } finally {
+    await client.close().catch(err => {
+      console.warn(`${logPrefix} error closing MCP client (ignored)`, err);
+    });
+  }
 }

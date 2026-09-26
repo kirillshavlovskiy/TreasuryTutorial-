@@ -293,6 +293,48 @@ export function mergeHedgeBooksPreservingPrepared(
   return out;
 }
 
+/**
+ * Prefer primary's ticket + prepared membership so a stale secondary
+ * snapshot cannot resurrect cancelled strip rows or un-staged packages.
+ * Secondary still fills market / carry / desk / ratios where useful.
+ * Use {@link mergeHedgeBooksPreservingPrepared} when the primary looks like
+ * an accidental wipe and membership must be restored from secondary.
+ */
+export function mergeHedgeBooksKeepingPrimaryTickets(
+  primary: Record<string, EntityHedgeBook> | undefined,
+  secondary: Record<string, EntityHedgeBook> | undefined,
+): Record<string, EntityHedgeBook> {
+  const keys = new Set([
+    ...Object.keys(primary ?? {}),
+    ...Object.keys(secondary ?? {}),
+  ]);
+  const out: Record<string, EntityHedgeBook> = {};
+  for (const key of keys) {
+    const a = primary?.[key];
+    const b = secondary?.[key];
+    if (!a) {
+      if (b) out[key] = b;
+      continue;
+    }
+    const desk = mergeHedgeDesk(a.desk, b?.desk);
+    out[key] = {
+      bookedHedges: [...(a.bookedHedges ?? [])],
+      hedgeRatios: { ...(b?.hedgeRatios ?? {}), ...(a.hedgeRatios ?? {}) },
+      preparedByCcy: { ...(a.preparedByCcy ?? {}) },
+      carrySessionsByCcy: {
+        ...(b?.carrySessionsByCcy ?? {}),
+        ...(a.carrySessionsByCcy ?? {}),
+      },
+      marketRatesByCcy: {
+        ...(b?.marketRatesByCcy ?? {}),
+        ...(a.marketRatesByCcy ?? {}),
+      },
+      ...(desk ? { desk } : {}),
+    };
+  }
+  return out;
+}
+
 function ledgerScore(score: ReturnType<typeof hedgeBookContentScore>): number {
   return score.booked + score.prepared + score.carry + score.market;
 }

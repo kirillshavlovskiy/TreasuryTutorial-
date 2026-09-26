@@ -349,8 +349,6 @@ export function WorkbenchFxDesk({
           bookedHedges={bookedHedges}
           varSetup={varSetup}
           forecastProfile={analyticsBook.forecastProfile}
-          preparedByCcy={preparedByCcy}
-          marketRatesByCcy={marketRatesByCcy}
           title={`Live Ladder — ${entity.name}`}
         />
       }
